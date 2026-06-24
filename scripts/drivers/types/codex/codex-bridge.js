@@ -777,7 +777,7 @@ class CodexBridge {
     this.pendingWake = false;
     this.watchHandle = null;
     this.wakeCount = 0;
-    this.lastWakeMaxId = 0;
+    this.lastWakeMaxId = "";
     this.staleWakeCount = 0;
     this.watchFailureCount = 0;
     this.watchRearmTimer = null;
@@ -1312,7 +1312,9 @@ class CodexBridge {
   }
 
   isStaleWake(maxId) {
-    if (maxId <= 0 || this.lastWakeMaxId !== maxId) {
+    // maxId is an OPAQUE token (the unread frontier id from watch-once), compared
+    // only for equality — never ordered. An empty token means "no unread".
+    if (!maxId || this.lastWakeMaxId !== maxId) {
       this.lastWakeMaxId = maxId;
       this.staleWakeCount = 0;
       return false;
@@ -1391,8 +1393,10 @@ function readPid(file) {
 }
 
 function parseMaxId(stdout) {
-  const match = String(stdout || "").match(/\bmax_id=([0-9]+)/);
-  return match ? Number(match[1]) : 0;
+  // max_id is now an opaque token (UUIDv7 / legacy decimal / any whitespace-free
+  // string), not an integer — return it verbatim for equality-only comparison.
+  const match = String(stdout || "").match(/\bmax_id=(\S+)/);
+  return match ? match[1] : "";
 }
 
 async function main() {
