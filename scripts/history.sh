@@ -16,9 +16,10 @@ case "$LIMIT" in ''|*[!0-9]*) LIMIT=20 ;; esac
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/storage.sh"
 agmsg_storage_load
-DB="$(agmsg_db_path)"
 
-if [ ! -f "$DB" ]; then
+# Ask the active driver whether a store exists (driver-level, works for jsonl) —
+# a history read must not create one in a storeless project.
+if ! storage_store_exists; then
   echo "No messages (DB not initialized)"
   exit 0
 fi
