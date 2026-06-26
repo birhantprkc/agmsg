@@ -28,9 +28,6 @@ agmsg_validate_team_name "$OLD_TEAM" || exit 1
 agmsg_validate_team_name "$NEW_TEAM" || exit 1
 TEAMS_DIR="$SCRIPT_DIR/../teams"
 DB="$(agmsg_db_path)"
-# Escape interpolated identifiers as SQL string literals (parity with
-# send.sh): a team/agent name with a single quote would break the UPDATE.
-_agmsg_sqlesc() { printf %s "$1" | sed "s/'/''/g"; }
 OLD_DIR="$TEAMS_DIR/$OLD_TEAM"
 NEW_DIR="$TEAMS_DIR/$NEW_TEAM"
 
@@ -71,23 +68,34 @@ fi
 mv "$OLD_DIR/config.json" "$NEW_DIR/config.json"
 
 # --- Update name in config.json ---
+# Read the config with readfile() (not `.param set`, whose dot-command tokenizer
+# does NOT honour SQL '' escaping, so an apostrophe in the config content breaks
+# the binding) and escape the new team name as a SQL string literal (#223, #87):
+# a team name may contain a single quote (validate.sh only blocks path traversal).
+# Mirrors join.sh's readfile-based, apostrophe-safe registry read.
 NEW_CONFIG="$NEW_DIR/config.json"
 if [ -f "$NEW_CONFIG" ]; then
-  CONFIG_ESCAPED=$(sed "s/'/''/g" "$NEW_CONFIG")
-  UPDATED=$(agmsg_sqlite_mem ".param set :json '$CONFIG_ESCAPED'" \
-    "SELECT json_set(:json, '\$.name', '$NEW_TEAM');")
-  agmsg_write_atomic "$NEW_CONFIG" "$UPDATED"
+  CONFIG_SQL=$(agmsg_sql_readfile_path "$NEW_CONFIG")
+  NEW_TEAM_LIT=$(agmsg_sqlesc "$NEW_TEAM")
+  UPDATED=$(agmsg_sqlite_mem \
+    "SELECT json_set(CAST(readfile('$CONFIG_SQL') AS TEXT), '\$.name', '$NEW_TEAM_LIT');")
+  echo "$UPDATED" > "$NEW_CONFIG"
 fi
 
 # --- Update messages in DB ---
 # Rewrite the team name in BOTH stores: the event log (where storage_send now
 # writes) and the legacy messages table (pre-event-log installs). Without the
 # events update a rename would orphan every message sent after the storage flip.
+# Escape both team names as SQL string literals (#223, #87): a team name may
+# contain a single quote (validate.sh only blocks path traversal), which would
+# otherwise break the UPDATE and is an injection surface.
 if [ -f "$DB" ]; then
-  agmsg_sqlite "$DB" "UPDATE messages SET team='$(_agmsg_sqlesc "$NEW_TEAM")' WHERE team='$(_agmsg_sqlesc "$OLD_TEAM")';"
+  OLD_LIT=$(agmsg_sqlesc "$OLD_TEAM")
+  NEW_LIT=$(agmsg_sqlesc "$NEW_TEAM")
+  agmsg_sqlite "$DB" "UPDATE messages SET team='$NEW_LIT' WHERE team='$OLD_LIT';"
   # events may not exist yet on an install that has not sent since the storage
   # flip — best-effort, never abort the rename over a missing optional table.
-  agmsg_sqlite "$DB" "UPDATE events SET team='$(_agmsg_sqlesc "$NEW_TEAM")' WHERE team='$(_agmsg_sqlesc "$OLD_TEAM")';" 2>/dev/null || true
+  agmsg_sqlite "$DB" "UPDATE events SET team='$NEW_LIT' WHERE team='$OLD_LIT';" 2>/dev/null || true
 fi
 
 agmsg_lock_release
