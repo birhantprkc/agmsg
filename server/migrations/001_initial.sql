@@ -11,12 +11,15 @@ CREATE TABLE IF NOT EXISTS teams (
   min_available_seq BIGINT NOT NULL DEFAULT 0,
   policy_revision BIGINT NOT NULL DEFAULT 0 CHECK (policy_revision >= 0),
   accepted_envelope_versions INTEGER[] NOT NULL DEFAULT ARRAY[1],
-  write_allowed_ciphers TEXT[] NOT NULL DEFAULT ARRAY['none']::TEXT[],
+  write_allowed_ciphers TEXT[] NOT NULL DEFAULT ARRAY['none', 'age-v1']::TEXT[],
   max_blob_bytes INTEGER NOT NULL DEFAULT 1048576
     CHECK (max_blob_bytes BETWEEN 1 AND 1048576),
   members_revision BIGINT NOT NULL DEFAULT 0 CHECK (members_revision >= 0),
   CHECK (min_available_seq >= 0 AND min_available_seq <= current_seq)
 );
+
+ALTER TABLE teams ALTER COLUMN write_allowed_ciphers
+  SET DEFAULT ARRAY['none', 'age-v1']::TEXT[];
 
 CREATE TABLE IF NOT EXISTS team_policy_history (
   team_id UUID NOT NULL REFERENCES teams(team_id) ON DELETE RESTRICT,
@@ -87,3 +90,35 @@ CREATE TABLE IF NOT EXISTS registration_identity_history (
   member_id UUID NOT NULL,
   PRIMARY KEY (team_id, registration_id)
 );
+
+-- Pairing codes are short-lived bootstrap capabilities. Long-lived bearer
+-- secrets are stored only as domain-separated digests and are independently
+-- revocable per connected device.
+CREATE TABLE IF NOT EXISTS credentials (
+  team_id UUID NOT NULL REFERENCES teams(team_id) ON DELETE RESTRICT,
+  credential_id UUID NOT NULL,
+  secret_digest BYTEA NOT NULL UNIQUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  last_active_at TIMESTAMPTZ,
+  revoked_at TIMESTAMPTZ,
+  PRIMARY KEY (team_id, credential_id)
+);
+
+CREATE INDEX IF NOT EXISTS credentials_team_created_idx
+  ON credentials(team_id, created_at, credential_id);
+
+CREATE TABLE IF NOT EXISTS pairing_tokens (
+  token_digest BYTEA PRIMARY KEY,
+  team_id UUID NOT NULL REFERENCES teams(team_id) ON DELETE RESTRICT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  expires_at TIMESTAMPTZ NOT NULL,
+  consumed_at TIMESTAMPTZ,
+  credential_id UUID,
+  CHECK (expires_at > created_at),
+  CHECK ((consumed_at IS NULL) = (credential_id IS NULL)),
+  FOREIGN KEY (team_id, credential_id)
+    REFERENCES credentials(team_id, credential_id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS pairing_tokens_team_expiry_idx
+  ON pairing_tokens(team_id, expires_at);

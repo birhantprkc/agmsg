@@ -1,4 +1,3 @@
-import { timingSafeEqual } from "node:crypto";
 import Fastify, {
   type FastifyInstance,
   type FastifyRequest,
@@ -7,6 +6,13 @@ import * as duplicateKeyJson from "json-dup-key-validator";
 import type { Pool } from "pg";
 import { ZodError, z } from "zod";
 import type { Config } from "./config.js";
+import {
+  authenticateCredential,
+  credentialBinding,
+  exchangePairingToken,
+  revokeCredential,
+  type CredentialIdentity,
+} from "./credentials.js";
 import { errorBody, ProtocolError } from "./errors.js";
 import {
   MAX_REQUEST_BYTES,
@@ -24,14 +30,10 @@ import {
 } from "./storage.js";
 
 const emptyQuerySchema = z.object({}).strict();
+const pairingExchangeSchema = z.object({ token: z.string().min(32).max(256) }).strict();
+const credentialParamsSchema = z.object({ credentialId: uuidV7Schema }).strict();
 
-function tokenMatches(expected: string, actual: string): boolean {
-  const left = Buffer.from(expected);
-  const right = Buffer.from(actual);
-  return left.length === right.length && timingSafeEqual(left, right);
-}
-
-function scopedTeamId(request: FastifyRequest, token: string): string {
+function requireProtocol(request: FastifyRequest): void {
   const version = request.headers["agmsg-protocol-version"];
   if (version !== "1") {
     throw new ProtocolError(
@@ -41,14 +43,9 @@ function scopedTeamId(request: FastifyRequest, token: string): string {
       { requested_version: version ?? null, supported_versions: [1] },
     );
   }
-  const authorization = request.headers.authorization;
-  if (
-    typeof authorization !== "string" ||
-    !authorization.startsWith("Bearer ") ||
-    !tokenMatches(token, authorization.slice("Bearer ".length))
-  ) {
-    throw new ProtocolError(401, "unauthenticated", "valid credentials are required");
-  }
+}
+
+function requestedTeamId(request: FastifyRequest): string {
   const parsed = uuidV7Schema.safeParse(request.headers["agmsg-team-id"]);
   if (!parsed.success) {
     throw new ProtocolError(400, "invalid-request", "Agmsg-Team-ID is invalid");
@@ -56,9 +53,53 @@ function scopedTeamId(request: FastifyRequest, token: string): string {
   return parsed.data;
 }
 
+function bearerSecret(request: FastifyRequest): string | undefined {
+  const authorization = request.headers.authorization;
+  return typeof authorization === "string" && authorization.startsWith("Bearer ")
+    ? authorization.slice("Bearer ".length)
+    : undefined;
+}
+
+async function scopedCredential(
+  pool: Pool,
+  request: FastifyRequest,
+  includeRevoked = false,
+): Promise<{ teamId: string; credential?: CredentialIdentity }> {
+  requireProtocol(request);
+  const teamId = requestedTeamId(request);
+  const secret = bearerSecret(request);
+  if (!secret) {
+    throw new ProtocolError(401, "unauthenticated", "valid credentials are required");
+  }
+  const credential = await authenticateCredential(pool, teamId, secret, includeRevoked);
+  if (!credential) {
+    throw new ProtocolError(401, "unauthenticated", "valid credentials are required");
+  }
+  return { teamId, credential };
+}
+
+async function scopedTeamId(
+  pool: Pool,
+  request: FastifyRequest,
+): Promise<string> {
+  return (await scopedCredential(pool, request)).teamId;
+}
+
 export function createApp(pool: Pool, config: Config): FastifyInstance {
   const app = Fastify({
-    logger: config.logLevel === "silent" ? false : { level: config.logLevel },
+    logger: config.logLevel === "silent" ? false : {
+      level: config.logLevel,
+      redact: {
+        paths: [
+          "req.headers.authorization",
+          "req.body.token",
+          "res.body.credential",
+          "token",
+          "credential",
+        ],
+        censor: "[REDACTED]",
+      },
+    },
     bodyLimit: MAX_REQUEST_BYTES,
   });
 
@@ -146,26 +187,53 @@ export function createApp(pool: Pool, config: Config): FastifyInstance {
 
   app.get("/v1/capabilities", async (request, reply) => {
     emptyQuerySchema.parse(request.query);
-    const teamId = scopedTeamId(request, config.token);
+    const teamId = await scopedTeamId(pool, request);
     reply.header("Cache-Control", "no-store");
     return getCapabilities(pool, teamId);
   });
 
   app.get("/v1/members", async (request) => {
     emptyQuerySchema.parse(request.query);
-    return getMembers(pool, scopedTeamId(request, config.token));
+    return getMembers(pool, await scopedTeamId(pool, request));
   });
 
   app.get("/v1/messages", async (request) => {
-    const teamId = scopedTeamId(request, config.token);
+    const teamId = await scopedTeamId(pool, request);
     const query = messagesQuerySchema.parse(request.query);
     return getMessages(pool, teamId, parseSequence(query.after), query.limit);
   });
 
   app.post("/v1/messages", async (request) => {
-    const teamId = scopedTeamId(request, config.token);
+    const teamId = await scopedTeamId(pool, request);
     const body = postMessagesSchema.parse(request.body);
     return postMessages(pool, teamId, body.messages);
+  });
+
+  app.post("/v1/pairing/exchange", async (request, reply) => {
+    requireProtocol(request);
+    const body = pairingExchangeSchema.parse(request.body);
+    reply.header("Cache-Control", "no-store");
+    return exchangePairingToken(pool, body.token);
+  });
+
+  app.post("/v1/credentials/:credentialId/revoke", async (request, reply) => {
+    const params = credentialParamsSchema.parse(request.params);
+    const authenticated = await scopedCredential(pool, request, true);
+    if (
+      authenticated.credential &&
+      authenticated.credential.credentialId !== params.credentialId
+    ) {
+      const binding = await credentialBinding(pool, authenticated.teamId);
+      throw new ProtocolError(
+        403,
+        "credential-scope-violation",
+        "a credential may revoke only itself",
+        { credential_id: params.credentialId },
+        binding,
+      );
+    }
+    reply.header("Cache-Control", "no-store");
+    return revokeCredential(pool, authenticated.teamId, params.credentialId);
   });
 
   return app;

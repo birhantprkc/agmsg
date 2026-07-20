@@ -20,7 +20,6 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql://agmsg:agmsg-local-only@postgres:5432/agmsg
-      AGMSG_SERVER_TOKEN: change-this-development-token
       HOST: 0.0.0.0
       PORT: 8787
     ports:

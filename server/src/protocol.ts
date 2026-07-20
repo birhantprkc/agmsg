@@ -18,6 +18,16 @@ export const uuidV4Schema = z.string().regex(uuidV4Pattern);
 export const uuidV7Schema = z.string().regex(uuidV7Pattern);
 export const timestampSchema = z.string().regex(timestampPattern);
 
+export const teamNameSchema = z.string().refine((value) => {
+  const scalars = [...value];
+  return (
+    value === value.normalize("NFC") &&
+    scalars.length >= 1 &&
+    scalars.length <= 128 &&
+    !/[\u0000-\u001f\u007f]/u.test(value)
+  );
+});
+
 export const sequenceSchema = z.string().regex(sequencePattern).refine((value) => {
   try {
     return BigInt(value) <= MAX_SEQUENCE;
@@ -66,6 +76,13 @@ export const envelopeSchema = z
         code: "custom",
         path: ["key_id"],
         message: "key_id must be null for cipher none",
+      });
+    }
+    if (value.cipher !== "none" && value.key_id === null) {
+      context.addIssue({
+        code: "custom",
+        path: ["key_id"],
+        message: "key_id must be present for encrypted ciphers",
       });
     }
   });

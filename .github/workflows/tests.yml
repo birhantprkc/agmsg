@@ -442,11 +442,23 @@ jobs:
         if: needs.changes.outputs.server_changed != 'false'
         run: npm run build
 
+      - name: Compiled admin onboarding smoke test
+        if: needs.changes.outputs.server_changed != 'false'
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/agmsg_test
+        run: |
+          team_json=$(npm run --silent admin -- team create --name ci-onboarding --json)
+          printf '%s\n' "$team_json" | grep -Eq '^\{"team_id":"[0-9a-f-]+","team_name":"ci-onboarding"\}$'
+          connect_command=$(npm run --silent admin -- \
+            token issue --team ci-onboarding --endpoint https://sync.example.test)
+          test "$(printf '%s\n' "$connect_command" | wc -l)" -eq 1
+          printf '%s\n' "$connect_command" | grep -Eq \
+            '^agmsg remote connect --endpoint https://sync\.example\.test agmsg_pair_[A-Za-z0-9_-]+$'
+
       - name: Compiled start smoke test
         if: needs.changes.outputs.server_changed != 'false'
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/agmsg_test
-          AGMSG_SERVER_TOKEN: ci-compiled-start-token
           LOG_LEVEL: silent
         run: |
           npm start > "$RUNNER_TEMP/agmsg-server.log" 2>&1 &
@@ -469,12 +481,11 @@ jobs:
         if: needs.changes.outputs.server_changed != 'false'
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/agmsg_test
-          AGMSG_SERVER_TOKEN: ci-docker-start-token
           CONTAINER_NAME: agmsg-reference-ci-${{ github.run_id }}
         run: |
           docker build -t agmsg-reference-server:ci .
           docker run --detach --name "$CONTAINER_NAME" --network host \
-            --env DATABASE_URL --env AGMSG_SERVER_TOKEN \
+            --env DATABASE_URL \
             --env HOST=127.0.0.1 --env PORT=8788 --env LOG_LEVEL=silent \
             agmsg-reference-server:ci
           cleanup() {

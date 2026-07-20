@@ -3,7 +3,12 @@ import * as duplicateKeyJson from "json-dup-key-validator";
 import { z } from "zod";
 import { loadConfig } from "./config.js";
 import { createPool, inTransaction, migrate } from "./db.js";
-import { agentNameSchema, MAX_SEQUENCE, uuidV7Schema } from "./protocol.js";
+import {
+  agentNameSchema,
+  MAX_SEQUENCE,
+  teamNameSchema,
+  uuidV7Schema,
+} from "./protocol.js";
 
 const registrationSchema = z
   .object({
@@ -24,14 +29,7 @@ const memberSchema = z
 const manifestSchema = z
   .object({
     team_id: uuidV7Schema,
-    team_name: z
-      .string()
-      .refine(
-        (value) =>
-          value === value.normalize("NFC") &&
-          [...value].length >= 1 &&
-          [...value].length <= 128,
-      ),
+    team_name: teamNameSchema,
     members: z.array(memberSchema),
   })
   .strict();
@@ -98,15 +96,17 @@ try {
       );
     } else {
       await client.query(
-        `INSERT INTO teams (team_id, team_name, members_revision)
-         VALUES ($1, $2, 0)`,
+        `INSERT INTO teams
+           (team_id, team_name, members_revision,
+            accepted_envelope_versions, write_allowed_ciphers)
+         VALUES ($1, $2, 0, ARRAY[1], ARRAY['none', 'age-v1']::TEXT[])`,
         [manifest.team_id, manifest.team_name],
       );
       await client.query(
         `INSERT INTO team_policy_history
            (team_id, policy_revision, effective_from_seq,
             accepted_envelope_versions, write_allowed_ciphers)
-         VALUES ($1, 0, 1, ARRAY[1], ARRAY['none']::TEXT[])`,
+         VALUES ($1, 0, 1, ARRAY[1], ARRAY['none', 'age-v1']::TEXT[])`,
         [manifest.team_id],
       );
     }

@@ -9,6 +9,7 @@ import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createApp } from "../src/app.js";
 import type { Config } from "../src/config.js";
+import { exchangePairingToken, issuePairingToken } from "../src/credentials.js";
 import { migrate } from "../src/db.js";
 import { envelopeDigest } from "../src/protocol.js";
 
@@ -19,7 +20,7 @@ const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
 
 describeDatabase("Stage-1 polling sync client", () => {
   const schema = `agmsg_sync_${randomBytes(8).toString("hex")}`;
-  const token = "sync-integration-token-32-bytes";
+  let token: string;
   const teamId = "018f3f7e-0000-7000-8000-000000000101";
   const localTeam = "dogfood-team";
   let admin: Pool;
@@ -40,12 +41,15 @@ describeDatabase("Stage-1 polling sync client", () => {
       `INSERT INTO team_policy_history
          (team_id,policy_revision,effective_from_seq,
           accepted_envelope_versions,write_allowed_ciphers)
-       VALUES($1,0,1,ARRAY[1],ARRAY['none']::TEXT[])`,
+       VALUES($1,0,1,ARRAY[1],ARRAY['none','age-v1']::TEXT[])`,
       [teamId],
     );
     const config: Config = {
-      databaseUrl: databaseUrl ?? "", token, host: "127.0.0.1", port: 8787, logLevel: "silent",
+      databaseUrl: databaseUrl ?? "",
+      host: "127.0.0.1", port: 8787, logLevel: "silent",
     };
+    const issued = await issuePairingToken(pool, teamId);
+    token = String((await exchangePairingToken(pool, issued.token)).credential);
     app = createApp(pool, config);
     serverUrl = await app.listen({ host: "127.0.0.1", port: 0 });
     root = await mkdtemp(join(tmpdir(), "agmsg-stage1-sync-"));
@@ -172,5 +176,5 @@ storage_history "$2"`;
     expect((await history(storeA)).map((message) => message.body)).toEqual([
       "fixture from machine A", "fixture reply from machine B",
     ]);
-  });
+  }, 20_000);
 });

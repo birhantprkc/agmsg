@@ -170,7 +170,7 @@ export async function postMessages(
     const fresh = [...firstById.values()].filter((message) => !existing.has(message.id));
     for (const message of fresh) {
       const { envelope, id } = message;
-      if (envelope.v !== 1 || envelope.cipher !== "none") {
+      if (envelope.v !== 1 || !["none", "age-v1"].includes(envelope.cipher)) {
         throw new ProtocolError(
           422,
           "unsupported-cipher",

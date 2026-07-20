@@ -4,26 +4,63 @@ This directory contains the thin, self-hosted PostgreSQL reference
 implementation of the [HTTP API v1 contract](spec/v1.md). It is independent of
 the root installer package and desktop app.
 
-The server currently implements the v1 plaintext envelope (`cipher: "none"`).
-It stores envelope blobs opaquely and does not inspect sender, recipient, body,
-or client creation time. Authentication is a deployment concern in the protocol;
-this reference uses one required bearer token and still authorizes every
-team-scoped operation against an immutable `Agmsg-Team-ID`.
+The server stores every envelope blob opaquely and does not inspect sender,
+recipient, body, or client creation time. New teams allow both `cipher: "none"`
+and `cipher: "age-v1"` by default. Each connected device receives an independent,
+team-scoped bearer credential that can be listed and revoked by its stable,
+non-secret `credential_id`.
+
+## Four-step self-host quickstart
+
+Use an endpoint that both machines can reach. Pairing tokens expire after 15
+minutes, are valid for one exchange, and create one device credential each.
+
+1. Start the reference server and PostgreSQL:
+
+   ```sh
+   docker compose up -d --build
+   ```
+
+2. Create a team:
+
+   ```sh
+   docker compose exec -T server npm run --silent admin -- \
+     team create --name my-team
+   ```
+
+3. Issue one pairing token for each machine. The command writes only the
+   paste-ready connect command to stdout; expiry information goes to stderr:
+
+   ```sh
+   docker compose exec -T server npm run --silent admin -- \
+     token issue --team my-team --endpoint https://sync.example.com
+   ```
+
+4. Paste the returned command on the target machine:
+
+   ```sh
+   agmsg remote connect --endpoint https://sync.example.com agmsg_pair_EXAMPLE
+   ```
+
+   Repeat steps 3 and 4 for the second machine. Each machine receives a distinct
+   credential for the same team; normal agmsg send/sync activity then crosses
+   the shared team stream without sharing a credential between machines.
 
 ## Run with Compose
 
-Change the token and database password in `compose.yaml` before exposing the
-service outside a local development machine, then run:
+Change the database password in `compose.yaml` and terminate TLS in front of the
+service before exposing it outside a local development machine, then run:
 
 ```sh
 docker compose up --build
 ```
 
 `GET /v1/health` is available without credentials. The message, member, and
-capability endpoints require these headers:
+capability endpoints require the credential returned by pairing plus these
+headers:
 
 ```http
-Authorization: Bearer <AGMSG_SERVER_TOKEN>
+Authorization: Bearer <device credential>
 Agmsg-Protocol-Version: 1
 Agmsg-Team-ID: <immutable UUIDv7 team ID>
 ```
@@ -35,9 +72,9 @@ Node.js 22 and PostgreSQL 17 are the reference versions.
 ```sh
 npm install
 export DATABASE_URL=postgresql://localhost/agmsg
-export AGMSG_SERVER_TOKEN='replace-with-at-least-16-bytes'
 npm run migrate
 npm run provision -- example/team.json
+npm run build
 npm run dev
 ```
 
@@ -45,6 +82,59 @@ The server also runs the idempotent migration at startup. Team creation and
 roster mutation remain outside HTTP v1: the provisioning command atomically
 applies the complete operator-owned roster manifest. IDs and retired names are
 checked against permanent identity history before replacement.
+
+## Admin commands
+
+Admin commands are non-interactive and use noun + verb consistently. Human
+explanations go to stderr. Primary output goes to stdout so it can be piped;
+`token issue` emits exactly the same `agmsg remote connect` block as a hosted
+console. Every command supports `--json`.
+
+```sh
+npm run --silent admin -- team create --name TEAM [--team-id UUID] [--json]
+npm run --silent admin -- token issue --team TEAM_OR_ID --endpoint URL [--json]
+npm run --silent admin -- credential list --team TEAM_OR_ID [--json]
+npm run --silent admin -- credential revoke --team TEAM_OR_ID \
+  --credential-id UUID [--json]
+```
+
+The credential list is keyed by `(team, credential_id)`: three connected
+devices produce three independently revocable rows with connected and
+last-active timestamps. Pairing tokens and bearer secrets are stored only as
+domain-separated SHA-256 digests. Raw pairing tokens appear only in the
+one-time admin output; raw bearer credentials appear only in the exchange
+response. Do not enable request/response-body capture for the exchange route.
+
+The client-side disconnect operation revokes its own credential through:
+
+```http
+POST /v1/credentials/<credential_id>/revoke
+Authorization: Bearer <that device credential>
+Agmsg-Protocol-Version: 1
+Agmsg-Team-ID: <immutable UUIDv7 team ID>
+```
+
+Self-revoke is idempotent: retrying with the same now-revoked credential returns
+success, while that credential is rejected by every sync endpoint. The local
+admin command uses the same revoke operation for a lost device.
+
+The paste command sends the opaque code once:
+
+```http
+POST /v1/pairing/exchange
+Agmsg-Protocol-Version: 1
+Content-Type: application/json
+
+{"token":"agmsg_pair_..."}
+```
+
+The `200` response is `Cache-Control: no-store` and contains
+`credential_id`, the one-time-visible bearer `credential`,
+`server_instance_id`, `remote_team_id`, `remote_team_name`, `protocol_version`,
+and the authenticated `capabilities` snapshot. Unknown, consumed, and expired
+codes fail as `invalid-pairing-token`, `pairing-token-consumed`, and
+`pairing-token-expired`; credential creation and token consumption share one
+database transaction.
 
 Retention is also an operator operation. It atomically creates permanent
 idempotency tombstones, removes the covered delivery prefix, and advances the
@@ -68,5 +158,6 @@ npm run build
 
 The integration suite covers atomic batch rollback, complete input-order ack
 mapping, transactional team sequence allocation, UUID conflict handling,
-retention tombstones, cursor floors, capability snapshots, roster reads, and
-strict JSON framing.
+retention tombstones, cursor floors, capability snapshots, roster reads,
+one-time pairing, per-device credential revocation, admin CLI output, and strict
+JSON framing.
