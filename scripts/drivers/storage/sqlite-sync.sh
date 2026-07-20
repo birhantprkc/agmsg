@@ -343,7 +343,11 @@ storage_sync_apply_pull() {
       WHERE EXISTS(SELECT 1 FROM sync_quarantine qx
         WHERE qx.server_instance_id='$server' AND qx.remote_team_id='$remote'
           AND qx.protocol_version=$protocol AND qx.server_seq='$seq'
-          AND qx.wire_id<>'$wire');
+          AND qx.wire_id<>'$wire')
+         OR EXISTS(SELECT 1 FROM sync_messages mx
+        WHERE mx.server_instance_id='$server' AND mx.remote_team_id='$remote'
+          AND mx.protocol_version=$protocol AND mx.server_seq='$seq'
+          AND mx.wire_id<>'$wire');
       INSERT OR IGNORE INTO sync_conflicts
         (local_team,server_instance_id,remote_team_id,protocol_version,
          driver_generation,server_seq,wire_id,envelope_v,cipher,key_id,blob,
@@ -358,7 +362,14 @@ storage_sync_apply_pull() {
           AND (qx.server_seq<>'$seq' OR qx.envelope_v<>$v
             OR qx.cipher<>'$(_sqlite_lit "$cipher")'
             OR COALESCE(qx.key_id,'')<>'$(_sqlite_lit "$key_id")'
-            OR qx.blob<>'$(_sqlite_lit "$blob")'));
+            OR qx.blob<>'$(_sqlite_lit "$blob")'))
+         OR EXISTS(SELECT 1 FROM sync_messages mx
+        WHERE mx.server_instance_id='$server' AND mx.remote_team_id='$remote'
+          AND mx.protocol_version=$protocol AND mx.wire_id='$wire'
+          AND (mx.server_seq IS NOT NULL AND mx.server_seq<>'$seq'
+            OR mx.envelope_v<>$v OR mx.cipher<>'$(_sqlite_lit "$cipher")'
+            OR COALESCE(mx.key_id,'')<>'$(_sqlite_lit "$key_id")'
+            OR mx.blob<>'$(_sqlite_lit "$blob")'));
       INSERT OR IGNORE INTO sync_quarantine
         (local_team,server_instance_id,remote_team_id,protocol_version,
          driver_generation,server_seq,wire_id,server_received_at,envelope_v,
@@ -373,6 +384,12 @@ storage_sync_apply_pull() {
          AND (server_seq<>'$seq' OR envelope_v<>$v OR cipher<>'$(_sqlite_lit "$cipher")'
               OR COALESCE(key_id,'')<>'$(_sqlite_lit "$key_id")'
               OR blob<>'$(_sqlite_lit "$blob")');
+      UPDATE sync_quarantine SET status='corrupt_state',reason='binding sequence conflict'
+       WHERE server_instance_id='$server' AND remote_team_id='$remote'
+         AND protocol_version=$protocol AND wire_id='$wire'
+         AND EXISTS(SELECT 1 FROM sync_conflicts cx
+           WHERE cx.server_instance_id='$server' AND cx.remote_team_id='$remote'
+             AND cx.protocol_version=$protocol AND cx.wire_id='$wire');
       UPDATE sync_quarantine SET status='corrupt_state',reason='mapped envelope mismatch'
        WHERE server_instance_id='$server' AND remote_team_id='$remote'
          AND protocol_version=$protocol AND wire_id='$wire' AND EXISTS(

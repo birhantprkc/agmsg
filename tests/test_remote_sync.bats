@@ -107,6 +107,34 @@ prepare_push() {
   [ "$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM sync_conflicts;" | tr -d '\r')" -eq 1 ]
 }
 
+@test "sync contract: pull conflicts with an acked mapping before its echo arrives" {
+  storage_send demo alice bob "acked without echo" >/dev/null
+  local prepared candidate ack remote page result db
+  prepared=$(prepare_push)
+  candidate=$(printf '%s\n' "$prepared" | jq -c 'select(.type=="sync_push_candidate")')
+  ack=$(printf '%s\n' "$candidate" | jq -c \
+    '{type:"sync_push_ack",local_position,id,server_seq:"1",disposition:"stored"}')
+  printf '%s\n' "$ack" | storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
+  remote=$(jq -nc '
+    {type:"sync_pull_message",server_seq:"1",
+     id:"550e8400-e29b-41d4-a716-446655440012",
+     server_received_at:"2026-07-20T13:01:30.000000Z",
+     envelope:{v:1,cipher:"none",key_id:null,blob:(
+       {body:"conflicting remote",created_at:"2026-07-20T13:01:30.000000Z",
+        from_agent:"carol",to_agent:"bob"}|tojson|@base64)},
+     status:"importable",policy_revision:"0",local_security_revision:"0",
+     projection:{body:"conflicting remote",created_at:"2026-07-20T13:01:30.000000Z",
+                 from_agent:"carol",to_agent:"bob"}}')
+  page=$(printf '%s\n%s\n' "$remote" '{"type":"sync_pull_cursor","next_after":"1"}')
+  result=$(printf '%s\n' "$page" | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1)
+  [ "$(printf '%s\n' "$result" | jq -sr '.[0].corrupt_count')" -ge 1 ]
+  [ "$(printf '%s\n' "$result" | jq -sr '[.[]|select(.id=="550e8400-e29b-41d4-a716-446655440012")][0].status')" = corrupt_state ]
+  [ "$(storage_history demo | jq -s 'length')" -eq 1 ]
+  db=$(agmsg_db_path)
+  [ "$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM sync_messages WHERE server_seq='1';" | tr -d '\r')" -eq 1 ]
+  [ "$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM sync_conflicts;" | tr -d '\r')" -eq 1 ]
+}
+
 @test "sync contract: a mapped echo keeps its blocking policy evaluation" {
   storage_send demo alice bob "mapped" >/dev/null
   local prepared candidate ack blocked page result db wire

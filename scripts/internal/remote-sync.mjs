@@ -87,7 +87,7 @@ function endpoint(base, path) {
   return root;
 }
 
-async function request(config, path, init = {}) {
+export async function request(config, path, init = {}) {
   const token = process.env.AGMSG_SYNC_TOKEN;
   if (!token) throw new Error("AGMSG_SYNC_TOKEN is required");
   const headers = {
@@ -96,9 +96,10 @@ async function request(config, path, init = {}) {
     Authorization: `Bearer ${token}`,
     ...init.headers,
   };
+  const url = endpoint(config.server_url, path);
   let response;
   try {
-    response = await fetch(endpoint(config.server_url, path), {
+    response = await fetch(url, {
       ...init, headers, redirect: "error", signal: AbortSignal.timeout(15_000),
     });
   } catch (error) {
@@ -106,10 +107,28 @@ async function request(config, path, init = {}) {
     throw error;
   }
   const protocol = response.headers.get("agmsg-protocol-version");
-  if (protocol !== PROTOCOL) throw new Error("response protocol version mismatch");
-  const text = await response.text();
+  let text;
+  try { text = await response.text(); } catch (error) {
+    error.retryable = true;
+    throw error;
+  }
   let body;
-  try { body = JSON.parse(text); } catch { throw new Error(`HTTP ${response.status} returned invalid JSON`); }
+  try { body = JSON.parse(text); } catch {
+    if (!response.ok && [502, 503, 504].includes(response.status)) {
+      const error = new Error(`HTTP ${response.status} intermediary failure`);
+      error.status = response.status; error.retryable = true;
+      throw error;
+    }
+    throw new Error(`HTTP ${response.status} returned invalid JSON`);
+  }
+  if (protocol !== PROTOCOL) {
+    if (!response.ok && [502, 503, 504].includes(response.status)) {
+      const error = new Error(`HTTP ${response.status} intermediary failure`);
+      error.status = response.status; error.retryable = true;
+      throw error;
+    }
+    throw new Error("response protocol version mismatch");
+  }
   if (!response.ok) {
     validateErrorBinding(config, response.status, body);
     const code = body?.error?.code ?? "unknown-error";
@@ -268,20 +287,60 @@ export function validateCapabilities(config, value) {
       !Array.isArray(value.accepted_envelope_versions) || !Array.isArray(value.write_allowed_ciphers)) {
     throw new Error("capabilities response is invalid");
   }
-  sequence(value.policy_revision, "policy_revision");
-  sequence(value.effective_from_seq, "effective_from_seq");
+  const current = BigInt(value.current_seq);
+  const floor = BigInt(value.min_available_seq);
+  if (floor > current) throw new Error("min_available_seq exceeds current_seq");
+  const currentRevision = BigInt(sequence(value.policy_revision, "policy_revision"));
+  const currentBoundary = BigInt(sequence(value.effective_from_seq, "effective_from_seq"));
   sequence(value.max_blob_bytes, "max_blob_bytes");
   if (BigInt(value.max_blob_bytes) < 1n || BigInt(value.max_blob_bytes) > 1_048_576n) {
     throw new Error("max_blob_bytes is outside the protocol limit");
   }
+  validatePolicySet(value.accepted_envelope_versions, value.write_allowed_ciphers, "current policy");
+  let previousRevision = -1n;
+  let previousBoundary = 0n;
   for (const entry of value.policy_history) {
-    sequence(entry.policy_revision, "policy history revision");
-    sequence(entry.effective_from_seq, "policy history boundary");
-    if (!Array.isArray(entry.accepted_envelope_versions) || !Array.isArray(entry.write_allowed_ciphers)) {
-      throw new Error("policy history entry is invalid");
+    const revision = BigInt(sequence(entry.policy_revision, "policy history revision"));
+    const boundary = BigInt(sequence(entry.effective_from_seq, "policy history boundary"));
+    validatePolicySet(entry.accepted_envelope_versions, entry.write_allowed_ciphers, "policy history");
+    if (revision <= previousRevision || boundary <= previousBoundary) {
+      throw new Error("policy history is not canonical ascending history");
     }
+    previousRevision = revision; previousBoundary = boundary;
   }
-  if (value.next_sequence_boundary !== null) sequence(value.next_sequence_boundary, "next_sequence_boundary");
+  if (BigInt(value.policy_history[0].effective_from_seq) !== 1n) {
+    throw new Error("policy history must begin at sequence 1");
+  }
+  const final = value.policy_history.at(-1);
+  if (BigInt(final.policy_revision) !== currentRevision ||
+      BigInt(final.effective_from_seq) !== currentBoundary ||
+      !sameArray(final.accepted_envelope_versions, value.accepted_envelope_versions) ||
+      !sameArray(final.write_allowed_ciphers, value.write_allowed_ciphers)) {
+    throw new Error("current policy does not match final policy history entry");
+  }
+  if (value.next_sequence_boundary === null) {
+    if (current !== MAX_SEQUENCE) throw new Error("next_sequence_boundary is unexpectedly null");
+  } else {
+    const next = BigInt(sequence(value.next_sequence_boundary, "next_sequence_boundary"));
+    if (current === MAX_SEQUENCE || next !== current + 1n) {
+      throw new Error("next_sequence_boundary does not follow current_seq");
+    }
+    if (previousBoundary > next) throw new Error("policy history starts beyond the next sequence boundary");
+  }
+}
+
+function validatePolicySet(versions, ciphers, label) {
+  if (!Array.isArray(versions) || versions.length < 1 ||
+      versions.some((version) => !Number.isInteger(version) || version < 0 || version > 0xffff_ffff) ||
+      new Set(versions).size !== versions.length || !Array.isArray(ciphers) ||
+      ciphers.some((cipher) => typeof cipher !== "string" || !/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(cipher)) ||
+      new Set(ciphers).size !== ciphers.length) {
+    throw new Error(`${label} capability set is invalid`);
+  }
+}
+
+function sameArray(left, right) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 export function plaintextWriteEligible(config, value) {

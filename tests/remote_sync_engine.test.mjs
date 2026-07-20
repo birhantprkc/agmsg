@@ -7,7 +7,9 @@ import {
   driver,
   isRetryable,
   plaintextWriteEligible,
+  request,
   validateAckMapping,
+  validateCapabilities,
   validateErrorBinding,
 } from "../scripts/internal/remote-sync.mjs";
 
@@ -63,6 +65,48 @@ test("run retry classification excludes permanent HTTP and validation failures",
   assert.equal(isRetryable(new Error("binding mismatch")), false);
 });
 
+test("headerless non-JSON intermediary failures remain retryable", async () => {
+  const previousFetch = globalThis.fetch;
+  const previousToken = process.env.AGMSG_SYNC_TOKEN;
+  process.env.AGMSG_SYNC_TOKEN = "fixture-token";
+  try {
+    for (const status of [502, 503, 504]) {
+      globalThis.fetch = async () => new Response("temporary proxy failure", { status });
+      await assert.rejects(request({ ...config, server_url: "https://sync.example" }, "/v1/messages"),
+        (error) => error.status === status && error.retryable === true);
+    }
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousToken === undefined) delete process.env.AGMSG_SYNC_TOKEN;
+    else process.env.AGMSG_SYNC_TOKEN = previousToken;
+  }
+});
+
+test("request distinguishes config errors from response transport loss", async () => {
+  const previousFetch = globalThis.fetch;
+  const previousToken = process.env.AGMSG_SYNC_TOKEN;
+  process.env.AGMSG_SYNC_TOKEN = "fixture-token";
+  let fetchCalled = false;
+  try {
+    globalThis.fetch = async () => { fetchCalled = true; throw new Error("unexpected fetch"); };
+    await assert.rejects(request({ ...config, server_url: "not a URL" }, "/v1/messages"),
+      (error) => error.retryable !== true);
+    assert.equal(fetchCalled, false);
+
+    globalThis.fetch = async () => ({
+      ok: true, status: 200,
+      headers: { get: () => "1" },
+      text: async () => { throw new Error("body stream reset"); },
+    });
+    await assert.rejects(request({ ...config, server_url: "https://sync.example" }, "/v1/messages"),
+      (error) => error.retryable === true);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousToken === undefined) delete process.env.AGMSG_SYNC_TOKEN;
+    else process.env.AGMSG_SYNC_TOKEN = previousToken;
+  }
+});
+
 test("write-ineligible capabilities still validate for pull", () => {
   const base = {
     protocol_version: 1,
@@ -82,7 +126,43 @@ test("write-ineligible capabilities still validate for pull", () => {
     }],
   };
   assert.equal(plaintextWriteEligible(config, base), false);
-  assert.equal(plaintextWriteEligible(config, { ...base, next_sequence_boundary: null }), false);
+  assert.equal(plaintextWriteEligible(config, {
+    ...base,
+    current_seq: "9223372036854775807",
+    next_sequence_boundary: null,
+  }), false);
+});
+
+test("capability policy history must be canonical and match current policy", () => {
+  const base = {
+    protocol_version: 1,
+    server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id,
+    min_available_seq: "0", current_seq: "4", next_sequence_boundary: "5",
+    accepted_envelope_versions: [1], write_allowed_ciphers: ["future-aead"],
+    policy_revision: "2", effective_from_seq: "3", max_blob_bytes: "1048576",
+    policy_history: [
+      { policy_revision: "0", effective_from_seq: "1",
+        accepted_envelope_versions: [1], write_allowed_ciphers: ["none"] },
+      { policy_revision: "2", effective_from_seq: "3",
+        accepted_envelope_versions: [1], write_allowed_ciphers: ["future-aead"] },
+    ],
+  };
+  assert.doesNotThrow(() => validateCapabilities(config, base));
+  assert.throws(() => validateCapabilities(config, {
+    ...base, write_allowed_ciphers: ["none"],
+  }), /does not match/u);
+  assert.throws(() => validateCapabilities(config, {
+    ...base,
+    policy_history: [...base.policy_history,
+      { policy_revision: "3", effective_from_seq: "3",
+        accepted_envelope_versions: [1], write_allowed_ciphers: ["future-aead"] }],
+    policy_revision: "3",
+  }), /canonical ascending/u);
+  assert.throws(() => validateCapabilities(config, {
+    ...base,
+    policy_history: [base.policy_history[1], base.policy_history[0]],
+  }), /canonical ascending|begin at sequence 1/u);
 });
 
 test("storage driver subprocess cannot observe the bearer token", async () => {
