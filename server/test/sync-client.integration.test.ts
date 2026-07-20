@@ -1,0 +1,136 @@
+import { randomBytes } from "node:crypto";
+import { execFile } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+import { Pool } from "pg";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createApp } from "../src/app.js";
+import type { Config } from "../src/config.js";
+import { migrate } from "../src/db.js";
+
+const databaseUrl = process.env.TEST_DATABASE_URL;
+const describeDatabase = databaseUrl ? describe : describe.skip;
+const execFileAsync = promisify(execFile);
+const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
+
+describeDatabase("Stage-1 polling sync client", () => {
+  const schema = `agmsg_sync_${randomBytes(8).toString("hex")}`;
+  const token = "sync-integration-token-32-bytes";
+  const teamId = "018f3f7e-0000-7000-8000-000000000101";
+  const localTeam = "dogfood-team";
+  let admin: Pool;
+  let pool: Pool;
+  let app: ReturnType<typeof createApp>;
+  let serverUrl: string;
+  let root: string;
+  let storeA: string;
+  let storeB: string;
+
+  beforeAll(async () => {
+    admin = new Pool({ connectionString: databaseUrl });
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    pool = new Pool({ connectionString: databaseUrl, options: `-c search_path=${schema}` });
+    await migrate(pool);
+    await pool.query("INSERT INTO teams(team_id,team_name) VALUES($1,$2)", [teamId, localTeam]);
+    await pool.query(
+      `INSERT INTO team_policy_history
+         (team_id,policy_revision,effective_from_seq,
+          accepted_envelope_versions,write_allowed_ciphers)
+       VALUES($1,0,1,ARRAY[1],ARRAY['none']::TEXT[])`,
+      [teamId],
+    );
+    const config: Config = {
+      databaseUrl: databaseUrl ?? "", token, host: "127.0.0.1", port: 8787, logLevel: "silent",
+    };
+    app = createApp(pool, config);
+    serverUrl = await app.listen({ host: "127.0.0.1", port: 0 });
+    root = await mkdtemp(join(tmpdir(), "agmsg-stage1-sync-"));
+    storeA = join(root, "machine-a");
+    storeB = join(root, "machine-b");
+  });
+
+  afterAll(async () => {
+    await app.close();
+    await pool.end();
+    if (!/^agmsg_sync_[0-9a-f]{16}$/.test(schema)) throw new Error("unsafe sync test schema");
+    await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+    await admin.end();
+    if (!root.startsWith(join(tmpdir(), "agmsg-stage1-sync-"))) throw new Error("unsafe sync test root");
+    await rm(root, { recursive: true });
+  });
+
+  function environment(store: string) {
+    return {
+      ...process.env,
+      AGMSG_STORAGE_PATH: store,
+      AGMSG_STORAGE_DRIVER: "sqlite",
+      AGMSG_SYNC_TOKEN: token,
+      AGMSG_NODE: process.execPath,
+      HOME: join(store, "home"),
+    };
+  }
+
+  async function sync(store: string, ...args: string[]) {
+    return execFileAsync("bash", [join(repositoryRoot, "scripts/remote-sync.sh"), ...args], {
+      cwd: repositoryRoot,
+      env: environment(store),
+      maxBuffer: 4 * 1024 * 1024,
+    });
+  }
+
+  async function localSend(store: string, from: string, to: string, body: string) {
+    const script = `. "$1/scripts/lib/storage.sh"
+agmsg_storage_load
+storage_init >/dev/null
+storage_send "$2" "$3" "$4" "$5"`;
+    return execFileAsync("bash", ["-c", script, "stage1-test", repositoryRoot, localTeam, from, to, body], {
+      cwd: repositoryRoot,
+      env: environment(store),
+    });
+  }
+
+  async function history(store: string) {
+    const script = `. "$1/scripts/lib/storage.sh"
+agmsg_storage_load
+storage_history "$2"`;
+    const result = await execFileAsync("bash", ["-c", script, "stage1-test", repositoryRoot, localTeam], {
+      cwd: repositoryRoot,
+      env: environment(store),
+    });
+    return result.stdout.trim().split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+  }
+
+  it("synchronizes two isolated AGMSG_STORAGE_PATH stores without echo duplicates", async () => {
+    for (const store of [storeA, storeB]) {
+      await sync(store, "configure", "--team", localTeam, "--server", serverUrl,
+        "--team-id", teamId, "--minimum-security", "plaintext-allowed");
+    }
+
+    await localSend(storeA, "machine-a", "machine-b", "fixture from machine A");
+    const pushedA = await sync(storeA, "once", "--team", localTeam);
+    expect(pushedA.stdout).toContain('"event":"push.ack"');
+    expect(pushedA.stdout).toContain('"event":"pull.applied"');
+
+    const pulledB = await sync(storeB, "once", "--team", localTeam);
+    expect(pulledB.stdout).toContain('"event":"pull.import"');
+    expect(await history(storeB)).toMatchObject([
+      { from: "machine-a", to: "machine-b", body: "fixture from machine A" },
+    ]);
+
+    await localSend(storeB, "machine-b", "machine-a", "fixture reply from machine B");
+    await sync(storeB, "once", "--team", localTeam);
+    await sync(storeA, "once", "--team", localTeam);
+
+    const a = await history(storeA);
+    const b = await history(storeB);
+    expect(a.map((message) => message.body)).toEqual([
+      "fixture from machine A", "fixture reply from machine B",
+    ]);
+    expect(b.map((message) => message.body)).toEqual([
+      "fixture from machine A", "fixture reply from machine B",
+    ]);
+  });
+});

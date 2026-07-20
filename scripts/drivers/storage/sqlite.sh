@@ -80,6 +80,7 @@ storage_check() {
 storage_describe() {
   printf 'name=sqlite\n'
   printf 'backend=SQLite (WAL) event log + legacy messages table\n'
+  printf 'capabilities=stage1-sync\n'
   printf 'db=%s\n' "$(_sqlite_db)"
 }
 
@@ -335,3 +336,9 @@ storage_compact() {
   " >/dev/null 2>&1 || { echo runtime_error; return 13; }
   echo ok
 }
+
+# Optional Stage-1 remote synchronization extension (ADR 0005). Keep the
+# implementation separate from the local storage ABI so local-only callers do
+# not pay its jq/base64 dependency cost.
+# shellcheck disable=SC1090
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sqlite-sync.sh"
