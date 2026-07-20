@@ -3,6 +3,10 @@
   "profile": "age-v1",
   "profile_document": "../age-v1-profile.md",
   "warning": "PUBLIC TEST KEYS. NEVER USE THESE IDENTITIES OUTSIDE TESTS.",
+  "generated_with": {
+    "implementation": "filippo.io/age/cmd/age",
+    "version": "v1.3.1"
+  },
   "binding": {
     "protocol_version": 1,
     "team_id": "018f3f7e-0000-7000-8000-000000000001",
@@ -36,20 +40,37 @@
         "v": 1,
         "cipher": "age-v1",
         "key_id": "epoch-1",
-        "blob": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSA3Q1VXOWNPQU8rdWtnc1NWVkxuWTRqT0l4cnRUaU5PQWNtbVpJV3hFUzFZCnFMem9aVDJUZ2tTY1F6M2kxWE03Sys0VmNvaG5ub1NjOTBNeDRncmhpeU0KLS0tIHNicURaY2RCTC9RYWlId1F3OHhIWFgwSzFPZTQ5b2dydERFUDJldGZDb0UKYx112yU0L0vyFxTCe+3fpzsnPQw/9BdRGTXy4qi8UJFDTkLeuoKWo73PZu5FwWqqB6GibqZ4ebksdbhP2Tmhk9CUQUX8Phd7kHnV8W+celC4a1TrdSduvYkIgy/T4pao1rB5Vla/qpvAKDiOGDB6plspSLZebwkI/i2RUuPJuJXa1mT8pX4SnDzQyMsFFrbEHLIWDEwoUIdR2YA+rClVRom0R4WcR27/NlnCp8EpQXPUuLCkOWDItYdHiJNvQMWZ+VNw6bFXDkzGniQglQZaNP9M8U9Sqc5zB+HPGS9p7ZnE"
+        "blob": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBqcUF4ckRhSjN0czBsM1ZvUWZIcXExdEZUMVYwUEhhUWtLYXg1RlNsT0dBCkxtbmZRNnlZM3BkTjQzVzV0czhFMy91MlJwVzgyNDZUQ0luUE1DMGs0eFkKLS0tIEZ2dGhPYk1tVlByOC9kQW1Qd2o3N2NsMjI0dWtmVjZ5bTErYjhPVHFMVkUKT4l3I8o1elhVb8HPW3nM/z/Kh1hrNYCZ8ZLlG7ZpxRvUTW+qsnlwi/N0tckmbyehnMxaNyabBp1fRGvBlSVeq2oJ6uv7RIGEICUBuDSgGcn4L8CLYTLIMZh/QUKWnV1kZrvkxU9A9vhNuz2NgEBPa+jjeGdwEB6tf4tJ3/y0+jeEWwU7Ye/DfdyOcyB8bjRam3fA/+N2cBCDk4Hg2wxBnfNIzhBJojBVdGDE+FfSoL077+sESVVnUjipHOwKDgqomyF93PA5MfwOkeveRcxDvUB1vPccqt5lvnyZbZb3jti8"
       },
+      "age_file_sha256": "4f004c4d08202ef85ba7dd6988b510d4abadfb93dbda9dfcc8541275a7f251d6",
+      "decrypted_frame_sha256": "6c12c093ea0471a1c19cd8eb0475723411a72ca848b128289c5d19458487aae9",
       "identity": "team_a",
       "expected_state": "importable"
     },
     {
       "name": "wrong-team-identity",
       "envelope_from": "valid",
+      "age_file_sha256": "4f004c4d08202ef85ba7dd6988b510d4abadfb93dbda9dfcc8541275a7f251d6",
+      "decrypted_frame_sha256": "6c12c093ea0471a1c19cd8eb0475723411a72ca848b128289c5d19458487aae9",
       "identity": "team_b",
+      "expected_state": "authentication_failed"
+    },
+    {
+      "name": "team-id-substitution",
+      "envelope_from": "valid",
+      "age_file_sha256": "4f004c4d08202ef85ba7dd6988b510d4abadfb93dbda9dfcc8541275a7f251d6",
+      "decrypted_frame_sha256": "6c12c093ea0471a1c19cd8eb0475723411a72ca848b128289c5d19458487aae9",
+      "identity": "team_a",
+      "binding_override": {
+        "team_id": "018f3f7e-0000-7000-8000-000000000002"
+      },
       "expected_state": "authentication_failed"
     },
     {
       "name": "wire-id-substitution",
       "envelope_from": "valid",
+      "age_file_sha256": "4f004c4d08202ef85ba7dd6988b510d4abadfb93dbda9dfcc8541275a7f251d6",
+      "decrypted_frame_sha256": "6c12c093ea0471a1c19cd8eb0475723411a72ca848b128289c5d19458487aae9",
       "identity": "team_a",
       "binding_override": {
         "wire_id": "550e8400-e29b-41d4-a716-446655440001"
@@ -57,13 +78,48 @@
       "expected_state": "authentication_failed"
     },
     {
+      "name": "protocol-version-substitution",
+      "envelope_from": "valid",
+      "age_file_sha256": "4f004c4d08202ef85ba7dd6988b510d4abadfb93dbda9dfcc8541275a7f251d6",
+      "decrypted_frame_sha256": "6c12c093ea0471a1c19cd8eb0475723411a72ca848b128289c5d19458487aae9",
+      "identity": "team_a",
+      "binding_override": {
+        "protocol_version": 2
+      },
+      "expected_state": "authentication_failed"
+    },
+    {
+      "name": "key-id-substitution",
+      "envelope_from": "valid",
+      "age_file_sha256": "4f004c4d08202ef85ba7dd6988b510d4abadfb93dbda9dfcc8541275a7f251d6",
+      "decrypted_frame_sha256": "6c12c093ea0471a1c19cd8eb0475723411a72ca848b128289c5d19458487aae9",
+      "identity": "team_a",
+      "envelope_override": {
+        "key_id": "epoch-2"
+      },
+      "expected_state": "authentication_failed"
+    },
+    {
+      "name": "cipher-substitution",
+      "envelope_from": "valid",
+      "age_file_sha256": "4f004c4d08202ef85ba7dd6988b510d4abadfb93dbda9dfcc8541275a7f251d6",
+      "decrypted_frame_sha256": "6c12c093ea0471a1c19cd8eb0475723411a72ca848b128289c5d19458487aae9",
+      "identity": "team_a",
+      "envelope_override": {
+        "cipher": "age-v2"
+      },
+      "expected_state": "unsupported_cipher"
+    },
+    {
       "name": "truncated-context",
       "envelope": {
         "v": 1,
         "cipher": "age-v1",
         "key_id": "epoch-1",
-        "blob": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBQVG1wbnk0MXNTRlUyai9pa3FsZjhEMmhWdjlEWnJIS3VJanpYTDJzNGg4CkJ5c2hIZi9NaThZVWlQRjdmcUFPTXAyMU9uck9vVXFySGRHRTZXdHR6a3cKLS0tIEZYVG12MjhDQ1JNRE9VTHVUMytlOHVkNmRYVWl5UXRoa091OXoyUDEvUlEKHi9GF1tTlvrGCsTVLBK0lEeXB9vhRchpcX+0wfwIlkUeEzs8fpHUgU3am/Ag7bNa2xz1QOPlsh3g76WpYCb4iDIfEsaTST1dXjC1DyjKWllfYiqSgcRgQxYSDNoJDByePWfDXT0n1EmWJduiNbr8XAVeArXyTjuxUQR4E5FyE5aQMR5lYT1tylk0gdRDCFy5uG6WmeOjWnOHMw7eTeKPp+kbfOGSqij9Cyr/rjcMQ8g7yVAK1Ybkev1VP6Gfkmgmix77jjMGFq14SoBv4dWXU1UPH1fZn4cjp1VN7oBKJKE="
+        "blob": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBIQkdRNHlqUUowcFNEanU4WlRZeVM2Um1PZjkzTVVKYzhXMHJlblNVUm0wCithb1FBZTRtZU1VVE1yRmNHYUVkL1VGV2tzQnJqazNka2ZGZWpCc25PVjgKLS0tIE9sZVNoenF1dUY1dmk0VTQrNUd1U1BWdFAxdGU5ZUE2dHR5UzFWa3ByZVEK99cMGWck3b7iKt3mLed/2xYvEkB20z3NNFWFw60VpxXAe+FvR5E9gYqgQS2REiF/eArcXaarMvYrBwtoIPlZRCN3z7c5ePMaKmYfeTYyEOQsZlwC099KkRLDnwuyBr5SCupvha7ghae08ZR2e+cZrHARdi/WESLR7TZKDx+9LuCxx3MGOHVFrz6RcZ3DEOlE9OS4ESISNH2f8BUe7F6cKhJotr3MT5yUEkfJ2BtfmNhECcYOK2MrrPkkUN+fwF4HpE/NRv5TvhwYgCBFLrwI7x68dELz1nDBcknvcDZObfY="
       },
+      "age_file_sha256": "39420223c641053194c10897d50076cd4a5baedaeca02d7e8e86dacbc6578efd",
+      "decrypted_frame_sha256": "8a16c6bd5009bae65a76d0f6fc24f9b8f5f3a2b02a128df1dcf55c607659078a",
       "identity": "team_a",
       "expected_state": "authentication_failed"
     },
@@ -73,10 +129,129 @@
         "v": 1,
         "cipher": "age-v1",
         "key_id": "epoch-1",
-        "blob": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBFOXFnZVpQNzVuS0c5NzF2dzR2UDRXMkp2MlUwd3dHQXpSRVl0ZE5Na3hZCkQxV0lXbUQ2dkFmMjVlZzR1MlpvRE5SNGNZL25pbUdXc2trSHc5b1FNNGsKLS0tIERaNmFOOXNtNTVDRlkzRU9saEFtQTdBa0d3ams5dHNRdU9ReDVzMmZ0YjgKGF7tFmt4at6hsqqkvU1TznHc7DMYDX6vsOgH6N/woiAlxu62EMqtSVcTqUbrQ/DpKIPuctS/a0HO9UGZ5711uCx5eCBBtGP7RLyMV8zVh1/VF30tM6Z6vl1F9s/duSuqn5o6+6eD2nhjVzvvCcuMYM85AQc0loFMZNC1Jg0hgtfqL432zkTixm+hm/Z6QClYZX7xBjEZKYJAXUJS+ynTf7dfIi4PnDH2xr8jZsuKc3nnEtHhCeREdAYin7qQ8uM8pQazPhuC/iO7LKBb2R7yNhBqKUfJiJsEndgI/rYiqJ2f"
+        "blob": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBYK3FTRVBSVGxHem9VNTRmbTdnb0NJdXpqcnkxSE5yM3REMDYyQndFaURBCmQyUkFrZFlEeXRlbjhmY1E4Q1RTQ3BIVHlmaWpqRmNVRjk2ajcrMUtCWXcKLS0tIHFWelJETXdYZW9kcCtwYjM4d3IwRG5CRFhhbUhaaDg3Z2xhaThHZVprK2cKldO017dqSx0WuT7BQ/HZSiWJdGqJCL4gjUS9+m6M5Sp9RIMRsapcJWn3QKY/4orrRtVUw67jkMWjYJqbLk6eZlnB6/ab0VxzNfRUAioAljW1QeuSOMXoOpo3LLDF0rgLB8hFLwhLE5cb5ZcI8z2UlhU6tRQvnZ1SRyDmOSYG2xsfwmCJWegd62/9kOAV2RaFOM0LeGZxbXa9eC5NJq5PqYORgOHGXqpFttW7nK9LaLYytlGpzdVFqB8cbC+Lhtvib7MGMPe7WjI5p1zwEttdNaKwc5//Pw3nkAhL4XbsaUYe"
       },
+      "age_file_sha256": "43c3b59a42d843a6b579d2d539cc52c14c425df417f1acb1b53cfec99d6aeccb",
+      "decrypted_frame_sha256": "feb7b5fad89b086c4e4b825becce4d1f17b29530593e9ad2af20d9a0b05d9401",
       "identity": "team_a",
       "expected_state": "authentication_failed"
+    },
+    {
+      "name": "cipher-length-substitution",
+      "envelope": {
+        "v": 1,
+        "cipher": "age-v1",
+        "key_id": "epoch-1",
+        "blob": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBldDV2RmFPRGpUdlZ3Q0RESTNpN29nTDF6bmZlSVNVUjE2dHpBWkVTRjNvCjNCMXAzaFYzWElyeVQ4K2JMaFQ3S2RraVpRUGRGVkViYVhGeW9LTE0wVkkKLS0tIE53elgrSnlObi9LeklXMFRqSnIybWozb09vblRlQ3JkK0lvL3FsQmZqbHMKJ/OFtutQa0sLMFwR/eds9AILtBWwYoKe4xVP1U0Df25w+wOg/4j7BfRR4jMyZ3WXCx1m0xEf4zXn9gEY3IPKFO/DEpTtFfgJBbn5rP0jUJcQyOLu/is97DvviCZa5wCZ1JEvHXkxC0NGIjHhRmojoljt4tnomG6HevVFpbkW74kCHnIZRjg8JBQvitO64e/UmMN+e3G5skfhTvduIhNguEsSm92KuNGyWRonzZEBi5A0uLgFcQn/QNv8Uq0YvH0lmvIyA2z1ywIiWSBpCzX90c1IIilJh8F/ZzK6j8f6wG9F"
+      },
+      "age_file_sha256": "1061096144ac7751b7e46e70b71a0b85774d60ecff9a3129ef66083f9c4f7fb3",
+      "decrypted_frame_sha256": "2742c81c80746a3a0ddee55883329b0a4b0458c5c7c344af770497c653adb9ea",
+      "identity": "team_a",
+      "expected_state": "authentication_failed"
+    },
+    {
+      "name": "key-id-length-substitution",
+      "envelope": {
+        "v": 1,
+        "cipher": "age-v1",
+        "key_id": "epoch-1",
+        "blob": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBjQW1tNnNYaHkxajdQdDVKTFdLL3BFU1lpT1ZWUHlPamRHa3ZQR2d3WFZnCnpGakEyYWRlYUJVeVlLM3JldUhXT29vVzhQSGxXUmpVeVhLZXNMNHdjNlUKLS0tIGQ3K0Z0YWdoRkZBcUxOWVFwbmNjWHBJTUdtSXpBYkJKNWNUbzhYcjhhUXcK7fQ1KJLdgdF77lZhoWxXYMXym4B4ajrhXFNSOYkFD7As5n19q8fhSBC9W+Khj5sftE1ABQlzCwDICJUaZvVanfgHT49c6wN/O1oXHXxXpp0KjE6TN4QoPzC2zn+Izf6dXzY3RWU6I5KOpkgB4YuTjywKGLrWhzzzv7EOqD9V+08LosFatVaMkHLMjpsj1HJYPL/UY6t/Izk8f05hUXQfQ1+BaRoKpvD0WfORpR56RawFfwYVZqU4g5mE+CLBzme1poz4cngZouojcoaX9X4jRSTRS8B81wrFanW66BxjzlGp"
+      },
+      "age_file_sha256": "8525f64665868e9471f8bf1e39e59f02089423b1e2d6c2b3dd85508cc40301e3",
+      "decrypted_frame_sha256": "6df552fd079a05dba2646b996b9b37d70f692bae19265c199fd34fca5d748d75",
+      "identity": "team_a",
+      "expected_state": "authentication_failed"
+    },
+    {
+      "name": "context-length-overflow",
+      "envelope": {
+        "v": 1,
+        "cipher": "age-v1",
+        "key_id": "epoch-1",
+        "blob": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBzVUVFbGFSeDh0NTJGT1ViT0ZwOEZzYWtRU3BrYis3Q0ltLzVid0hwcXljCjJPZDVlalR4RnVCZVlNa29hSnRZQTBKRGVqOWJKcHAybFlvTFRyamVjOU0KLS0tIEtLaVdNa1dLUDZtQ0J3c01MdCtoMlJSQWtqN01ZRXBLeU42V3J2UDk3YzQK6fPxeZo0FonH2DhAizUjQ6fkftUQBz9/qOFV1+6V55XjgGyuA/o260Kd6FhKrLz/o7C0Rb0="
+      },
+      "age_file_sha256": "d8081cf086bb8ad10820dc9642e94e6f18964adc0d23c4ce6754e51c9de8bafc",
+      "decrypted_frame_sha256": "0d6f1128ff71ce30cf7bc83b39d7a26b4fc147c700405c881672f6f5de6c0ff2",
+      "identity": "team_a",
+      "expected_state": "authentication_failed"
+    },
+    {
+      "name": "zero-message-length",
+      "envelope": {
+        "v": 1,
+        "cipher": "age-v1",
+        "key_id": "epoch-1",
+        "blob": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSB3VlZROVVlMk1qdUpKeHhkKzg2eGppMDh5SmxBck9EaXpOSFRRMEZlSlhFCkY5OUk3MDRXd1JuREpqZXBLeXJ3OU5wdmV6cC9VZWtyOUNaMVp6NjlHNlUKLS0tIE00bmVJbGZ0YklBcWV4UUNubXhPSThCVmg3dEhsQkhEVWZ1d05iVUxhbHcK7Ibo9G03ZbvEHlqnaV3nN4qpX76BbFAioDt9GuoOFUd40XOGVDoUyqPt/PXjCQQ8y9nRVwB/0F4U3Uard4/CKU1aNRunBkvUAkhhoKosl/s5YXO7u9wmCb4pPet75vfccnmhspGXj6OmQWMfcg=="
+      },
+      "age_file_sha256": "8570106258b4ea8efc10a63ff967b6713ba51c523c6c587e9e6b513d028e7613",
+      "decrypted_frame_sha256": "78aaba8402edfc8cb5c2144a20405781541cc7db7e4dc4309f145b635796b139",
+      "identity": "team_a",
+      "expected_state": "malformed"
+    },
+    {
+      "name": "message-length-overflow",
+      "envelope": {
+        "v": 1,
+        "cipher": "age-v1",
+        "key_id": "epoch-1",
+        "blob": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSB6OWoxblBLTE8xSVEwL2x4d1lKZ0ZSVk1qYWZIUzhIMys3akV4ZXhiZWpzCk5CTk5jdDBYM3ZyWHRncEJjM0E2a0tRd0dGb0FYZXhWTlExbWllUGdvN1UKLS0tIEZ5Wi91aWNIYmxFZGsxNFJRK2orU3BSbk9CRWEvYXdkL2gvT25OV08vK00K+dobfjNFgMPG+i2PHfQhIGVd1237riqFw45UTkKS0P+iDXGRLzpZmi3Hk4l2SQrNNdVFFjRSYLrSkcmjLXYzPYmFUfl5pKSDs7WshbNbO5JB1WWmZP48s4cPJ2WElAIQIrR9zw9FhKbnakMloVA="
+      },
+      "age_file_sha256": "d55bfe2793c0886e6531ff459e48a79c3b7710c434c0899e9180c4489bcff507",
+      "decrypted_frame_sha256": "32f3332c2b68fa6b91ec3ac603d4a7cd64e0d25a1884acd0b1e1fa44a596bb52",
+      "identity": "team_a",
+      "expected_state": "authentication_failed"
+    },
+    {
+      "name": "trailing-frame-byte",
+      "envelope": {
+        "v": 1,
+        "cipher": "age-v1",
+        "key_id": "epoch-1",
+        "blob": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSA5NHFYVWZOV3lQOVRrTCsyZ1F2Sk9oMHhQcWdlS3JNWGt5Yk1zNHlzQ1ZjCkNGM01NODFoN25hNWdqcEtwUkFMUkplc1crblN0UHdLZ1krbm91cHVNcmMKLS0tIG1jWjgzLzBHbmdtSXYzSGd1TzhEcGhEcEk2Yk9uWGZuaytmdUhYMC8rRjQKNnAw2V32At+FGG7jWE0j9tv1qJeYjeotIzho+drNivxJYBMg37rz20tHAOZd1Z74Bd52BlBXqPFz2uQVoYlsikirEiAEE5dzMLc24qzAnSxAhrAOaVn/1QdX59hp9PZShDVr5TTyGVRYWJPyZ0pSMLkrnGjCGSkBxvl7aArlZ/GGdquy1iseUM+eMUxh1PvQz8WDIqhWJU4HpAP2jkdtTDubIqrbtFPFI1Veki25hZ3ARTdjCfVNmLDsyOhUZKU8Q2zcMhocxrnIqBIYlZKIlcaWkinjuM6Wj8REIdJ50Gx1lQ=="
+      },
+      "age_file_sha256": "340344a2b3620f66ea4de2714a4796f0acc8b16ff76886f2a61ff395bee2916d",
+      "decrypted_frame_sha256": "35082d6e87bd9875c0e64c9f7df031448d16adc6d298dfb3edcccbeaf4d72b5b",
+      "identity": "team_a",
+      "expected_state": "authentication_failed"
+    },
+    {
+      "name": "duplicate-message-key",
+      "envelope": {
+        "v": 1,
+        "cipher": "age-v1",
+        "key_id": "epoch-1",
+        "blob": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBCQ1BzeXE2N2FGY0NHOEVjQlVITHR3eUp3MUxLTHNFeS9VUWZPcWcvK0NBClAzTWpJVUtDNndVMDVGZC9iZFhZcmh1ck5zbG9Ob1ZVVlYyWHRuQUI1TUUKLS0tIEk0TTRUUm4vdFdCSG5KbXhyeGVRK3Y2VDVqeXZNcFAyakxtSEk5QU9CbncKMifQW3GIp4ZYGC2H9EWMN4TWt4g3w6O+81lC1XXef70m4usH3B1X0Os7feb1NTq6ZArq9GwL5RC8bcHbmPRXjS2S829jzB/ZRrfOD690kZvgg94DAV0mRZC6g8I5T/hwv5v9/vedeQbDfz7B1n+0SWDq7UWUs6l4e3b0iNVladBpI00a5GgZ+XnkhWo6GqgW/DnhuHjgSAASfVRI+Y1otJpeeXpXAEh6abfNrX9SF41BBvolu5GTcUT9Rw4R3UNrxoPpJCWDYbIa/iXA78awD1dWMocncXZPodLeE3pjBgCOTNNcGBgmjh651+leD7rfQoU="
+      },
+      "age_file_sha256": "203089b1839975644279a6b32834038632558ba3ff0b4329a493dc9372583261",
+      "decrypted_frame_sha256": "ca751c2115a503b990e72a3870fca1a7c459421388cdc0c5bbbced6294920f8e",
+      "identity": "team_a",
+      "expected_state": "malformed"
+    },
+    {
+      "name": "unknown-message-key",
+      "envelope": {
+        "v": 1,
+        "cipher": "age-v1",
+        "key_id": "epoch-1",
+        "blob": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSB5VDBTc21ZRTNNQWZsRTluOTc1R1pTcVMwU0N0U1BlWkVTQkd2ZFJMWEY0Ckt3Yk1lTGxSUHUwTG5wMWwzSkJMcldQOW5lc21FQzFMR296UkJFUzBKaDAKLS0tIEROT1VaVm1RYUhydXFlU0F6MG55eHNhakR0bmQ4OUxQd3JmVDMrVmIvZkEKw+gDjpHlkJJHYAcCftn6jn4G4ZSBXeA6fJ/GoLVDf3drB0/jcAv2XaTXDVZYw5aJQRvBO1guByabY7afi1PpDdYvJN5HcBcSMi2X1mpK+VTudORIFzZd//NbtWRL2fEB+2DGwXQWmKLG9/iIrciW7wJOzWVBLYJU68pzzu0O+gyymyElbpHE8rOrAK2PbT73mAyFhLmuksq8JsvhbjSqMdL1c3qmkzrBtMg8oa/JklIPKArcVkvJSE2uApJ64XU6KKuWCZyyifgENUDmPE2E8Xm5XYXZpynGtTq/5O/7g6oGQixhWSG3ku+lImcapQ=="
+      },
+      "age_file_sha256": "02b9c2ff40eb67c7670054a8e3cb9d95235cea9338d80b9205e3f4c9de3b9b17",
+      "decrypted_frame_sha256": "7fbb0d1ca51905c690409e32a54929021de2af8ffb491d9b9210384988fce53a",
+      "identity": "team_a",
+      "expected_state": "malformed"
+    },
+    {
+      "name": "noncanonical-message",
+      "envelope": {
+        "v": 1,
+        "cipher": "age-v1",
+        "key_id": "epoch-1",
+        "blob": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSA3RUVydFZiVWRpNjlPL0NXWTdsdkNadzhyMlFFcEF2eHFVc3ltcm10U3dNCmJRM2ovZXFDTHQxZzFaeXBpUnNKQ3FrVWdTNDVyU2dCT2J3Sm9jMUF4dXcKLS0tIDhNdVZxSm9qdnhUUEQrWlI0QTQ2dVdoNXI3d3hYSUtDNytEZVNCT0U1YlUKneUOi4dPmpSqkfjP6MDbgCKWgL9jqXOOgBu0RdyFxyyLgo1B3R1+X2fI52C9HNEnTvA/5wFC4Tup8eRZFhxtWYkqAddKCfMAHetfFeim3BZIdjp1CJDsD2HBp3kclSbQ/fX3D6CqEQFe1k1cxnn1aVwt15OgTjFTE3b7cS+T5r1iIhJs+lvDFLcjQ8VuVSkQlVFSA0cL8rtBQZuOJqQgb3sWblWhw8T4OcIF3ya3EBcuZ3uEaru11yMrxso3NFxUmal5AKCIT8nEPcKtyvJk0LovGvbT6DZ22Rw60KiHnaUF"
+      },
+      "age_file_sha256": "0fe26c15ab8f1c1e3a9200bc4132e04107d9723475a56903bb1a89750b21dc1d",
+      "decrypted_frame_sha256": "52153825b692c9f432db23c54195cc5c3978036707771bf4246f649dfc7cf863",
+      "identity": "team_a",
+      "expected_state": "malformed"
     }
   ]
 }

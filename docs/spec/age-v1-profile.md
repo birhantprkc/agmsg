@@ -72,7 +72,52 @@ recipient-set manifest MUST bind the remote `server_instance_id`, `team_id`,
 `key_id`, recipient list, and profile identifier and MUST be distributed over
 an authenticated out-of-band channel. The server never receives private
 identities. A writer MUST encrypt each new envelope to every recipient in the
-selected immutable manifest and to no recipient outside it.
+selected immutable manifest and to no recipient outside it. The manifest MUST
+contain 1–256 distinct recipients; the age header contains exactly one X25519
+stanza for each. Age intentionally hides recipient identity, so a recipient
+cannot prove from a ciphertext that the writer included the complete manifest
+or excluded an outsider. This is a writer-side obligation. A malicious writer
+already holds plaintext and is outside the confidentiality boundary; conforming
+implementations MUST still test and fail closed on accidental manifest drift.
+
+### Epoch snapshots and rollback resistance
+
+The manifest and complete key-epoch history are distributed as one
+binding-scoped **epoch snapshot**. Each snapshot contains at least:
+
+- `server_instance_id`, `team_id`, and profile identifier;
+- a canonical decimal, strictly increasing `epoch_revision`;
+- a canonical decimal, strictly increasing `writer_generation`;
+- the complete authorized writer roster for that generation;
+- the complete effective key-epoch history and referenced recipient manifests;
+- `previous_snapshot_sha256`, which is null only for revision `0` and otherwise
+  is the lowercase SHA-256 digest of the preceding snapshot's RFC 8785 JCS
+  bytes.
+
+The snapshot itself is encoded as RFC 8785 JCS. Its SHA-256 digest and revision
+form the trusted checkpoint. Distribution MUST provide both authenticity and
+freshness; transport authentication alone is insufficient because a valid old
+snapshot can be replayed. An already-provisioned client durably retains its
+greatest accepted `(epoch_revision, snapshot_sha256, writer_generation)` and
+rejects a lower revision, a same-revision different digest, a broken hash
+chain, or a lower writer generation.
+
+The **epoch authority** is an operator-selected management trust root whose
+identity is pinned independently of the message server and snapshot payload.
+A live freshness confirmation is either a nonce-bound response from that
+authority or a human verification of the current revision and digest over a
+separate live channel. A cached response bundled with the snapshot is not a
+freshness proof. If the authority is unavailable or the confirmation cannot be
+verified, writes remain disabled.
+
+A new or reset device MUST obtain the current trusted checkpoint through a live
+epoch authority or an explicit operator confirmation made at provisioning
+time. An archived snapshot, a valid authenticated download without freshness
+proof, or the message server's current cipher policy alone MUST NOT enable
+writes. Until the device possesses the complete chain through the confirmed
+checkpoint, it remains write-disabled. It may continue transport quarantine,
+but messages beyond its verified history coverage remain unprojected. Resetting
+local sync state MUST NOT silently reset the retained anti-rollback checkpoint.
 
 Each client binding maintains an append-only, sequence-effective key-epoch
 history alongside the local security history. Each entry contains a local
@@ -97,6 +142,43 @@ Readers SHOULD retain authorized old identities while old messages or durable
 quarantine may require them. A missing identity for the expected epoch produces
 `pending_key`, not a fallback to `none` or another key.
 
+### Multi-writer cutover protocol
+
+The HTTP v1 server admits `cipher` but does not enforce `key_id`. Therefore a
+client-local `next_sequence_boundary` update is not a safe epoch rotation. A
+deployment using this profile MUST perform the following barrier across the
+complete writer roster, or use a future authoritative server mechanism that
+enforces the same sequence-effective key ID:
+
+1. Announce the prospective rotation and quiesce every writer in the current
+   authorized writer roster. Quiesced writers may accept local messages, but
+   MUST NOT seal a new remote envelope. They may POST only an already-published
+   envelope while completing the drain in step 2.
+2. Every writer drains and reconciles all envelopes already published under the
+   old epoch. An envelope with an unknown POST outcome is retried byte-for-byte
+   until acknowledged. It MUST NOT be abandoned or re-encrypted. If any writer
+   cannot reach zero outstanding old-epoch envelopes, the rotation aborts.
+3. Every writer durably acknowledges the quiesced state and the current
+   `epoch_revision`. The coordinator MUST account for the complete roster; a
+   timeout or missing writer aborts rather than bypasses the barrier.
+4. Fence the old `writer_generation` at the server authorization layer, for
+   example by revoking its write credentials. A stale or paused process MUST be
+   unable to POST after this point. Shared credentials that cannot distinguish
+   or revoke the old generation are insufficient for safe rotation.
+5. After the fence is effective, fetch a fresh authenticated capability
+   snapshot. Commit the new epoch snapshot with
+   `effective_from_seq = next_sequence_boundary`, the new immutable manifest,
+   and a greater `writer_generation`. If the boundary is null, rotation fails.
+6. Distribute the complete snapshot and new write authorization only to writers
+   that verify the checkpoint and install the new epoch. Require durable
+   acknowledgements before resuming any writer.
+7. Resume writers. Every subsequently sealed envelope uses the new epoch.
+
+This barrier ensures that no old-epoch envelope can receive the first sequence
+of the new epoch and that a stale writer cannot disclose post-cutover plaintext
+to a removed recipient. Rotation is fail-closed: loss of coordination leaves
+writes paused but does not permit downgrade.
+
 ## Plaintext frame
 
 Age encrypts exactly one binary plaintext frame. Integers are unsigned,
@@ -116,6 +198,13 @@ The 16-byte magic is ASCII `agmsg-age-v1` followed by four zero bytes.
 `context_length` MUST equal the exact encoded context length.
 `message_length` MUST equal the exact canonical-message length. The frame ends
 immediately after the message bytes.
+
+Readers MUST validate every declared length against the bytes remaining before
+addition, slicing, or allocation. Integer addition MUST be overflow-safe;
+untrusted lengths MUST NOT drive an allocation. The canonical context length is
+47–110 bytes. A zero message length, a length exceeding the remaining frame,
+or any byte after the declared message is rejected according to the failure
+table below.
 
 ### Canonical authenticated binding context
 
@@ -159,17 +248,31 @@ file size before durably reserving the envelope.
 
 The writer performs these steps in order:
 
-1. Generate and durably reserve the random wire UUIDv4.
-2. Select the effective `key_id` and exact recipient-set manifest.
-3. Construct the canonical context and canonical message bytes.
-4. Encrypt the complete frame once as a binary age v1 file.
-5. Base64-encode the complete age file canonically and durably commit the exact
-   wire ID and outer envelope before exposing them to the HTTP engine.
+1. Select the effective `key_id` and exact recipient-set manifest.
+2. Generate a candidate random wire UUIDv4 in private process state. At this
+   point it is neither a published remote identity nor a durable reservation.
+3. Construct the canonical context and canonical message bytes and encrypt the
+   complete frame once as a binary age v1 file.
+4. Base64-encode the complete age file canonically.
+5. In one storage transaction, durably publish the wire ID and the complete
+   exact outer envelope as one indivisible reservation before exposing either
+   value to the HTTP engine, logs, export, or another process.
+
+A crash before step 5 publishes nothing. Recovery generates a new private
+candidate and may discard any uncommitted ciphertext because the prior wire ID
+never became an observable remote identity. A storage design that persists
+pre-publication work MUST persist the complete wire ID and exact envelope
+atomically; a durable wire-only or `sealing` state is forbidden. Concurrent
+sealers for one local message may do redundant work, but only the transaction
+winner becomes visible and all callers subsequently emit that winner.
 
 The Stage-1 H1 rule is absolute: every retry, reconciliation attempt, crash
 recovery, export, and compaction replay for that wire ID MUST reuse the exact
 `v`, `cipher`, `key_id`, and `blob`. A client MUST NOT re-encrypt or re-encode
-the same wire ID, even to the same recipients.
+the same published wire ID, even to the same recipients. A regression test MUST
+terminate sealing after ciphertext creation but before atomic publication and
+prove that restart neither exposes nor re-encrypts the abandoned private
+candidate wire ID.
 
 ## Open, binding verification, and failure states
 
@@ -212,8 +315,9 @@ by the HTTP v1 three-layer state model.
 ## Key bootstrap and operational limits
 
 - Recipient public keys, private identities, recipient-set manifests, and epoch
-  history are provisioned outside the message server over an authenticated
-  channel. Copying only the current private key is insufficient for history.
+  history are provisioned outside the message server over an authenticated,
+  freshness-proving channel. Copying only the current private key is
+  insufficient for history or rollback resistance.
 - A headless sync process MUST use explicit identity files or an equivalent
   non-interactive secret provider. Interactive passphrases and trial-decrypting
   every installed key are forbidden.
@@ -221,9 +325,24 @@ by the HTTP v1 three-layer state model.
   subprocess argument lists, and protected with platform-appropriate file
   permissions. HTTP bearer credentials and age identities are separate secrets.
 - The profile does not define padding. Team relationship, key epoch, age-file
-  length, server arrival time, traffic frequency, and sequence remain visible.
+  length, approximate recipient count and rotation pattern, server arrival
+  time, traffic frequency, and sequence remain visible. A `key_id` is public
+  metadata and MUST NOT contain a customer name, incident label, timestamp, or
+  other sensitive description.
 - Because the server cannot read the plaintext, routing, search, and wake remain
   team-wide; recipient projection happens locally after verified decryption.
+
+For manual recovery, first decode the outer base64 to an unarmored age file,
+then use a standard CLI without placing identity material itself on argv:
+
+```sh
+age --decrypt --identity "$IDENTITY_FILE" message.age > message.frame
+```
+
+`message.frame` is the binary frame defined above, not directly printable JSON;
+it still requires a conforming frame/context verifier before the message may be
+trusted or displayed. Implementations SHOULD include this CLI round trip in
+their contract tests.
 
 ## Shared conformance vectors
 
@@ -234,15 +353,27 @@ must cover at least:
 
 1. successful decryption and exact context/message recovery;
 2. decryption with the wrong team's identity;
-3. outer wire-ID substitution with otherwise unchanged ciphertext;
-4. an authenticated plaintext with a truncated context;
-5. an authenticated plaintext with reordered context fields.
+3. same-key trusted team-ID and wire-ID substitution;
+4. protocol-version, cipher, and key-ID substitution;
+5. an authenticated plaintext with a truncated or reordered context;
+6. zero or overflowing declared lengths and trailing plaintext bytes;
+7. duplicate/unknown JCS keys and an otherwise non-canonical message.
 
-The four negative cases MUST produce `authentication_failed` and MUST NOT yield
-a projection. In the manifest, `envelope_from` means reuse the named vector's
-envelope byte-for-byte, `binding_override` changes only the independently
-trusted expected binding, and `identity` selects the named public test
-identity. The manifest records exact expected states so every implementation
-consumes the same attacks.
+Each negative case MUST produce the state recorded in the manifest and MUST NOT
+yield a projection. Binding/frame failures are `authentication_failed`;
+unsupported profile dispatch is `unsupported_cipher`; a context-valid but
+invalid canonical message is `malformed`. In the manifest, `envelope_from`
+means reuse the named vector's envelope byte-for-byte, `binding_override`
+changes only the independently trusted expected binding, and `identity` selects
+the named public test identity. The manifest records the generating age
+implementation, SHA-256 of every decoded age file and decrypted frame, and
+exact expected states. The accompanying verifier independently checks that
+provenance and every attack.
+
+Regenerate the randomized ciphertext fixtures with
+[`generate-age-v1-vectors.mjs`](vectors/generate-age-v1-vectors.mjs) and verify
+the committed fixtures with
+[`verify-age-v1-vectors.mjs`](vectors/verify-age-v1-vectors.mjs). Set `AGE_BIN`
+when the desired standard `age` executable is not on `PATH`.
 
 [age-format]: https://age-encryption.org/v1
