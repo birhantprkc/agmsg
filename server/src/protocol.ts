@@ -54,7 +54,7 @@ const keyIdSchema = z.union([
 
 export const envelopeSchema = z
   .object({
-    v: z.number().int().nonnegative(),
+    v: z.number().int().min(0).max(0xffff_ffff),
     cipher: z.string().regex(cipherPattern),
     key_id: keyIdSchema,
     blob: z.string().refine(canonicalBlob),

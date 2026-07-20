@@ -9,6 +9,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createApp } from "../src/app.js";
 import type { Config } from "../src/config.js";
 import { migrate } from "../src/db.js";
+import { retainThrough } from "../src/storage.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const describeDatabase = databaseUrl ? describe : describe.skip;
@@ -84,13 +85,19 @@ describeDatabase("remote storage HTTP API v1", () => {
   });
 
   function message(id: string, text: string) {
+    const plaintext = JSON.stringify({
+      body: text,
+      created_at: "2026-07-20T06:30:00.000000Z",
+      from_agent: "leader",
+      to_agent: "worker-1",
+    });
     return {
       id,
       envelope: {
         v: 1,
         cipher: "none",
         key_id: null,
-        blob: Buffer.from(text).toString("base64"),
+        blob: Buffer.from(plaintext).toString("base64"),
       },
     };
   }
@@ -259,27 +266,52 @@ describeDatabase("remote storage HTTP API v1", () => {
     ).toEqual(["3", "4"]);
   });
 
-  it("keeps retained IDs idempotent while enforcing the pull floor", async () => {
-    const moved = await pool.query<{
-      id: string;
-      team_seq: string;
-      envelope_digest: Buffer;
+  it("retains atomically under the writer lock and keeps tombstones idempotent", async () => {
+    await pool.query(
+      `CREATE FUNCTION fail_tombstone_insert() RETURNS trigger AS $$
+       BEGIN RAISE EXCEPTION 'injected retention failure'; END;
+       $$ LANGUAGE plpgsql`,
+    );
+    await pool.query(
+      `CREATE TRIGGER fail_tombstone_insert
+       BEFORE INSERT ON message_tombstones
+       FOR EACH ROW EXECUTE FUNCTION fail_tombstone_insert()`,
+    );
+    await expect(retainThrough(pool, teamId, 1n)).rejects.toThrow(
+      /injected retention failure/,
+    );
+    const rolledBack = await pool.query<{
+      messages: string;
+      tombstones: string;
+      floor: string;
     }>(
-      `DELETE FROM messages WHERE team_id = $1 AND team_seq = 1
-       RETURNING id::text, team_seq::text, envelope_digest`,
+      `SELECT
+         (SELECT count(*)::text FROM messages WHERE team_id = $1) AS messages,
+         (SELECT count(*)::text FROM message_tombstones WHERE team_id = $1) AS tombstones,
+         (SELECT min_available_seq::text FROM teams WHERE team_id = $1) AS floor`,
       [teamId],
     );
-    const row = moved.rows[0];
-    expect(row).toBeDefined();
-    await pool.query(
-      `INSERT INTO message_tombstones
-         (team_id, id, original_team_seq, envelope_digest)
-       VALUES ($1, $2, $3, $4)`,
-      [teamId, row?.id, row?.team_seq, row?.envelope_digest],
-    );
-    await pool.query("UPDATE teams SET min_available_seq = 1 WHERE team_id = $1", [
-      teamId,
+    expect(rolledBack.rows[0]).toEqual({ messages: "4", tombstones: "0", floor: "0" });
+    await pool.query("DROP TRIGGER fail_tombstone_insert ON message_tombstones");
+    await pool.query("DROP FUNCTION fail_tombstone_insert()");
+
+    const concurrent = message("750e8400-e29b-41d4-a716-446655440007", "after-floor");
+    const [retained, posted] = await Promise.all([
+      retainThrough(pool, teamId, 4n),
+      app.inject({
+        method: "POST",
+        url: "/v1/messages",
+        headers,
+        payload: { messages: [concurrent] },
+      }),
     ]);
+    expect(retained).toMatchObject({
+      min_available_seq: "4",
+      retained_through: "4",
+      tombstones_created: "4",
+    });
+    expect(posted.statusCode).toBe(200);
+    expect(posted.json().acks[0].server_seq).toBe("5");
 
     const belowFloor = await app.inject({
       method: "GET",
@@ -301,6 +333,46 @@ describeDatabase("remote storage HTTP API v1", () => {
       server_seq: "1",
       disposition: "duplicate",
     });
+
+    await pool.query(
+      "UPDATE teams SET write_allowed_ciphers = ARRAY[]::TEXT[] WHERE team_id = $1",
+      [teamId],
+    );
+    const duplicateUnderNewPolicy = await app.inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers,
+      payload: {
+        messages: [message("550e8400-e29b-41d4-a716-446655440000", "first")],
+      },
+    });
+    expect(duplicateUnderNewPolicy.statusCode).toBe(200);
+    expect(duplicateUnderNewPolicy.json().acks[0].disposition).toBe("duplicate");
+    const rejectedFresh = await app.inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers,
+      payload: { messages: [message("750e8400-e29b-41d4-a716-446655440008", "fresh")] },
+    });
+    expect(rejectedFresh.statusCode).toBe(403);
+    await pool.query(
+      "UPDATE teams SET write_allowed_ciphers = ARRAY['none']::TEXT[] WHERE team_id = $1",
+      [teamId],
+    );
+
+    const invalidVersion = message(
+      "550e8400-e29b-41d4-a716-446655440000",
+      "first",
+    );
+    invalidVersion.envelope.v = 0x1_0000_0000;
+    const outOfRange = await app.inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers,
+      payload: { messages: [invalidVersion] },
+    });
+    expect(outOfRange.statusCode).toBe(400);
+    expect(outOfRange.json().error.code).toBe("invalid-request");
   });
 
   it("atomically provisions the operator roster and permanently retires IDs", async () => {

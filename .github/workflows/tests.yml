@@ -347,6 +347,54 @@ jobs:
         if: needs.changes.outputs.server_changed != 'false'
         run: npm run build
 
+      - name: Compiled start smoke test
+        if: needs.changes.outputs.server_changed != 'false'
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/agmsg_test
+          AGMSG_SERVER_TOKEN: ci-compiled-start-token
+          LOG_LEVEL: silent
+        run: |
+          npm start > "$RUNNER_TEMP/agmsg-server.log" 2>&1 &
+          server_pid=$!
+          cleanup() {
+            kill "$server_pid" 2>/dev/null || true
+            wait "$server_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          for _attempt in $(seq 1 20); do
+            if curl --fail --silent http://127.0.0.1:8787/v1/health >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/agmsg-server.log"
+          exit 1
+
+      - name: Docker image and health smoke test
+        if: needs.changes.outputs.server_changed != 'false'
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/agmsg_test
+          AGMSG_SERVER_TOKEN: ci-docker-start-token
+          CONTAINER_NAME: agmsg-reference-ci-${{ github.run_id }}
+        run: |
+          docker build -t agmsg-reference-server:ci .
+          docker run --detach --name "$CONTAINER_NAME" --network host \
+            --env DATABASE_URL --env AGMSG_SERVER_TOKEN \
+            --env HOST=127.0.0.1 --env PORT=8788 --env LOG_LEVEL=silent \
+            agmsg-reference-server:ci
+          cleanup() {
+            docker rm --force "$CONTAINER_NAME" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          for _attempt in $(seq 1 20); do
+            if curl --fail --silent http://127.0.0.1:8788/v1/health >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs "$CONTAINER_NAME"
+          exit 1
+
   # Windows leg for the app: the command layer's bash resolution and path
   # conversion are all behind cfg(windows) and had never run in CI — the very
   # 0.1.1→0.1.3 regressions (WSL bash.exe, backslash argv). This runs cargo test

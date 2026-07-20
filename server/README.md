@@ -46,6 +46,14 @@ roster mutation remain outside HTTP v1: the provisioning command atomically
 applies the complete operator-owned roster manifest. IDs and retired names are
 checked against permanent identity history before replacement.
 
+Retention is also an operator operation. It atomically creates permanent
+idempotency tombstones, removes the covered delivery prefix, and advances the
+team cursor floor while holding the same team-row lock as writers:
+
+```sh
+npm run retain -- <team-uuid> <through-sequence>
+```
+
 ## Verify
 
 Integration tests use an isolated, randomly named PostgreSQL schema. The test

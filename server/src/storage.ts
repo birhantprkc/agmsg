@@ -280,6 +280,59 @@ export async function postMessages(
   });
 }
 
+export async function retainThrough(
+  pool: Pool,
+  teamId: string,
+  through: bigint,
+): Promise<Record<string, unknown>> {
+  return inTransaction(pool, async (client) => {
+    const serverId = await serverInstanceId(client);
+    const team = await teamRow(client, teamId, true);
+    if (!team) throw notFound(serverId, teamId);
+    const currentFloor = BigInt(team.min_available_seq);
+    const currentSequence = BigInt(team.current_seq);
+    if (through < currentFloor || through > currentSequence) {
+      throw new ProtocolError(
+        400,
+        "invalid-request",
+        "retention floor must be between the current floor and current sequence",
+        {
+          through: through.toString(),
+          min_available_seq: team.min_available_seq,
+          current_seq: team.current_seq,
+        },
+        { serverInstanceId: serverId, teamId },
+      );
+    }
+
+    const tombstones = await client.query(
+      `INSERT INTO message_tombstones
+         (team_id, id, original_team_seq, envelope_digest)
+       SELECT team_id, id, team_seq, envelope_digest
+         FROM messages
+        WHERE team_id = $1 AND team_seq <= $2
+       RETURNING id`,
+      [teamId, through.toString()],
+    );
+    const deleted = await client.query(
+      "DELETE FROM messages WHERE team_id = $1 AND team_seq <= $2",
+      [teamId, through.toString()],
+    );
+    if (deleted.rowCount !== tombstones.rowCount) {
+      throw new Error("retention tombstone and deletion counts differ");
+    }
+    await client.query(
+      "UPDATE teams SET min_available_seq = $2 WHERE team_id = $1",
+      [teamId, through.toString()],
+    );
+    return {
+      ...common(serverId, { ...team, min_available_seq: through.toString() }),
+      retained_through: through.toString(),
+      tombstones_created: String(tombstones.rowCount ?? 0),
+    };
+  });
+}
+
 export async function getMessages(
   pool: Pool,
   teamId: string,

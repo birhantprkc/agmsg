@@ -11,7 +11,8 @@
     "dev": "tsx watch src/index.ts",
     "migrate": "tsx src/migrate.ts",
     "provision": "tsx src/provision.ts",
-    "start": "node dist/index.js",
+    "retain": "tsx src/retain.ts",
+    "start": "node dist/src/index.js",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
