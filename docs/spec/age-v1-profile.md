@@ -118,6 +118,10 @@ writes. Until the device possesses the complete chain through the confirmed
 checkpoint, it remains write-disabled. It may continue transport quarantine,
 but messages beyond its verified history coverage remain unprojected. Resetting
 local sync state MUST NOT silently reset the retained anti-rollback checkpoint.
+At most 4096 epoch snapshots may exist in one binding chain; a mutation that
+would exceed this limit MUST fail atomically. A future profile or management
+contract may define authority-confirmed prefix compaction, but `age-v1` clients
+MUST NOT invent or silently compact a chain.
 
 Each client binding maintains an append-only, sequence-effective key-epoch
 history alongside the local security history. Each entry contains a local
@@ -354,7 +358,9 @@ must cover at least:
 1. successful decryption and exact context/message recovery;
 2. decryption with the wrong team's identity;
 3. same-key trusted team-ID and wire-ID substitution;
-4. protocol-version, cipher, and key-ID substitution;
+4. protocol-version and cipher substitution, plus key-ID substitution both at
+   the pre-decrypt epoch-policy gate and after an explicitly matching trusted
+   epoch passes that gate;
 5. an authenticated plaintext with a truncated or reordered context;
 6. zero or overflowing declared lengths and trailing plaintext bytes;
 7. duplicate/unknown JCS keys and an otherwise non-canonical message.
@@ -362,13 +368,16 @@ must cover at least:
 Each negative case MUST produce the state recorded in the manifest and MUST NOT
 yield a projection. Binding/frame failures are `authentication_failed`;
 unsupported profile dispatch is `unsupported_cipher`; a context-valid but
-invalid canonical message is `malformed`. In the manifest, `envelope_from`
-means reuse the named vector's envelope byte-for-byte, `binding_override`
-changes only the independently trusted expected binding, and `identity` selects
-the named public test identity. The manifest records the generating age
-implementation, SHA-256 of every decoded age file and decrypted frame, and
-exact expected states. The accompanying verifier independently checks that
-provenance and every attack.
+invalid canonical message is `malformed`; an outer key ID that differs from the
+sequence-effective trusted epoch is `policy_violation` before decryption. In
+the manifest, `envelope_from` means reuse the named vector's envelope
+byte-for-byte, `envelope_override` mutates trusted outer metadata,
+`binding_override` changes the independently trusted stream binding,
+`trusted_epoch_key_id` supplies the sequence-effective epoch policy, and
+`identity` selects the named public test identity. The manifest records the
+generating age implementation, SHA-256 of every decoded age file and decrypted
+frame, and exact expected states. The accompanying verifier independently
+checks that provenance and every attack.
 
 Regenerate the randomized ciphertext fixtures with
 [`generate-age-v1-vectors.mjs`](vectors/generate-age-v1-vectors.mjs) and verify

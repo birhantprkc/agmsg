@@ -84,6 +84,8 @@ function classify(vector) {
     throw new Error(`${vector.name}: age-file SHA-256 mismatch`);
   }
   if (resolved.envelope.cipher !== "age-v1") return "unsupported_cipher";
+  const trustedEpochKeyId = vector.trusted_epoch_key_id || manifest.binding.key_id;
+  if (resolved.envelope.key_id !== trustedEpochKeyId) return "policy_violation";
 
   const identityPath = identityPaths.get(vector.identity);
   const decrypted = spawnSync(age, ["--decrypt", "--identity", identityPath], {
