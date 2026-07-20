@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { appendFile, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
-import { basename, dirname, join, resolve } from "node:path";
+import { appendFile, lstat, mkdir, open, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
-import { ageExecutableVersion, CipherStateError, openEnvelope } from "./sync-cipher.mjs";
+import { ageExecutableVersion, CipherStateError, openEnvelope,
+  readNativeAgeIdentity } from "./sync-cipher.mjs";
 
 const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -19,6 +20,7 @@ function usage() {
   remote-sync.sh configure --team NAME --server URL --team-id UUID --minimum-security plaintext-allowed
   remote-sync.sh configure --team NAME --server URL --team-id UUID --minimum-security e2ee-required \\
     --cipher age-v1 --age-snapshot FILE --age-checkpoint REVISION:SHA256 \\
+    --age-confirmation operator-live \\
     [--age-identity KEY_ID=FILE ...]
   remote-sync.sh once --team NAME [--limit N]
   remote-sync.sh run --team NAME [--limit N] [--interval SECONDS]
@@ -68,6 +70,18 @@ function configPath(team) {
   return join(root, "remote-sync", `${encodeURIComponent(team)}.json`);
 }
 
+function ageTrustPath(config) {
+  const root = process.env.AGMSG_SYNC_TRUST_DIR;
+  if (!root) throw new Error("AGMSG_SYNC_TRUST_DIR is required for age-v1 and must survive sync-state reset");
+  const resolvedRoot = resolve(root);
+  const storageRoot = resolve(process.env.AGMSG_SYNC_STORAGE_DIR ?? "");
+  if (resolvedRoot === storageRoot || resolvedRoot.startsWith(`${storageRoot}${sep}`)) {
+    throw new Error("AGMSG_SYNC_TRUST_DIR must be outside the resettable sync storage directory");
+  }
+  return join(resolvedRoot,
+    `age-v1-${config.server_instance_id}-${config.remote_team_id}-v${config.protocol_version}.json`);
+}
+
 async function writeConfig(path, value) {
   const directory = dirname(path);
   await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -84,20 +98,45 @@ async function loadConfig(team) {
   }
   value.cipher_profile ??= "none";
   validateLocalSecurityHistory(value.local_security_history);
-  if (value.cipher_profile === "age-v1") validateAgeConfiguration(value);
+  if (value.cipher_profile === "age-v1") {
+    validateAgeConfiguration(value);
+    await validateRetainedAgeCheckpoint(value);
+  }
   else if (value.cipher_profile !== "none") throw new Error("sync cipher profile is unsupported");
   return value;
 }
 
+function requireUnicodeScalars(value, label) {
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (index + 1 >= value.length || next < 0xdc00 || next > 0xdfff) {
+        throw new Error(`${label} contains a lone surrogate`);
+      }
+      index += 1;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      throw new Error(`${label} contains a lone surrogate`);
+    }
+  }
+}
+
 function canonicalJson(value) {
-  if (value === null || typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
+  if (value === null || typeof value === "boolean") return JSON.stringify(value);
+  if (typeof value === "string") {
+    requireUnicodeScalars(value, "snapshot string");
+    return JSON.stringify(value);
+  }
   if (typeof value === "number") {
     if (!Number.isFinite(value)) throw new Error("snapshot contains a non-finite number");
     return JSON.stringify(value);
   }
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   if (typeof value === "object") {
-    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+    return `{${Object.keys(value).sort().map((key) => {
+      requireUnicodeScalars(key, "snapshot key");
+      return `${JSON.stringify(key)}:${canonicalJson(value[key])}`;
+    }).join(",")}}`;
   }
   throw new Error("snapshot contains a non-JSON value");
 }
@@ -177,6 +216,108 @@ export function validateAgeConfiguration(config) {
     throw new Error("age epoch checkpoint does not match the snapshot");
   }
   return digest;
+}
+
+export function validateConfiguredAgeIdentities(config) {
+  for (const [keyId, path] of Object.entries(config.age_v1.identity_files)) {
+    const identity = readNativeAgeIdentity(path);
+    const matchingEpochs = config.age_v1.epoch_snapshot.history.filter((entry) => entry.key_id === keyId);
+    if (matchingEpochs.length < 1 || matchingEpochs.some((entry) => !entry.recipients.includes(identity.recipient))) {
+      throw new Error(`age identity for ${keyId} does not match its recipient manifest`);
+    }
+  }
+}
+
+function checkpointRecord(config, confirmation) {
+  return {
+    format_version: 1,
+    profile: "age-v1",
+    server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id,
+    protocol_version: config.protocol_version,
+    epoch_revision: config.age_v1.checkpoint.epoch_revision,
+    snapshot_sha256: config.age_v1.checkpoint.snapshot_sha256,
+    writer_generation: config.age_v1.checkpoint.writer_generation,
+    confirmation: { method: confirmation, confirmed_at: config.age_v1.checkpoint.confirmed_at },
+  };
+}
+
+function compareRetainedCheckpoint(config, retained) {
+  const proposed = checkpointRecord(config, retained.confirmation?.method);
+  if (retained.format_version !== 1 || retained.profile !== "age-v1" ||
+      retained.server_instance_id !== proposed.server_instance_id || retained.team_id !== proposed.team_id ||
+      retained.protocol_version !== proposed.protocol_version || retained.confirmation?.method !== "operator-live") {
+    throw new Error("retained age checkpoint is invalid");
+  }
+  const retainedRevision = BigInt(sequence(retained.epoch_revision, "retained epoch revision"));
+  const proposedRevision = BigInt(sequence(proposed.epoch_revision, "proposed epoch revision"));
+  const retainedGeneration = BigInt(sequence(retained.writer_generation, "retained writer generation"));
+  const proposedGeneration = BigInt(sequence(proposed.writer_generation, "proposed writer generation"));
+  if (proposedRevision < retainedRevision || proposedGeneration < retainedGeneration ||
+      (proposedRevision === retainedRevision && retained.snapshot_sha256 !== proposed.snapshot_sha256)) {
+    throw new Error("age checkpoint rollback or same-revision conflict detected");
+  }
+  if (proposedRevision !== retainedRevision || proposedGeneration !== retainedGeneration) {
+    throw new Error("age checkpoint advancement requires the fenced rotation workflow");
+  }
+  return retained;
+}
+
+async function readRetainedCheckpointFile(path) {
+  const metadata = await lstat(path);
+  if (!metadata.isFile() || metadata.isSymbolicLink() ||
+      (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
+    throw new Error("retained age checkpoint must be a private regular file");
+  }
+  return JSON.parse(await readFile(path, "utf8"));
+}
+
+export async function retainAgeCheckpoint(config, confirmation) {
+  const path = ageTrustPath(config);
+  try {
+    return compareRetainedCheckpoint(config, await readRetainedCheckpointFile(path));
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  if (confirmation !== "operator-live") {
+    throw new Error("initial age checkpoint requires --age-confirmation operator-live");
+  }
+  const retained = checkpointRecord(config, confirmation);
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const directoryMetadata = await lstat(dirname(path));
+  if (!directoryMetadata.isDirectory() ||
+      (process.platform !== "win32" && (directoryMetadata.mode & 0o077) !== 0)) {
+    throw new Error("AGMSG_SYNC_TRUST_DIR must be a private directory");
+  }
+  try {
+    const handle = await open(path, "wx", 0o600);
+    try {
+      await handle.writeFile(`${JSON.stringify(retained)}\n`, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    if (process.platform !== "win32") {
+      const directoryHandle = await open(dirname(path), "r");
+      try {
+        await directoryHandle.sync();
+      } finally {
+        await directoryHandle.close();
+      }
+    }
+    return retained;
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+    return compareRetainedCheckpoint(config, await readRetainedCheckpointFile(path));
+  }
+}
+
+export async function validateRetainedAgeCheckpoint(config) {
+  const retained = await readRetainedCheckpointFile(ageTrustPath(config));
+  compareRetainedCheckpoint(config, retained);
+  if (retained.confirmation.confirmed_at !== config.age_v1.checkpoint.confirmed_at) {
+    throw new Error("sync config does not match the retained age checkpoint confirmation");
+  }
 }
 
 function endpoint(base, path) {
@@ -290,6 +431,7 @@ export async function driver(operation, config, input, extra = []) {
   return new Promise((resolve, reject) => {
     const childEnvironment = { ...process.env };
     delete childEnvironment.AGMSG_SYNC_TOKEN;
+    delete childEnvironment.AGMSG_SYNC_TRUST_DIR;
     for (const key of Object.keys(childEnvironment)) {
       if (/^(?:AGMSG_AGE_IDENTITY|AGMSG_SYNC_AGE_IDENTITY)/u.test(key)) {
         delete childEnvironment[key];
@@ -400,7 +542,10 @@ export async function evaluatePull(config, capabilities, message) {
   try {
     const projection = await openEnvelope({ envelope: message.envelope,
       protocol_version: config.protocol_version, team_id: config.remote_team_id,
-      wire_id: message.id, identity_file: identityFile, max_blob_bytes: 1_048_576 });
+      wire_id: message.id, identity_file: identityFile,
+      expected_recipients: message.envelope.cipher === "age-v1" ?
+        currentAgeEpoch(config, message.server_seq).recipients : undefined,
+      max_blob_bytes: 1_048_576 });
     return { status: "importable", projection,
       policy_revision: serverPolicy.policy_revision,
       local_security_revision: localPolicy.local_security_revision };
@@ -602,6 +747,10 @@ async function configure(args) {
       throw new Error("age snapshot must be RFC 8785 JCS without duplicate or noncanonical fields");
     }
     const checkpoint = parseCheckpoint(args["age-checkpoint"]);
+    const confirmation = args["age-confirmation"];
+    if (confirmation !== "operator-live") {
+      throw new Error("age-v1 requires explicit --age-confirmation operator-live");
+    }
     config.age_v1 = {
       epoch_snapshot: snapshot,
       checkpoint: { ...checkpoint, writer_generation: snapshot.writer_generation,
@@ -610,7 +759,11 @@ async function configure(args) {
       age_version: ageExecutableVersion(),
     };
     validateAgeConfiguration(config);
-  } else if (args["age-snapshot"] || args["age-checkpoint"] || args["age-identity"]) {
+    validateConfiguredAgeIdentities(config);
+    const retained = await retainAgeCheckpoint(config, confirmation);
+    config.age_v1.checkpoint.confirmed_at = retained.confirmation.confirmed_at;
+  } else if (args["age-snapshot"] || args["age-checkpoint"] || args["age-confirmation"] ||
+      args["age-identity"]) {
     throw new Error("age options require --cipher age-v1");
   }
   const previous = await existingConfig(team);

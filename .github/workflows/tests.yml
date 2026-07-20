@@ -159,13 +159,29 @@ jobs:
         with:
           go-version: '1.25.x'
 
+      - name: Ensure SQLite and jq are available
+        if: needs.changes.outputs.docs_only != 'true'
+        run: |
+          sqlite3 --version >/dev/null 2>&1 && jq --version >/dev/null 2>&1 || {
+            sudo apt-get update
+            sudo apt-get install -y sqlite3 jq
+          }
+
       - name: Install pinned age implementation
         if: needs.changes.outputs.docs_only != 'true'
-        run: go install filippo.io/age/cmd/age@v1.3.1
+        run: |
+          go install filippo.io/age/cmd/age@v1.3.1
+          npm config set prefix "$HOME/.npm-global"
+          npm install -g bats
+          echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
 
       - name: Run age-v1 shared vectors
         if: needs.changes.outputs.docs_only != 'true'
-        run: AGMSG_AGE_BIN="$(go env GOPATH)/bin/age" node --test tests/sync_cipher.test.mjs
+        run: |
+          age_bin="$(go env GOPATH)/bin/age"
+          AGMSG_AGE_BIN="$age_bin" node --test tests/sync_cipher.test.mjs
+          AGMSG_AGE_BIN="$age_bin" bats --print-output-on-failure tests/test_sync_cipher.bats
+          AGE_BIN="$age_bin" node docs/spec/vectors/verify-age-v1-vectors.mjs
 
   # Continuously verify that the storage contract is backend-portable: run the
   # SAME driver-agnostic contract suite against the jsonl driver (the sqlite run

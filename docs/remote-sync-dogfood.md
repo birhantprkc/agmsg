@@ -83,6 +83,7 @@ digest with the epoch authority, configure the binding:
 
 ```sh
 export AGMSG_AGE_BIN=/path/to/age       # optional when age is already on PATH
+export AGMSG_SYNC_TRUST_DIR=/durable/path/agmsg-sync-trust
 chmod 600 /secure/path/epoch-1.identity
 
 scripts/remote-sync.sh configure \
@@ -93,8 +94,17 @@ scripts/remote-sync.sh configure \
   --cipher age-v1 \
   --age-snapshot /authenticated/path/epoch-snapshot.json \
   --age-checkpoint '0:CONFIRMED_LOWERCASE_SHA256' \
+  --age-confirmation operator-live \
   --age-identity epoch-1=/secure/path/epoch-1.identity
 ```
+
+`AGMSG_SYNC_TRUST_DIR` is the retained anti-rollback trust-anchor store. It is
+mandatory for `age-v1`, must be outside `AGMSG_STORAGE_PATH`, and must not be
+deleted by sync-state reset or local-store replacement. The first configuration
+requires `--age-confirmation operator-live`, which records that the operator
+verified the exact revision and digest through a separate live channel. A later
+same-revision/different-digest snapshot is rejected even if the ordinary sync
+config has been removed.
 
 Only the public recipient list crosses the storage-driver seam. The private
 identity path stays in the engine configuration and is used only while opening
@@ -109,6 +119,10 @@ For `age-v1`, lifecycle logs omit imported plaintext fields by default. Set
 `AGMSG_SYNC_LOG_PLAINTEXT=1` only when the log destination is intentionally
 trusted to contain decrypted message content. Plaintext bindings retain the
 existing body-inclusive dogfood trace.
+
+`AGMSG_SYNC_DRIVER`, `AGMSG_SYNC_CIPHER_HELPER`, and `AGMSG_AGE_BIN` select
+locally executable code and are trusted-operator settings. Do not accept these
+values from message content, remote responses, or untrusted project config.
 
 For a single-host two-machine simulation, repeat configuration with two
 different `AGMSG_STORAGE_PATH` directories and the same immutable remote team

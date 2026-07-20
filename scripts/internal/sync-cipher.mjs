@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 
-import { timingSafeEqual } from "node:crypto";
-import { statSync } from "node:fs";
+import { createPrivateKey, createPublicKey, timingSafeEqual } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import process from "node:process";
 
 const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -13,6 +15,7 @@ const AGE_RECIPIENT = /^age1[0-9a-z]{58}$/u;
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
 const MAGIC = Buffer.concat([Buffer.from("agmsg-age-v1", "ascii"), Buffer.alloc(4)]);
 const MAX_BLOB_BYTES = 1_048_576;
+const BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 
 export class CipherStateError extends Error {
   constructor(state, message) {
@@ -30,8 +33,40 @@ function authenticationFailed(message) {
   throw new CipherStateError("authentication_failed", message);
 }
 
+function requireUnicodeScalars(value, label) {
+  if (typeof value !== "string") malformed(`${label} is not a string`);
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (index + 1 >= value.length || next < 0xdc00 || next > 0xdfff) {
+        malformed(`${label} contains a lone surrogate`);
+      }
+      index += 1;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      malformed(`${label} contains a lone surrogate`);
+    }
+  }
+  return value;
+}
+
+function validTimestamp(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.(\d{6})Z$/u.exec(value ?? "");
+  if (!match) return false;
+  const [, year, month, day, hour, minute, second, micros] = match.map(Number);
+  if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) return false;
+  const instant = new Date(0);
+  instant.setUTCFullYear(year, month - 1, day);
+  instant.setUTCHours(hour, minute, second, Math.floor(micros / 1000));
+  return instant.getUTCFullYear() === year && instant.getUTCMonth() === month - 1 &&
+    instant.getUTCDate() === day && instant.getUTCHours() === hour &&
+    instant.getUTCMinutes() === minute && instant.getUTCSeconds() === second;
+}
+
 function requireName(value, label) {
-  if (typeof value !== "string" || value.length < 1 || value.length > 128 ||
+  requireUnicodeScalars(value, label);
+  const scalarLength = [...value].length;
+  if (scalarLength < 1 || scalarLength > 128 ||
       value.startsWith("-") || value === "." || value === ".." ||
       /[./\\"\[\]\u0000-\u001f\u007f]/u.test(value) || value !== value.normalize("NFC")) {
     malformed(`${label} is invalid`);
@@ -43,9 +78,11 @@ function canonicalMessage(projection) {
   if (!projection || Array.isArray(projection) || typeof projection !== "object" ||
       typeof projection.body !== "string" || Buffer.byteLength(projection.body) < 1 ||
       Buffer.byteLength(projection.body) > 1_000_000 ||
-      typeof projection.created_at !== "string" || !TIMESTAMP.test(projection.created_at)) {
+      typeof projection.created_at !== "string" || !TIMESTAMP.test(projection.created_at) ||
+      !validTimestamp(projection.created_at)) {
     malformed("message projection is invalid");
   }
+  requireUnicodeScalars(projection.body, "body");
   requireName(projection.from_agent, "from_agent");
   requireName(projection.to_agent, "to_agent");
   return Buffer.from(JSON.stringify({
@@ -147,12 +184,111 @@ function validateAgeHeader(ageFile) {
       if (!insideStanza || stanzaCount < 1 || value.split(" ").length !== 2 || offset >= ageFile.length) {
         malformed("age header footer is invalid");
       }
-      return;
+      return stanzaCount;
     } else if (!insideStanza || !/^[A-Za-z0-9+/]+={0,2}$/u.test(value)) {
       malformed("age recipient stanza body is invalid");
     }
   }
   malformed("age header footer is missing");
+}
+
+function bech32Polymod(values) {
+  const generators = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+  let checksum = 1;
+  for (const value of values) {
+    const top = checksum >>> 25;
+    checksum = ((checksum & 0x1ffffff) << 5) ^ value;
+    for (let bit = 0; bit < 5; bit += 1) if ((top >>> bit) & 1) checksum ^= generators[bit];
+  }
+  return checksum >>> 0;
+}
+
+function bech32HrpExpand(hrp) {
+  return [...hrp].map((character) => character.charCodeAt(0) >>> 5)
+    .concat([0], [...hrp].map((character) => character.charCodeAt(0) & 31));
+}
+
+function convertBits(values, fromBits, toBits, pad) {
+  let accumulator = 0;
+  let bits = 0;
+  const result = [];
+  const maxValue = (1 << toBits) - 1;
+  for (const value of values) {
+    if (value < 0 || value >>> fromBits !== 0) malformed("age identity bech32 data is invalid");
+    accumulator = (accumulator << fromBits) | value;
+    bits += fromBits;
+    while (bits >= toBits) {
+      bits -= toBits;
+      result.push((accumulator >>> bits) & maxValue);
+    }
+  }
+  if (pad) {
+    if (bits > 0) result.push((accumulator << (toBits - bits)) & maxValue);
+  } else if (bits >= fromBits || ((accumulator << (toBits - bits)) & maxValue) !== 0) {
+    malformed("age identity bech32 padding is invalid");
+  }
+  return result;
+}
+
+function decodeAgeSecretKey(value) {
+  if (value !== value.toUpperCase() || !value.startsWith("AGE-SECRET-KEY-1")) {
+    malformed("age identity is not a native X25519 secret key");
+  }
+  const lower = value.toLowerCase();
+  const separator = lower.lastIndexOf("1");
+  const hrp = lower.slice(0, separator);
+  const encoded = [...lower.slice(separator + 1)].map((character) => BECH32_CHARSET.indexOf(character));
+  if (hrp !== "age-secret-key-" || encoded.length < 7 || encoded.some((item) => item < 0) ||
+      bech32Polymod(bech32HrpExpand(hrp).concat(encoded)) !== 1) {
+    malformed("age identity checksum is invalid");
+  }
+  const raw = Buffer.from(convertBits(encoded.slice(0, -6), 5, 8, false));
+  if (raw.length !== 32) malformed("age identity key length is invalid");
+  return raw;
+}
+
+function bech32Encode(hrp, bytes) {
+  const data = convertBits(bytes, 8, 5, true);
+  const values = bech32HrpExpand(hrp).concat(data, [0, 0, 0, 0, 0, 0]);
+  const polymod = bech32Polymod(values) ^ 1;
+  const checksum = Array.from({ length: 6 }, (_, index) => (polymod >>> (5 * (5 - index))) & 31);
+  return `${hrp}1${data.concat(checksum).map((item) => BECH32_CHARSET[item]).join("")}`;
+}
+
+export function nativeAgeIdentity(bytes) {
+  let text;
+  try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+  catch { malformed("age identity is not UTF-8"); }
+  const identities = [];
+  for (const rawLine of text.split(/\r?\n/u)) {
+    if (rawLine === "" || rawLine.startsWith("#")) continue;
+    if (rawLine !== rawLine.trim()) malformed("age identity line has surrounding whitespace");
+    identities.push(rawLine);
+  }
+  if (identities.length !== 1) malformed("age identity file must contain exactly one native key");
+  const privateBytes = decodeAgeSecretKey(identities[0]);
+  const privateKey = createPrivateKey({ key: Buffer.concat([
+    Buffer.from("302e020100300506032b656e04220420", "hex"), privateBytes,
+  ]), format: "der", type: "pkcs8" });
+  const publicDer = createPublicKey(privateKey).export({ format: "der", type: "spki" });
+  const prefix = Buffer.from("302a300506032b656e032100", "hex");
+  if (!publicDer.subarray(0, prefix.length).equals(prefix) || publicDer.length !== prefix.length + 32) {
+    malformed("age identity did not derive an X25519 public key");
+  }
+  return { bytes: Buffer.from(bytes), recipient: bech32Encode("age", publicDer.subarray(prefix.length)) };
+}
+
+export function readNativeAgeIdentity(path) {
+  try {
+    const metadata = statSync(path);
+    if (!metadata.isFile() || (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
+      throw new Error("identity file is not private");
+    }
+    return nativeAgeIdentity(readFileSync(path));
+  } catch (error) {
+    if (error instanceof CipherStateError) throw error;
+    throw new CipherStateError("pending_key", "age identity is not securely readable");
+  }
 }
 
 function runAge(args, input) {
@@ -163,6 +299,17 @@ function runAge(args, input) {
   }
   if (result.error) throw result.error;
   return result;
+}
+
+function runAgeWithIdentity(ageFile, identityBytes) {
+  const scratch = mkdtempSync(join(tmpdir(), "agmsg-age-open."));
+  const ciphertextPath = join(scratch, "message.age");
+  try {
+    writeFileSync(ciphertextPath, ageFile, { mode: 0o600, flag: "wx" });
+    return runAge(["--decrypt", "--identity", "-", ciphertextPath], identityBytes);
+  } finally {
+    rmSync(scratch, { recursive: true });
+  }
 }
 
 export function ageExecutableVersion() {
@@ -199,7 +346,9 @@ function sealAge(input) {
   if (result.stdout.length > input.max_blob_bytes || result.stdout.length > MAX_BLOB_BYTES) {
     malformed("encrypted age file exceeds max_blob_bytes");
   }
-  validateAgeHeader(result.stdout);
+  if (validateAgeHeader(result.stdout) !== input.recipients.length) {
+    malformed("age recipient stanza count differs from the manifest");
+  }
   return { v: 1, cipher: "age-v1", key_id: input.key_id, blob: result.stdout.toString("base64") };
 }
 
@@ -229,23 +378,26 @@ function openNone(envelope, maxBlobBytes) {
   return parseCanonicalMessage(canonicalBlob(envelope.blob, maxBlobBytes));
 }
 
-function openAge({ envelope, protocol_version: protocolVersion, team_id: teamId, wire_id: wireId,
-  identity_file: identityFile, max_blob_bytes: maxBlobBytes = MAX_BLOB_BYTES }) {
+async function openAge({ envelope, protocol_version: protocolVersion, team_id: teamId, wire_id: wireId,
+  identity_file: identityFile, expected_recipients: expectedRecipients,
+  max_blob_bytes: maxBlobBytes = MAX_BLOB_BYTES }) {
   if (envelope.v !== 1 || typeof envelope.key_id !== "string" || !KEY_ID.test(envelope.key_id)) {
     malformed("age-v1 envelope metadata is invalid");
   }
   if (!identityFile) throw new CipherStateError("pending_key", "age identity is not installed");
-  try {
-    const metadata = statSync(identityFile);
-    if (!metadata.isFile() || (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
-      throw new Error("identity file is not private");
-    }
-  } catch {
-    throw new CipherStateError("pending_key", "age identity is not readable");
+  if (!Array.isArray(expectedRecipients) || expectedRecipients.length < 1 || expectedRecipients.length > 256 ||
+      expectedRecipients.some((recipient) => typeof recipient !== "string" || !AGE_RECIPIENT.test(recipient))) {
+    malformed("expected age recipient manifest is invalid");
+  }
+  const identity = readNativeAgeIdentity(identityFile);
+  if (!expectedRecipients.includes(identity.recipient)) {
+    authenticationFailed("age identity does not match the expected recipient manifest");
   }
   const ageFile = canonicalBlob(envelope.blob, maxBlobBytes);
-  validateAgeHeader(ageFile);
-  const result = runAge(["--decrypt", "--identity", identityFile], ageFile);
+  if (validateAgeHeader(ageFile) !== expectedRecipients.length) {
+    authenticationFailed("age recipient stanza count differs from the manifest");
+  }
+  const result = runAgeWithIdentity(ageFile, identity.bytes);
   if (result.status !== 0) authenticationFailed("age decryption failed");
   const bytes = result.stdout;
   if (bytes.length < 24 || !bytes.subarray(0, 16).equals(MAGIC)) authenticationFailed("age frame magic is invalid");

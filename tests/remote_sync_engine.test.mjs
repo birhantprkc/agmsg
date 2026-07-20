@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,9 +9,11 @@ import {
   isRetryable,
   plaintextWriteEligible,
   request,
+  retainAgeCheckpoint,
   selectWriteProfile,
   validateAckMapping,
   validateAgeConfiguration,
+  validateConfiguredAgeIdentities,
   validateCapabilities,
   validateErrorBinding,
 } from "../scripts/internal/remote-sync.mjs";
@@ -173,6 +175,7 @@ test("storage driver subprocess cannot observe HTTP or age identity secrets", as
   const mock = join(root, "driver.sh");
   await writeFile(mock, `#!/usr/bin/env bash
 [ -z "\${AGMSG_SYNC_TOKEN:-}" ] || exit 99
+[ -z "\${AGMSG_SYNC_TRUST_DIR:-}" ] || exit 95
 [ -z "\${AGMSG_AGE_IDENTITY:-}" ] || exit 98
 [ -z "\${AGMSG_AGE_IDENTITY_FILE:-}" ] || exit 97
 [ -z "\${AGMSG_SYNC_AGE_IDENTITY_EPOCH_1:-}" ] || exit 96
@@ -183,11 +186,13 @@ printf '{"type":"mock-ok"}\\n'
   const previousIdentity = process.env.AGMSG_AGE_IDENTITY;
   const previousIdentityFile = process.env.AGMSG_AGE_IDENTITY_FILE;
   const previousSyncIdentity = process.env.AGMSG_SYNC_AGE_IDENTITY_EPOCH_1;
+  const previousTrust = process.env.AGMSG_SYNC_TRUST_DIR;
   process.env.AGMSG_SYNC_DRIVER = mock;
   process.env.AGMSG_SYNC_TOKEN = "must-not-cross-driver-boundary";
   process.env.AGMSG_AGE_IDENTITY = "AGE-SECRET-KEY-1FIXTURE";
   process.env.AGMSG_AGE_IDENTITY_FILE = "/secret/identity";
   process.env.AGMSG_SYNC_AGE_IDENTITY_EPOCH_1 = "/secret/identity";
+  process.env.AGMSG_SYNC_TRUST_DIR = "/durable/trust";
   try {
     assert.deepEqual(await driver("prepare", config, [], ["1"]), [{ type: "mock-ok" }]);
   } finally {
@@ -201,6 +206,8 @@ printf '{"type":"mock-ok"}\\n'
     else process.env.AGMSG_AGE_IDENTITY_FILE = previousIdentityFile;
     if (previousSyncIdentity === undefined) delete process.env.AGMSG_SYNC_AGE_IDENTITY_EPOCH_1;
     else process.env.AGMSG_SYNC_AGE_IDENTITY_EPOCH_1 = previousSyncIdentity;
+    if (previousTrust === undefined) delete process.env.AGMSG_SYNC_TRUST_DIR;
+    else process.env.AGMSG_SYNC_TRUST_DIR = previousTrust;
     if (!root.startsWith(join(tmpdir(), "agmsg-sync-driver-env-"))) throw new Error("unsafe test root");
     await rm(root, { recursive: true });
   }
@@ -232,6 +239,8 @@ test("age-v1 write selection exposes only public epoch material", () => {
 });
 
 test("age-v1 configuration binds its checkpoint and initial history", () => {
+  assert.throws(() => ageSnapshotDigest({ bad: "\ud800" }), /lone surrogate/u);
+  assert.throws(() => ageSnapshotDigest({ ["\udc00"]: "bad-key" }), /lone surrogate/u);
   const snapshot = {
     profile: "age-v1",
     server_instance_id: config.server_instance_id,
@@ -268,4 +277,64 @@ test("age-v1 configuration binds its checkpoint and initial history", () => {
     checkpoint: { ...ageConfig.age_v1.checkpoint, epoch_revision: "1",
       snapshot_sha256: ageSnapshotDigest(rotated) },
   } }), /only an initial revision-0/u);
+});
+
+test("retained age checkpoint survives sync config reset and rejects same-revision conflict", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agmsg-age-trust-"));
+  const previousTrust = process.env.AGMSG_SYNC_TRUST_DIR;
+  const previousStorage = process.env.AGMSG_SYNC_STORAGE_DIR;
+  process.env.AGMSG_SYNC_TRUST_DIR = join(root, "trust");
+  process.env.AGMSG_SYNC_STORAGE_DIR = join(root, "resettable-store");
+  const snapshot = {
+    profile: "age-v1", server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id, epoch_revision: "0", writer_generation: "0",
+    authorized_writers: ["writer-a"], previous_snapshot_sha256: null,
+    history: [{ epoch_revision: "0", effective_from_seq: "1", cipher: "age-v1",
+      key_id: "epoch-1", recipients: [
+        "age1mmqjrejftea4f6xh47lhpc0jn4vw0yuhz349sw2e3sfl22k5gcjsv6xcvp",
+      ] }],
+  };
+  const makeConfig = (value) => ({ ...config, cipher_profile: "age-v1", age_v1: {
+    epoch_snapshot: value,
+    checkpoint: { epoch_revision: "0", writer_generation: "0",
+      snapshot_sha256: ageSnapshotDigest(value), confirmed_at: "2026-07-21T00:00:00.000Z" },
+    identity_files: {}, age_version: "v1.3.1",
+  } });
+  try {
+    await assert.rejects(retainAgeCheckpoint(makeConfig(snapshot), undefined), /operator-live/u);
+    const retained = await retainAgeCheckpoint(makeConfig(snapshot), "operator-live");
+    assert.equal(retained.snapshot_sha256, ageSnapshotDigest(snapshot));
+    const resettableConfig = join(process.env.AGMSG_SYNC_STORAGE_DIR, "remote-sync", "demo.json");
+    await mkdir(join(process.env.AGMSG_SYNC_STORAGE_DIR, "remote-sync"), { recursive: true });
+    await writeFile(resettableConfig, "{}\n");
+    await unlink(resettableConfig);
+    const conflicting = { ...snapshot, authorized_writers: ["writer-b"] };
+    await assert.rejects(retainAgeCheckpoint(makeConfig(conflicting), "operator-live"),
+      /same-revision conflict/u);
+  } finally {
+    if (previousTrust === undefined) delete process.env.AGMSG_SYNC_TRUST_DIR;
+    else process.env.AGMSG_SYNC_TRUST_DIR = previousTrust;
+    if (previousStorage === undefined) delete process.env.AGMSG_SYNC_STORAGE_DIR;
+    else process.env.AGMSG_SYNC_STORAGE_DIR = previousStorage;
+    await rm(root, { recursive: true });
+  }
+});
+
+test("configured native identity must belong to its epoch recipient manifest", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agmsg-age-identity-"));
+  const identity = join(root, "identity");
+  await writeFile(identity,
+    "AGE-SECRET-KEY-14Z7XMNPZTPEMMM6DG2FSKEH042L7UMU79T645GAQJKU2LLJGPM2S7GWNLQ\n",
+    { mode: 0o600 });
+  const ageConfig = { ...config, age_v1: {
+    identity_files: { "epoch-1": identity },
+    epoch_snapshot: { history: [{ key_id: "epoch-1", recipients: [
+      "age1mmqjrejftea4f6xh47lhpc0jn4vw0yuhz349sw2e3sfl22k5gcjsv6xcvp",
+    ] }] },
+  } };
+  try {
+    assert.throws(() => validateConfiguredAgeIdentities(ageConfig), /does not match/u);
+  } finally {
+    await rm(root, { recursive: true });
+  }
 });

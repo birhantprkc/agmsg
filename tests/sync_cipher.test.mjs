@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { evaluatePull } from "../scripts/internal/remote-sync.mjs";
-import { openEnvelope, sealEnvelope } from "../scripts/internal/sync-cipher.mjs";
+import { nativeAgeIdentity, openEnvelope, sealEnvelope } from "../scripts/internal/sync-cipher.mjs";
 
 const manifest = JSON.parse(await readFile(
   new URL("../docs/spec/vectors/age-v1-vectors.json", import.meta.url), "utf8"));
@@ -97,8 +97,81 @@ test("none and age-v1 profiles share one seal/open registry", async () => {
       recipients: [manifest.recipient_sets.team_a.recipient] });
     assert.deepEqual(await openEnvelope({ envelope: age, protocol_version: 1,
       team_id: base.team_id, wire_id: base.wire_id, identity_file: identity,
+      expected_recipients: [manifest.recipient_sets.team_a.recipient],
       max_blob_bytes: 1_048_576 }), manifest.canonical_message);
   } finally {
     await rm(scratch, { recursive: true });
   }
+});
+
+test("age-v1 accepts only native X25519 identity files", () => {
+  const teamA = nativeAgeIdentity(Buffer.from(`${manifest.recipient_sets.team_a.identity}\n`));
+  assert.equal(teamA.recipient, manifest.recipient_sets.team_a.recipient);
+  assert.throws(() => nativeAgeIdentity(Buffer.from("AGE-PLUGIN-EXAMPLE-1COMMAND\n")),
+    /native X25519/u);
+  assert.throws(() => nativeAgeIdentity(Buffer.from("-----BEGIN AGE ENCRYPTED FILE-----\nfixture\n")),
+    /native (?:X25519|key)/u);
+});
+
+test("age-v1 recipient stanza count must match the effective manifest", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "agmsg-age-v1-stanzas-"));
+  try {
+    const identity = join(scratch, "identity");
+    await writeFile(identity, `${manifest.recipient_sets.team_a.identity}\n`, { mode: 0o600 });
+    const base = { type: "sync_seal", envelope_v: 1, cipher: "age-v1", key_id: "epoch-1",
+      max_blob_bytes: 1_048_576, wire_id: manifest.binding.wire_id,
+      team_id: manifest.binding.team_id, protocol_version: 1,
+      projection: manifest.canonical_message };
+    const one = sealEnvelope({ ...base, recipients: [manifest.recipient_sets.team_a.recipient] });
+    const two = sealEnvelope({ ...base, recipients: [manifest.recipient_sets.team_a.recipient,
+      manifest.recipient_sets.team_b.recipient] });
+    await assert.rejects(openEnvelope({ envelope: one, protocol_version: 1,
+      team_id: base.team_id, wire_id: base.wire_id, identity_file: identity,
+      expected_recipients: [manifest.recipient_sets.team_a.recipient,
+        manifest.recipient_sets.team_b.recipient], max_blob_bytes: 1_048_576 }),
+    (error) => error.state === "authentication_failed");
+    await assert.rejects(openEnvelope({ envelope: two, protocol_version: 1,
+      team_id: base.team_id, wire_id: base.wire_id, identity_file: identity,
+      expected_recipients: [manifest.recipient_sets.team_a.recipient], max_blob_bytes: 1_048_576 }),
+    (error) => error.state === "authentication_failed");
+  } finally {
+    await rm(scratch, { recursive: true });
+  }
+});
+
+test("age-v1 rejects trailing bytes and concatenated age files", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "agmsg-age-v1-trailing-"));
+  try {
+    const identity = join(scratch, "identity");
+    await writeFile(identity, `${manifest.recipient_sets.team_a.identity}\n`, { mode: 0o600 });
+    const source = byName.get("valid").envelope;
+    const ageFile = Buffer.from(source.blob, "base64");
+    for (const bytes of [Buffer.concat([ageFile, Buffer.from([0])]), Buffer.concat([ageFile, ageFile])]) {
+      await assert.rejects(openEnvelope({ envelope: { ...source, blob: bytes.toString("base64") },
+        protocol_version: 1, team_id: manifest.binding.team_id, wire_id: manifest.binding.wire_id,
+        identity_file: identity, expected_recipients: [manifest.recipient_sets.team_a.recipient],
+        max_blob_bytes: 1_048_576 }), (error) => error.state === "authentication_failed");
+    }
+  } finally {
+    await rm(scratch, { recursive: true });
+  }
+});
+
+test("canonical plaintext rejects lone surrogates and impossible timestamps", async () => {
+  const base = { type: "sync_seal", envelope_v: 1, cipher: "none", key_id: null,
+    recipients: [], max_blob_bytes: 1_048_576, wire_id: manifest.binding.wire_id,
+    team_id: manifest.binding.team_id, protocol_version: 1,
+    projection: manifest.canonical_message };
+  assert.throws(() => sealEnvelope({ ...base,
+    projection: { ...base.projection, body: "\ud800" } }), /lone surrogate/u);
+  assert.throws(() => sealEnvelope({ ...base,
+    projection: { ...base.projection, created_at: "2026-99-99T99:99:99.999999Z" } }), /projection/u);
+  const invalid = Buffer.from(JSON.stringify({ ...base.projection, body: "\udc00" })).toString("base64");
+  await assert.rejects(openEnvelope({ envelope: { v: 1, cipher: "none", key_id: null, blob: invalid },
+    max_blob_bytes: 1_048_576 }), (error) => error.state === "malformed");
+  assert.doesNotThrow(() => sealEnvelope({ ...base,
+    projection: { ...base.projection, created_at: "2028-02-29T23:59:59.999999Z",
+      from_agent: "😀".repeat(65) } }));
+  assert.throws(() => sealEnvelope({ ...base,
+    projection: { ...base.projection, from_agent: "😀".repeat(129) } }), /from_agent/u);
 });

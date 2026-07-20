@@ -325,9 +325,18 @@ by the HTTP v1 three-layer state model.
 - A headless sync process MUST use explicit identity files or an equivalent
   non-interactive secret provider. Interactive passphrases and trial-decrypting
   every installed key are forbidden.
+- A native identity file for this profile contains exactly one uppercase
+  `AGE-SECRET-KEY-1...` X25519 identity. Empty lines and lines beginning with
+  `#` are permitted; surrounding whitespace, multiple identities,
+  passphrase-encrypted identities, and `AGE-PLUGIN-...` identities are
+  forbidden. Before enabling a configured key epoch, the client MUST derive
+  the corresponding public recipient and require it to appear in that epoch's
+  immutable manifest.
 - Identity files MUST be kept outside remote storage, excluded from logs and
-  subprocess argument lists, and protected with platform-appropriate file
-  permissions. HTTP bearer credentials and age identities are separate secrets.
+  protected with platform-appropriate file permissions. The reference client
+  validates the exact native identity bytes and passes those same bytes to age
+  over a private pipe, preventing a path substitution between validation and
+  open. HTTP bearer credentials and age identities are separate secrets.
 - The profile does not define padding. Team relationship, key epoch, age-file
   length, approximate recipient count and rotation pattern, server arrival
   time, traffic frequency, and sequence remain visible. A `key_id` is public
