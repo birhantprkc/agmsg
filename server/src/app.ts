@@ -211,12 +211,15 @@ export function createApp(pool: Pool, config: Config): FastifyInstance {
 
   app.post("/v1/pairing/exchange", async (request, reply) => {
     requireProtocol(request);
+    emptyQuerySchema.parse(request.query);
     const body = pairingExchangeSchema.parse(request.body);
     reply.header("Cache-Control", "no-store");
     return exchangePairingToken(pool, body.token);
   });
 
   app.post("/v1/credentials/:credentialId/revoke", async (request, reply) => {
+    emptyQuerySchema.parse(request.query);
+    z.undefined().parse(request.body);
     const params = credentialParamsSchema.parse(request.params);
     const authenticated = await scopedCredential(pool, request, true);
     if (

@@ -646,6 +646,13 @@ describeDatabase("remote storage HTTP API v1", () => {
       server_instance_id: first.server_instance_id,
       team_id: onboardingTeam,
     });
+    const revokeWithBody = await app.inject({
+      method: "POST",
+      url: `/v1/credentials/${first.credential_id}/revoke`,
+      headers: credentialHeaders(first.credential),
+      payload: {},
+    });
+    expect(revokeWithBody.statusCode).toBe(400);
 
     const revokeSelf = () => app.inject({
       method: "POST",
