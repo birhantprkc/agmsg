@@ -386,53 +386,58 @@ export async function getMessages(
   );
 }
 
+export async function capabilitySnapshot(
+  client: PoolClient,
+  teamId: string,
+  lockTeam = false,
+): Promise<Record<string, unknown>> {
+  const serverId = await serverInstanceId(client);
+  const team = await teamRow(client, teamId, lockTeam);
+  if (!team) throw notFound(serverId, teamId);
+  const historyResult = await client.query<{
+    policy_revision: string;
+    effective_from_seq: string;
+    accepted_envelope_versions: number[];
+    write_allowed_ciphers: string[];
+  }>(
+    `SELECT policy_revision::text, effective_from_seq::text,
+            accepted_envelope_versions, write_allowed_ciphers
+       FROM (
+         SELECT DISTINCT ON (effective_from_seq)
+                policy_revision, effective_from_seq,
+                accepted_envelope_versions, write_allowed_ciphers
+           FROM team_policy_history
+          WHERE team_id = $1
+          ORDER BY effective_from_seq, policy_revision DESC
+       ) effective
+      ORDER BY effective_from_seq, policy_revision`,
+    [teamId],
+  );
+  if (historyResult.rows.length < 1 || historyResult.rows.length > 4096) {
+    throw new Error("team policy history is outside the protocol bounds");
+  }
+  const current = BigInt(team.current_seq);
+  return {
+    ...common(serverId, team),
+    current_seq: team.current_seq,
+    next_sequence_boundary:
+      current === MAX_SEQUENCE ? null : (current + 1n).toString(),
+    accepted_envelope_versions: team.accepted_envelope_versions,
+    write_allowed_ciphers: team.write_allowed_ciphers,
+    policy_revision: team.policy_revision,
+    effective_from_seq: historyResult.rows.at(-1)?.effective_from_seq,
+    max_blob_bytes: String(team.max_blob_bytes),
+    policy_history: historyResult.rows,
+  };
+}
+
 export async function getCapabilities(
   pool: Pool,
   teamId: string,
 ): Promise<Record<string, unknown>> {
   return inTransaction(
     pool,
-    async (client) => {
-      const serverId = await serverInstanceId(client);
-      const team = await teamRow(client, teamId);
-      if (!team) throw notFound(serverId, teamId);
-      const historyResult = await client.query<{
-        policy_revision: string;
-        effective_from_seq: string;
-        accepted_envelope_versions: number[];
-        write_allowed_ciphers: string[];
-      }>(
-        `SELECT policy_revision::text, effective_from_seq::text,
-                accepted_envelope_versions, write_allowed_ciphers
-           FROM (
-             SELECT DISTINCT ON (effective_from_seq)
-                    policy_revision, effective_from_seq,
-                    accepted_envelope_versions, write_allowed_ciphers
-               FROM team_policy_history
-              WHERE team_id = $1
-              ORDER BY effective_from_seq, policy_revision DESC
-           ) effective
-          ORDER BY effective_from_seq, policy_revision`,
-        [teamId],
-      );
-      if (historyResult.rows.length > 4096) {
-        throw new Error("team policy history exceeds protocol limit");
-      }
-      const current = BigInt(team.current_seq);
-      return {
-        ...common(serverId, team),
-        current_seq: team.current_seq,
-        next_sequence_boundary:
-          current === MAX_SEQUENCE ? null : (current + 1n).toString(),
-        accepted_envelope_versions: team.accepted_envelope_versions,
-        write_allowed_ciphers: team.write_allowed_ciphers,
-        policy_revision: team.policy_revision,
-        effective_from_seq:
-          historyResult.rows.at(-1)?.effective_from_seq ?? "1",
-        max_blob_bytes: String(team.max_blob_bytes),
-        policy_history: historyResult.rows,
-      };
-    },
+    (client) => capabilitySnapshot(client, teamId),
     { readOnly: true, repeatableRead: true },
   );
 }

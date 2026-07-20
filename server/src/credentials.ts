@@ -3,24 +3,14 @@ import type { Pool, PoolClient } from "pg";
 import { v7 as uuidv7 } from "uuid";
 import { inTransaction } from "./db.js";
 import { ProtocolError } from "./errors.js";
-import { MAX_SEQUENCE, teamNameSchema, uuidV7Schema } from "./protocol.js";
+import { teamNameSchema, uuidV7Schema } from "./protocol.js";
+import { capabilitySnapshot } from "./storage.js";
 
 const PAIRING_TTL_MINUTES = 15;
 const SUPPORTED_ENVELOPE_VERSIONS = [1];
 const DEFAULT_WRITE_CIPHERS = ["none", "age-v1"];
 const timestampSql = (column: string) => `to_char(${column} AT TIME ZONE 'UTC',
   'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
-
-type TeamCapabilityRow = {
-  team_id: string;
-  team_name: string;
-  current_seq: string;
-  min_available_seq: string;
-  policy_revision: string;
-  accepted_envelope_versions: number[];
-  write_allowed_ciphers: string[];
-  max_blob_bytes: number;
-};
 
 type PairingRow = {
   team_id: string;
@@ -69,62 +59,6 @@ async function serverInstanceId(client: PoolClient): Promise<string> {
   const value = result.rows[0]?.server_instance_id;
   if (!value) throw new Error("server metadata is not initialized");
   return value;
-}
-
-async function capabilityDocument(
-  client: PoolClient,
-  teamId: string,
-): Promise<{
-  team: TeamCapabilityRow;
-  capabilities: Record<string, unknown>;
-}> {
-  const teamResult = await client.query<TeamCapabilityRow>(
-    `SELECT team_id::text, team_name, current_seq::text, min_available_seq::text,
-            policy_revision::text, accepted_envelope_versions,
-            write_allowed_ciphers, max_blob_bytes
-       FROM teams WHERE team_id = $1`,
-    [teamId],
-  );
-  const team = teamResult.rows[0];
-  if (!team) throw new Error("team is not provisioned");
-  const history = await client.query<{
-    policy_revision: string;
-    effective_from_seq: string;
-    accepted_envelope_versions: number[];
-    write_allowed_ciphers: string[];
-  }>(
-    `SELECT policy_revision::text, effective_from_seq::text,
-            accepted_envelope_versions, write_allowed_ciphers
-       FROM (
-         SELECT DISTINCT ON (effective_from_seq)
-                policy_revision, effective_from_seq,
-                accepted_envelope_versions, write_allowed_ciphers
-           FROM team_policy_history
-          WHERE team_id = $1
-          ORDER BY effective_from_seq, policy_revision DESC
-       ) effective
-      ORDER BY effective_from_seq, policy_revision`,
-    [teamId],
-  );
-  if (history.rows.length < 1 || history.rows.length > 4096) {
-    throw new Error("team policy history is invalid");
-  }
-  const current = BigInt(team.current_seq);
-  return {
-    team,
-    capabilities: {
-      min_available_seq: team.min_available_seq,
-      current_seq: team.current_seq,
-      next_sequence_boundary:
-        current === MAX_SEQUENCE ? null : (current + 1n).toString(),
-      accepted_envelope_versions: team.accepted_envelope_versions,
-      write_allowed_ciphers: team.write_allowed_ciphers,
-      policy_revision: team.policy_revision,
-      effective_from_seq: history.rows.at(-1)?.effective_from_seq,
-      max_blob_bytes: String(team.max_blob_bytes),
-      policy_history: history.rows,
-    },
-  };
 }
 
 export async function resolveTeamId(pool: Pool, selector: string): Promise<string> {
@@ -257,14 +191,17 @@ export async function exchangePairingToken(
         WHERE token_digest = $1`,
       [digest("pairing", token), credentialId],
     );
-    const { team, capabilities } = await capabilityDocument(client, pairing.team_id);
+    // The team-row lock is the same serialization point used by policy writes.
+    // It makes the nested document one canonical snapshot even though this is
+    // a read/write exchange transaction rather than the read-only GET path.
+    const capabilities = await capabilitySnapshot(client, pairing.team_id, true);
     return {
       credential_id: credentialId,
       credential,
       protocol_version: 1,
       server_instance_id: serverId,
-      remote_team_id: team.team_id,
-      remote_team_name: team.team_name,
+      remote_team_id: capabilities.team_id,
+      remote_team_name: capabilities.team_name,
       capabilities,
     };
   });

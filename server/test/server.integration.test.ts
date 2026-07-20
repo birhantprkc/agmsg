@@ -490,6 +490,16 @@ describeDatabase("remote storage HTTP API v1", () => {
       "rejected",
     ]);
 
+    await expect(runAdmin(
+      "token", "issue", "--team", onboardingName,
+      "--endpoint", "ftp://sync.example.test",
+    )).rejects.toThrow(/HTTP\(S\)/u);
+    const noOrphanToken = await pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM pairing_tokens WHERE team_id = $1",
+      [onboardingTeam],
+    );
+    expect(noOrphanToken.rows[0]?.count).toBe("0");
+
     const firstIssue = await runAdmin(
       "token", "issue", "--team", onboardingName,
       "--endpoint", "http://127.0.0.1:8787/",
@@ -499,6 +509,17 @@ describeDatabase("remote storage HTTP API v1", () => {
     );
     const firstToken = firstIssue.stdout.trim().split(" ").at(-1) ?? "";
     expect(firstIssue.stderr).not.toContain(firstToken);
+
+    const legacyGlobalToken = await app.inject({
+      method: "GET",
+      url: "/v1/members",
+      headers: {
+        authorization: "Bearer change-this-development-token",
+        "agmsg-protocol-version": "1",
+        "agmsg-team-id": onboardingTeam,
+      },
+    });
+    expect(legacyGlobalToken.statusCode).toBe(401);
 
     const exchange = async (pairingToken: string) =>
       app.inject({
@@ -563,6 +584,13 @@ describeDatabase("remote storage HTTP API v1", () => {
       method: "GET", url: "/v1/members", headers: credentialHeaders(first.credential),
     });
     expect(authorized.statusCode).toBe(200);
+    const canonicalCapabilities = await app.inject({
+      method: "GET",
+      url: "/v1/capabilities",
+      headers: credentialHeaders(first.credential),
+    });
+    expect(canonicalCapabilities.statusCode).toBe(200);
+    expect(first.capabilities).toEqual(canonicalCapabilities.json());
     const wrongTeam = await app.inject({
       method: "GET",
       url: "/v1/members",
@@ -661,6 +689,49 @@ describeDatabase("remote storage HTTP API v1", () => {
     const expired = await exchange(thirdIssue.token);
     expect(expired.statusCode).toBe(410);
     expect(expired.json().error.code).toBe("pairing-token-expired");
+
+    const racedToken = (await issuePairingToken(pool, onboardingTeam)).token;
+    const policyClient = await pool.connect();
+    try {
+      await policyClient.query("BEGIN");
+      await policyClient.query("SELECT 1 FROM teams WHERE team_id = $1 FOR UPDATE", [
+        onboardingTeam,
+      ]);
+      await policyClient.query(
+        `UPDATE teams
+            SET policy_revision = 1,
+                write_allowed_ciphers = ARRAY['age-v1']::TEXT[]
+          WHERE team_id = $1`,
+        [onboardingTeam],
+      );
+      await policyClient.query(
+        `INSERT INTO team_policy_history
+           (team_id, policy_revision, effective_from_seq,
+            accepted_envelope_versions, write_allowed_ciphers)
+         VALUES ($1, 1, 2, ARRAY[1], ARRAY['age-v1']::TEXT[])`,
+        [onboardingTeam],
+      );
+      const racedExchange = exchange(racedToken);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await policyClient.query("COMMIT");
+      const raced = await racedExchange;
+      expect(raced.statusCode).toBe(200);
+      expect(raced.json().capabilities).toMatchObject({
+        protocol_version: 1,
+        server_instance_id: raced.json().server_instance_id,
+        team_id: onboardingTeam,
+        team_name: onboardingName,
+        policy_revision: "1",
+        effective_from_seq: "2",
+        write_allowed_ciphers: ["age-v1"],
+        policy_history: [{ policy_revision: "0" }, { policy_revision: "1" }],
+      });
+    } catch (error) {
+      await policyClient.query("ROLLBACK");
+      throw error;
+    } finally {
+      policyClient.release();
+    }
   }, 20_000);
 
   it("rejects duplicate JSON keys and rolls back a sequence-crossing batch", async () => {

@@ -492,14 +492,45 @@ jobs:
             docker rm --force "$CONTAINER_NAME" >/dev/null 2>&1 || true
           }
           trap cleanup EXIT
+          healthy=false
           for _attempt in $(seq 1 20); do
             if curl --fail --silent http://127.0.0.1:8788/v1/health >/dev/null; then
-              exit 0
+              healthy=true
+              break
             fi
             sleep 1
           done
-          docker logs "$CONTAINER_NAME"
-          exit 1
+          if [ "$healthy" != true ]; then
+            docker logs "$CONTAINER_NAME"
+            exit 1
+          fi
+          docker exec "$CONTAINER_NAME" npm run --silent admin -- \
+            team create --name ci-docker-onboarding \
+            --team-id 018f3f7e-0000-7000-8000-000000000901 >/dev/null
+          connect_command=$(docker exec "$CONTAINER_NAME" npm run --silent admin -- \
+            token issue --team ci-docker-onboarding --endpoint http://127.0.0.1:8788)
+          pairing_token=${connect_command##* }
+          docker exec --env PAIRING_TOKEN="$pairing_token" "$CONTAINER_NAME" \
+            node --input-type=module -e '
+            const endpoint = "http://127.0.0.1:8788";
+            const team = "018f3f7e-0000-7000-8000-000000000901";
+            const common = {"Agmsg-Protocol-Version": "1"};
+            const exchange = await fetch(`${endpoint}/v1/pairing/exchange`, {
+              method: "POST",
+              headers: {...common, "Content-Type": "application/json"},
+              body: JSON.stringify({token: process.env.PAIRING_TOKEN}),
+            });
+            if (exchange.status !== 200) process.exit(1);
+            const connected = await exchange.json();
+            const members = await fetch(`${endpoint}/v1/members`, {
+              headers: {
+                ...common,
+                "Agmsg-Team-ID": team,
+                Authorization: `Bearer ${connected.credential}`,
+              },
+            });
+            if (members.status !== 200) process.exit(1);
+          '
 
   # Windows leg for the app: the command layer's bash resolution and path
   # conversion are all behind cfg(windows) and had never run in CI — the very

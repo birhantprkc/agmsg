@@ -108,9 +108,9 @@ async function run(): Promise<void> {
     }
     if (operation === "token issue") {
       expectOptions(args, ["team", "endpoint"]);
+      const serverEndpoint = endpoint(option(args, "endpoint") ?? "");
       const teamId = await resolveTeamId(pool, option(args, "team") ?? "");
       const issued = await issuePairingToken(pool, teamId);
-      const serverEndpoint = endpoint(option(args, "endpoint") ?? "");
       const command = `agmsg remote connect --endpoint ${serverEndpoint} ${issued.token}`;
       if (jsonEnabled(args)) writeJson({ ...issued, endpoint: serverEndpoint, command });
       else process.stdout.write(`${command}\n`);

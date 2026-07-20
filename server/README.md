@@ -15,6 +15,12 @@ non-secret `credential_id`.
 Use an endpoint that both machines can reach. Pairing tokens expire after 15
 minutes, are valid for one exchange, and create one device credential each.
 
+> Client dependency: the server-side flow in this branch is complete, but the
+> `agmsg remote connect` client command lands separately after its UX review.
+> Until that client branch is stacked, step 4 is the exact intended paste block
+> but is illustrative rather than executable. The cross-machine quickstart E2E
+> is gated on that dependency.
+
 1. Start the reference server and PostgreSQL:
 
    ```sh
@@ -49,7 +55,9 @@ minutes, are valid for one exchange, and create one device credential each.
 ## Run with Compose
 
 Change the database password in `compose.yaml` and terminate TLS in front of the
-service before exposing it outside a local development machine, then run:
+service before exposing it outside a local development machine. Apply a
+reverse-proxy request-rate limit to the public pairing exchange route and do
+not capture request or response bodies there. Then run:
 
 ```sh
 docker compose up --build
@@ -135,6 +143,26 @@ and the authenticated `capabilities` snapshot. Unknown, consumed, and expired
 codes fail as `invalid-pairing-token`, `pairing-token-consumed`, and
 `pairing-token-expired`; credential creation and token consumption share one
 database transaction.
+
+If the exchange response is lost, the consumed token cannot recover the raw
+credential because the server never stores it. Use `credential list` to find
+and revoke the orphan, then issue a new token.
+
+## Pre-release authentication cutover
+
+The reference server stack is still an unmerged dogfood track and has no public
+deployment compatibility contract. This branch intentionally removes the old
+global `AGMSG_SERVER_TOKEN`; it does not accept that value as a fallback or
+seed credentials from it. A team with no device credentials fails closed with
+`401` on every team data endpoint while health and pairing exchange remain
+available for bootstrap.
+
+Existing disposable dogfood deployments must be rebuilt or re-paired under the
+per-device model. Start the upgraded server, issue one token per device, and
+run the connect command once the client-side dependency noted above lands.
+There is no global-token compatibility window. A future post-release auth
+migration requires a separately specified cutover rather than silently
+reintroducing a cross-team master credential.
 
 Retention is also an operator operation. It atomically creates permanent
 idempotency tombstones, removes the covered delivery prefix, and advances the
