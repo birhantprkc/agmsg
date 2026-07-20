@@ -70,6 +70,21 @@ sqlite). 1.1.2 = `redis` (message store).
   must move behind the contract before any non-sqlite driver works (the bulk of
   1.1.1 — #203/#204/#206). Sourced drivers keep ADR 0002's trust concern,
   mitigated by opt-in + the `storage_*` prefix discipline.
+- Known gap (not yet migrated, tracked for a follow-up): `rename.sh` /
+  `rename-team.sh` rewrite historical `from_agent`/`to_agent`/`team` values by
+  running `UPDATE` directly against the sqlite driver's own `messages` and
+  `events` tables — bypassing the contract entirely, guarded only by "does the
+  sqlite db file exist". A team/agent renamed while a non-sqlite driver is
+  active gets its live registry entry renamed correctly, but the driver's
+  historical message log is not — no contract function exists yet for
+  "rewrite a name across history" (`storage_send`/`storage_history`/etc. all
+  operate on messages, not identities). `api.sh`'s `get teams <team> messages`
+  read path has the same coupling for a different reason: it needs
+  `--before-id` cursor pagination `storage_history` does not expose, so it
+  runs its own event-log ∪ legacy-table query rather than the facade function
+  — correct today (it still reads driver-shaped tables, not different ones),
+  but it too would need a driver-contract addition (a paginated history op) to
+  stop assuming sqlite's schema shape under a non-sqlite driver.
 - Neutral: the subcommand+pipe protocol and multi-host coordination are
   explicitly *deferred, not rejected* — each can land under a later ADR.
 

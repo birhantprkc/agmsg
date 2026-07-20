@@ -216,6 +216,16 @@ Writes target the event log. There is no automated migration; legacy rows stay
 queryable indefinitely. Legacy integer ids are passed through as decimal strings
 (opaque, per §2.5).
 
+**Known gap — consumers still coupled to the sqlite driver's own schema.**
+`rename.sh`/`rename-team.sh` (rewriting a renamed identity across historical
+messages) and `api.sh`'s `get teams <team> messages` (which needs
+`--before-id` pagination the contract does not expose) currently read/write
+the sqlite driver's `messages`/`events` tables directly rather than through a
+`storage_*` function, so they only work correctly when sqlite is the active
+driver. See [ADR 0003](../adr/0003-storage-axis-driver-abi-and-scope.md)'s
+consequences for the tracked follow-up (a rename-across-history op, and a
+paginated history op).
+
 ### 2.5 Identifiers
 
 IDs that drivers generate for new writes are **UUIDv7** strings. The interface
