@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import process from "node:process";
+import { pathToFileURL } from "node:url";
 
 const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -95,15 +96,22 @@ async function request(config, path, init = {}) {
     Authorization: `Bearer ${token}`,
     ...init.headers,
   };
-  const response = await fetch(endpoint(config.server_url, path), {
-    ...init, headers, redirect: "error", signal: AbortSignal.timeout(15_000),
-  });
+  let response;
+  try {
+    response = await fetch(endpoint(config.server_url, path), {
+      ...init, headers, redirect: "error", signal: AbortSignal.timeout(15_000),
+    });
+  } catch (error) {
+    error.retryable = true;
+    throw error;
+  }
   const protocol = response.headers.get("agmsg-protocol-version");
   if (protocol !== PROTOCOL) throw new Error("response protocol version mismatch");
   const text = await response.text();
   let body;
   try { body = JSON.parse(text); } catch { throw new Error(`HTTP ${response.status} returned invalid JSON`); }
   if (!response.ok) {
+    validateErrorBinding(config, response.status, body);
     const code = body?.error?.code ?? "unknown-error";
     const error = new Error(`HTTP ${response.status} ${code}`);
     error.status = response.status; error.code = code; error.body = body;
@@ -113,16 +121,31 @@ async function request(config, path, init = {}) {
   return body;
 }
 
+export function validateErrorBinding(config, status, body) {
+  const preResolution = status === 400 || status === 401 || status === 426;
+  const carriesBinding = body?.server_instance_id !== undefined || body?.team_id !== undefined;
+  if (!preResolution || carriesBinding) validateBinding(config, body);
+}
+
 async function health(serverUrl) {
-  const response = await fetch(endpoint(serverUrl, "/v1/health"), {
-    redirect: "error", signal: AbortSignal.timeout(15_000),
-  });
+  let response;
+  try {
+    response = await fetch(endpoint(serverUrl, "/v1/health"), {
+      redirect: "error", signal: AbortSignal.timeout(15_000),
+    });
+  } catch (error) {
+    error.retryable = true;
+    throw error;
+  }
   if (response.headers.get("agmsg-protocol-version") !== PROTOCOL) {
     throw new Error("health protocol version mismatch");
   }
   const body = await response.json();
   if (!response.ok || body.status !== "ok" || body.database !== "ok" || !UUID_V7.test(body.server_instance_id)) {
-    throw new Error("server health is unavailable or unbound");
+    const error = new Error("server health is unavailable or unbound");
+    error.status = response.status;
+    error.retryable = response.status === 503;
+    throw error;
   }
   return body;
 }
@@ -134,13 +157,15 @@ function validateBinding(config, body) {
   }
 }
 
-async function driver(operation, config, input, extra = []) {
+export async function driver(operation, config, input, extra = []) {
   const script = process.env.AGMSG_SYNC_DRIVER;
   if (!script) throw new Error("AGMSG_SYNC_DRIVER is not set");
   const args = [script, operation, config.local_team, config.server_instance_id,
     config.remote_team_id, String(config.protocol_version), ...extra];
   return new Promise((resolve, reject) => {
-    const child = spawn("bash", args, { stdio: ["pipe", "pipe", "pipe"], env: process.env });
+    const childEnvironment = { ...process.env };
+    delete childEnvironment.AGMSG_SYNC_TOKEN;
+    const child = spawn("bash", args, { stdio: ["pipe", "pipe", "pipe"], env: childEnvironment });
     let stdout = ""; let stderr = "";
     child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => { stdout += chunk; });
@@ -236,22 +261,65 @@ function evaluatePull(config, capabilities, message) {
   }
 }
 
-function validateCapabilities(config, value) {
+export function validateCapabilities(config, value) {
   validateBinding(config, value);
   sequence(value.current_seq, "current_seq"); sequence(value.min_available_seq, "min_available_seq");
   if (!Array.isArray(value.policy_history) || value.policy_history.length < 1 || value.policy_history.length > 4096 ||
       !Array.isArray(value.accepted_envelope_versions) || !Array.isArray(value.write_allowed_ciphers)) {
     throw new Error("capabilities response is invalid");
   }
-  if (!value.accepted_envelope_versions.includes(1) || !value.write_allowed_ciphers.includes("none")) {
-    throw new Error("server does not currently allow Stage-1 plaintext writes");
+  sequence(value.policy_revision, "policy_revision");
+  sequence(value.effective_from_seq, "effective_from_seq");
+  sequence(value.max_blob_bytes, "max_blob_bytes");
+  if (BigInt(value.max_blob_bytes) < 1n || BigInt(value.max_blob_bytes) > 1_048_576n) {
+    throw new Error("max_blob_bytes is outside the protocol limit");
   }
+  for (const entry of value.policy_history) {
+    sequence(entry.policy_revision, "policy history revision");
+    sequence(entry.effective_from_seq, "policy history boundary");
+    if (!Array.isArray(entry.accepted_envelope_versions) || !Array.isArray(entry.write_allowed_ciphers)) {
+      throw new Error("policy history entry is invalid");
+    }
+  }
+  if (value.next_sequence_boundary !== null) sequence(value.next_sequence_boundary, "next_sequence_boundary");
+}
+
+export function plaintextWriteEligible(config, value) {
+  validateCapabilities(config, value);
   const boundary = value.next_sequence_boundary;
-  if (boundary === null) throw new Error("remote sequence is exhausted");
-  sequence(boundary, "next_sequence_boundary");
-  if (currentLocalPolicy(config, boundary).minimum_security_mode !== "plaintext-allowed") {
-    throw new Error("local security policy disallows Stage-1 plaintext writes");
+  return boundary !== null && value.accepted_envelope_versions.includes(1) &&
+    value.write_allowed_ciphers.includes("none") &&
+    currentLocalPolicy(config, boundary).minimum_security_mode === "plaintext-allowed";
+}
+
+export function isRetryable(error) {
+  if (error?.retryable === true) return true;
+  return [408, 429, 500, 502, 503, 504].includes(error?.status);
+}
+
+export function validateAckMapping(candidates, acks) {
+  if (!Array.isArray(acks) || acks.length !== candidates.length) {
+    throw new Error("incomplete ack mapping");
   }
+  const seenIds = new Set();
+  const seenSequences = new Set();
+  let previous = -1n;
+  return acks.map((ack, index) => {
+    const candidate = candidates[index];
+    const fields = Object.keys(ack).sort().join(",");
+    if (fields !== "disposition,id,server_seq" || ack.id !== candidate.id ||
+        !["stored", "duplicate"].includes(ack.disposition)) {
+      throw new Error("ack shape/order/id mismatch");
+    }
+    sequence(ack.server_seq, "ack server_seq");
+    const current = BigInt(ack.server_seq);
+    if (seenIds.has(ack.id) || seenSequences.has(ack.server_seq) || current <= previous) {
+      throw new Error("ack sequence mapping is not strictly increasing and unique");
+    }
+    seenIds.add(ack.id); seenSequences.add(ack.server_seq); previous = current;
+    return { type: "sync_push_ack", local_position: candidate.local_position, id: ack.id,
+      server_seq: ack.server_seq, disposition: ack.disposition };
+  });
 }
 
 async function configure(args) {
@@ -285,8 +353,10 @@ async function cycle(config, limit) {
   await event("capabilities", { team: config.local_team, current_seq: capabilities.current_seq,
     policy_revision: capabilities.policy_revision });
 
+  const writeEligible = plaintextWriteEligible(config, capabilities);
   const prepared = await driver("prepare", config, [{ type: "sync_prepare", envelope_v: 1,
-    cipher: "none", key_id: null, max_blob_bytes: Number(capabilities.max_blob_bytes) }], [String(limit)]);
+    cipher: "none", key_id: null, max_blob_bytes: Number(capabilities.max_blob_bytes),
+    allow_new: writeEligible }], [String(limit)]);
   const state = prepared.find((record) => record.type === "sync_state");
   const candidates = prepared.filter((record) => record.type === "sync_push_candidate");
   if (!state) throw new Error("driver omitted sync_state");
@@ -294,18 +364,14 @@ async function cycle(config, limit) {
   await event("push.prepared", { count: candidates.length, local_positions: candidates.map((item) => item.local_position),
     wire_ids: candidates.map((item) => item.id) });
 
-  if (candidates.length > 0) {
+  if (!writeEligible) {
+    await event("push.blocked", { reason: capabilities.next_sequence_boundary === null ?
+      "sequence-exhausted" : "plaintext-write-not-allowed" });
+  } else if (candidates.length > 0) {
     const posted = await request(config, "/v1/messages", { method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ messages: candidates.map(({ id, envelope }) => ({ id, envelope })) }) });
-    if (!Array.isArray(posted.acks) || posted.acks.length !== candidates.length) throw new Error("incomplete ack mapping");
-    const ackRecords = posted.acks.map((ack, index) => {
-      const candidate = candidates[index];
-      if (ack.id !== candidate.id || !["stored", "duplicate"].includes(ack.disposition)) throw new Error("ack order/id mismatch");
-      sequence(ack.server_seq, "ack server_seq");
-      return { type: "sync_push_ack", local_position: candidate.local_position, id: ack.id,
-        server_seq: ack.server_seq, disposition: ack.disposition };
-    });
+    const ackRecords = validateAckMapping(candidates, posted.acks);
     await event("push.ack", { acks: ackRecords.map(({ id, server_seq, disposition }) => ({ id, server_seq, disposition })) });
     const reconciled = await driver("reconcile", config, ackRecords);
     await event("push.reconciled", { result: reconciled[0] ?? null });
@@ -344,12 +410,16 @@ async function cycle(config, limit) {
     await event("pull.received", { after: cursor, next_after: page.next_after,
       messages: page.messages.map((message) => ({ id: message.id, server_seq: message.server_seq })) });
     const applied = await driver("apply", config, records);
-    for (const record of records) {
-      if (record.type === "sync_pull_message" && record.projection) {
-        await event("pull.import", { id: record.id, server_seq: record.server_seq,
-          from_agent: record.projection.from_agent, to_agent: record.projection.to_agent,
-          body: record.projection.body });
-      }
+    for (const outcome of applied.filter((record) => record.type === "sync_apply_outcome")) {
+      const source = records.find((record) => record.type === "sync_pull_message" && record.id === outcome.id);
+      await event(outcome.status === "imported" ? "pull.import" :
+        outcome.status === "reconciled" ? "pull.reconciled" : "pull.quarantined", {
+        id: outcome.id, server_seq: outcome.server_seq, status: outcome.status,
+        ...(outcome.status === "imported" && source?.projection ? {
+          from_agent: source.projection.from_agent, to_agent: source.projection.to_agent,
+          body: source.projection.body,
+        } : {}),
+      });
     }
     await event("pull.applied", { result: applied[0] ?? null });
     cursor = page.next_after;
@@ -373,14 +443,16 @@ async function main() {
     try { await cycle(config, limit); }
     catch (error) {
       await event("cycle.error", { message: error.message, code: error.code ?? null });
-      if (error.status === 410 || error.code === "resync-required") throw error;
+      if (!isRetryable(error)) throw error;
     }
     await new Promise((resolve) => setTimeout(resolve, interval * 1000));
   }
 }
 
-main().catch(async (error) => {
-  await event("fatal", { message: error.message, code: error.code ?? null });
-  process.stderr.write(`${error.message}\n`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch(async (error) => {
+    await event("fatal", { message: error.message, code: error.code ?? null });
+    process.stderr.write(`${error.message}\n`);
+    process.exitCode = 1;
+  });
+}

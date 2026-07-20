@@ -61,6 +61,12 @@ envelope selected by the binding configuration. Stage 1 supports only envelope
 version 1 with `cipher: "none"`; a future encrypted driver performs its
 encrypt-once operation at this same boundary.
 
+The record also contains `allow_new`. When current policy or sequence exhaustion
+blocks new writes, the engine sets it to false: prepare must still emit
+`sync_state` so pull can continue, but must not reserve a new envelope. Write
+eligibility is not pull eligibility; unsupported or policy-violating remote
+envelopes still need durable quarantine and transport progress.
+
 The driver emits one `sync_state` record followed by zero or more ordered
 `sync_push_candidate` records. `sync_state` includes the driver generation and
 durable pull transport cursor, allowing a cycle to begin without adding a

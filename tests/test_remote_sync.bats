@@ -13,7 +13,7 @@ setup() {
   storage_init >/dev/null
   SERVER_ID=018f3f7e-0000-7000-8000-000000000000
   TEAM_ID=018f3f7e-0000-7000-8000-000000000001
-  PREPARE='{"type":"sync_prepare","envelope_v":1,"cipher":"none","key_id":null,"max_blob_bytes":1048576}'
+  PREPARE='{"type":"sync_prepare","envelope_v":1,"cipher":"none","key_id":null,"max_blob_bytes":1048576,"allow_new":true}'
 }
 
 teardown() { teardown_test_env; }
@@ -79,7 +79,7 @@ prepare_push() {
                  from_agent:"carol",to_agent:"bob"}}')
   page=$(printf '%s\n%s\n%s\n' "$echo" "$remote" '{"type":"sync_pull_cursor","next_after":"2"}')
   result=$(printf '%s\n' "$page" | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1)
-  [ "$(printf '%s\n' "$result" | jq -r '.transport_cursor')" = 2 ]
+  [ "$(printf '%s\n' "$result" | jq -sr '.[0].transport_cursor')" = 2 ]
   [ "$(storage_history demo | jq -s 'length')" -eq 2 ]
   [ "$(storage_history demo | jq -s '[.[]|select(.body=="outgoing")]|length')" -eq 1 ]
   [ "$(storage_history demo | jq -s '[.[]|select(.body=="incoming")]|length')" -eq 1 ]
@@ -87,4 +87,44 @@ prepare_push() {
   # Re-applying a durable page cannot create a second local event.
   printf '%s\n' "$page" | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
   [ "$(storage_history demo | jq -s 'length')" -eq 2 ]
+}
+
+@test "sync contract: a server sequence reused by another wire ID is durably corrupt" {
+  local first second first_page second_page result db
+  first=$(jq -nc '
+    {type:"sync_pull_message",server_seq:"1",id:"550e8400-e29b-41d4-a716-446655440010",
+     server_received_at:"2026-07-20T13:01:00.000000Z",
+     envelope:{v:1,cipher:"none",key_id:null,blob:"e30="},status:"malformed",
+     policy_revision:"0",local_security_revision:"0",reason:"fixture"}')
+  first_page=$(printf '%s\n%s\n' "$first" '{"type":"sync_pull_cursor","next_after":"1"}')
+  printf '%s\n' "$first_page" | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
+  second=$(printf '%s\n' "$first" | jq -c '.id="550e8400-e29b-41d4-a716-446655440011"')
+  second_page=$(printf '%s\n%s\n' "$second" '{"type":"sync_pull_cursor","next_after":"1"}')
+  result=$(printf '%s\n' "$second_page" | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1)
+  [ "$(printf '%s\n' "$result" | jq -s '.[0].corrupt_count')" -ge 1 ]
+  [ "$(printf '%s\n' "$result" | jq -s '[.[]|select(.id=="550e8400-e29b-41d4-a716-446655440011" and .status=="corrupt_state")]|length')" -eq 1 ]
+  db=$(agmsg_db_path)
+  [ "$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM sync_conflicts;" | tr -d '\r')" -eq 1 ]
+}
+
+@test "sync contract: a mapped echo keeps its blocking policy evaluation" {
+  storage_send demo alice bob "mapped" >/dev/null
+  local prepared candidate ack blocked page result db wire
+  prepared=$(prepare_push)
+  candidate=$(printf '%s\n' "$prepared" | jq -c 'select(.type=="sync_push_candidate")')
+  ack=$(printf '%s\n' "$candidate" | jq -c \
+    '{type:"sync_push_ack",local_position,id,server_seq:"1",disposition:"stored"}')
+  printf '%s\n' "$ack" | storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
+  wire=$(printf '%s\n' "$candidate" | jq -r '.id')
+  blocked=$(printf '%s\n' "$candidate" | jq -c '
+    {type:"sync_pull_message",server_seq:"1",id,
+     server_received_at:"2026-07-20T13:02:00.000000Z",envelope,
+     status:"policy_violation",policy_revision:"2",local_security_revision:"1",
+     reason:"E2EE required"}')
+  page=$(printf '%s\n%s\n' "$blocked" '{"type":"sync_pull_cursor","next_after":"1"}')
+  result=$(printf '%s\n' "$page" | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1)
+  [ "$(printf '%s\n' "$result" | jq -sr --arg wire "$wire" '[.[]|select(.id==$wire)][0].status')" = policy_violation ]
+  db=$(agmsg_db_path)
+  [ "$(agmsg_sqlite "$db" "SELECT status FROM sync_quarantine WHERE wire_id='$wire';" | tr -d '\r')" = policy_violation ]
+  [ "$(storage_history demo | jq -s 'length')" -eq 1 ]
 }

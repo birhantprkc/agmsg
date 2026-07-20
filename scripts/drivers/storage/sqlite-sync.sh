@@ -83,6 +83,24 @@ _sqlite_sync_schema() {
       PRIMARY KEY(server_instance_id,remote_team_id,protocol_version,wire_id),
       UNIQUE(server_instance_id,remote_team_id,protocol_version,server_seq)
     );
+    CREATE TABLE IF NOT EXISTS sync_conflicts (
+      conflict_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      local_team TEXT NOT NULL,
+      server_instance_id TEXT NOT NULL,
+      remote_team_id TEXT NOT NULL,
+      protocol_version INTEGER NOT NULL,
+      driver_generation TEXT NOT NULL,
+      server_seq TEXT NOT NULL,
+      wire_id TEXT NOT NULL,
+      envelope_v INTEGER NOT NULL,
+      cipher TEXT NOT NULL,
+      key_id TEXT,
+      blob TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      observed_at TEXT NOT NULL,
+      UNIQUE(server_instance_id,remote_team_id,protocol_version,
+             server_seq,wire_id,reason)
+    );
   " >/dev/null 2>&1 || return 13
   generation=$(agmsg_sqlite "$db" \
     "SELECT generation FROM sync_store_metadata WHERE singleton=1;" 2>/dev/null | tr -d '\r')
@@ -114,17 +132,18 @@ storage_sync_prepare_push() {
   [ "$limit" -ge 1 ] && [ "$limit" -le 1000 ] || return 13
   _sqlite_sync_schema || return $?
 
-  local prepare generation db tl input_ok version cipher key_id max_blob
+  local prepare generation db tl input_ok version cipher key_id max_blob allow_new
   prepare=$(cat)
   input_ok=$(printf '%s\n' "$prepare" | jq -r \
     'select(.type=="sync_prepare" and (.envelope_v|type)=="number" and
             (.cipher|type)=="string" and has("key_id") and
-            (.max_blob_bytes|type)=="number") | "ok"' 2>/dev/null)
+            (.max_blob_bytes|type)=="number" and (.allow_new|type)=="boolean") | "ok"' 2>/dev/null)
   [ "$input_ok" = ok ] || return 13
   version=$(printf '%s\n' "$prepare" | jq -r '.envelope_v')
   cipher=$(printf '%s\n' "$prepare" | jq -r '.cipher')
   key_id=$(printf '%s\n' "$prepare" | jq -r '.key_id // empty')
   max_blob=$(printf '%s\n' "$prepare" | jq -r '.max_blob_bytes')
+  allow_new=$(printf '%s\n' "$prepare" | jq -r 'if .allow_new then 1 else 0 end')
   # Stage 1 implements the cipher-neutral ABI with the plaintext profile only.
   [ "$version" = 1 ] && [ "$cipher" = none ] && [ -z "$key_id" ] || return 13
   case "$max_blob" in ''|*[!0-9]*) return 13 ;; esac
@@ -149,6 +168,7 @@ storage_sync_prepare_push() {
        AND m.driver_generation=b.driver_generation AND m.local_position=e.seq
      WHERE e.type='message_sent' AND e.team='$tl' AND e.seq>b.push_cursor
        AND m.server_seq IS NULL
+       AND ($allow_new=1 OR m.wire_id IS NOT NULL)
      ORDER BY e.seq LIMIT $limit;
   ") || return 13
 
@@ -229,7 +249,8 @@ storage_sync_reconcile_push() {
   [ "$count" -gt 0 ] || return 13
 
   agmsg_sqlite "$db" "BEGIN IMMEDIATE;
-    CREATE TEMP TABLE incoming_sync_acks(local_position INTEGER,wire_id TEXT,server_seq TEXT);
+    CREATE TEMP TABLE incoming_sync_acks(
+      local_position INTEGER UNIQUE,wire_id TEXT UNIQUE,server_seq TEXT UNIQUE);
     INSERT INTO incoming_sync_acks VALUES $values;
     CREATE TEMP TABLE sync_assert(ok INTEGER CHECK(ok=1));
     INSERT INTO sync_assert SELECT CASE WHEN COUNT(*)=$count THEN 1 ELSE 0 END
@@ -273,12 +294,14 @@ storage_sync_apply_pull() {
   local team="$1" server="$2" remote="$3" protocol="$4"
   _sqlite_sync_valid_binding "$server" "$remote" "$protocol" || return 13
   _sqlite_sync_schema || return $?
-  local generation db tl sql_file line type final_cursor="" corrupt=0
+  local generation db tl sql_file line type final_cursor="" corrupt=0 outcome_ids=""
   local seq wire received v cipher key_id blob status policy local_rev reason
   local from to body at local_id q
   generation=$(_sqlite_sync_generation); db="$(_sqlite_db)"; tl="$(_sqlite_lit "$team")"
   _sqlite_sync_ensure_binding "$team" "$server" "$remote" "$protocol" "$generation" || return 13
   sql_file=$(mktemp "${TMPDIR:-/tmp}/agmsg-sync-sql.XXXXXX") || return 13
+  _AGMSG_SYNC_SQL_FILE="$sql_file"
+  trap 'case "${_AGMSG_SYNC_SQL_FILE:-}" in "${TMPDIR:-/tmp}"/agmsg-sync-sql.*) rm -f "$_AGMSG_SYNC_SQL_FILE" ;; esac' EXIT INT TERM HUP
   printf '%s\n' 'BEGIN IMMEDIATE;' > "$sql_file"
 
   while IFS= read -r line; do
@@ -292,6 +315,10 @@ storage_sync_apply_pull() {
     [ "$type" = sync_pull_message ] || { rm -f "$sql_file"; return 13; }
     seq=$(printf '%s\n' "$line" | jq -r '.server_seq // empty')
     wire=$(printf '%s\n' "$line" | jq -r '.id // empty')
+    printf '%s\n' "$wire" | grep -Eq \
+      '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' \
+      || { rm -f "$sql_file"; trap - EXIT INT TERM HUP; return 13; }
+    outcome_ids="${outcome_ids}${outcome_ids:+,}'$wire'"
     received=$(printf '%s\n' "$line" | jq -r '.server_received_at // empty')
     v=$(printf '%s\n' "$line" | jq -r '.envelope.v')
     cipher=$(printf '%s\n' "$line" | jq -r '.envelope.cipher')
@@ -305,6 +332,33 @@ storage_sync_apply_pull() {
     case "$status" in importable|unsupported_cipher|pending_key|authentication_failed|malformed|policy_violation) ;; *) rm -f "$sql_file"; return 13 ;; esac
     q="'$(_sqlite_lit "$key_id")'"; [ -n "$key_id" ] || q=NULL
     printf "%s\n" "
+      INSERT OR IGNORE INTO sync_conflicts
+        (local_team,server_instance_id,remote_team_id,protocol_version,
+         driver_generation,server_seq,wire_id,envelope_v,cipher,key_id,blob,
+         reason,observed_at)
+      SELECT '$tl','$server','$remote',$protocol,'$generation','$seq','$wire',$v,
+             '$(_sqlite_lit "$cipher")',$q,'$(_sqlite_lit "$blob")',
+             'server sequence maps to another wire id',
+             strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE EXISTS(SELECT 1 FROM sync_quarantine qx
+        WHERE qx.server_instance_id='$server' AND qx.remote_team_id='$remote'
+          AND qx.protocol_version=$protocol AND qx.server_seq='$seq'
+          AND qx.wire_id<>'$wire');
+      INSERT OR IGNORE INTO sync_conflicts
+        (local_team,server_instance_id,remote_team_id,protocol_version,
+         driver_generation,server_seq,wire_id,envelope_v,cipher,key_id,blob,
+         reason,observed_at)
+      SELECT '$tl','$server','$remote',$protocol,'$generation','$seq','$wire',$v,
+             '$(_sqlite_lit "$cipher")',$q,'$(_sqlite_lit "$blob")',
+             'wire id maps to another sequence or envelope',
+             strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE EXISTS(SELECT 1 FROM sync_quarantine qx
+        WHERE qx.server_instance_id='$server' AND qx.remote_team_id='$remote'
+          AND qx.protocol_version=$protocol AND qx.wire_id='$wire'
+          AND (qx.server_seq<>'$seq' OR qx.envelope_v<>$v
+            OR qx.cipher<>'$(_sqlite_lit "$cipher")'
+            OR COALESCE(qx.key_id,'')<>'$(_sqlite_lit "$key_id")'
+            OR qx.blob<>'$(_sqlite_lit "$blob")'));
       INSERT OR IGNORE INTO sync_quarantine
         (local_team,server_instance_id,remote_team_id,protocol_version,
          driver_generation,server_seq,wire_id,server_received_at,envelope_v,
@@ -332,10 +386,14 @@ storage_sync_apply_pull() {
         AND remote_team_id='$remote' AND protocol_version=$protocol AND wire_id='$wire'
         AND envelope_v=$v AND cipher='$(_sqlite_lit "$cipher")'
         AND COALESCE(key_id,'')='$(_sqlite_lit "$key_id")'
-        AND blob='$(_sqlite_lit "$blob")' AND (server_seq IS NULL OR server_seq='$seq');
+        AND blob='$(_sqlite_lit "$blob")' AND (server_seq IS NULL OR server_seq='$seq')
+        AND EXISTS(SELECT 1 FROM sync_quarantine qx
+          WHERE qx.server_instance_id='$server' AND qx.remote_team_id='$remote'
+            AND qx.protocol_version=$protocol AND qx.wire_id='$wire'
+            AND qx.status='importable');
       UPDATE sync_quarantine SET status='reconciled' WHERE server_instance_id='$server'
         AND remote_team_id='$remote' AND protocol_version=$protocol AND wire_id='$wire'
-        AND status<>'corrupt_state' AND EXISTS(SELECT 1 FROM sync_messages m
+        AND status='importable' AND EXISTS(SELECT 1 FROM sync_messages m
           WHERE m.server_instance_id='$server' AND m.remote_team_id='$remote'
             AND m.protocol_version=$protocol AND m.wire_id='$wire' AND m.server_seq='$seq');" >> "$sql_file"
 
@@ -356,7 +414,10 @@ storage_sync_apply_pull() {
           AND NOT EXISTS(SELECT 1 FROM sync_quarantine qx
           WHERE qx.server_instance_id='$server' AND qx.remote_team_id='$remote'
             AND qx.protocol_version=$protocol AND qx.wire_id='$wire'
-            AND qx.status='corrupt_state');
+            AND qx.status='corrupt_state')
+          AND NOT EXISTS(SELECT 1 FROM sync_conflicts cx
+          WHERE cx.server_instance_id='$server' AND cx.remote_team_id='$remote'
+            AND cx.protocol_version=$protocol AND cx.wire_id='$wire');
         INSERT OR IGNORE INTO sync_messages
           (local_team,server_instance_id,remote_team_id,protocol_version,
            driver_generation,local_position,local_id,wire_id,envelope_v,cipher,
@@ -378,14 +439,34 @@ storage_sync_apply_pull() {
       AND protocol_version=$protocol AND driver_generation='$generation';
     COMMIT;" >> "$sql_file"
   if ! agmsg_sqlite "$db" < "$sql_file" >/dev/null 2>&1; then
-    rm -f "$sql_file"; return 13
+    rm -f "$sql_file"; trap - EXIT INT TERM HUP; return 13
   fi
   rm -f "$sql_file"
-  corrupt=$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM sync_quarantine WHERE
+  trap - EXIT INT TERM HUP
+  _AGMSG_SYNC_SQL_FILE=""
+  corrupt=$(agmsg_sqlite "$db" "SELECT
+    (SELECT COUNT(*) FROM sync_quarantine WHERE
     server_instance_id='$server' AND remote_team_id='$remote' AND protocol_version=$protocol
-    AND status='corrupt_state';" | tr -d '\r')
+    AND status='corrupt_state') +
+    (SELECT COUNT(*) FROM sync_conflicts WHERE server_instance_id='$server'
+     AND remote_team_id='$remote' AND protocol_version=$protocol);" | tr -d '\r')
   _sqlite_data "SELECT json_object('type','sync_apply_result','transport_cursor',
     transport_cursor,'corrupt_count',$corrupt) FROM sync_bindings
     WHERE local_team='$tl' AND server_instance_id='$server' AND remote_team_id='$remote'
-      AND protocol_version=$protocol AND driver_generation='$generation';"
+      AND protocol_version=$protocol AND driver_generation='$generation';
+    SELECT json_object('type','sync_apply_outcome','id',wire_id,
+                       'server_seq',server_seq,'status',status)
+      FROM sync_quarantine WHERE server_instance_id='$server'
+       AND remote_team_id='$remote' AND protocol_version=$protocol
+       AND wire_id IN (${outcome_ids:-''})
+    UNION ALL
+    SELECT json_object('type','sync_apply_outcome','id',c.wire_id,
+                       'server_seq',c.server_seq,'status','corrupt_state')
+      FROM sync_conflicts c WHERE c.server_instance_id='$server'
+       AND c.remote_team_id='$remote' AND c.protocol_version=$protocol
+       AND c.wire_id IN (${outcome_ids:-''})
+       AND NOT EXISTS(SELECT 1 FROM sync_quarantine qx
+         WHERE qx.server_instance_id=c.server_instance_id
+           AND qx.remote_team_id=c.remote_team_id
+           AND qx.protocol_version=c.protocol_version AND qx.wire_id=c.wire_id);"
 }

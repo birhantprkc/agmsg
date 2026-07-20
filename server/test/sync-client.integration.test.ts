@@ -10,6 +10,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createApp } from "../src/app.js";
 import type { Config } from "../src/config.js";
 import { migrate } from "../src/db.js";
+import { envelopeDigest } from "../src/protocol.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const describeDatabase = databaseUrl ? describe : describe.skip;
@@ -130,6 +131,45 @@ storage_history "$2"`;
       "fixture from machine A", "fixture reply from machine B",
     ]);
     expect(b.map((message) => message.body)).toEqual([
+      "fixture from machine A", "fixture reply from machine B",
+    ]);
+
+    const futureEnvelope = {
+      v: 1, cipher: "future-aead", key_id: "epoch-1",
+      blob: Buffer.from("opaque future ciphertext").toString("base64"),
+    };
+    await pool.query("BEGIN");
+    await pool.query(
+      `UPDATE teams SET current_seq=3,policy_revision=1,
+         accepted_envelope_versions=ARRAY[1],
+         write_allowed_ciphers=ARRAY['future-aead']::TEXT[]
+       WHERE team_id=$1`,
+      [teamId],
+    );
+    await pool.query(
+      `INSERT INTO team_policy_history
+         (team_id,policy_revision,effective_from_seq,
+          accepted_envelope_versions,write_allowed_ciphers)
+       VALUES($1,1,3,ARRAY[1],ARRAY['future-aead']::TEXT[])`,
+      [teamId],
+    );
+    await pool.query(
+      `INSERT INTO messages
+         (team_id,id,team_seq,envelope_v,cipher,key_id,blob,envelope_digest)
+       VALUES($1,'550e8400-e29b-41d4-a716-446655440099',3,1,
+              'future-aead','epoch-1',$2,$3)`,
+      [teamId, futureEnvelope.blob, envelopeDigest(futureEnvelope)],
+    );
+    await pool.query("COMMIT");
+
+    const policyTransition = await sync(storeA, "once", "--team", localTeam);
+    expect(policyTransition.stdout).toContain('"event":"push.blocked"');
+    expect(policyTransition.stdout).toContain('"event":"pull.quarantined"');
+    expect(policyTransition.stdout).toContain('"status":"unsupported_cipher"');
+    const quarantined = await execFileAsync("sqlite3", [join(storeA, "messages.db"),
+      "SELECT status || ':' || server_seq FROM sync_quarantine WHERE wire_id='550e8400-e29b-41d4-a716-446655440099';"]);
+    expect(quarantined.stdout.trim()).toBe("unsupported_cipher:3");
+    expect((await history(storeA)).map((message) => message.body)).toEqual([
       "fixture from machine A", "fixture reply from machine B",
     ]);
   });
