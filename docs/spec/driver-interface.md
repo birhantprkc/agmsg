@@ -284,6 +284,32 @@ its fast band, so its behaviour is **contractual**, not best-effort. A conformin
 Compaction must never touch `message_sent` records; it operates only on the
 redundant read-state markers layered over them.
 
+### 2.8 Optional Stage-1 remote synchronization extension
+
+A driver that can make remote reconciliation atomic with its local message log
+may advertise `capabilities=stage1-sync` from `storage_describe` and implement:
+
+```text
+storage_sync_prepare_push <local-team> <server-instance-id> <remote-team-id> <protocol-version> <limit>
+storage_sync_reconcile_push <local-team> <server-instance-id> <remote-team-id> <protocol-version>
+storage_sync_apply_pull <local-team> <server-instance-id> <remote-team-id> <protocol-version>
+```
+
+The extension is optional: a driver without it remains a conforming local-only
+storage driver. Bulk input and output are UTF-8 JSONL on stdin/stdout; only the
+non-secret binding identifiers and limits above may use argv. The binding key
+is `(server_instance_id, remote_team_id, protocol_version)`, and every local
+position is additionally paired with the driver's persistent generation.
+
+Prepare durably reserves a wire ID and exact canonical envelope before emitting
+it and is re-entrant by local position. Reconcile atomically records complete
+server acknowledgements and advances only an acknowledged contiguous local
+prefix. Apply-pull atomically quarantines unchanged envelopes, reconciles mapped
+echoes or imports unmapped wire IDs once, and advances the transport cursor only
+after durable local outcomes. Transport, decrypt/import, and read progress are
+independent. The complete framing, record schemas, crash boundaries, and future
+reserved operation names are defined by [ADR 0005](../adr/0005-stage-1-remote-sync.md).
+
 ## 3. CLI mapping
 
 | User command | Driver function(s) |
