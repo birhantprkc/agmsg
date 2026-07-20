@@ -1,0 +1,82 @@
+{
+  "format_version": 1,
+  "profile": "age-v1",
+  "profile_document": "../age-v1-profile.md",
+  "warning": "PUBLIC TEST KEYS. NEVER USE THESE IDENTITIES OUTSIDE TESTS.",
+  "binding": {
+    "protocol_version": 1,
+    "team_id": "018f3f7e-0000-7000-8000-000000000001",
+    "wire_id": "550e8400-e29b-41d4-a716-446655440000",
+    "cipher": "age-v1",
+    "key_id": "epoch-1"
+  },
+  "recipient_sets": {
+    "team_a": {
+      "recipient": "age1mmqjrejftea4f6xh47lhpc0jn4vw0yuhz349sw2e3sfl22k5gcjsv6xcvp",
+      "identity": "AGE-SECRET-KEY-1WWJJYKYVUUQNL8ZX7Y6NYRTEW79LHTF0H28EYC0CFYN5A7WECDHQMT4S0V"
+    },
+    "team_b": {
+      "recipient": "age1ykvctct4aklx4f4mnjd8rmzqs7p2le9ufg4faydljsk5mvcy0pls27mu64",
+      "identity": "AGE-SECRET-KEY-14Z7XMNPZTPEMMM6DG2FSKEH042L7UMU79T645GAQJKU2LLJGPM2S7GWNLQ"
+    }
+  },
+  "canonical_message": {
+    "body": "Run the test suite",
+    "created_at": "2026-07-20T06:30:00.000000Z",
+    "from_agent": "leader",
+    "to_agent": "worker-1"
+  },
+  "canonical_message_utf8_base64": "eyJib2R5IjoiUnVuIHRoZSB0ZXN0IHN1aXRlIiwiY3JlYXRlZF9hdCI6IjIwMjYtMDctMjBUMDY6MzA6MDAuMDAwMDAwWiIsImZyb21fYWdlbnQiOiJsZWFkZXIiLCJ0b19hZ2VudCI6Indvcmtlci0xIn0=",
+  "canonical_context_hex": "00000001018f3f7e000070008000000000000001550e8400e29b41d4a71644665544000000066167652d7631000765706f63682d31",
+  "canonical_plaintext_hex": "61676d73672d6167652d7631000000000000003500000001018f3f7e000070008000000000000001550e8400e29b41d4a71644665544000000066167652d7631000765706f63682d31000000747b22626f6479223a2252756e207468652074657374207375697465222c22637265617465645f6174223a22323032362d30372d32305430363a33303a30302e3030303030305a222c2266726f6d5f6167656e74223a226c6561646572222c22746f5f6167656e74223a22776f726b65722d31227d",
+  "vectors": [
+    {
+      "name": "valid",
+      "envelope": {
+        "v": 1,
+        "cipher": "age-v1",
+        "key_id": "epoch-1",
+        "blob": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSA3Q1VXOWNPQU8rdWtnc1NWVkxuWTRqT0l4cnRUaU5PQWNtbVpJV3hFUzFZCnFMem9aVDJUZ2tTY1F6M2kxWE03Sys0VmNvaG5ub1NjOTBNeDRncmhpeU0KLS0tIHNicURaY2RCTC9RYWlId1F3OHhIWFgwSzFPZTQ5b2dydERFUDJldGZDb0UKYx112yU0L0vyFxTCe+3fpzsnPQw/9BdRGTXy4qi8UJFDTkLeuoKWo73PZu5FwWqqB6GibqZ4ebksdbhP2Tmhk9CUQUX8Phd7kHnV8W+celC4a1TrdSduvYkIgy/T4pao1rB5Vla/qpvAKDiOGDB6plspSLZebwkI/i2RUuPJuJXa1mT8pX4SnDzQyMsFFrbEHLIWDEwoUIdR2YA+rClVRom0R4WcR27/NlnCp8EpQXPUuLCkOWDItYdHiJNvQMWZ+VNw6bFXDkzGniQglQZaNP9M8U9Sqc5zB+HPGS9p7ZnE"
+      },
+      "identity": "team_a",
+      "expected_state": "importable"
+    },
+    {
+      "name": "wrong-team-identity",
+      "envelope_from": "valid",
+      "identity": "team_b",
+      "expected_state": "authentication_failed"
+    },
+    {
+      "name": "wire-id-substitution",
+      "envelope_from": "valid",
+      "identity": "team_a",
+      "binding_override": {
+        "wire_id": "550e8400-e29b-41d4-a716-446655440001"
+      },
+      "expected_state": "authentication_failed"
+    },
+    {
+      "name": "truncated-context",
+      "envelope": {
+        "v": 1,
+        "cipher": "age-v1",
+        "key_id": "epoch-1",
+        "blob": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBQVG1wbnk0MXNTRlUyai9pa3FsZjhEMmhWdjlEWnJIS3VJanpYTDJzNGg4CkJ5c2hIZi9NaThZVWlQRjdmcUFPTXAyMU9uck9vVXFySGRHRTZXdHR6a3cKLS0tIEZYVG12MjhDQ1JNRE9VTHVUMytlOHVkNmRYVWl5UXRoa091OXoyUDEvUlEKHi9GF1tTlvrGCsTVLBK0lEeXB9vhRchpcX+0wfwIlkUeEzs8fpHUgU3am/Ag7bNa2xz1QOPlsh3g76WpYCb4iDIfEsaTST1dXjC1DyjKWllfYiqSgcRgQxYSDNoJDByePWfDXT0n1EmWJduiNbr8XAVeArXyTjuxUQR4E5FyE5aQMR5lYT1tylk0gdRDCFy5uG6WmeOjWnOHMw7eTeKPp+kbfOGSqij9Cyr/rjcMQ8g7yVAK1Ybkev1VP6Gfkmgmix77jjMGFq14SoBv4dWXU1UPH1fZn4cjp1VN7oBKJKE="
+      },
+      "identity": "team_a",
+      "expected_state": "authentication_failed"
+    },
+    {
+      "name": "reordered-context-fields",
+      "envelope": {
+        "v": 1,
+        "cipher": "age-v1",
+        "key_id": "epoch-1",
+        "blob": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBFOXFnZVpQNzVuS0c5NzF2dzR2UDRXMkp2MlUwd3dHQXpSRVl0ZE5Na3hZCkQxV0lXbUQ2dkFmMjVlZzR1MlpvRE5SNGNZL25pbUdXc2trSHc5b1FNNGsKLS0tIERaNmFOOXNtNTVDRlkzRU9saEFtQTdBa0d3ams5dHNRdU9ReDVzMmZ0YjgKGF7tFmt4at6hsqqkvU1TznHc7DMYDX6vsOgH6N/woiAlxu62EMqtSVcTqUbrQ/DpKIPuctS/a0HO9UGZ5711uCx5eCBBtGP7RLyMV8zVh1/VF30tM6Z6vl1F9s/duSuqn5o6+6eD2nhjVzvvCcuMYM85AQc0loFMZNC1Jg0hgtfqL432zkTixm+hm/Z6QClYZX7xBjEZKYJAXUJS+ynTf7dfIi4PnDH2xr8jZsuKc3nnEtHhCeREdAYin7qQ8uM8pQazPhuC/iO7LKBb2R7yNhBqKUfJiJsEndgI/rYiqJ2f"
+      },
+      "identity": "team_a",
+      "expected_state": "authentication_failed"
+    }
+  ]
+}
