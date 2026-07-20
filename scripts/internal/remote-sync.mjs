@@ -716,6 +716,10 @@ async function reprocessCycle(config, limit) {
   sequence(state.transport_cursor, "transport_cursor");
   const records = [];
   for (const candidate of candidates) {
+    sequence(candidate.server_seq, "reprocess server_seq");
+    if (BigInt(candidate.server_seq) > BigInt(capabilities.current_seq)) {
+      throw new Error("quarantine sequence exceeds authenticated server state");
+    }
     const message = { server_seq: candidate.server_seq, id: candidate.id,
       server_received_at: candidate.server_received_at, envelope: candidate.envelope };
     const evaluated = await evaluatePull(config, capabilities, message);
