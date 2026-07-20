@@ -94,11 +94,11 @@ jobs:
     # block the PR). When changes failed, docs_only is empty → heavy steps run.
     if: ${{ !cancelled() }}
     runs-on: ${{ matrix.os }}
-    # Bound a hung runner/test: the suite normally finishes in ~5 min, so a job
-    # still running at 15 fails fast (and is re-runnable) instead of pinning this
-    # REQUIRED check for the GitHub default of 6h — seen with a stalled macOS
-    # runner. bats-windows already sets its own timeout; this covers ubuntu/macos.
-    timeout-minutes: 15
+    # Bound a hung runner/test without cutting off the slower macOS suite. The
+    # full suite now exceeds 15 min on macOS as coverage has grown; 25 min still
+    # fails fast compared with GitHub's 6h default. bats-windows has its own
+    # timeout; this covers ubuntu/macos.
+    timeout-minutes: 25
     strategy:
       # Cover both GNU (Linux) and BSD (macOS) userlands — the scripts shell out
       # to sed/stat/mktemp/ps etc. whose flags differ between them.
