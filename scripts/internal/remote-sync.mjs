@@ -1,9 +1,11 @@
 #!/usr/bin/env node
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { appendFile, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
+import { ageExecutableVersion, CipherStateError, openEnvelope } from "./sync-cipher.mjs";
 
 const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -15,8 +17,12 @@ const MAX_SEQUENCE = 9_223_372_036_854_775_807n;
 function usage() {
   return `usage:
   remote-sync.sh configure --team NAME --server URL --team-id UUID --minimum-security plaintext-allowed
+  remote-sync.sh configure --team NAME --server URL --team-id UUID --minimum-security e2ee-required \\
+    --cipher age-v1 --age-snapshot FILE --age-checkpoint REVISION:SHA256 \\
+    [--age-identity KEY_ID=FILE ...]
   remote-sync.sh once --team NAME [--limit N]
   remote-sync.sh run --team NAME [--limit N] [--interval SECONDS]
+  remote-sync.sh reprocess --team NAME [--limit N]
 
 AGMSG_SYNC_TOKEN is required and is never written to config or argv.`;
 }
@@ -28,7 +34,13 @@ function options(args) {
     if (!value.startsWith("--")) { result._.push(value); continue; }
     const next = args[index + 1];
     if (next === undefined || next.startsWith("--")) throw new Error(`missing value for ${value}`);
-    result[value.slice(2)] = next;
+    const key = value.slice(2);
+    if (key === "age-identity") {
+      if (!Array.isArray(result[key])) result[key] = [];
+      result[key].push(next);
+    } else {
+      result[key] = next;
+    }
     index += 1;
   }
   return result;
@@ -70,7 +82,101 @@ async function loadConfig(team) {
       !UUID_V7.test(value.server_instance_id) || !UUID_V7.test(value.remote_team_id)) {
     throw new Error("sync config binding is invalid");
   }
+  value.cipher_profile ??= "none";
+  validateLocalSecurityHistory(value.local_security_history);
+  if (value.cipher_profile === "age-v1") validateAgeConfiguration(value);
+  else if (value.cipher_profile !== "none") throw new Error("sync cipher profile is unsupported");
   return value;
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("snapshot contains a non-finite number");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  throw new Error("snapshot contains a non-JSON value");
+}
+
+export function ageSnapshotDigest(value) {
+  return createHash("sha256").update(canonicalJson(value), "utf8").digest("hex");
+}
+
+function validateLocalSecurityHistory(history) {
+  if (!Array.isArray(history) || history.length < 1 || history.length > 4096) {
+    throw new Error("local security history is invalid");
+  }
+  let priorRevision = -1n;
+  let priorBoundary = 0n;
+  for (const entry of history) {
+    const revision = BigInt(sequence(entry.local_security_revision, "local security revision"));
+    const boundary = BigInt(sequence(entry.effective_from_seq, "local security boundary"));
+    if (revision <= priorRevision || boundary <= priorBoundary ||
+        !["plaintext-allowed", "e2ee-required"].includes(entry.minimum_security_mode)) {
+      throw new Error("local security history is not canonical");
+    }
+    priorRevision = revision;
+    priorBoundary = boundary;
+  }
+  if (history[0].effective_from_seq !== "1") throw new Error("local security history must begin at 1");
+}
+
+export function validateAgeConfiguration(config) {
+  const age = config.age_v1;
+  const snapshot = age?.epoch_snapshot;
+  const checkpoint = age?.checkpoint;
+  if (!age || !snapshot || !checkpoint || snapshot.profile !== "age-v1" ||
+      snapshot.server_instance_id !== config.server_instance_id || snapshot.team_id !== config.remote_team_id ||
+      !Array.isArray(snapshot.authorized_writers) || snapshot.authorized_writers.length < 1 ||
+      new Set(snapshot.authorized_writers).size !== snapshot.authorized_writers.length ||
+      snapshot.authorized_writers.some((writer) => typeof writer !== "string" || writer.length < 1) ||
+      !Array.isArray(snapshot.history) || snapshot.history.length < 1 || snapshot.history.length > 4096 ||
+      !age.identity_files || typeof age.identity_files !== "object" || Array.isArray(age.identity_files) ||
+      Object.entries(age.identity_files).some(([keyId, path]) =>
+        !/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(keyId) || typeof path !== "string" || path.length < 1) ||
+      typeof age.age_version !== "string" || age.age_version.length < 1) {
+    throw new Error("age-v1 configuration is invalid");
+  }
+  const snapshotRevision = sequence(snapshot.epoch_revision, "epoch_revision");
+  sequence(snapshot.writer_generation, "writer_generation");
+  if (snapshotRevision !== "0") {
+    throw new Error("age-v1 dogfood currently accepts only an initial revision-0 epoch snapshot");
+  }
+  if ((snapshotRevision === "0" && snapshot.previous_snapshot_sha256 !== null) ||
+      (snapshotRevision !== "0" && (typeof snapshot.previous_snapshot_sha256 !== "string" ||
+        !/^[0-9a-f]{64}$/u.test(snapshot.previous_snapshot_sha256)))) {
+    throw new Error("epoch snapshot previous digest is invalid");
+  }
+  let priorRevision = -1n;
+  let priorBoundary = 0n;
+  for (const entry of snapshot.history) {
+    const revision = BigInt(sequence(entry.epoch_revision, "epoch history revision"));
+    const boundary = BigInt(sequence(entry.effective_from_seq, "epoch history boundary"));
+    if (revision <= priorRevision || boundary <= priorBoundary || entry.cipher !== "age-v1" ||
+        typeof entry.key_id !== "string" || !/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(entry.key_id) ||
+        !Array.isArray(entry.recipients) || entry.recipients.length < 1 || entry.recipients.length > 256 ||
+        new Set(entry.recipients).size !== entry.recipients.length ||
+        entry.recipients.some((recipient) => typeof recipient !== "string" || !/^age1[0-9a-z]{58}$/u.test(recipient))) {
+      throw new Error("age epoch history is not canonical");
+    }
+    priorRevision = revision;
+    priorBoundary = boundary;
+  }
+  if (snapshot.history[0].effective_from_seq !== "1" ||
+      snapshot.history.at(-1).epoch_revision !== snapshot.epoch_revision) {
+    throw new Error("age epoch history does not cover the snapshot revision");
+  }
+  const digest = ageSnapshotDigest(snapshot);
+  if (checkpoint.epoch_revision !== snapshot.epoch_revision || checkpoint.snapshot_sha256 !== digest ||
+      checkpoint.writer_generation !== snapshot.writer_generation ||
+      typeof checkpoint.confirmed_at !== "string" || Number.isNaN(Date.parse(checkpoint.confirmed_at))) {
+    throw new Error("age epoch checkpoint does not match the snapshot");
+  }
+  return digest;
 }
 
 function endpoint(base, path) {
@@ -184,6 +290,11 @@ export async function driver(operation, config, input, extra = []) {
   return new Promise((resolve, reject) => {
     const childEnvironment = { ...process.env };
     delete childEnvironment.AGMSG_SYNC_TOKEN;
+    for (const key of Object.keys(childEnvironment)) {
+      if (/^(?:AGMSG_AGE_IDENTITY|AGMSG_SYNC_AGE_IDENTITY)/u.test(key)) {
+        delete childEnvironment[key];
+      }
+    }
     const child = spawn("bash", args, { stdio: ["pipe", "pipe", "pipe"], env: childEnvironment });
     let stdout = ""; let stderr = "";
     child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
@@ -211,6 +322,21 @@ async function event(name, fields = {}) {
   }
 }
 
+async function logApplyOutcomes(config, records, applied) {
+  for (const outcome of applied.filter((record) => record.type === "sync_apply_outcome")) {
+    const source = records.find((record) => record.type === "sync_pull_message" && record.id === outcome.id);
+    await event(outcome.status === "imported" ? "pull.import" :
+      outcome.status === "reconciled" ? "pull.reconciled" : "pull.quarantined", {
+      id: outcome.id, server_seq: outcome.server_seq, status: outcome.status,
+      ...(outcome.status === "imported" && source?.projection &&
+        (config.cipher_profile === "none" || process.env.AGMSG_SYNC_LOG_PLAINTEXT === "1") ? {
+        from_agent: source.projection.from_agent, to_agent: source.projection.to_agent,
+        body: source.projection.body,
+      } : {}),
+    });
+  }
+}
+
 function currentPolicy(capabilities, serverSeq) {
   const target = BigInt(serverSeq);
   const candidates = capabilities.policy_history.filter((entry) =>
@@ -226,31 +352,18 @@ function currentLocalPolicy(config, serverSeq) {
   return candidates.reduce((best, entry) => BigInt(entry.local_security_revision) > BigInt(best.local_security_revision) ? entry : best);
 }
 
-function canonicalPlaintext(envelope) {
-  if (envelope.v !== 1 || envelope.cipher !== "none" || envelope.key_id !== null ||
-      typeof envelope.blob !== "string" || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(envelope.blob)) {
-    throw new Error("malformed envelope");
-  }
-  const bytes = Buffer.from(envelope.blob, "base64");
-  if (bytes.length < 1 || bytes.length > 1024 * 1024 || bytes.toString("base64") !== envelope.blob) {
-    throw new Error("malformed base64 blob");
-  }
-  const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-  const value = JSON.parse(text);
-  const keys = Object.keys(value);
-  if (JSON.stringify(keys) !== JSON.stringify(["body", "created_at", "from_agent", "to_agent"]) ||
-      typeof value.body !== "string" || Buffer.byteLength(value.body) < 1 || Buffer.byteLength(value.body) > 1_000_000 ||
-      typeof value.created_at !== "string" || !TIMESTAMP.test(value.created_at)) {
-    throw new Error("malformed plaintext projection");
-  }
-  requireName(value.from_agent, "from_agent"); requireName(value.to_agent, "to_agent");
-  const canonical = JSON.stringify({ body: value.body, created_at: value.created_at,
-    from_agent: value.from_agent, to_agent: value.to_agent });
-  if (canonical !== text) throw new Error("plaintext is not canonical JCS");
-  return value;
+function currentAgeEpoch(config, serverSeq) {
+  const history = config.age_v1?.epoch_snapshot?.history;
+  if (!Array.isArray(history) || history.length < 1) return null;
+  const target = BigInt(sequence(serverSeq, "age epoch server_seq"));
+  const candidates = history.filter((entry) =>
+    BigInt(sequence(entry.effective_from_seq, "age epoch effective_from_seq")) <= target);
+  if (candidates.length === 0) return null;
+  return candidates.reduce((best, entry) =>
+    BigInt(entry.epoch_revision) > BigInt(best.epoch_revision) ? entry : best);
 }
 
-function evaluatePull(config, capabilities, message) {
+export async function evaluatePull(config, capabilities, message) {
   sequence(message.server_seq, "message server_seq");
   if (!UUID_V4.test(message.id) || !TIMESTAMP.test(message.server_received_at) || typeof message.envelope !== "object") {
     return { status: "malformed", reason: "invalid message metadata" };
@@ -264,17 +377,36 @@ function evaluatePull(config, capabilities, message) {
       policy_revision: serverPolicy.policy_revision,
       local_security_revision: localPolicy.local_security_revision };
   }
-  if (message.envelope.v !== 1 || message.envelope.cipher !== "none") {
-    return { status: "unsupported_cipher", reason: "Stage-1 supports cipher none only",
+  if (message.envelope.v !== 1 || !["none", "age-v1"].includes(message.envelope.cipher)) {
+    return { status: "unsupported_cipher", reason: "cipher profile is not implemented",
       policy_revision: serverPolicy.policy_revision,
       local_security_revision: localPolicy.local_security_revision };
   }
+  let identityFile;
+  if (message.envelope.cipher === "age-v1") {
+    if (config.cipher_profile !== "age-v1" || !config.age_v1) {
+      return { status: "unsupported_cipher", reason: "age-v1 is not configured",
+        policy_revision: serverPolicy.policy_revision,
+        local_security_revision: localPolicy.local_security_revision };
+    }
+    const epoch = currentAgeEpoch(config, message.server_seq);
+    if (!epoch || message.envelope.key_id !== epoch.key_id) {
+      return { status: "policy_violation", reason: "envelope key_id violates effective epoch",
+        policy_revision: serverPolicy.policy_revision,
+        local_security_revision: localPolicy.local_security_revision };
+    }
+    identityFile = config.age_v1.identity_files?.[epoch.key_id];
+  }
   try {
-    return { status: "importable", projection: canonicalPlaintext(message.envelope),
+    const projection = await openEnvelope({ envelope: message.envelope,
+      protocol_version: config.protocol_version, team_id: config.remote_team_id,
+      wire_id: message.id, identity_file: identityFile, max_blob_bytes: 1_048_576 });
+    return { status: "importable", projection,
       policy_revision: serverPolicy.policy_revision,
       local_security_revision: localPolicy.local_security_revision };
   } catch (error) {
-    return { status: "malformed", reason: error.message,
+    const status = error instanceof CipherStateError ? error.state : "malformed";
+    return { status, reason: error.message,
       policy_revision: serverPolicy.policy_revision,
       local_security_revision: localPolicy.local_security_revision };
   }
@@ -351,6 +483,30 @@ export function plaintextWriteEligible(config, value) {
     currentLocalPolicy(config, boundary).minimum_security_mode === "plaintext-allowed";
 }
 
+export function selectWriteProfile(config, value) {
+  validateCapabilities(config, value);
+  const boundary = value.next_sequence_boundary;
+  const profile = config.cipher_profile ?? "none";
+  if (boundary === null) return { eligible: false, reason: "sequence-exhausted", profile };
+  if (!value.accepted_envelope_versions.includes(1) || !value.write_allowed_ciphers.includes(profile)) {
+    return { eligible: false, reason: `${profile}-write-not-allowed`, profile };
+  }
+  const localPolicy = currentLocalPolicy(config, boundary);
+  if (profile === "none") {
+    return localPolicy.minimum_security_mode === "plaintext-allowed" ?
+      { eligible: true, profile, key_id: null, recipients: [] } :
+      { eligible: false, reason: "local-e2ee-required", profile };
+  }
+  if (profile === "age-v1") {
+    const epoch = currentAgeEpoch(config, boundary);
+    if (!epoch || !Array.isArray(epoch.recipients)) {
+      return { eligible: false, reason: "age-epoch-unavailable", profile };
+    }
+    return { eligible: true, profile, key_id: epoch.key_id, recipients: epoch.recipients };
+  }
+  return { eligible: false, reason: "cipher-profile-unsupported", profile };
+}
+
 export function isRetryable(error) {
   if (error?.retryable === true) return true;
   return [408, 429, 500, 502, 503, 504].includes(error?.status);
@@ -381,11 +537,50 @@ export function validateAckMapping(candidates, acks) {
   });
 }
 
+function parseCheckpoint(value) {
+  const match = /^(0|[1-9][0-9]*):([0-9a-f]{64})$/u.exec(value ?? "");
+  if (!match) throw new Error("age-checkpoint must be REVISION:SHA256");
+  sequence(match[1], "age checkpoint revision");
+  return { epoch_revision: match[1], snapshot_sha256: match[2] };
+}
+
+async function identityFiles(values) {
+  const result = {};
+  for (const value of values ?? []) {
+    const separator = value.indexOf("=");
+    const keyId = separator === -1 ? "" : value.slice(0, separator);
+    const suppliedPath = separator === -1 ? "" : value.slice(separator + 1);
+    if (!/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(keyId) || !suppliedPath || result[keyId]) {
+      throw new Error("age-identity must be a unique KEY_ID=FILE mapping");
+    }
+    const path = resolve(suppliedPath);
+    const metadata = await stat(path);
+    if (!metadata.isFile()) throw new Error(`age identity for ${keyId} is not a file`);
+    if (process.platform !== "win32" && (metadata.mode & 0o077) !== 0) {
+      throw new Error(`age identity for ${keyId} must not be group/world accessible`);
+    }
+    result[keyId] = path;
+  }
+  return result;
+}
+
+async function existingConfig(team) {
+  try { return await loadConfig(team); }
+  catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
 async function configure(args) {
   const team = requireName(args.team, "team");
   if (!UUID_V7.test(args["team-id"] ?? "")) throw new Error("team-id must be a canonical UUIDv7");
-  if (args["minimum-security"] !== "plaintext-allowed") {
-    throw new Error("Stage-1 requires explicit --minimum-security plaintext-allowed");
+  const cipherProfile = args.cipher ?? "none";
+  const minimumSecurity = args["minimum-security"];
+  if (!["none", "age-v1"].includes(cipherProfile)) throw new Error("cipher must be none or age-v1");
+  if ((cipherProfile === "none" && minimumSecurity !== "plaintext-allowed") ||
+      (cipherProfile === "age-v1" && minimumSecurity !== "e2ee-required")) {
+    throw new Error(`${cipherProfile} requires its explicit matching minimum-security mode`);
   }
   if (!process.env.AGMSG_SYNC_TOKEN) throw new Error("AGMSG_SYNC_TOKEN is required");
   const serverUrl = new URL(args.server).toString().replace(/\/$/, "");
@@ -393,10 +588,42 @@ async function configure(args) {
   const config = {
     format_version: 1, local_team: team, server_url: serverUrl,
     server_instance_id: ready.server_instance_id, remote_team_id: args["team-id"],
-    protocol_version: 1,
+    protocol_version: 1, cipher_profile: cipherProfile,
     local_security_history: [{ local_security_revision: "0", effective_from_seq: "1",
-      minimum_security_mode: "plaintext-allowed" }],
+      minimum_security_mode: minimumSecurity }],
   };
+  if (cipherProfile === "age-v1") {
+    if (!args["age-snapshot"] || !args["age-checkpoint"]) {
+      throw new Error("age-v1 requires --age-snapshot and --age-checkpoint");
+    }
+    const snapshotText = await readFile(resolve(args["age-snapshot"]), "utf8");
+    const snapshot = JSON.parse(snapshotText);
+    if (snapshotText.trim() !== canonicalJson(snapshot)) {
+      throw new Error("age snapshot must be RFC 8785 JCS without duplicate or noncanonical fields");
+    }
+    const checkpoint = parseCheckpoint(args["age-checkpoint"]);
+    config.age_v1 = {
+      epoch_snapshot: snapshot,
+      checkpoint: { ...checkpoint, writer_generation: snapshot.writer_generation,
+        confirmed_at: new Date().toISOString() },
+      identity_files: await identityFiles(args["age-identity"]),
+      age_version: ageExecutableVersion(),
+    };
+    validateAgeConfiguration(config);
+  } else if (args["age-snapshot"] || args["age-checkpoint"] || args["age-identity"]) {
+    throw new Error("age options require --cipher age-v1");
+  }
+  const previous = await existingConfig(team);
+  if (previous && (previous.server_instance_id !== config.server_instance_id ||
+      previous.remote_team_id !== config.remote_team_id || previous.cipher_profile !== config.cipher_profile)) {
+    throw new Error("configure cannot replace an existing binding or cipher profile");
+  }
+  if (previous?.cipher_profile === "age-v1" &&
+      (previous.age_v1.checkpoint.epoch_revision !== config.age_v1.checkpoint.epoch_revision ||
+       previous.age_v1.checkpoint.snapshot_sha256 !== config.age_v1.checkpoint.snapshot_sha256 ||
+       previous.age_v1.checkpoint.writer_generation !== config.age_v1.checkpoint.writer_generation)) {
+    throw new Error("age epoch changes require the fenced cutover procedure");
+  }
   const capabilities = await request(config, "/v1/capabilities");
   validateCapabilities(config, capabilities);
   await writeConfig(configPath(team), config);
@@ -412,10 +639,11 @@ async function cycle(config, limit) {
   await event("capabilities", { team: config.local_team, current_seq: capabilities.current_seq,
     policy_revision: capabilities.policy_revision });
 
-  const writeEligible = plaintextWriteEligible(config, capabilities);
+  const writeProfile = selectWriteProfile(config, capabilities);
   const prepared = await driver("prepare", config, [{ type: "sync_prepare", envelope_v: 1,
-    cipher: "none", key_id: null, max_blob_bytes: Number(capabilities.max_blob_bytes),
-    allow_new: writeEligible }], [String(limit)]);
+    cipher: writeProfile.profile, key_id: writeProfile.key_id ?? null,
+    recipients: writeProfile.recipients ?? [], max_blob_bytes: Number(capabilities.max_blob_bytes),
+    allow_new: writeProfile.eligible }], [String(limit)]);
   const state = prepared.find((record) => record.type === "sync_state");
   const candidates = prepared.filter((record) => record.type === "sync_push_candidate");
   if (!state) throw new Error("driver omitted sync_state");
@@ -423,9 +651,8 @@ async function cycle(config, limit) {
   await event("push.prepared", { count: candidates.length, local_positions: candidates.map((item) => item.local_position),
     wire_ids: candidates.map((item) => item.id) });
 
-  if (!writeEligible) {
-    await event("push.blocked", { reason: capabilities.next_sequence_boundary === null ?
-      "sequence-exhausted" : "plaintext-write-not-allowed" });
+  if (!writeProfile.eligible) {
+    await event("push.blocked", { reason: writeProfile.reason });
   } else if (candidates.length > 0) {
     const posted = await request(config, "/v1/messages", { method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -461,40 +688,60 @@ async function cycle(config, limit) {
         throw new Error("capability history does not cover the pull page");
       }
     }
-    const records = page.messages.map((message) => {
-      const evaluated = evaluatePull(config, pullCapabilities, message);
-      return { type: "sync_pull_message", ...message, ...evaluated };
-    });
+    const records = [];
+    for (const message of page.messages) {
+      const evaluated = await evaluatePull(config, pullCapabilities, message);
+      records.push({ type: "sync_pull_message", ...message, ...evaluated });
+    }
     records.push({ type: "sync_pull_cursor", next_after: page.next_after });
     await event("pull.received", { after: cursor, next_after: page.next_after,
       messages: page.messages.map((message) => ({ id: message.id, server_seq: message.server_seq })) });
     const applied = await driver("apply", config, records);
-    for (const outcome of applied.filter((record) => record.type === "sync_apply_outcome")) {
-      const source = records.find((record) => record.type === "sync_pull_message" && record.id === outcome.id);
-      await event(outcome.status === "imported" ? "pull.import" :
-        outcome.status === "reconciled" ? "pull.reconciled" : "pull.quarantined", {
-        id: outcome.id, server_seq: outcome.server_seq, status: outcome.status,
-        ...(outcome.status === "imported" && source?.projection ? {
-          from_agent: source.projection.from_agent, to_agent: source.projection.to_agent,
-          body: source.projection.body,
-        } : {}),
-      });
-    }
+    await logApplyOutcomes(config, records, applied);
     await event("pull.applied", { result: applied[0] ?? null });
     cursor = page.next_after;
     if (!page.has_more) break;
   }
 }
 
+async function reprocessCycle(config, limit) {
+  const ready = await health(config.server_url);
+  if (ready.server_instance_id !== config.server_instance_id) throw new Error("health server instance changed");
+  const capabilities = await request(config, "/v1/capabilities");
+  validateCapabilities(config, capabilities);
+  const pending = await driver("reprocess", config, [], [String(limit)]);
+  const state = pending.find((record) => record.type === "sync_state");
+  const candidates = pending.filter((record) => record.type === "sync_reprocess_candidate");
+  if (!state) throw new Error("driver omitted sync_state while reprocessing");
+  sequence(state.transport_cursor, "transport_cursor");
+  const records = [];
+  for (const candidate of candidates) {
+    const message = { server_seq: candidate.server_seq, id: candidate.id,
+      server_received_at: candidate.server_received_at, envelope: candidate.envelope };
+    const evaluated = await evaluatePull(config, capabilities, message);
+    records.push({ type: "sync_pull_message", ...message, ...evaluated });
+  }
+  if (records.length === 0) {
+    await event("reprocess.complete", { count: 0, transport_cursor: state.transport_cursor });
+    return;
+  }
+  records.push({ type: "sync_pull_cursor", next_after: state.transport_cursor });
+  const applied = await driver("apply", config, records);
+  await logApplyOutcomes(config, records, applied);
+  await event("reprocess.complete", { count: candidates.length,
+    transport_cursor: state.transport_cursor, result: applied[0] ?? null });
+}
+
 async function main() {
   const [command, ...rest] = process.argv.slice(2);
   const args = options(rest);
-  if (!["configure", "once", "run"].includes(command)) throw new Error(usage());
+  if (!["configure", "once", "run", "reprocess"].includes(command)) throw new Error(usage());
   if (command === "configure") { await configure(args); return; }
   const team = requireName(args.team, "team");
   const limit = Number(args.limit ?? 100);
   if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new Error("limit must be 1..1000");
   const config = await loadConfig(team);
+  if (command === "reprocess") { await reprocessCycle(config, limit); return; }
   if (command === "once") { await cycle(config, limit); return; }
   const interval = Number(args.interval ?? 5);
   if (!Number.isFinite(interval) || interval < 0.2) throw new Error("interval must be at least 0.2 seconds");

@@ -34,6 +34,16 @@ Or poll continuously (five seconds by default):
 scripts/remote-sync.sh run --team example-team --interval 5
 ```
 
+After installing a previously missing identity or deliberately changing local
+open support, retry durable quarantine without rewinding the transport cursor:
+
+```sh
+scripts/remote-sync.sh reprocess --team example-team --limit 100
+```
+
+Reprocessing is explicit. Continuous polling does not repeatedly decrypt a
+permanently invalid ciphertext.
+
 The command emits timestamped JSONL lifecycle events. Set a log file to retain
 the exact push/ack/pull/import trace; the file is append-only from the client's
 perspective and includes imported plaintext bodies:
@@ -42,6 +52,63 @@ perspective and includes imported plaintext bodies:
 export AGMSG_SYNC_LOG_FILE=/path/to/stage1-dogfood.jsonl
 scripts/remote-sync.sh once --team example-team
 ```
+
+For an `age-v1` binding, install the standard `age` CLI and provision a
+freshness-confirmed epoch snapshot outside the message server. Identity files
+must be regular files with mode `0600` on POSIX systems. The snapshot is public
+key material and its file must use compact RFC 8785 JCS; the expanded example
+below shows its minimum initial-epoch data shape:
+
+```json
+{
+  "profile": "age-v1",
+  "server_instance_id": "018f3f7e-0000-7000-8000-000000000000",
+  "team_id": "018f3f7e-0000-7000-8000-000000000001",
+  "epoch_revision": "0",
+  "writer_generation": "0",
+  "authorized_writers": ["machine-a"],
+  "previous_snapshot_sha256": null,
+  "history": [{
+    "epoch_revision": "0",
+    "effective_from_seq": "1",
+    "cipher": "age-v1",
+    "key_id": "epoch-1",
+    "recipients": ["age1..."]
+  }]
+}
+```
+
+After independently confirming the current revision and lowercase JCS SHA-256
+digest with the epoch authority, configure the binding:
+
+```sh
+export AGMSG_AGE_BIN=/path/to/age       # optional when age is already on PATH
+chmod 600 /secure/path/epoch-1.identity
+
+scripts/remote-sync.sh configure \
+  --team example-team \
+  --server https://sync.example \
+  --team-id 018f3f7e-0000-7000-8000-000000000001 \
+  --minimum-security e2ee-required \
+  --cipher age-v1 \
+  --age-snapshot /authenticated/path/epoch-snapshot.json \
+  --age-checkpoint '0:CONFIRMED_LOWERCASE_SHA256' \
+  --age-identity epoch-1=/secure/path/epoch-1.identity
+```
+
+Only the public recipient list crosses the storage-driver seam. The private
+identity path stays in the engine configuration and is used only while opening
+pulled envelopes. The current dogfood command accepts only an initial revision-0
+snapshot. Joining an established rotated binding or rotating an active binding
+requires complete chain verification, quiesce, drain, a server authorization
+fence, and the fresh-boundary procedure in the
+[`age-v1` profile](spec/age-v1-profile.md#multi-writer-cutover-protocol), which
+is not yet automated by this client.
+
+For `age-v1`, lifecycle logs omit imported plaintext fields by default. Set
+`AGMSG_SYNC_LOG_PLAINTEXT=1` only when the log destination is intentionally
+trusted to contain decrypted message content. Plaintext bindings retain the
+existing body-inclusive dogfood trace.
 
 For a single-host two-machine simulation, repeat configuration with two
 different `AGMSG_STORAGE_PATH` directories and the same immutable remote team

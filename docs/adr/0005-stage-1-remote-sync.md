@@ -29,6 +29,7 @@ operations in addition to the ADR 0003 ABI:
 storage_sync_prepare_push <local-team> <server-instance-id> <remote-team-id> <protocol-version> <limit>
 storage_sync_reconcile_push <local-team> <server-instance-id> <remote-team-id> <protocol-version>
 storage_sync_apply_pull <local-team> <server-instance-id> <remote-team-id> <protocol-version>
+storage_sync_reprocess <local-team> <server-instance-id> <remote-team-id> <protocol-version> <limit>
 ```
 
 The SQLite driver is the Stage-1 implementation. Drivers that do not advertise
@@ -57,9 +58,17 @@ prevents a reused local position from inheriting stale remote state.
 `storage_sync_prepare_push` reads one `sync_prepare` JSONL record from stdin.
 It contains the engine's validated envelope selection and capability limits,
 but no credentials. The ABI is cipher-neutral: the driver creates the canonical
-envelope selected by the binding configuration. Stage 1 supports only envelope
-version 1 with `cipher: "none"`; a future encrypted driver performs its
-encrypt-once operation at this same boundary.
+envelope selected by the binding configuration. `none` is the default profile.
+The optional `age-v1` profile defined in
+[`../spec/age-v1-profile.md`](../spec/age-v1-profile.md) performs its
+encrypt-once operation at this same boundary. Prepare receives only the public
+recipient manifest; age identity files remain in the HTTP engine's open path
+and never cross the storage-driver boundary.
+
+The input record fields are `type`, `envelope_v`, `cipher`, `key_id`,
+`recipients`, `max_blob_bytes`, and `allow_new`. `recipients` is an empty array
+for `none` and the public, immutable X25519 recipient manifest for `age-v1`.
+Private identities and HTTP credentials are forbidden in this record.
 
 The record also contains `allow_new`. When current policy or sequence exhaustion
 blocks new writes, the engine sets it to false: prepare must still emit
@@ -78,6 +87,13 @@ position)`. Calling prepare again before reconciliation must emit the identical
 wire ID and byte-identical envelope; it must not reserialize, re-encode,
 re-encrypt, or reserve a second wire ID. Existing unacknowledged reservations
 are emitted before new local positions.
+
+For a randomized cipher, sealing precedes publication. A wire ID used during a
+private sealing attempt is not a durable or observable reservation. The driver
+publishes the wire ID and complete envelope together in one local transaction.
+If the process fails before that transaction, recovery abandons the private
+candidate and seals under a new wire ID. If it fails after commit, recovery
+reuses the committed envelope byte-for-byte.
 
 ### Reconcile push
 
@@ -131,12 +147,18 @@ adding a key may reprocess quarantine without rewinding transport; importing a
 message does not mark it read. Existing local `message_read` events remain the
 read layer.
 
-The following future operation names are reserved but are not implemented in
+`storage_sync_reprocess` emits durable blocking envelopes without changing the
+transport cursor. The engine reevaluates them against the current authenticated
+policy and installed identities, then passes the outcomes through apply-pull's
+existing atomic import transition. Reprocessing is explicit rather than part of
+every polling cycle, so a permanently invalid ciphertext cannot cause an
+automatic decrypt loop.
+
+The following future operation remains reserved but is not implemented in
 Stage 1:
 
 ```text
 storage_sync_resync       # operator-approved recovery after HTTP 410
-storage_sync_reprocess    # retry pending decrypt/import states
 ```
 
 HTTP 410 remains terminal in Stage 1. The engine must not reset a transport

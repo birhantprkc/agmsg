@@ -12,4 +12,6 @@ export SKILL_DIR
 export AGMSG_SYNC_STORAGE_DIR="$(agmsg_storage_dir)"
 export AGMSG_SYNC_DRIVER="$SCRIPT_DIR/internal/storage-sync-driver.sh"
 NODE_BIN="$(agmsg_resolve_node)"
+export AGMSG_SYNC_NODE_BIN="$NODE_BIN"
+export AGMSG_SYNC_CIPHER_HELPER="$SCRIPT_DIR/internal/sync-cipher.mjs"
 exec "$NODE_BIN" "$SCRIPT_DIR/internal/remote-sync.mjs" "$@"

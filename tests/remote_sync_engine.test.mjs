@@ -4,11 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  ageSnapshotDigest,
   driver,
   isRetryable,
   plaintextWriteEligible,
   request,
+  selectWriteProfile,
   validateAckMapping,
+  validateAgeConfiguration,
   validateCapabilities,
   validateErrorBinding,
 } from "../scripts/internal/remote-sync.mjs";
@@ -165,17 +168,26 @@ test("capability policy history must be canonical and match current policy", () 
   }), /canonical ascending|begin at sequence 1/u);
 });
 
-test("storage driver subprocess cannot observe the bearer token", async () => {
+test("storage driver subprocess cannot observe HTTP or age identity secrets", async () => {
   const root = await mkdtemp(join(tmpdir(), "agmsg-sync-driver-env-"));
   const mock = join(root, "driver.sh");
   await writeFile(mock, `#!/usr/bin/env bash
 [ -z "\${AGMSG_SYNC_TOKEN:-}" ] || exit 99
+[ -z "\${AGMSG_AGE_IDENTITY:-}" ] || exit 98
+[ -z "\${AGMSG_AGE_IDENTITY_FILE:-}" ] || exit 97
+[ -z "\${AGMSG_SYNC_AGE_IDENTITY_EPOCH_1:-}" ] || exit 96
 printf '{"type":"mock-ok"}\\n'
 `, { mode: 0o700 });
   const previousDriver = process.env.AGMSG_SYNC_DRIVER;
   const previousToken = process.env.AGMSG_SYNC_TOKEN;
+  const previousIdentity = process.env.AGMSG_AGE_IDENTITY;
+  const previousIdentityFile = process.env.AGMSG_AGE_IDENTITY_FILE;
+  const previousSyncIdentity = process.env.AGMSG_SYNC_AGE_IDENTITY_EPOCH_1;
   process.env.AGMSG_SYNC_DRIVER = mock;
   process.env.AGMSG_SYNC_TOKEN = "must-not-cross-driver-boundary";
+  process.env.AGMSG_AGE_IDENTITY = "AGE-SECRET-KEY-1FIXTURE";
+  process.env.AGMSG_AGE_IDENTITY_FILE = "/secret/identity";
+  process.env.AGMSG_SYNC_AGE_IDENTITY_EPOCH_1 = "/secret/identity";
   try {
     assert.deepEqual(await driver("prepare", config, [], ["1"]), [{ type: "mock-ok" }]);
   } finally {
@@ -183,7 +195,77 @@ printf '{"type":"mock-ok"}\\n'
     else process.env.AGMSG_SYNC_DRIVER = previousDriver;
     if (previousToken === undefined) delete process.env.AGMSG_SYNC_TOKEN;
     else process.env.AGMSG_SYNC_TOKEN = previousToken;
+    if (previousIdentity === undefined) delete process.env.AGMSG_AGE_IDENTITY;
+    else process.env.AGMSG_AGE_IDENTITY = previousIdentity;
+    if (previousIdentityFile === undefined) delete process.env.AGMSG_AGE_IDENTITY_FILE;
+    else process.env.AGMSG_AGE_IDENTITY_FILE = previousIdentityFile;
+    if (previousSyncIdentity === undefined) delete process.env.AGMSG_SYNC_AGE_IDENTITY_EPOCH_1;
+    else process.env.AGMSG_SYNC_AGE_IDENTITY_EPOCH_1 = previousSyncIdentity;
     if (!root.startsWith(join(tmpdir(), "agmsg-sync-driver-env-"))) throw new Error("unsafe test root");
     await rm(root, { recursive: true });
   }
+});
+
+test("age-v1 write selection exposes only public epoch material", () => {
+  const recipients = ["age1mmqjrejftea4f6xh47lhpc0jn4vw0yuhz349sw2e3sfl22k5gcjsv6xcvp"];
+  const ageConfig = {
+    ...config,
+    cipher_profile: "age-v1",
+    local_security_history: [{ local_security_revision: "0", effective_from_seq: "1",
+      minimum_security_mode: "e2ee-required" }],
+    age_v1: { epoch_snapshot: { history: [{ epoch_revision: "0", effective_from_seq: "1",
+      cipher: "age-v1", key_id: "epoch-1", recipients }] },
+    identity_files: { "epoch-1": "/secret/identity" } },
+  };
+  const policy = {
+    protocol_version: 1, server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id, min_available_seq: "0", current_seq: "4",
+    next_sequence_boundary: "5", accepted_envelope_versions: [1],
+    write_allowed_ciphers: ["age-v1"], policy_revision: "0", effective_from_seq: "1",
+    max_blob_bytes: "1048576", policy_history: [{ policy_revision: "0",
+      effective_from_seq: "1", accepted_envelope_versions: [1],
+      write_allowed_ciphers: ["age-v1"] }],
+  };
+  const selected = selectWriteProfile(ageConfig, policy);
+  assert.deepEqual(selected, { eligible: true, profile: "age-v1", key_id: "epoch-1", recipients });
+  assert.equal(JSON.stringify(selected).includes("identity"), false);
+});
+
+test("age-v1 configuration binds its checkpoint and initial history", () => {
+  const snapshot = {
+    profile: "age-v1",
+    server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id,
+    epoch_revision: "0",
+    writer_generation: "0",
+    authorized_writers: ["writer-a"],
+    previous_snapshot_sha256: null,
+    history: [{ epoch_revision: "0", effective_from_seq: "1", cipher: "age-v1",
+      key_id: "epoch-1", recipients: [
+        "age1mmqjrejftea4f6xh47lhpc0jn4vw0yuhz349sw2e3sfl22k5gcjsv6xcvp",
+      ] }],
+  };
+  const ageConfig = { ...config, cipher_profile: "age-v1", age_v1: {
+    epoch_snapshot: snapshot,
+    checkpoint: { epoch_revision: "0", writer_generation: "0",
+      snapshot_sha256: ageSnapshotDigest(snapshot), confirmed_at: "2026-07-21T00:00:00.000Z" },
+    identity_files: {}, age_version: "v1.3.1",
+  } };
+  assert.doesNotThrow(() => validateAgeConfiguration(ageConfig));
+  assert.throws(() => validateAgeConfiguration({ ...ageConfig, age_v1: {
+    ...ageConfig.age_v1, checkpoint: { ...ageConfig.age_v1.checkpoint,
+      snapshot_sha256: "0".repeat(64) },
+  } }), /checkpoint/u);
+  assert.throws(() => validateAgeConfiguration({ ...ageConfig, age_v1: {
+    ...ageConfig.age_v1, epoch_snapshot: { ...snapshot, previous_snapshot_sha256: "1".repeat(64) },
+  } }), /previous digest/u);
+  const rotated = { ...snapshot, epoch_revision: "1", previous_snapshot_sha256: "1".repeat(64),
+    history: [...snapshot.history, { ...snapshot.history[0], epoch_revision: "1",
+      effective_from_seq: "2", key_id: "epoch-2" }] };
+  assert.throws(() => validateAgeConfiguration({ ...ageConfig, age_v1: {
+    ...ageConfig.age_v1,
+    epoch_snapshot: rotated,
+    checkpoint: { ...ageConfig.age_v1.checkpoint, epoch_revision: "1",
+      snapshot_sha256: ageSnapshotDigest(rotated) },
+  } }), /only an initial revision-0/u);
 });

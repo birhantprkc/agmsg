@@ -132,7 +132,7 @@ storage_sync_prepare_push() {
   [ "$limit" -ge 1 ] && [ "$limit" -le 1000 ] || return 13
   _sqlite_sync_schema || return $?
 
-  local prepare generation db tl input_ok version cipher key_id max_blob allow_new
+  local prepare generation db tl input_ok version cipher key_json key_id recipients max_blob allow_new
   prepare=$(cat)
   input_ok=$(printf '%s\n' "$prepare" | jq -r \
     'select(.type=="sync_prepare" and (.envelope_v|type)=="number" and
@@ -141,18 +141,31 @@ storage_sync_prepare_push() {
   [ "$input_ok" = ok ] || return 13
   version=$(printf '%s\n' "$prepare" | jq -r '.envelope_v')
   cipher=$(printf '%s\n' "$prepare" | jq -r '.cipher')
+  key_json=$(printf '%s\n' "$prepare" | jq -c '.key_id')
   key_id=$(printf '%s\n' "$prepare" | jq -r '.key_id // empty')
+  recipients=$(printf '%s\n' "$prepare" | jq -c '.recipients // []')
   max_blob=$(printf '%s\n' "$prepare" | jq -r '.max_blob_bytes')
   allow_new=$(printf '%s\n' "$prepare" | jq -r 'if .allow_new then 1 else 0 end')
-  # Stage 1 implements the cipher-neutral ABI with the plaintext profile only.
-  [ "$version" = 1 ] && [ "$cipher" = none ] && [ -z "$key_id" ] || return 13
+  [ "$version" = 1 ] || return 13
+  case "$cipher" in
+    none) [ "$key_json" = null ] && [ "$recipients" = '[]' ] || return 13 ;;
+    age-v1)
+      printf '%s\n' "$key_id" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$' || return 13
+      [ "$(printf '%s\n' "$recipients" | jq -r 'length >= 1 and length <= 256 and (all(.[]; type=="string"))')" = true ] || return 13
+      ;;
+    *) return 13 ;;
+  esac
   case "$max_blob" in ''|*[!0-9]*) return 13 ;; esac
 
   generation=$(_sqlite_sync_generation) || return 13
   _sqlite_sync_ensure_binding "$team" "$server" "$remote" "$protocol" "$generation" || return 13
   db="$(_sqlite_db)"; tl="$(_sqlite_lit "$team")"
 
-  local rows line pos local_id body at created plaintext blob bytes wire
+  local rows line pos local_id body at created envelope blob wire
+  local cipher_helper node_bin seal_request q
+  cipher_helper="${AGMSG_SYNC_CIPHER_HELPER:-$SKILL_DIR/scripts/internal/sync-cipher.mjs}"
+  node_bin="${AGMSG_SYNC_NODE_BIN:-${AGMSG_NODE:-node}}"
+  [ -f "$cipher_helper" ] || return 13
   rows=$(_sqlite_data "
     SELECT json_object('local_position',CAST(e.seq AS TEXT),'local_id',e.id,
                        'body',e.body,'at',e.at,'from_agent',e.from_agent,
@@ -187,12 +200,29 @@ storage_sync_prepare_push() {
     [ -n "$body" ] || return 13
     at=$(printf '%s\n' "$line" | jq -r '.at')
     case "$at" in ????-??-??T??:??:??Z) created="${at%Z}.000000Z" ;; *) created="$at" ;; esac
-    plaintext=$(printf '%s\n' "$line" | jq -c --arg created "$created" \
-      '{body:.body,created_at:$created,from_agent:.from_agent,to_agent:.to_agent}') || return 13
-    bytes=$(LC_ALL=C printf '%s' "$plaintext" | wc -c | tr -d ' ')
-    [ "$bytes" -ge 1 ] && [ "$bytes" -le 1048576 ] && [ "$bytes" -le "$max_blob" ] || return 13
-    blob=$(printf '%s' "$plaintext" | base64 | tr -d '\r\n') || return 13
     wire=$(_sqlite_sync_uuid4) || return 13
+    seal_request=$(printf '%s\n' "$line" | jq -c \
+      --arg type sync_seal --arg cipher "$cipher" --arg key "$key_id" \
+      --arg wire "$wire" --arg team_id "$remote" --arg created "$created" \
+      --argjson version "$version" --argjson protocol "$protocol" \
+      --argjson max_blob "$max_blob" --argjson recipients "$recipients" \
+      '{type:$type,envelope_v:$version,cipher:$cipher,
+        key_id:(if $key=="" then null else $key end),max_blob_bytes:$max_blob,
+        wire_id:$wire,team_id:$team_id,protocol_version:$protocol,recipients:$recipients,
+        projection:{body:.body,created_at:$created,from_agent:.from_agent,to_agent:.to_agent}}') || return 13
+    envelope=$(printf '%s\n' "$seal_request" | "$node_bin" "$cipher_helper" seal) || return 13
+    if ! printf '%s\n' "$envelope" | jq -e --arg cipher "$cipher" --argjson key "$key_json" \
+      '.v==1 and .cipher==$cipher and .key_id==$key and (.blob|type)=="string" and (.blob|length)>0' \
+      >/dev/null 2>&1; then
+      printf 'agmsg: cipher helper returned an invalid envelope (%s)\n' \
+        "$(printf '%s\n' "$envelope" | jq -c '{v,cipher,key_id,blob_type:(.blob|type),blob_length:(.blob|length)}' 2>/dev/null || echo unparseable)" >&2
+      return 13
+    fi
+    blob=$(printf '%s\n' "$envelope" | jq -r '.blob // empty')
+    if [ "${AGMSG_SYNC_TEST_ABORT_AFTER_SEAL:-}" = 1 ]; then
+      return 75
+    fi
+    if [ -n "$key_id" ]; then q="'$(_sqlite_lit "$key_id")'"; else q="NULL"; fi
     # INSERT OR IGNORE makes concurrent prepare calls converge on one winner;
     # the final SELECT below always emits the committed winner's bytes.
     agmsg_sqlite "$db" "BEGIN IMMEDIATE;
@@ -201,7 +231,7 @@ storage_sync_prepare_push() {
          driver_generation,local_position,local_id,wire_id,envelope_v,cipher,
          key_id,blob,direction)
       VALUES('$tl','$server','$remote',$protocol,'$generation',$pos,
-             '$(_sqlite_lit "$local_id")','$wire',1,'none',NULL,
+             '$(_sqlite_lit "$local_id")','$wire',1,'$(_sqlite_lit "$cipher")',$q,
              '$(_sqlite_lit "$blob")','push');
       COMMIT;" >/dev/null 2>&1 || return 13
   done <<EOF
@@ -378,6 +408,17 @@ storage_sync_apply_pull() {
         '$(_sqlite_lit "$received")',$v,'$(_sqlite_lit "$cipher")',$q,
         '$(_sqlite_lit "$blob")','$status','$(_sqlite_lit "$policy")',
         '$(_sqlite_lit "$local_rev")','$(_sqlite_lit "$reason")');
+      UPDATE sync_quarantine SET status='$status',
+          policy_revision='$(_sqlite_lit "$policy")',
+          local_security_revision='$(_sqlite_lit "$local_rev")',
+          reason='$(_sqlite_lit "$reason")'
+       WHERE server_instance_id='$server' AND remote_team_id='$remote'
+         AND protocol_version=$protocol AND wire_id='$wire'
+         AND server_seq='$seq' AND envelope_v=$v
+         AND cipher='$(_sqlite_lit "$cipher")'
+         AND COALESCE(key_id,'')='$(_sqlite_lit "$key_id")'
+         AND blob='$(_sqlite_lit "$blob")'
+         AND status NOT IN ('corrupt_state','imported','reconciled');
       UPDATE sync_quarantine SET status='corrupt_state',reason='wire envelope mismatch'
        WHERE server_instance_id='$server' AND remote_team_id='$remote'
          AND protocol_version=$protocol AND wire_id='$wire'
@@ -486,4 +527,34 @@ storage_sync_apply_pull() {
          WHERE qx.server_instance_id=c.server_instance_id
            AND qx.remote_team_id=c.remote_team_id
            AND qx.protocol_version=c.protocol_version AND qx.wire_id=c.wire_id);"
+}
+
+# Emits durable blocking envelopes for explicit decrypt/import reprocessing.
+# This never changes the transport cursor; apply performs any resulting state
+# transition atomically against that already-advanced cursor.
+storage_sync_reprocess() {
+  local team="$1" server="$2" remote="$3" protocol="$4" limit="$5"
+  _sqlite_sync_valid_binding "$server" "$remote" "$protocol" || return 13
+  case "$limit" in ''|*[!0-9]*) return 13 ;; esac
+  [ "$limit" -ge 1 ] && [ "$limit" -le 1000 ] || return 13
+  _sqlite_sync_schema || return $?
+  local generation tl
+  generation=$(_sqlite_sync_generation) || return 13
+  tl=$(_sqlite_lit "$team")
+  _sqlite_sync_ensure_binding "$team" "$server" "$remote" "$protocol" "$generation" || return 13
+  _sqlite_data "SELECT json_object('type','sync_state','driver_generation',
+      '$generation','transport_cursor',transport_cursor)
+    FROM sync_bindings WHERE local_team='$tl' AND server_instance_id='$server'
+      AND remote_team_id='$remote' AND protocol_version=$protocol
+      AND driver_generation='$generation';
+    SELECT json_object('type','sync_reprocess_candidate','server_seq',server_seq,
+      'id',wire_id,'server_received_at',server_received_at,
+      'envelope',json_object('v',envelope_v,'cipher',cipher,'key_id',key_id,'blob',blob),
+      'prior_status',status)
+    FROM sync_quarantine WHERE local_team='$tl' AND server_instance_id='$server'
+      AND remote_team_id='$remote' AND protocol_version=$protocol
+      AND driver_generation='$generation'
+      AND status IN ('unsupported_cipher','pending_key','authentication_failed',
+                     'malformed','policy_violation')
+    ORDER BY CAST(server_seq AS INTEGER),wire_id LIMIT $limit;"
 }

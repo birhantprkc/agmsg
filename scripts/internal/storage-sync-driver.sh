@@ -17,5 +17,7 @@ case "$op" in
              storage_sync_reconcile_push "$@" ;;
   apply)     command -v storage_sync_apply_pull >/dev/null 2>&1 || exit 14
              storage_sync_apply_pull "$@" ;;
-  *) echo "usage: storage-sync-driver.sh prepare|reconcile|apply ..." >&2; exit 2 ;;
+  reprocess) command -v storage_sync_reprocess >/dev/null 2>&1 || exit 14
+             storage_sync_reprocess "$@" ;;
+  *) echo "usage: storage-sync-driver.sh prepare|reconcile|apply|reprocess ..." >&2; exit 2 ;;
 esac

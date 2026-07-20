@@ -34,6 +34,32 @@ prepare_push() {
       and (.envelope.cipher=="none") and (.envelope.key_id==null)' >/dev/null
 }
 
+@test "sync contract: a crash after sealing publishes neither wire nor envelope" {
+  storage_send demo alice bob "seal once after recovery" >/dev/null
+  export AGMSG_SYNC_TEST_WIRE_LOG="$BATS_TEST_TMPDIR/private-wires.log"
+  export AGMSG_SYNC_REAL_CIPHER_HELPER="$SCRIPTS/internal/sync-cipher.mjs"
+  export AGMSG_SYNC_CIPHER_HELPER="$BATS_TEST_DIRNAME/fixtures/sync-cipher-capture.mjs"
+  export AGMSG_SYNC_TEST_ABORT_AFTER_SEAL=1
+  run prepare_push
+  [ "$status" -eq 75 ]
+  local db
+  db=$(agmsg_db_path)
+  [ "$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM sync_messages;" | tr -d '\r')" -eq 0 ]
+
+  unset AGMSG_SYNC_TEST_ABORT_AFTER_SEAL
+  run prepare_push
+  [ "$status" -eq 0 ]
+  local published first_private second_private
+  published=$(printf '%s\n' "$output" | jq -r 'select(.type=="sync_push_candidate") | .id')
+  first_private=$(sed -n '1p' "$AGMSG_SYNC_TEST_WIRE_LOG")
+  second_private=$(sed -n '2p' "$AGMSG_SYNC_TEST_WIRE_LOG")
+  [ -n "$first_private" ]
+  [ -n "$second_private" ]
+  [ "$first_private" != "$second_private" ]
+  [ "$published" = "$second_private" ]
+  [ "$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM sync_messages;" | tr -d '\r')" -eq 1 ]
+}
+
 @test "sync contract: reconcile advances only the acknowledged contiguous prefix" {
   storage_send demo alice bob one >/dev/null
   storage_send demo alice bob two >/dev/null
@@ -155,4 +181,34 @@ prepare_push() {
   db=$(agmsg_db_path)
   [ "$(agmsg_sqlite "$db" "SELECT status FROM sync_quarantine WHERE wire_id='$wire';" | tr -d '\r')" = policy_violation ]
   [ "$(storage_history demo | jq -s 'length')" -eq 1 ]
+}
+
+@test "sync contract: explicit reprocess imports quarantine without rewinding transport" {
+  local blocked page pending candidate reevaluated result db
+  blocked=$(jq -nc '
+    {type:"sync_pull_message",server_seq:"1",
+     id:"550e8400-e29b-41d4-a716-446655440020",
+     server_received_at:"2026-07-20T13:03:00.000000Z",
+     envelope:{v:1,cipher:"age-v1",key_id:"epoch-1",blob:"YWdlLWZpeHR1cmU="},
+     status:"pending_key",policy_revision:"0",local_security_revision:"0",
+     reason:"identity not installed"}')
+  page=$(printf '%s\n%s\n' "$blocked" '{"type":"sync_pull_cursor","next_after":"1"}')
+  printf '%s\n' "$page" | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
+  pending=$(storage_sync_reprocess demo "$SERVER_ID" "$TEAM_ID" 1 100)
+  [ "$(printf '%s\n' "$pending" | jq -s '[.[]|select(.type=="sync_reprocess_candidate")]|length')" -eq 1 ]
+  [ "$(printf '%s\n' "$pending" | jq -r 'select(.type=="sync_state")|.transport_cursor')" = 1 ]
+  candidate=$(printf '%s\n' "$pending" | jq -c 'select(.type=="sync_reprocess_candidate")')
+  reevaluated=$(printf '%s\n' "$candidate" | jq -c '
+    .type="sync_pull_message" | .status="importable" | .policy_revision="0"
+    | .local_security_revision="0" | del(.prior_status)
+    | .projection={body:"opened later",created_at:"2026-07-20T13:03:00.000000Z",
+                   from_agent:"alice",to_agent:"bob"}')
+  result=$(printf '%s\n%s\n' "$reevaluated" \
+    '{"type":"sync_pull_cursor","next_after":"1"}' \
+    | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1)
+  [ "$(printf '%s\n' "$result" | jq -sr '.[0].transport_cursor')" = 1 ]
+  [ "$(printf '%s\n' "$result" | jq -sr '[.[]|select(.status=="imported")]|length')" -eq 1 ]
+  [ "$(storage_history demo | jq -s '[.[]|select(.body=="opened later")]|length')" -eq 1 ]
+  db=$(agmsg_db_path)
+  [ "$(agmsg_sqlite "$db" "SELECT status FROM sync_quarantine WHERE wire_id='550e8400-e29b-41d4-a716-446655440020';" | tr -d '\r')" = imported ]
 }
