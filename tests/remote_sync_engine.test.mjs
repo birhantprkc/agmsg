@@ -129,8 +129,9 @@ test("Stage-1-only driver skips the optional Stage-2 network path", async () => 
 
 test("Stage-2 isolates a limit offender and continues read-only synchronization", async () => {
   const members = [
-    { member_id: "018f3f7e-0000-7000-8000-000000000010", name: "worker-1" },
-    { member_id: "018f3f7e-0000-7000-8000-000000000020", name: "worker-2" },
+    { member_id: "018f3f7e-0000-7000-8000-000000000010", name: "causal-a" },
+    { member_id: "018f3f7e-0000-7000-8000-000000000020", name: "worker-b" },
+    { member_id: "018f3f7e-0000-7000-8000-000000000030", name: "reported-c" },
   ];
   const capabilities = {
     protocol_version: 1, server_instance_id: config.server_instance_id,
@@ -151,9 +152,14 @@ test("Stage-2 isolates a limit offender and continues read-only synchronization"
       if (operation === "capabilities") return [{
         type: "sync_driver_capabilities", capabilities: ["stage1-sync", "stage2-read-state"],
       }];
-      if (operation === "read-prepare") return members.map((member) => ({
-        type: "sync_read_frontier", member_id: member.member_id, server_seq: "0",
-      }));
+      if (operation === "read-prepare") return [
+        { type: "sync_read_frontier", member_id: members[0].member_id, server_seq: "0" },
+        ...Array.from({ length: 5001 }, (_, index) => ({ type: "sync_read_exact",
+          member_id: members[0].member_id,
+          wire_id: `550e8400-e29b-4000-8000-${String(index).padStart(12, "0")}` })),
+        ...members.slice(1).map((member) => ({ type: "sync_read_frontier",
+          member_id: member.member_id, server_seq: "0" })),
+      ];
       if (operation === "read-block") {
         assert.equal(input[0].member_id, members[0].member_id);
         return [{ type: "sync_read_blocked", member_id: members[0].member_id,
@@ -168,15 +174,19 @@ test("Stage-2 isolates a limit offender and continues read-only synchronization"
       assert.equal(path, "/v1/read-state/sync");
       postCount += 1;
       const updates = JSON.parse(init.body).updates;
-      if (postCount === 1) {
-        assert.deepEqual(updates.map((update) => update.member_id),
-          members.map((member) => member.member_id));
+      if (postCount <= 4) {
+        assert.deepEqual(updates.map((update) => update.member_id), [members[0].member_id]);
+      }
+      if (postCount === 5) {
+        assert.deepEqual(updates.map((update) => update.member_id), [members[0].member_id]);
         const error = new Error("limit");
         error.code = "read-state-limit-exceeded";
-        error.body = { error: { details: { member_id: members[0].member_id } } };
+        error.body = { error: { details: { member_id: members[2].member_id } } };
         throw error;
       }
-      assert.deepEqual(updates.map((update) => update.member_id), [members[1].member_id]);
+      if (postCount > 5) {
+        assert.equal(updates.some((update) => update.member_id === members[0].member_id), false);
+      }
       return { protocol_version: 1, server_instance_id: config.server_instance_id,
         team_id: config.remote_team_id, min_available_seq: "0", current_seq: "0",
         items: members.map((member) => ({ kind: "frontier",
@@ -185,7 +195,7 @@ test("Stage-2 isolates a limit offender and continues read-only synchronization"
     },
     eventCall: async () => {},
   });
-  assert.equal(postCount, 2);
+  assert.equal(postCount, 7);
   assert.ok(operations.includes("read-block"));
   assert.ok(operations.includes("read-apply"));
 });

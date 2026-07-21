@@ -25,6 +25,7 @@ function usage() {
   remote-sync.sh once --team NAME [--limit N]
   remote-sync.sh run --team NAME [--limit N] [--interval SECONDS]
   remote-sync.sh reprocess --team NAME [--limit N]
+  remote-sync.sh unblock-read --team NAME --member-id UUID
 
 AGMSG_SYNC_TOKEN is required and is never written to config or argv.`;
 }
@@ -967,7 +968,7 @@ export async function readStateCycle(config, limit, dependencies = {}) {
   let page;
   const blockedThisCycle = new Set();
   for (const updates of batches) {
-    let remaining = updates;
+    let remaining = updates.filter((update) => !blockedThisCycle.has(update.member_id));
     for (;;) {
       try {
         page = await requestCall(config, "/v1/read-state/sync", { method: "POST",
@@ -975,9 +976,13 @@ export async function readStateCycle(config, limit, dependencies = {}) {
           body: JSON.stringify({ updates: remaining, page_after: null, page_limit: pageLimit }) });
         break;
       } catch (error) {
-        const memberId = error?.body?.error?.details?.member_id;
-        if (error?.code !== "read-state-limit-exceeded" || !UUID_V7.test(memberId ?? "") ||
-            !members.some((member) => member.member_id === memberId) || blockedThisCycle.has(memberId)) {
+        const reportedMemberId = error?.body?.error?.details?.member_id;
+        const memberId = remaining.some((update) => update.member_id === reportedMemberId)
+          ? reportedMemberId
+          : remaining.find((update) => update.exact_wire_ids.length > 0)?.member_id;
+        if (error?.code !== "read-state-limit-exceeded" || !UUID_V7.test(reportedMemberId ?? "") ||
+            !members.some((member) => member.member_id === reportedMemberId) ||
+            !UUID_V7.test(memberId ?? "") || blockedThisCycle.has(memberId)) {
           throw error;
         }
         blockedThisCycle.add(memberId);
@@ -985,7 +990,7 @@ export async function readStateCycle(config, limit, dependencies = {}) {
           reason: "read-state-limit-exceeded" }]);
         remaining = remaining.filter((update) => update.member_id !== memberId);
         await eventCall("read-state.blocked", { member_id: memberId,
-          reason: "read-state-limit-exceeded" });
+          reported_member_id: reportedMemberId, reason: "read-state-limit-exceeded" });
       }
     }
   }
@@ -1135,12 +1140,22 @@ async function reprocessCycle(config, limit) {
 async function main() {
   const [command, ...rest] = process.argv.slice(2);
   const args = options(rest);
-  if (!["configure", "once", "run", "reprocess"].includes(command)) throw new Error(usage());
+  if (!["configure", "once", "run", "reprocess", "unblock-read"].includes(command)) {
+    throw new Error(usage());
+  }
   if (command === "configure") { await configure(args); return; }
   const team = requireName(args.team, "team");
   const limit = Number(args.limit ?? 100);
   if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new Error("limit must be 1..1000");
   const config = await loadConfig(team);
+  if (command === "unblock-read") {
+    if (!UUID_V7.test(args["member-id"] ?? "")) throw new Error("member-id must be a canonical UUIDv7");
+    const result = await driver("read-unblock", config, [{
+      type: "sync_read_unblock", member_id: args["member-id"],
+    }]);
+    await event("read-state.unblocked", { member_id: args["member-id"], result: result[0] ?? null });
+    return;
+  }
   if (command === "reprocess") { await reprocessCycle(config, limit); return; }
   if (command === "once") { await cycle(config, limit); return; }
   const interval = Number(args.interval ?? 5);

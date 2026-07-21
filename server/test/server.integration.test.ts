@@ -323,6 +323,68 @@ describeDatabase("remote storage HTTP API v1", () => {
     expect(future.json().error.code).toBe("invalid-request");
   });
 
+  it("attributes a team-wide exact overflow to a causal request member", async () => {
+    const causalWire = "750e8400-e29b-41d4-a716-446655440009";
+    const causalMember = "018f3f7e-0000-7000-8000-000000000099";
+    await pool.query(
+      `INSERT INTO message_tombstones(team_id,id,original_team_seq,envelope_digest)
+       VALUES($1,$2,1,decode(repeat('00',32),'hex'))`,
+      [teamId, causalWire],
+    );
+    await pool.query(
+      `INSERT INTO members(team_id, member_id, name)
+       SELECT $1,
+         ('018f3f7e-0000-7000-8000-' || lpad(value::text, 12, '0'))::uuid,
+         'limit-member-' || value::text
+       FROM generate_series(100, 115) AS value`,
+      [teamId],
+    );
+    await pool.query(
+      "INSERT INTO members(team_id,member_id,name) VALUES($1,$2,'limit-causal-member')",
+      [teamId, causalMember],
+    );
+    await pool.query(
+      `INSERT INTO read_exact(team_id, member_id, wire_id)
+       SELECT $1,
+         ('018f3f7e-0000-7000-8000-' ||
+           lpad((100 + ((value - 1) / 4096))::text, 12, '0'))::uuid,
+         ('550e8400-e29b-4000-8000-' || lpad(value::text, 12, '0'))::uuid
+       FROM generate_series(1, 65536) AS value`,
+      [teamId],
+    );
+    const seeded = await pool.query<{ count: string }>(
+      "SELECT COUNT(*)::text AS count FROM read_exact WHERE team_id=$1",
+      [teamId],
+    );
+    expect(seeded.rows[0]?.count).toBe("65536");
+    try {
+      const overflow = await app.inject({
+        method: "POST",
+        url: "/v1/read-state/sync",
+        headers,
+        payload: {
+          updates: [{ member_id: causalMember, server_seq: "0", exact_wire_ids: [causalWire] }],
+          page_after: null,
+          page_limit: 1,
+        },
+      });
+      expect(overflow.statusCode).toBe(409);
+      expect(overflow.json().error).toMatchObject({
+        code: "read-state-limit-exceeded",
+        details: { member_id: causalMember, team_exact_count: "65537" },
+      });
+    } finally {
+      await pool.query(
+        `DELETE FROM members WHERE team_id=$1 AND name LIKE 'limit-%'`,
+        [teamId],
+      );
+      await pool.query(
+        "DELETE FROM message_tombstones WHERE team_id=$1 AND id=$2",
+        [teamId, causalWire],
+      );
+    }
+  });
+
   it("serializes concurrent writers on the team row", async () => {
     const writes = await Promise.all(
       [

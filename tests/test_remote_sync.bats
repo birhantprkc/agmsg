@@ -257,6 +257,7 @@ prepare_push() {
 @test "Stage-2 rename mismatch blocks remote frontier in either ordering" {
   local old_context new_context prepared db member
   member=018f3f7e-0000-7000-8000-000000000010
+  storage_send demo alice bob "local bob authority" >/dev/null
   old_context=$(jq -nc --arg member "$member" '
     {type:"sync_read_context",min_available_seq:"0",current_seq:"0",
      members:[{member_id:$member,name:"bob"}]}')
@@ -273,6 +274,7 @@ prepare_push() {
   [ "$(printf '%s\n' "$prepared" | jq -s '[.[]|select(.type=="sync_read_frontier")]|length')" -eq 0 ]
 
   db=$(agmsg_db_path)
+  agmsg_sqlite "$db" "UPDATE events SET to_agent='robert' WHERE team='demo' AND to_agent='bob';" >/dev/null
   agmsg_sqlite "$db" "UPDATE sync_read_members SET agent='robert',
     name_mismatch=CASE WHEN remote_agent='robert' THEN 0 ELSE 1 END
     WHERE local_team='demo' AND member_id='$member';" >/dev/null
@@ -283,9 +285,24 @@ prepare_push() {
   [ "$(printf '%s\n' "$prepared" | jq -s '[.[]|select(.type=="sync_read_frontier")]|length')" -eq 0 ]
 }
 
-@test "Stage-2 exact limit block is durable and clears only after safe recomputation" {
+@test "Stage-2 initial remote name without local authority is blocked" {
+  local context prepared member
+  member=018f3f7e-0000-7000-8000-000000000010
+  storage_send demo bob alice "local alice only" >/dev/null
+  context=$(jq -nc --arg member "$member" '
+    {type:"sync_read_context",min_available_seq:"0",current_seq:"0",
+     members:[{member_id:$member,name:"bob"}]}')
+  prepared=$(printf '%s\n' "$context" |
+    storage_sync_prepare_read_state demo "$SERVER_ID" "$TEAM_ID" 1)
+  [ "$(printf '%s\n' "$prepared" | jq -r 'select(.type=="sync_read_blocked")|.reason')" = \
+    member-name-mismatch ]
+  [ "$(printf '%s\n' "$prepared" | jq -s '[.[]|select(.type=="sync_read_frontier" or .type=="sync_read_exact")]|length')" -eq 0 ]
+}
+
+@test "Stage-2 exact limit block persists until explicit operator unblock" {
   local context member db result prepared
   member=018f3f7e-0000-7000-8000-000000000010
+  storage_send demo alice bob "local bob authority" >/dev/null
   context=$(jq -nc --arg member "$member" '
     {type:"sync_read_context",min_available_seq:"0",current_seq:"0",
      members:[{member_id:$member,name:"bob"}]}')
@@ -300,6 +317,12 @@ prepare_push() {
     read-state-limit-exceeded ]
   prepared=$(printf '%s\n' "$context" |
     storage_sync_prepare_read_state demo "$SERVER_ID" "$TEAM_ID" 1)
+  [ "$(printf '%s\n' "$prepared" | jq -r 'select(.type=="sync_read_blocked")|.reason')" = \
+    read-state-limit-exceeded ]
+  result=$(jq -nc --arg member "$member" '{type:"sync_read_unblock",member_id:$member}' |
+    storage_sync_unblock_read_state demo "$SERVER_ID" "$TEAM_ID" 1)
+  [ "$(printf '%s\n' "$result" | jq -r '.type')" = sync_read_unblocked ]
+  prepared=$(printf '%s\n' "$context" |
+    storage_sync_prepare_read_state demo "$SERVER_ID" "$TEAM_ID" 1)
   [ "$(printf '%s\n' "$prepared" | jq -s '[.[]|select(.type=="sync_read_frontier")]|length')" -eq 1 ]
-  [ -z "$(agmsg_sqlite "$db" "SELECT blocked_reason FROM sync_read_members WHERE member_id='$member';" | tr -d '\r')" ]
 }

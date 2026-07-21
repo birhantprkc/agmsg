@@ -308,10 +308,15 @@ other members. It MAY continue read-only pagination so incoming remote facts are
 not lost. It MUST NOT busy-retry the rejected update or discard exact facts.
 
 The error details include the offending `member_id`, per-member and team counts,
-and both limits. If the oldest hole is a normal imported unread message, operator
+and both limits. For a team-wide overflow the member is selected from the
+current request's newly added exact facts, not merely from the largest existing
+set, so iterative isolation converges. If the oldest hole is a normal imported unread message, operator
 remediation is its ordinary authorized consume. If it is blocking quarantine,
 the cause must be resolved and the envelope reprocessed so the frontier can
-advance. A future explicit terminal/non-display disposition may provide another
+advance. The durable block is cleared only by the explicit operator command
+`remote-sync.sh unblock-read --team NAME --member-id UUID`; the following
+cycle either succeeds after remediation or durably blocks the member again. A
+future explicit terminal/non-display disposition may provide another
 monotonic remediation, but silently skipping poison or resetting read state is
 forbidden.
 

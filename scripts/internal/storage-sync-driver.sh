@@ -29,5 +29,7 @@ case "$op" in
               storage_sync_apply_read_state "$@" ;;
   read-block) command -v storage_sync_block_read_state >/dev/null 2>&1 || exit 14
               storage_sync_block_read_state "$@" ;;
-  *) echo "usage: storage-sync-driver.sh capabilities|prepare|reconcile|apply|reprocess|read-prepare|read-apply|read-block ..." >&2; exit 2 ;;
+  read-unblock) command -v storage_sync_unblock_read_state >/dev/null 2>&1 || exit 14
+                storage_sync_unblock_read_state "$@" ;;
+  *) echo "usage: storage-sync-driver.sh capabilities|prepare|reconcile|apply|reprocess|read-prepare|read-apply|read-block|read-unblock ..." >&2; exit 2 ;;
 esac

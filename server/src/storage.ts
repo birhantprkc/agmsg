@@ -326,7 +326,16 @@ export async function syncReadState(
       }
     }
 
-    const exactIds = [...new Set(input.updates.flatMap((update) => update.exact_wire_ids))];
+    const exactMembers: string[] = [];
+    const exactWires: string[] = [];
+    for (const update of input.updates) {
+      for (const wireId of update.exact_wire_ids) {
+        exactMembers.push(update.member_id);
+        exactWires.push(wireId);
+      }
+    }
+    const exactIds = [...new Set(exactWires)];
+    const novelExactMembers = new Set<string>();
     if (exactIds.length > 0) {
       const resolved = await client.query<{ id: string }>(
         `SELECT id::text FROM messages WHERE team_id = $1 AND id = ANY($2::uuid[])
@@ -346,6 +355,16 @@ export async function syncReadState(
           binding,
         );
       }
+      const novel = await client.query<{ member_id: string }>(
+        `SELECT DISTINCT incoming.member_id::text
+           FROM unnest($2::uuid[], $3::uuid[]) AS incoming(member_id, wire_id)
+           LEFT JOIN read_exact existing
+             ON existing.team_id=$1 AND existing.member_id=incoming.member_id
+            AND existing.wire_id=incoming.wire_id
+          WHERE existing.wire_id IS NULL`,
+        [teamId, exactMembers, exactWires],
+      );
+      for (const row of novel.rows) novelExactMembers.add(row.member_id);
     }
 
     // The authenticated retention floor is a safe baseline for every existing
@@ -373,14 +392,6 @@ export async function syncReadState(
       );
     }
 
-    const exactMembers: string[] = [];
-    const exactWires: string[] = [];
-    for (const update of input.updates) {
-      for (const wireId of update.exact_wire_ids) {
-        exactMembers.push(update.member_id);
-        exactWires.push(wireId);
-      }
-    }
     if (exactWires.length > 0) {
       await client.query(
         `INSERT INTO read_exact(team_id, member_id, wire_id)
@@ -406,11 +417,14 @@ export async function syncReadState(
     );
     const teamCount = Number(teamCountResult.rows[0]?.exact_count ?? "0");
     if (memberOverflow.rows[0] || teamCount > MAX_EXACT_PER_TEAM) {
+      const causalMemberId = input.updates.find((update) =>
+        novelExactMembers.has(update.member_id))?.member_id;
       const offender = memberOverflow.rows[0] ?? (await client.query<{ member_id: string; exact_count: string }>(
         `SELECT member_id::text, COUNT(*)::text AS exact_count
            FROM read_exact WHERE team_id = $1
+            AND ($2::uuid IS NULL OR member_id=$2::uuid)
           GROUP BY member_id ORDER BY COUNT(*) DESC, member_id LIMIT 1`,
-        [teamId],
+        [teamId, causalMemberId ?? null],
       )).rows[0];
       throw new ProtocolError(
         409,

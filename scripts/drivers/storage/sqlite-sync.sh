@@ -699,7 +699,11 @@ EOF
 
   agmsg_sqlite "$db" "BEGIN IMMEDIATE;
     CREATE TEMP TABLE incoming_read_members(member_id TEXT UNIQUE,agent TEXT UNIQUE);
+    CREATE TEMP TABLE local_read_agents(agent TEXT PRIMARY KEY);
     $insert_members
+    INSERT OR IGNORE INTO local_read_agents
+      SELECT to_agent FROM events WHERE type='message_sent' AND team='$tl' AND to_agent IS NOT NULL
+      UNION SELECT agent FROM read_cursors WHERE team='$tl';
     UPDATE sync_read_members SET active=0 WHERE local_team='$tl'
       AND server_instance_id='$server' AND remote_team_id='$remote'
       AND protocol_version=$protocol AND driver_generation='$generation';
@@ -707,12 +711,16 @@ EOF
       (local_team,server_instance_id,remote_team_id,protocol_version,
        driver_generation,member_id,agent,remote_agent,active,name_mismatch,
        remote_server_seq,min_available_seq)
-    SELECT '$tl','$server','$remote',$protocol,'$generation',member_id,agent,agent,1,0,
+    SELECT '$tl','$server','$remote',$protocol,'$generation',member_id,agent,agent,1,
+           CASE WHEN EXISTS(SELECT 1 FROM local_read_agents l WHERE l.agent=incoming_read_members.agent)
+                THEN 0 ELSE 1 END,
            '$floor','$floor' FROM incoming_read_members WHERE 1
     ON CONFLICT(local_team,server_instance_id,remote_team_id,protocol_version,
                 driver_generation,member_id) DO UPDATE SET
       remote_agent=excluded.agent,active=1,
-      name_mismatch=CASE WHEN sync_read_members.agent=excluded.agent THEN 0 ELSE 1 END,
+      name_mismatch=CASE WHEN sync_read_members.agent=excluded.agent
+        AND EXISTS(SELECT 1 FROM local_read_agents l WHERE l.agent=excluded.agent)
+        THEN 0 ELSE 1 END,
       remote_server_seq=CAST(MAX(CAST(sync_read_members.remote_server_seq AS INTEGER),$floor) AS TEXT),
       min_available_seq=CAST(MAX(CAST(sync_read_members.min_available_seq AS INTEGER),$floor) AS TEXT);
     INSERT OR IGNORE INTO sync_read_aliases
@@ -786,33 +794,6 @@ EOF
        AND rm.remote_team_id='$remote' AND rm.protocol_version=$protocol
        AND rm.driver_generation='$generation' AND rm.active=1
        AND rm.name_mismatch=0;
-    UPDATE sync_read_members AS rm SET blocked_reason=NULL
-     WHERE rm.local_team='$tl' AND rm.server_instance_id='$server'
-       AND rm.remote_team_id='$remote' AND rm.protocol_version=$protocol
-       AND rm.driver_generation='$generation' AND rm.active=1
-       AND rm.name_mismatch=0 AND rm.blocked_reason='read-state-limit-exceeded'
-       AND (SELECT COUNT(*) FROM (
-         SELECT x.wire_id FROM sync_read_aliases x JOIN sync_read_prepared f
-           ON f.local_team=rm.local_team AND f.server_instance_id=rm.server_instance_id
-          AND f.remote_team_id=rm.remote_team_id AND f.protocol_version=rm.protocol_version
-          AND f.driver_generation=rm.driver_generation AND f.member_id=rm.member_id
-          WHERE x.local_team=rm.local_team AND x.server_instance_id=rm.server_instance_id
-            AND x.remote_team_id=rm.remote_team_id AND x.protocol_version=rm.protocol_version
-            AND x.driver_generation=rm.driver_generation AND x.agent=rm.agent
-            AND x.server_seq IS NOT NULL AND CAST(x.server_seq AS INTEGER)>CAST(f.server_seq AS INTEGER)
-         UNION
-         SELECT x.wire_id FROM sync_read_remote_exact x JOIN sync_read_prepared f
-           ON f.local_team=rm.local_team AND f.server_instance_id=rm.server_instance_id
-          AND f.remote_team_id=rm.remote_team_id AND f.protocol_version=rm.protocol_version
-          AND f.driver_generation=rm.driver_generation AND f.member_id=rm.member_id
-          LEFT JOIN sync_messages m ON m.server_instance_id=x.server_instance_id
-           AND m.remote_team_id=x.remote_team_id AND m.protocol_version=x.protocol_version
-           AND m.wire_id=x.wire_id
-          WHERE x.local_team=rm.local_team AND x.server_instance_id=rm.server_instance_id
-            AND x.remote_team_id=rm.remote_team_id AND x.protocol_version=rm.protocol_version
-            AND x.driver_generation=rm.driver_generation AND x.member_id=rm.member_id
-            AND (m.server_seq IS NULL OR CAST(m.server_seq AS INTEGER)>CAST(f.server_seq AS INTEGER))
-       ))<=4096;
     COMMIT;" >/dev/null || return 13
 
   _sqlite_data "SELECT json_object('type','sync_read_frontier','member_id',f.member_id,
@@ -869,6 +850,31 @@ storage_sync_block_read_state() {
     INSERT INTO sync_read_block_assert VALUES(changes());
     COMMIT;" >/dev/null || return 13
   printf '{"type":"sync_read_blocked","member_id":"%s","reason":"%s"}\n' "$member" "$reason"
+}
+
+storage_sync_unblock_read_state() {
+  local team="$1" server="$2" remote="$3" protocol="$4"
+  _sqlite_sync_valid_binding "$server" "$remote" "$protocol" || return 13
+  _sqlite_sync_schema || return $?
+  local generation db tl input member
+  generation=$(_sqlite_sync_generation) || return 13
+  db="$(_sqlite_db)"; tl="$(_sqlite_lit "$team")"; input=$(cat)
+  member=$(printf '%s\n' "$input" | jq -r 'select(.type=="sync_read_unblock")|.member_id // empty')
+  printf '%s\n' "$member" | grep -Eq \
+    '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' || return 13
+  agmsg_sqlite "$db" "BEGIN IMMEDIATE;
+    CREATE TEMP TABLE sync_read_unblock_assert(ok INTEGER CHECK(ok=1));
+    INSERT INTO sync_read_unblock_assert SELECT COUNT(*) FROM sync_read_members
+     WHERE local_team='$tl' AND server_instance_id='$server'
+       AND remote_team_id='$remote' AND protocol_version=$protocol
+       AND driver_generation='$generation' AND member_id='$member' AND active=1;
+    UPDATE sync_read_members SET blocked_reason=NULL
+     WHERE local_team='$tl' AND server_instance_id='$server'
+       AND remote_team_id='$remote' AND protocol_version=$protocol
+       AND driver_generation='$generation' AND member_id='$member' AND active=1
+       AND blocked_reason='read-state-limit-exceeded';
+    COMMIT;" >/dev/null || return 13
+  printf '{"type":"sync_read_unblocked","member_id":"%s"}\n' "$member"
 }
 
 # Merge one authenticated server read-state page and project coverage only onto
