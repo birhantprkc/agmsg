@@ -8,6 +8,7 @@ import {
   driver,
   isRetryable,
   plaintextWriteEligible,
+  readStateUpdateBatches,
   request,
   retainAgeCheckpoint,
   selectWriteProfile,
@@ -16,6 +17,8 @@ import {
   validateConfiguredAgeIdentities,
   validateCapabilities,
   validateErrorBinding,
+  validateMembers,
+  validateReadStatePage,
 } from "../scripts/internal/remote-sync.mjs";
 
 const config = {
@@ -47,6 +50,37 @@ test("ack mapping rejects reversed and duplicate server sequences", () => {
     { id: candidates[0].id, server_seq: "1", disposition: "stored", extra: true },
     { id: candidates[1].id, server_seq: "2", disposition: "stored" },
   ]), /shape/u);
+});
+
+test("Stage-2 roster, update batches, and response pages are canonical", () => {
+  const members = [{ member_id: "018f3f7e-0000-7000-8000-000000000010", name: "worker-1" }];
+  assert.deepEqual(validateMembers(config, {
+    protocol_version: 1, server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id, min_available_seq: "0", members_revision: "1",
+    members: [{ ...members[0], registrations: [] }],
+  }), members);
+  const exact = Array.from({ length: 1001 }, (_, index) =>
+    `550e8400-e29b-41d4-a716-${String(index).padStart(12, "0")}`);
+  const batches = readStateUpdateBatches(members, [
+    { type: "sync_read_frontier", member_id: members[0].member_id, server_seq: "7" },
+    ...exact.map((wire_id) => ({ type: "sync_read_exact", member_id: members[0].member_id, wire_id })),
+  ]);
+  assert.equal(batches.length, 2);
+  assert.equal(batches[0][0].exact_wire_ids.length, 1000);
+  assert.equal(batches[1][0].exact_wire_ids.length, 1);
+
+  assert.doesNotThrow(() => validateReadStatePage(config, {
+    protocol_version: 1, server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id, min_available_seq: "4", current_seq: "9",
+    items: [{ kind: "frontier", member_id: members[0].member_id, server_seq: "7" }],
+    next_page_after: { member_id: members[0].member_id, kind: "frontier" }, has_more: true,
+  }, 1));
+  assert.throws(() => validateReadStatePage(config, {
+    protocol_version: 1, server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id, min_available_seq: "4", current_seq: "9",
+    items: [{ kind: "frontier", member_id: members[0].member_id, server_seq: "3" }],
+    next_page_after: null, has_more: false,
+  }, 1), /item is invalid/u);
 });
 
 test("resolved protocol errors enforce the immutable binding", () => {
