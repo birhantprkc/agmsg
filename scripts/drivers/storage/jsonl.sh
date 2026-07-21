@@ -229,10 +229,21 @@ _jsonl_read_cursor_write_locked() {
 
 _jsonl_read_cursor_consume_locked() {
   local team="$1" agent="$2" target="$3"; shift 3
-  local current safe log
+  local current safe log tip normalized
   current=$(storage_read_cursor_get "$team" "$agent") || return 1
   _jsonl_mark "$team" "$agent" "$@" || return 1
   log="$(_jsonl_log)"
+  tip=$(jq -s '[.[] | select(.type=="message_sent")] | length' "$log") || return 1
+  # Cap against the same locked log snapshot. Compare canonical decimal strings
+  # instead of shell integers so a maliciously huge target cannot overflow the
+  # host shell before it is reduced to the real tip.
+  normalized=$(printf '%s' "$target" | sed 's/^0*//'); [ -n "$normalized" ] || normalized=0
+  target="$normalized"
+  if [ "${#target}" -gt "${#tip}" ] || {
+    [ "${#target}" -eq "${#tip}" ] && [[ "$target" > "$tip" ]];
+  }; then
+    target="$tip"
+  fi
   safe=$(jq -r --arg team "$team" --arg agent "$agent" --argjson current "$current" \
     --argjson target "$target" -s -f "$_JSONL_DRIVER_DIR/jsonl-read-cursor.jq" "$log") || return 1
   [ "$safe" -ge "$current" ] || safe="$current"
@@ -292,11 +303,17 @@ storage_watch_after() {
   # One file read = one snapshot: the trailing cursor (total message_sent count)
   # is computed from the same scan, so it never runs ahead of the rows returned.
   jq -c --argjson cursor "$cursor" --argjson pairs "$pairs_json" -s '
-    [.[] | select(.type=="message_sent")] as $sent
+    . as $events
+    | (reduce $events[] as $event ({};
+        if $event.type=="message_read" then
+          .[([$event.team,$event.agent,$event.msg_id] | tojson)] = true
+        else . end)) as $read
+    | [$events[] | select(.type=="message_sent")] as $sent
     | ($sent
         | to_entries
         | map(select((.key >= $cursor)
-              and ((.value.team + ":" + .value.to) as $p | ($pairs | index($p)) != null)))
+              and ((.value.team + ":" + .value.to) as $p | ($pairs | index($p)) != null)
+              and (($read[[.value.team,.value.to,.value.id] | tojson] // false) | not)))
         | .[].value
         | {type:"message_sent",id:.id,team:.team,from:.from,to:.to,body:.body,at:.at}),
       {type:"cursor",cursor:(($sent | length) | tostring)}

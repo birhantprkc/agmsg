@@ -221,10 +221,12 @@ storage_read_cursor_consume() {
     UPDATE read_cursors SET local_position=MAX(local_position,COALESCE((
       SELECT MIN(e.seq)-1 FROM events e
        WHERE e.type='message_sent' AND e.team='$tl' AND e.to_agent='$al'
-         AND e.seq>read_cursors.local_position AND e.seq<=$target
+         AND e.seq>read_cursors.local_position
+         AND e.seq<=MIN($target,$(_sqlite_highwater))
          AND NOT EXISTS(SELECT 1 FROM events r WHERE r.type='message_read'
            AND r.team=e.team AND r.agent='$al' AND r.msg_id=e.id)
-    ),$target)) WHERE team='$tl' AND agent='$al';
+    ),MIN($target,$(_sqlite_highwater))))
+    WHERE team='$tl' AND agent='$al';
     COMMIT;" >/dev/null 2>&1 || { echo runtime_error; return 13; }
   echo ok
 }
@@ -303,6 +305,9 @@ storage_watch_after() {
     FROM events
     WHERE type='message_sent' AND seq > $cursor
       AND (team || ':' || to_agent) IN ($pairs)
+      AND NOT EXISTS(SELECT 1 FROM events r
+        WHERE r.type='message_read' AND r.team=events.team
+          AND r.agent=events.to_agent AND r.msg_id=events.id)
     ORDER BY seq ASC;
     SELECT json_object('type','cursor','cursor',
                        CAST(MAX($cursor, $(_sqlite_highwater)) AS TEXT));

@@ -92,6 +92,28 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
   [ "$(storage_read_cursor_get agsuite bob)" = "$tip" ]
 }
 
+@test "contract: read cursor cannot advance beyond the current driver tip" {
+  storage_read_cursor_consume agsuite bob 999999 >/dev/null
+  [ "$(storage_read_cursor_get agsuite bob)" = "0" ]
+  storage_send agsuite alice bob "not-skipped-by-future-cursor" >/dev/null
+  run storage_list_unread agsuite bob
+  [[ "$output" == *not-skipped-by-future-cursor* ]]
+}
+
+@test "contract: watch_after excludes an exact read beyond an earlier gap" {
+  local first second tip
+  first=$(storage_send agsuite alice bob "watch-gap")
+  second=$(storage_send agsuite alice bob "watch-exact")
+  tip=$(storage_watch_tip agsuite:bob)
+  storage_read_cursor_consume agsuite bob "$tip" "$second" >/dev/null
+
+  run storage_watch_after 0 agsuite:bob
+  [[ "$output" == *"$first"* ]]
+  [[ "$output" != *"$second"* ]]
+  [[ "$output" == *watch-gap* ]]
+  [[ "$output" != *watch-exact* ]]
+}
+
 @test "contract: cursor migration consumes existing backlog but not later messages" {
   storage_send agsuite alice bob "before-cursor-migration" >/dev/null
 
