@@ -361,6 +361,77 @@ storage_compact() {
   _jsonl_with_lock _jsonl_compact_do || { echo runtime_error; return 13; }
   echo ok
 }
+
+# Internal rename hooks keep the store-owned cursor beside its rewritten event
+# identity. The cursor file briefly contains both keys before the log flips, so
+# a crash can only leave a redundant cursor key, never a message with no usable
+# read frontier.
+_jsonl_rename_agent_locked() {
+  local team="$1" old="$2" new="$3" log cursors log_tmp dual_tmp clean_tmp
+  log="$(_jsonl_log)"; cursors="$(_jsonl_read_cursors)"
+  log_tmp=$(mktemp "${log}.rename.XXXXXX") || return 1
+  dual_tmp=$(mktemp "${cursors}.rename-dual.XXXXXX") || { rm -f "$log_tmp"; return 1; }
+  clean_tmp=$(mktemp "${cursors}.rename-clean.XXXXXX") || {
+    rm -f "$log_tmp" "$dual_tmp"; return 1;
+  }
+  jq -c --arg team "$team" --arg old "$old" --arg new "$new" '
+    if .team != $team then .
+    elif .type == "message_sent" then
+      (if .from == $old then .from = $new else . end) |
+      (if .to == $old then .to = $new else . end)
+    elif .type == "message_read" and .agent == $old then .agent = $new
+    else . end' "$log" > "$log_tmp" || {
+      rm -f "$log_tmp" "$dual_tmp" "$clean_tmp"; return 1;
+    }
+  awk -F '\t' -v OFS='\t' -v team="$team" -v old="$old" -v new="$new" '
+    $1==team && $2==old { print; $2=new; print; next } { print }' "$cursors" > "$dual_tmp" || {
+      rm -f "$log_tmp" "$dual_tmp" "$clean_tmp"; return 1;
+    }
+  awk -F '\t' -v OFS='\t' -v team="$team" -v old="$old" '
+    !($1==team && $2==old) { print }' "$dual_tmp" > "$clean_tmp" || {
+      rm -f "$log_tmp" "$dual_tmp" "$clean_tmp"; return 1;
+    }
+  mv "$dual_tmp" "$cursors" && mv "$log_tmp" "$log" && mv "$clean_tmp" "$cursors" || {
+    rm -f "$log_tmp" "$dual_tmp" "$clean_tmp"; return 1;
+  }
+}
+
+storage_rename_agent() {
+  _jsonl_init_file || { echo runtime_error; return 13; }
+  _jsonl_with_lock _jsonl_rename_agent_locked "$1" "$2" "$3" || {
+    echo runtime_error; return 13;
+  }
+  echo ok
+}
+
+_jsonl_rename_team_locked() {
+  local old="$1" new="$2" log cursors log_tmp dual_tmp clean_tmp
+  log="$(_jsonl_log)"; cursors="$(_jsonl_read_cursors)"
+  log_tmp=$(mktemp "${log}.rename.XXXXXX") || return 1
+  dual_tmp=$(mktemp "${cursors}.rename-dual.XXXXXX") || { rm -f "$log_tmp"; return 1; }
+  clean_tmp=$(mktemp "${cursors}.rename-clean.XXXXXX") || {
+    rm -f "$log_tmp" "$dual_tmp"; return 1;
+  }
+  jq -c --arg old "$old" --arg new "$new" 'if .team == $old then .team = $new else . end' \
+    "$log" > "$log_tmp" || { rm -f "$log_tmp" "$dual_tmp" "$clean_tmp"; return 1; }
+  awk -F '\t' -v OFS='\t' -v old="$old" -v new="$new" '
+    $1==old { print; $1=new; print; next } { print }' "$cursors" > "$dual_tmp" || {
+      rm -f "$log_tmp" "$dual_tmp" "$clean_tmp"; return 1;
+    }
+  awk -F '\t' -v OFS='\t' -v old="$old" '$1!=old { print }' \
+    "$dual_tmp" > "$clean_tmp" || { rm -f "$log_tmp" "$dual_tmp" "$clean_tmp"; return 1; }
+  mv "$dual_tmp" "$cursors" && mv "$log_tmp" "$log" && mv "$clean_tmp" "$cursors" || {
+    rm -f "$log_tmp" "$dual_tmp" "$clean_tmp"; return 1;
+  }
+}
+
+storage_rename_team() {
+  _jsonl_init_file || { echo runtime_error; return 13; }
+  _jsonl_with_lock _jsonl_rename_team_locked "$1" "$2" || {
+    echo runtime_error; return 13;
+  }
+  echo ok
+}
 _jsonl_compact_do() {
   local log tmp; log="$(_jsonl_log)"; tmp="$log.compact.$$"
   # Keep every message_sent in order; collapse duplicate message_read for the same

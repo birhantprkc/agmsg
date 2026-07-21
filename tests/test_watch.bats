@@ -33,6 +33,27 @@ run_watcher_for() {
   wait "$pid" 2>/dev/null || true
 }
 
+run_watcher_until() {
+  local sid="$1" out="$2" needle="$3" before
+  before=$(_read_cursor team alice 2>/dev/null || echo 0)
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- 4>&- &
+  local pid=$!
+  _wait_for_file_contains "$out" "$needle"
+  local found=$?
+  if [ "$found" -eq 0 ]; then
+    local i cursor
+    for i in $(seq 1 100); do
+      cursor=$(_read_cursor team alice 2>/dev/null || echo 0)
+      [ "${cursor:-0}" -gt "${before:-0}" ] && break
+      sleep 0.1
+    done
+    [ "${cursor:-0}" -gt "${before:-0}" ] || found=1
+  fi
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  return "$found"
+}
+
 # Compute the per-process instance id (#93) that watch.sh / session-end key on
 # for <sid>, the same way the scripts do. Resolves to a composite "<sid>.<pid>"
 # when an agent ancestor is present (e.g. running the suite under a Claude Code
@@ -67,6 +88,7 @@ _wait_for_file() {
     [ -f "$file" ] && return 0
     sleep 0.1
   done
+  [ "${cursor:-0}" -gt 0 ]
   return 1
 }
 
@@ -98,7 +120,13 @@ _wait_for_file_contains() {
   local w1=$!
   sleep 1.5
   bash "$SCRIPTS/send.sh" team bob alice "M1-before-stop" >/dev/null
-  sleep 2
+  _wait_for_file_contains "$TEST_SKILL_DIR/out1.log" "M1-before-stop"
+  local i cursor
+  for i in $(seq 1 100); do
+    cursor=$(_read_cursor team alice 2>/dev/null || echo 0)
+    [ "${cursor:-0}" -gt 0 ] && break
+    sleep 0.1
+  done
   kill "$w1" 2>/dev/null || true
   wait "$w1" 2>/dev/null || true
   grep -q "M1-before-stop" "$TEST_SKILL_DIR/out1.log"
@@ -120,11 +148,11 @@ _wait_for_file_contains() {
   # Pre-existing message before any watcher for this session ever runs.
   bash "$SCRIPTS/send.sh" team bob alice "M0-history" >/dev/null
 
-  run_watcher_for "sess-fresh" "$TEST_SKILL_DIR/fresh1.log" 2
+  run_watcher_until "sess-fresh" "$TEST_SKILL_DIR/fresh1.log" "M0-history"
   grep -q "M0-history" "$TEST_SKILL_DIR/fresh1.log"
 
   bash "$SCRIPTS/send.sh" team bob alice "M-live" >/dev/null
-  run_watcher_for "sess-fresh2" "$TEST_SKILL_DIR/fresh2.log" 2
+  run_watcher_until "sess-fresh2" "$TEST_SKILL_DIR/fresh2.log" "M-live"
   grep -q "M-live" "$TEST_SKILL_DIR/fresh2.log"
   ! grep -q "M0-history" "$TEST_SKILL_DIR/fresh2.log"
 }
