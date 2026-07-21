@@ -31,8 +31,9 @@ Before changing local state, the engine MUST:
 
 1. load and validate the existing immutable binding;
 2. obtain an authenticated capability snapshot;
-3. read the driver's current transport cursor without publishing a new
-   envelope;
+3. call the read-only resync-status ABI to obtain the driver's current
+   transport cursor and any audit record for the accepted floor, without
+   publishing a new envelope;
 4. reproduce `410 resync-required` by requesting that exact cursor;
 5. validate the error binding and require the error floor, capability floor,
    and `--accept-floor` value to be identical; and
@@ -40,15 +41,28 @@ Before changing local state, the engine MUST:
 
 A stale approval, a changed binding, a non-410 response, or a floor that changes
 during those checks is terminal and leaves local state unchanged. The operator
-must inspect the new floor and invoke the command again.
+must inspect the new floor and invoke the command again. The sole exception is
+an identical audit record returned by status: if its accepted floor equals the
+operator argument and the current cursor is at least that floor, the command
+returns the recorded result idempotently. It does not require the now-impossible
+old-cursor 410 to be reproduced.
 
 ### Driver transaction and audit record
 
 The optional `stage1-resync` capability adds:
 
 ```text
+storage_sync_resync_status <local-team> <server-instance-id> <remote-team-id> <protocol-version> <accepted-floor>
 storage_sync_resync <local-team> <server-instance-id> <remote-team-id> <protocol-version>
 ```
+
+Status is strictly read-only. It emits one `sync_resync_status` containing the
+current transport cursor and either the immutable audit whose accepted floor
+matches the canonical `accepted-floor` argument or `audit: null`. It MUST NOT
+reserve a wire ID, seal an envelope, initialize a new binding, advance a cursor,
+or change any other storage state. This is the normative backend-neutral seam;
+the engine never inspects a driver's database directly and never substitutes
+the mutating Stage-1 prepare operation.
 
 The operation consumes exactly one UTF-8 JSONL record:
 
@@ -58,9 +72,10 @@ The operation consumes exactly one UTF-8 JSONL record:
 
 In one storage transaction, the driver MUST revalidate the binding and exact
 expected cursor, insert an immutable audit record for the unavailable inclusive
-range `43..100`, and advance the transport cursor to `100`. The audit key
-contains the binding, driver generation, old cursor, and accepted floor so that
-retry is idempotent. A conflicting retry fails without mutation.
+range `43..100`, and advance the transport cursor to `100`. The audit has a
+unique `(binding, driver generation, accepted floor)` lookup key and records the
+old cursor. A conflicting record for the same accepted floor fails without
+mutation.
 
 The operation MUST NOT delete or rewrite local messages, remote projections,
 wire mappings, acknowledgements, conflicts, quarantine entries, security
@@ -74,9 +89,12 @@ checkpoints, or read state. In particular:
   under ADR 0008.
 
 The transaction emits one `sync_resync_result` with the old cursor, new cursor,
-and accepted gap. After it commits, a normal polling cycle starts at the floor
-and downloads only `server_seq > min_available_seq`. No event is fabricated for
-the unavailable range.
+and accepted gap. If the process crashes after commit but before observing that
+result, the repeated command obtains the same immutable row through status and
+returns the same result without requiring the old cursor as CLI input. After a
+commit, a normal polling cycle starts at the floor and downloads only
+`server_seq > min_available_seq`. No event is fabricated for the unavailable
+range.
 
 Drivers without `stage1-resync` remain valid Stage-1 drivers. The engine checks
 the advertised capability before the operator command and fails without a
@@ -86,8 +104,10 @@ network or local mutation when it is absent.
 
 The reference server accepts optional
 `AGMSG_RETENTION_MAX_LIVE_MESSAGES=<positive integer>`. It is disabled when
-unset. After a successful message batch has its canonical acknowledgements, the
-same transaction and team-row lock advance the floor to
+unset. The value MUST be canonical decimal, positive, and no greater than the
+signed 64-bit sequence maximum; an invalid value fails server startup before
+listening. After a successful message batch has its canonical acknowledgements,
+the same transaction and team-row lock advance the floor to
 `max(existing_floor, current_seq - max_live_messages)` when needed, create
 permanent digest tombstones, delete the covered live prefix, advance read
 frontiers, and garbage-collect covered exact reads before commit.
@@ -100,13 +120,18 @@ expose a floor without complete tombstones.
 This setting bounds retained envelope payload rows, not all database bytes.
 Permanent UUID/digest tombstones, credentials, membership, policy history, and
 audit records remain durable protocol state. Operators must include that
-metadata in capacity planning.
+metadata in capacity planning. A window smaller than an offline interval, or
+small relative to a large active write batch, can force healthy clients through
+410 recovery. The reference server MUST document this consequence and emit a
+retention log or metric containing the team, old floor, new floor, and removed
+live-row count without logging envelopes or credentials.
 
 ## Failure and retry semantics
 
 - `once` and `run` continue to stop on 410 and log the authenticated floor.
-- `resync` is safe to retry only with the same expected cursor and floor; an
-  already committed identical audit record returns the same result.
+- `resync` is safe to retry with the same accepted floor; an already committed
+  identical audit record returns the same result even though the current cursor
+  has advanced and the original 410 can no longer be reproduced.
 - A crash before the driver commit changes nothing. A crash after commit leaves
   the advanced cursor and audit row together, so the next poll resumes safely.
 - Resync never weakens age-v1 anti-rollback checkpoints or cipher policy.
