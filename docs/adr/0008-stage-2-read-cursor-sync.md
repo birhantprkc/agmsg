@@ -23,16 +23,16 @@ remote message.
 
 ### Store-owned composite frontier
 
-Each storage driver owns one composite read state per local `(team, agent)` and
-remote binding:
+Each storage driver composes two independently scoped layers:
 
-- `local_position`: the contiguous covered prefix of the driver's local message
-  order;
-- `remote_server_seq`: the contiguous covered prefix of the immutable remote
-  team stream;
-- exact local reads, keyed by stable local message ID until a wire mapping
-  exists; and
-- exact remote reads, keyed by wire ID.
+- the local layer, keyed by `(driver_generation, local_team_identity,
+  local_agent_identity)`, contains `local_position`, the contiguous covered
+  prefix of that store's message order, plus exact local reads keyed by stable
+  local message ID; and
+- the remote overlay, keyed by `(server_instance_id, remote_team_id,
+  protocol_version, member_id)`, contains `remote_server_seq`, the contiguous
+  covered prefix of that immutable remote stream, plus exact remote reads keyed
+  by wire ID.
 
 A projected message is read for an agent when at least one of these facts covers
 that message itself:
@@ -43,10 +43,14 @@ that message itself:
 3. its stable local ID or wire ID is in the corresponding exact-read set.
 
 The driver MUST NOT infer remote coverage for a local message without a durable
-wire/sequence mapping. The remote component and exact remote facts are scoped by
-`(server_instance_id, remote_team_id, protocol_version, member_id)`. The local
-team name and mutable member name are not remote identities. A roster name is
-associated durably with its immutable `member_id`; rename preserves the
+wire/sequence mapping. Local read progress survives remote binding replacement
+because it is not binding-scoped. A previous binding's remote overlay may remain
+durable for audit/recovery, but it is neither copied into nor consulted by a new
+binding. Coverage composes the one local layer with only the currently active
+binding/member overlay selected by authenticated sync configuration.
+
+The local team name and mutable member name are not remote identities. A roster
+name is associated durably with its immutable `member_id`; rename preserves the
 association, and retired names cannot be rebound as required by HTTP v1.
 
 The transport cursor, quarantine/decrypt state, composite read state, and the
@@ -96,8 +100,31 @@ scan advances it even if the scanned span contains no message for the agent.
 The monitor's former per-session watermark is no longer read authority.
 
 An upgrade from the pre-cursor model treats the existing backlog as consumed to
-avoid a full-history monitor storm. Fresh stores begin at zero. Messages that
-arrive after migration remain unread.
+avoid a full-history monitor storm. A fresh local layer begins at zero; its
+remote overlay follows the authenticated retention-floor rule below. Messages
+that arrive after migration remain unread.
+
+### Retention floor
+
+The authenticated `min_available_seq` is a safe lower bound for remote read
+state because the inclusive retained prefix can never again be transported or
+projected. For every member, the effective remote frontier is therefore
+`max(stored_remote_server_seq, min_available_seq)`. A new read-state row or a
+new device starts at the authenticated floor, not at zero when the floor is
+nonzero. This is a server fact, never a client guess.
+
+Prepare begins its contiguous proof at that effective frontier and requires
+durable outcomes only for later sequences. Apply stores the response floor and
+frontier atomically before using them for coverage. A stale response whose floor
+or current sequence contradicts the authenticated binding snapshot is terminal.
+
+Retention already locks the team sequencing row while it creates permanent
+tombstones, deletes the covered message prefix, and advances
+`min_available_seq`. In that same transaction it MUST max-merge every stored
+member frontier to the new floor and remove exact rows whose live `team_seq` or
+tombstone `original_seq` is now covered. Members without stored rows acquire the
+floor logically on response/bootstrap. A migration regression MUST cover a new
+device joining after a nonzero floor and continued compaction above that floor.
 
 ### Wire-ID promotion and atomicity
 
@@ -129,8 +156,10 @@ storage_sync_apply_read_state <local-team> <server-instance-id> <remote-team-id>
 ```
 
 Both operations use UTF-8 JSONL on stdin/stdout. Prepare receives one validated
-`sync_read_roster` record containing the current immutable member IDs and names.
-It emits zero or more `sync_read_frontier` and `sync_read_exact` records:
+`sync_read_context` record containing the current immutable member IDs and
+names, `min_available_seq`, and `current_seq` from one authenticated server
+snapshot. It first max-merges the remote overlay with the authenticated floor,
+then emits zero or more `sync_read_frontier` and `sync_read_exact` records:
 
 ```jsonl
 {"type":"sync_read_frontier","member_id":"018f...","server_seq":"42"}
@@ -144,10 +173,12 @@ to that member that local read state does not cover. Imported messages for other
 members are vacuously covered for this member. It emits exact wire reads above
 the safe prefix only when their mappings and server sequences are durable.
 
-Apply consumes a page of authenticated server `sync_read_frontier` and
-`sync_read_exact` records. In one transaction it max-merges frontiers, set-unions
-exact facts, projects coverage only onto already imported messages, compacts
-each local prefix, and removes only exact facts whose own durable mapping proves
+Apply consumes one authenticated `sync_read_snapshot` record containing the
+response `min_available_seq` and `current_seq`, followed by a page of server
+`sync_read_frontier` and `sync_read_exact` records. In one transaction it
+max-merges the floor and frontiers, set-unions exact facts, projects coverage
+only onto already imported messages, compacts each local prefix, and removes
+only exact facts whose own durable mapping proves
 `server_seq <= remote_server_seq`. It MUST NOT garbage-collect by wire ID alone.
 It never changes transport or decrypt/import progress.
 
@@ -174,7 +205,10 @@ binding/version rules. The strict request is:
 contains distinct canonical UUIDv4 wire IDs, and the request contains at most
 1,000 exact IDs in total. `server_seq` is a canonical signed-BIGINT decimal
 string. `page_limit` is an integer from 1 through 1,000. `page_after` is either
-null or the exact `{member_id, wire_id}` key returned by the previous response.
+null or the exact canonical item key returned by the previous response. A
+frontier key is exactly `{"member_id":"...","kind":"frontier"}`; an exact key
+is exactly `{"member_id":"...","kind":"exact","wire_id":"..."}`. The key is
+a comparison boundary and need not still exist when the next page is read.
 Unknown and duplicate fields are rejected under the common v1 JSON rules.
 
 In one transaction the server:
@@ -186,13 +220,16 @@ In one transaction the server:
 3. max-merges frontiers and set-unions exact reads;
 4. removes an exact row only when the resolved live message `team_seq` or
    tombstone `original_seq` is at or below that member's merged frontier;
-5. verifies the remaining exact set is at most 4,096 rows per member and 65,536
+5. max-merges every stored frontier to at least `min_available_seq` and removes
+   every exact row proven covered by the resulting effective frontier;
+6. verifies the remaining exact set is at most 4,096 rows per member and 65,536
    rows per team, failing the entire update atomically with `409
    read-state-limit-exceeded` otherwise; and
-6. reads the response from the same snapshot.
+7. reads the response page from the same snapshot.
 
-The response contains every active member frontier plus one lexicographically
-ordered page of unabsorbed exact rows:
+The response contains one bounded page from a single canonical item stream.
+Every active member contributes one `frontier` item, and every unabsorbed exact
+row contributes one `exact` item:
 
 ```json
 {
@@ -202,24 +239,30 @@ ordered page of unabsorbed exact rows:
   "team_name": "example-team",
   "min_available_seq": "0",
   "current_seq": "52",
-  "frontiers": [
-    {"member_id":"018f3f7e-0000-7000-8000-000000000010","server_seq":"42"}
+  "items": [
+    {"kind":"frontier","member_id":"018f3f7e-0000-7000-8000-000000000010","server_seq":"42"},
+    {"kind":"exact","member_id":"018f3f7e-0000-7000-8000-000000000010","wire_id":"550e8400-e29b-41d4-a716-446655440000"}
   ],
-  "exact_reads": [
-    {"member_id":"018f3f7e-0000-7000-8000-000000000010","wire_id":"550e8400-e29b-41d4-a716-446655440000"}
-  ],
-  "next_page_after": null,
-  "has_more": false
+  "next_page_after": {"member_id":"018f3f7e-0000-7000-8000-000000000010","kind":"exact","wire_id":"550e8400-e29b-41d4-a716-446655440000"},
+  "has_more": true
 }
 ```
 
-Frontiers are sorted by `member_id`; exact rows are sorted by
-`(member_id, wire_id)`. A member with no row has frontier zero. Pagination is
-keyset-based. Each request is an independent current snapshot: concurrent
-monotonic additions that sort before an in-progress page cursor may be observed
-on the next poll, while an exact row removed by GC is necessarily represented
-by the always-returned frontier. Clients therefore apply every page
-monotonically and restart at `page_after: null` on the next polling cycle.
+Items are sorted by `(member_id, kind_order, wire_id)`, where `frontier` sorts
+before `exact` and its wire component is empty. A member with no stored row has
+the effective frontier `min_available_seq`. `items.length` never exceeds
+`page_limit`; frontier cardinality is therefore bounded by the same pagination
+contract as exact state. `next_page_after` is null exactly when `has_more` is
+false, otherwise it is the final emitted item key.
+
+Pagination is keyset-based. Each request is an independent current snapshot:
+concurrent monotonic additions that sort before an in-progress page cursor may
+be observed on the next poll. An exact row removed by GC is necessarily covered
+by a frontier item; if that item was on an earlier page, the client has already
+applied it, and otherwise it appears in the current or next polling cycle.
+Member deletion is learned from the separately authenticated roster and retires
+that member's local remote overlay. Clients apply every page monotonically and
+restart at `page_after: null` on the next polling cycle.
 
 An empty update list is the read-only synchronization form. Retrying an update
 is idempotent. The engine sends local updates with the first page request and
@@ -229,7 +272,25 @@ canonical ordering, limits, and pagination before giving a page to the driver.
 The server schema is keyed by immutable `(team_id, member_id)` and
 `(team_id, member_id, wire_id)`. Removing a member cascades its read state.
 Member rename preserves it. A team credential may synchronize any active member
-in its own team; cross-team access is impossible.
+in its own team; cross-team access is impossible. Consequently, compromise of a
+team credential can destroy unread availability for every member by advancing
+their read state, in addition to reading and writing the team message stream.
+Stage 2 does not claim per-member credential isolation.
+
+### Limit failure and recovery
+
+`read-state-limit-exceeded` is definitive and non-retryable without a state
+change. The client retains every local frontier/exact fact, marks the identified
+member's read synchronization as blocked, excludes that member from subsequent
+mutation batches, and continues message push/pull plus read synchronization for
+other members. It MAY continue read-only pagination so incoming remote facts are
+not lost. It MUST NOT busy-retry the rejected update or discard exact facts.
+
+The error details include the offending `member_id`, per-member and team counts,
+and both limits. Operator remediation is to resolve and reprocess the oldest
+blocking quarantine hole so the frontier can absorb exact rows. A future
+explicit terminal/non-display disposition may provide another monotonic
+remediation, but silently skipping poison or resetting read state is forbidden.
 
 ### Explicitly out of scope
 
