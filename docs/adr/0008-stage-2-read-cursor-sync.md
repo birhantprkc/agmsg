@@ -53,6 +53,14 @@ The local team name and mutable member name are not remote identities. A roster
 name is associated durably with its immutable `member_id`; rename preserves the
 association, and retired names cannot be rebound as required by HTTP v1.
 
+The v1 bundled local drivers do not yet assign separate UUIDs to local teams or
+agents, so `local_team_identity` and `local_agent_identity` are their normalized
+names within the persistent driver generation. A successful local rename MUST
+atomically migrate the message projection, exact local reads, local frontier,
+and active member association to the new name in the same storage transaction.
+It MUST NOT create a fresh read layer or reuse a retired name. A future stable
+local UUID may replace this rename discipline without changing the remote key.
+
 The transport cursor, quarantine/decrypt state, composite read state, and the
 existing display/read receipt layer remain distinct. Receiving remote read
 state never imports, decrypts, displays, or marks a blocking quarantine entry as
@@ -287,10 +295,12 @@ other members. It MAY continue read-only pagination so incoming remote facts are
 not lost. It MUST NOT busy-retry the rejected update or discard exact facts.
 
 The error details include the offending `member_id`, per-member and team counts,
-and both limits. Operator remediation is to resolve and reprocess the oldest
-blocking quarantine hole so the frontier can absorb exact rows. A future
-explicit terminal/non-display disposition may provide another monotonic
-remediation, but silently skipping poison or resetting read state is forbidden.
+and both limits. If the oldest hole is a normal imported unread message, operator
+remediation is its ordinary authorized consume. If it is blocking quarantine,
+the cause must be resolved and the envelope reprocessed so the frontier can
+advance. A future explicit terminal/non-display disposition may provide another
+monotonic remediation, but silently skipping poison or resetting read state is
+forbidden.
 
 ### Explicitly out of scope
 
