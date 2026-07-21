@@ -30,11 +30,45 @@ _JSONL_DRIVER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)
 
 _jsonl_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 _jsonl_log() { printf '%s\n' "$(dirname "$(agmsg_db_path)")/events.jsonl"; }
+_jsonl_read_cursors() {
+  local log; log="$(_jsonl_log)"
+  printf '%s\n' "$(dirname "$log")/read-cursors.tsv"
+}
+_jsonl_read_cursor_marker() {
+  local log; log="$(_jsonl_log)"
+  printf '%s\n' "$(dirname "$log")/.read-cursor-v1"
+}
 
 _jsonl_init_file() {
   local log; log="$(_jsonl_log)"
   mkdir -p "$(dirname "$log")" 2>/dev/null || true
   [ -f "$log" ] || : > "$log" 2>/dev/null || true
+  _jsonl_read_cursor_migrate || return 1
+}
+
+# One-time Phase-3 adoption. Existing message history is treated as consumed so
+# upgrading a monitor-heavy installation cannot replay its entire log. An empty
+# fresh log writes an empty cursor file and starts naturally at zero.
+_jsonl_read_cursor_migrate() {
+  local marker lock i=0 log cursors tmp tip
+  marker="$(_jsonl_read_cursor_marker)"; [ -f "$marker" ] && return 0
+  lock="$marker.lock"
+  until mkdir "$lock" 2>/dev/null; do
+    [ -f "$marker" ] && return 0
+    i=$((i + 1)); [ "$i" -ge 1000 ] && return 1
+    sleep 0.01
+  done
+  if [ -f "$marker" ]; then rmdir "$lock" 2>/dev/null || true; return 0; fi
+  log="$(_jsonl_log)"; cursors="$(_jsonl_read_cursors)"
+  tmp=$(mktemp "${cursors}.tmp.XXXXXX") || { rmdir "$lock" 2>/dev/null || true; return 1; }
+  tip=$(jq -s '[.[] | select(.type=="message_sent")] | length' "$log") || {
+    rm -f "$tmp"; rmdir "$lock" 2>/dev/null || true; return 1;
+  }
+  jq -r --argjson tip "$tip" -s '[.[] | select(.type=="message_sent") | [.team,.to]] | unique[] | @tsv + "\t" + ($tip|tostring)' "$log" > "$tmp" || { rm -f "$tmp"; rmdir "$lock" 2>/dev/null || true; return 1; }
+  mv "$tmp" "$cursors" || { rm -f "$tmp"; rmdir "$lock" 2>/dev/null || true; return 1; }
+  : > "$marker.tmp.$$" || { rmdir "$lock" 2>/dev/null || true; return 1; }
+  mv "$marker.tmp.$$" "$marker" || { rm -f "$marker.tmp.$$"; rmdir "$lock" 2>/dev/null || true; return 1; }
+  rmdir "$lock" 2>/dev/null || true
 }
 
 # UUIDv7 (§2.5) — python3 preferred, /dev/urandom shell fallback. No counter file.
@@ -137,18 +171,12 @@ storage_list_unread() {
   while [ $# -gt 0 ]; do case "$1" in --limit) limit="$2"; shift 2 ;; *) shift ;; esac; done
   case "$limit" in ''|*[!0-9]*) limit="" ;; esac
   _jsonl_init_file
-  local log out; log="$(_jsonl_log)"
+  local log out cursor; log="$(_jsonl_log)"
+  cursor=$(storage_read_cursor_get "$team" "$agent") || return 1
   if _jsonl_use_duckdb; then
-    out="$(_jsonl_unread_duckdb "$team" "$agent" "$log")" || return 1
+    out="$(_jsonl_unread_duckdb "$team" "$agent" "$log" "$cursor")" || return 1
   else
-    out="$(jq -c --arg team "$team" --arg agent "$agent" -s '
-      (reduce .[] as $e ({};
-        if $e.type=="message_read" and $e.team==$team and $e.agent==$agent
-        then .[$e.msg_id]=true else . end)) as $read
-      | .[]
-      | select(.type=="message_sent" and .team==$team and .to==$agent and ($read[.id] | not))
-      | {type:"message_sent",id:.id,team:.team,from:.from,to:.to,body:.body,at:.at}
-    ' "$log")" || return 1
+    out="$(jq -c --arg team "$team" --arg agent "$agent" --argjson cursor "$cursor" -s '(reduce .[] as $e ({}; if $e.type=="message_read" and $e.team==$team and $e.agent==$agent then .[$e.msg_id]=true else . end)) as $read | [.[] | select(.type=="message_sent")] | to_entries[] | select((.key + 1) > $cursor and .value.team==$team and .value.to==$agent and ($read[.value.id] | not)) | .value | {type:"message_sent",id:.id,team:.team,from:.from,to:.to,body:.body,at:.at}' "$log")" || return 1
   fi
   [ -n "$out" ] || return 0
   if [ -n "$limit" ]; then printf '%s\n' "$out" | head -n "$limit"; else printf '%s\n' "$out"; fi
@@ -159,7 +187,7 @@ storage_list_unread() {
 # read_json_auto, whose type inference would parse `at` as a TIMESTAMP and re-emit
 # it as "Y-M-D H:M:S", losing the canonical ISO-8601 "...T...Z" the jq path keeps.
 _jsonl_unread_duckdb() {
-  local team="$1" agent="$2" log="$3" tl al lg sql tpl
+  local team="$1" agent="$2" log="$3" cursor="$4" tl al lg sql tpl
   # SQL-escape every value spliced into the query (team/agent are not apostrophe-
   # free per validate.sh, and the path may contain one) so a legal team/agent that
   # the jq path handles can't break — or silently misbehave on — the duckdb path.
@@ -176,17 +204,55 @@ _jsonl_unread_duckdb() {
   sql="${sql//__LG__/$lg}"
   sql="${sql//__TL__/$tl}"
   sql="${sql//__AL__/$al}"
+  sql="${sql//__CUR__/$cursor}"
   printf '%s\n' "$sql" | duckdb -noheader -list 2>/dev/null
+}
+
+storage_read_cursor_get() {
+  local team="$1" agent="$2" f
+  _jsonl_init_file || return 1
+  f="$(_jsonl_read_cursors)"
+  [ -f "$f" ] || { printf '0\n'; return 0; }
+  awk -F'\t' -v t="$team" -v a="$agent" '$1==t && $2==a {p=$3}
+    END { print (p=="" ? 0 : p) }' "$f"
+}
+
+_jsonl_read_cursor_write_locked() {
+  local team="$1" agent="$2" pos="$3" f tmp
+  f="$(_jsonl_read_cursors)"; tmp=$(mktemp "${f}.tmp.XXXXXX") || return 1
+  { [ -f "$f" ] && awk -F'\t' -v t="$team" -v a="$agent" '!($1==t && $2==a)' "$f"
+    printf '%s\t%s\t%s\n' "$team" "$agent" "$pos"; } > "$tmp" || {
+      rm -f "$tmp"; return 1;
+    }
+  mv "$tmp" "$f"
+}
+
+_jsonl_read_cursor_consume_locked() {
+  local team="$1" agent="$2" target="$3"; shift 3
+  local current safe log
+  current=$(storage_read_cursor_get "$team" "$agent") || return 1
+  _jsonl_mark "$team" "$agent" "$@" || return 1
+  log="$(_jsonl_log)"
+  safe=$(jq -r --arg team "$team" --arg agent "$agent" --argjson current "$current" \
+    --argjson target "$target" -s -f "$_JSONL_DRIVER_DIR/jsonl-read-cursor.jq" "$log") || return 1
+  [ "$safe" -ge "$current" ] || safe="$current"
+  _jsonl_read_cursor_write_locked "$team" "$agent" "$safe"
+}
+
+storage_read_cursor_consume() {
+  local team="$1" agent="$2" target="$3"; shift 3
+  case "$target" in ''|*[!0-9]*) echo runtime_error; return 13 ;; esac
+  _jsonl_init_file || { echo runtime_error; return 13; }
+  _jsonl_with_lock _jsonl_read_cursor_consume_locked "$team" "$agent" "$target" "$@" \
+    || { echo runtime_error; return 13; }
+  echo ok
 }
 
 storage_mark_read_batch() {
   local team="$1" agent="$2"; shift 2
-  _jsonl_init_file
-  # Propagate a lock-acquire / write failure as a §1.4 control-op error — never
-  # swallow it as ok, or inbox/check-inbox would treat unread as read with no
-  # message_read written (re-delivery loop / stale wake on the read hot path).
-  _jsonl_with_lock _jsonl_mark "$team" "$agent" "$@" || { echo runtime_error; return 13; }
-  echo ok
+  [ $# -gt 0 ] || { echo ok; return 0; }
+  local tip; tip=$(storage_watch_tip "$team:$agent") || { echo runtime_error; return 13; }
+  storage_read_cursor_consume "$team" "$agent" "$tip" "$@"
 }
 _jsonl_mark() {
   local team="$1" agent="$2"; shift 2
