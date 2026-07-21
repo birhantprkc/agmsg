@@ -166,7 +166,9 @@ storage_sync_apply_read_state <local-team> <server-instance-id> <remote-team-id>
 Both operations use UTF-8 JSONL on stdin/stdout. Prepare receives one validated
 `sync_read_context` record containing the current immutable member IDs and
 names, `min_available_seq`, and `current_seq` from one authenticated server
-snapshot. It first max-merges the remote overlay with the authenticated floor,
+snapshot, plus `local_agents` from the local team registry as a separate
+authority. Message sender/recipient strings are never roster evidence. It first
+max-merges the remote overlay with the authenticated floor,
 then emits zero or more `sync_read_frontier` and `sync_read_exact` records:
 
 ```jsonl

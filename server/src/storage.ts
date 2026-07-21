@@ -335,7 +335,7 @@ export async function syncReadState(
       }
     }
     const exactIds = [...new Set(exactWires)];
-    const novelExactMembers = new Set<string>();
+    const novelExactPairs = new Set<string>();
     if (exactIds.length > 0) {
       const resolved = await client.query<{ id: string }>(
         `SELECT id::text FROM messages WHERE team_id = $1 AND id = ANY($2::uuid[])
@@ -355,8 +355,8 @@ export async function syncReadState(
           binding,
         );
       }
-      const novel = await client.query<{ member_id: string }>(
-        `SELECT DISTINCT incoming.member_id::text
+      const novel = await client.query<{ member_id: string; wire_id: string }>(
+        `SELECT incoming.member_id::text, incoming.wire_id::text
            FROM unnest($2::uuid[], $3::uuid[]) AS incoming(member_id, wire_id)
            LEFT JOIN read_exact existing
              ON existing.team_id=$1 AND existing.member_id=incoming.member_id
@@ -364,7 +364,7 @@ export async function syncReadState(
           WHERE existing.wire_id IS NULL`,
         [teamId, exactMembers, exactWires],
       );
-      for (const row of novel.rows) novelExactMembers.add(row.member_id);
+      for (const row of novel.rows) novelExactPairs.add(`${row.member_id}:${row.wire_id}`);
     }
 
     // The authenticated retention floor is a safe baseline for every existing
@@ -404,6 +404,19 @@ export async function syncReadState(
 
     await deleteCoveredExact(client, teamId, floor);
 
+    const survivingRequestExact = exactWires.length === 0
+      ? new Set<string>()
+      : new Set((await client.query<{ member_id: string; wire_id: string }>(
+        `SELECT incoming.member_id::text, incoming.wire_id::text
+           FROM unnest($2::uuid[], $3::uuid[]) AS incoming(member_id, wire_id)
+           JOIN read_exact current
+             ON current.team_id=$1 AND current.member_id=incoming.member_id
+            AND current.wire_id=incoming.wire_id`,
+        [teamId, exactMembers, exactWires],
+      )).rows
+        .filter((row) => novelExactPairs.has(`${row.member_id}:${row.wire_id}`))
+        .map((row) => row.member_id));
+
     const memberOverflow = await client.query<{ member_id: string; exact_count: string }>(
       `SELECT member_id::text, COUNT(*)::text AS exact_count
          FROM read_exact WHERE team_id = $1
@@ -418,7 +431,7 @@ export async function syncReadState(
     const teamCount = Number(teamCountResult.rows[0]?.exact_count ?? "0");
     if (memberOverflow.rows[0] || teamCount > MAX_EXACT_PER_TEAM) {
       const causalMemberId = input.updates.find((update) =>
-        novelExactMembers.has(update.member_id))?.member_id;
+        survivingRequestExact.has(update.member_id))?.member_id;
       const offender = memberOverflow.rows[0] ?? (await client.query<{ member_id: string; exact_count: string }>(
         `SELECT member_id::text, COUNT(*)::text AS exact_count
            FROM read_exact WHERE team_id = $1

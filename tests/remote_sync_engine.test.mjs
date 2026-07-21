@@ -194,6 +194,7 @@ test("Stage-2 isolates a limit offender and continues read-only synchronization"
         next_page_after: null, has_more: false };
     },
     eventCall: async () => {},
+    localAgentsCall: async () => members.map((member) => member.name),
   });
   assert.equal(postCount, 7);
   assert.ok(operations.includes("read-block"));

@@ -664,7 +664,8 @@ storage_sync_prepare_read_state() {
   local team="$1" server="$2" remote="$3" protocol="$4"
   _sqlite_sync_valid_binding "$server" "$remote" "$protocol" || return 13
   _sqlite_sync_schema || return $?
-  local generation db tl context floor current members count values="" member id name insert_members=""
+  local generation db tl context floor current members local_agents count values="" local_values=""
+  local member id name agent insert_members="" insert_local_agents=""
   generation=$(_sqlite_sync_generation) || return 13
   db="$(_sqlite_db)"; tl="$(_sqlite_lit "$team")"
   _sqlite_sync_ensure_binding "$team" "$server" "$remote" "$protocol" "$generation" || return 13
@@ -672,6 +673,9 @@ storage_sync_prepare_read_state() {
   [ "$(printf '%s\n' "$context" | jq -r '
     select(.type=="sync_read_context" and (.min_available_seq|type)=="string" and
       (.current_seq|type)=="string" and (.members|type)=="array" and
+      (.local_agents|type)=="array" and (.local_agents|length)<=1000 and
+      ((.local_agents|unique|length)==(.local_agents|length)) and all(.local_agents[];
+        (type=="string") and length>0) and
       (.members|length)<=1000 and all(.members[];
         ((.member_id|type)=="string") and ((.name|type)=="string") and (.name|length)>0)) | "ok"' \
       2>/dev/null)" = ok ] || return 13
@@ -693,17 +697,25 @@ storage_sync_prepare_read_state() {
   done <<EOF
 $members
 EOF
+  local_agents=$(printf '%s\n' "$context" | jq -r '.local_agents[]')
+  while IFS= read -r agent; do
+    [ -n "$agent" ] || continue
+    local_values="${local_values}${local_values:+,}('$(_sqlite_lit "$agent")')"
+  done <<EOF
+$local_agents
+EOF
   if [ "$count" -gt 0 ]; then
     insert_members="INSERT INTO incoming_read_members VALUES $values;"
+  fi
+  if [ -n "$local_values" ]; then
+    insert_local_agents="INSERT INTO local_read_agents VALUES $local_values;"
   fi
 
   agmsg_sqlite "$db" "BEGIN IMMEDIATE;
     CREATE TEMP TABLE incoming_read_members(member_id TEXT UNIQUE,agent TEXT UNIQUE);
     CREATE TEMP TABLE local_read_agents(agent TEXT PRIMARY KEY);
     $insert_members
-    INSERT OR IGNORE INTO local_read_agents
-      SELECT to_agent FROM events WHERE type='message_sent' AND team='$tl' AND to_agent IS NOT NULL
-      UNION SELECT agent FROM read_cursors WHERE team='$tl';
+    $insert_local_agents
     UPDATE sync_read_members SET active=0 WHERE local_team='$tl'
       AND server_instance_id='$server' AND remote_team_id='$remote'
       AND protocol_version=$protocol AND driver_generation='$generation';

@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,6 +32,7 @@ describeDatabase("Stage-1 polling sync client", () => {
   let root: string;
   let storeA: string;
   let storeB: string;
+  let rosterFile: string;
 
   beforeAll(async () => {
     admin = new Pool({ connectionString: databaseUrl });
@@ -62,6 +63,10 @@ describeDatabase("Stage-1 polling sync client", () => {
     root = await mkdtemp(join(tmpdir(), "agmsg-stage1-sync-"));
     storeA = join(root, "machine-a");
     storeB = join(root, "machine-b");
+    rosterFile = join(root, "local-roster.json");
+    await writeFile(rosterFile, JSON.stringify({
+      agents: { "machine-a": {}, "machine-b": {} },
+    }));
   });
 
   afterAll(async () => {
@@ -80,6 +85,7 @@ describeDatabase("Stage-1 polling sync client", () => {
       AGMSG_STORAGE_PATH: store,
       AGMSG_STORAGE_DRIVER: "sqlite",
       AGMSG_SYNC_TOKEN: token,
+      AGMSG_SYNC_LOCAL_ROSTER_FILE: rosterFile,
       AGMSG_NODE: process.execPath,
       HOME: join(store, "home"),
     };

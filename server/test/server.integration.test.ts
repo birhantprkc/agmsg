@@ -324,12 +324,19 @@ describeDatabase("remote storage HTTP API v1", () => {
   });
 
   it("attributes a team-wide exact overflow to a causal request member", async () => {
+    const coveredWire = "750e8400-e29b-41d4-a716-446655440008";
     const causalWire = "750e8400-e29b-41d4-a716-446655440009";
+    const coveredMember = "018f3f7e-0000-7000-8000-000000000098";
     const causalMember = "018f3f7e-0000-7000-8000-000000000099";
+    const previousSequence = (await pool.query<{ current_seq: string }>(
+      "SELECT current_seq::text FROM teams WHERE team_id=$1", [teamId],
+    )).rows[0]?.current_seq ?? "0";
+    await pool.query("UPDATE teams SET current_seq=GREATEST(current_seq,2) WHERE team_id=$1", [teamId]);
     await pool.query(
       `INSERT INTO message_tombstones(team_id,id,original_team_seq,envelope_digest)
-       VALUES($1,$2,1,decode(repeat('00',32),'hex'))`,
-      [teamId, causalWire],
+       VALUES($1,$2,1,decode(repeat('00',32),'hex')),
+             ($1,$3,2,decode(repeat('11',32),'hex'))`,
+      [teamId, coveredWire, causalWire],
     );
     await pool.query(
       `INSERT INTO members(team_id, member_id, name)
@@ -340,8 +347,9 @@ describeDatabase("remote storage HTTP API v1", () => {
       [teamId],
     );
     await pool.query(
-      "INSERT INTO members(team_id,member_id,name) VALUES($1,$2,'limit-causal-member')",
-      [teamId, causalMember],
+      `INSERT INTO members(team_id,member_id,name) VALUES
+       ($1,$2,'limit-covered-member'),($1,$3,'limit-causal-member')`,
+      [teamId, coveredMember, causalMember],
     );
     await pool.query(
       `INSERT INTO read_exact(team_id, member_id, wire_id)
@@ -363,7 +371,10 @@ describeDatabase("remote storage HTTP API v1", () => {
         url: "/v1/read-state/sync",
         headers,
         payload: {
-          updates: [{ member_id: causalMember, server_seq: "0", exact_wire_ids: [causalWire] }],
+          updates: [
+            { member_id: coveredMember, server_seq: "1", exact_wire_ids: [coveredWire] },
+            { member_id: causalMember, server_seq: "0", exact_wire_ids: [causalWire] },
+          ],
           page_after: null,
           page_limit: 1,
         },
@@ -379,9 +390,10 @@ describeDatabase("remote storage HTTP API v1", () => {
         [teamId],
       );
       await pool.query(
-        "DELETE FROM message_tombstones WHERE team_id=$1 AND id=$2",
-        [teamId, causalWire],
+        "DELETE FROM message_tombstones WHERE team_id=$1 AND id=ANY($2::uuid[])",
+        [teamId, [coveredWire, causalWire]],
       );
+      await pool.query("UPDATE teams SET current_seq=$2 WHERE team_id=$1", [teamId, previousSequence]);
     }
   });
 

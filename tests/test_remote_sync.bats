@@ -236,7 +236,7 @@ prepare_push() {
   second_local=$(printf '%s\n' "$ids" | sed -n '2p')
   storage_read_cursor_consume demo bob "$(storage_watch_tip demo:bob)" "$second_local" >/dev/null
   context=$(jq -nc --arg member "018f3f7e-0000-7000-8000-000000000010" '
-    {type:"sync_read_context",min_available_seq:"0",current_seq:"2",
+    {type:"sync_read_context",min_available_seq:"0",current_seq:"2",local_agents:["bob"],
      members:[{member_id:$member,name:"bob"}]}')
   prepared=$(printf '%s\n' "$context" |
     storage_sync_prepare_read_state demo "$SERVER_ID" "$TEAM_ID" 1)
@@ -255,15 +255,18 @@ prepare_push() {
 }
 
 @test "Stage-2 rename mismatch blocks remote frontier in either ordering" {
-  local old_context new_context prepared db member
+  local old_context new_context local_first_context prepared db member
   member=018f3f7e-0000-7000-8000-000000000010
   storage_send demo alice bob "local bob authority" >/dev/null
   old_context=$(jq -nc --arg member "$member" '
-    {type:"sync_read_context",min_available_seq:"0",current_seq:"0",
+    {type:"sync_read_context",min_available_seq:"0",current_seq:"0",local_agents:["bob"],
      members:[{member_id:$member,name:"bob"}]}')
   new_context=$(jq -nc --arg member "$member" '
-    {type:"sync_read_context",min_available_seq:"0",current_seq:"0",
+    {type:"sync_read_context",min_available_seq:"0",current_seq:"0",local_agents:["bob"],
      members:[{member_id:$member,name:"robert"}]}')
+  local_first_context=$(jq -nc --arg member "$member" '
+    {type:"sync_read_context",min_available_seq:"0",current_seq:"0",local_agents:["robert"],
+     members:[{member_id:$member,name:"bob"}]}')
 
   printf '%s\n' "$old_context" |
     storage_sync_prepare_read_state demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
@@ -278,7 +281,7 @@ prepare_push() {
   agmsg_sqlite "$db" "UPDATE sync_read_members SET agent='robert',
     name_mismatch=CASE WHEN remote_agent='robert' THEN 0 ELSE 1 END
     WHERE local_team='demo' AND member_id='$member';" >/dev/null
-  prepared=$(printf '%s\n' "$old_context" |
+  prepared=$(printf '%s\n' "$local_first_context" |
     storage_sync_prepare_read_state demo "$SERVER_ID" "$TEAM_ID" 1)
   [ "$(printf '%s\n' "$prepared" | jq -r 'select(.type=="sync_read_blocked")|.reason')" = \
     member-name-mismatch ]
@@ -289,8 +292,9 @@ prepare_push() {
   local context prepared member
   member=018f3f7e-0000-7000-8000-000000000010
   storage_send demo bob alice "local alice only" >/dev/null
+  storage_send demo alice bob "remote projection cannot self-authorize bob" >/dev/null
   context=$(jq -nc --arg member "$member" '
-    {type:"sync_read_context",min_available_seq:"0",current_seq:"0",
+    {type:"sync_read_context",min_available_seq:"0",current_seq:"0",local_agents:["alice"],
      members:[{member_id:$member,name:"bob"}]}')
   prepared=$(printf '%s\n' "$context" |
     storage_sync_prepare_read_state demo "$SERVER_ID" "$TEAM_ID" 1)
@@ -304,7 +308,7 @@ prepare_push() {
   member=018f3f7e-0000-7000-8000-000000000010
   storage_send demo alice bob "local bob authority" >/dev/null
   context=$(jq -nc --arg member "$member" '
-    {type:"sync_read_context",min_available_seq:"0",current_seq:"0",
+    {type:"sync_read_context",min_available_seq:"0",current_seq:"0",local_agents:["bob"],
      members:[{member_id:$member,name:"bob"}]}')
   printf '%s\n' "$context" |
     storage_sync_prepare_read_state demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null

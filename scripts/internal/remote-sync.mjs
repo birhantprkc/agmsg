@@ -107,6 +107,22 @@ async function loadConfig(team) {
   return value;
 }
 
+async function localAgentRoster(team) {
+  const supplied = process.env.AGMSG_SYNC_LOCAL_ROSTER_FILE;
+  const skillRoot = process.env.SKILL_DIR;
+  const path = supplied || (skillRoot ? join(skillRoot, "teams", team, "config.json") : "");
+  if (!path) throw new Error("local team roster path is unavailable");
+  const value = JSON.parse(await readFile(path, "utf8"));
+  if (!value?.agents || typeof value.agents !== "object" || Array.isArray(value.agents)) {
+    throw new Error("local team roster is invalid");
+  }
+  const names = Object.keys(value.agents).map((name) => requireName(name, "local agent name")).sort();
+  if (names.length > 1000 || new Set(names).size !== names.length) {
+    throw new Error("local team roster is invalid");
+  }
+  return names;
+}
+
 function requireUnicodeScalars(value, label) {
   for (let index = 0; index < value.length; index += 1) {
     const unit = value.charCodeAt(index);
@@ -950,6 +966,7 @@ export async function readStateCycle(config, limit, dependencies = {}) {
   const driverCall = dependencies.driverCall ?? driver;
   const requestCall = dependencies.requestCall ?? request;
   const eventCall = dependencies.eventCall ?? event;
+  const localAgentsCall = dependencies.localAgentsCall ?? localAgentRoster;
   const driverCapabilities = await driverCall("capabilities", config, []);
   if (!stage2ReadStateSupported(driverCapabilities)) {
     await eventCall("read-state.skipped", { reason: "driver-capability-not-advertised" });
@@ -960,9 +977,10 @@ export async function readStateCycle(config, limit, dependencies = {}) {
   const { capabilities, members } = await consistentReadStateContext(
     config, initialCapabilities, requestCall,
   );
+  const localAgents = await localAgentsCall(config.local_team);
   const prepared = await driverCall("read-prepare", config, [{ type: "sync_read_context",
     min_available_seq: capabilities.min_available_seq, current_seq: capabilities.current_seq,
-    members }]);
+    members, local_agents: localAgents }]);
   const batches = readStateUpdateBatches(members, prepared);
   const pageLimit = Math.min(limit, 1000);
   let page;
