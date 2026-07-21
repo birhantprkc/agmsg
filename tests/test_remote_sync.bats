@@ -274,6 +274,20 @@ prepare_push() {
   [ "$(agmsg_sqlite "$db" "SELECT transport_cursor FROM sync_bindings;" | tr -d '\r')" = 0 ]
 }
 
+@test "sync contract: resync uses the resolved Node runtime when literal node is unavailable" {
+  prepare_push >/dev/null
+  local resolved_node input result
+  resolved_node=$(command -v node)
+  [ -x "$resolved_node" ]
+  input='{"type":"sync_resync","expected_transport_cursor":"0","min_available_seq":"5","current_seq":"7","reason":"retention-gap-accepted"}'
+  node() { return 127; }
+  export AGMSG_SYNC_NODE_BIN="$resolved_node"
+  unset AGMSG_NODE
+  result=$(storage_sync_resync demo "$SERVER_ID" "$TEAM_ID" 1 <<< "$input")
+  unset -f node
+  [ "$(printf '%s\n' "$result" | jq -r '.transport_cursor')" = 5 ]
+}
+
 @test "Stage-2 sync exports exact reads across holes and applies remote frontier separately" {
   local first second page ids second_local context prepared applied db
   first=$(jq -nc '

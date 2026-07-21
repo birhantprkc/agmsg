@@ -251,7 +251,7 @@ storage_sync_resync() {
   local team="$1" server="$2" remote="$3" protocol="$4"
   _sqlite_sync_valid_binding "$server" "$remote" "$protocol" || return 13
   local line expected floor current reason generation db tl gap_start node_bin strict_parser
-  node_bin="${AGMSG_NODE:-node}"
+  node_bin="${AGMSG_SYNC_NODE_BIN:-${AGMSG_NODE:-node}}"
   strict_parser="$SKILL_DIR/scripts/internal/strict-jsonl.mjs"
   command -v "$node_bin" >/dev/null 2>&1 && [ -f "$strict_parser" ] || return 10
   line=$("$node_bin" "$strict_parser" current_seq expected_transport_cursor \
