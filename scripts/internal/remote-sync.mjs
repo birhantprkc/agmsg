@@ -25,6 +25,7 @@ function usage() {
   remote-sync.sh once --team NAME [--limit N]
   remote-sync.sh run --team NAME [--limit N] [--interval SECONDS]
   remote-sync.sh reprocess --team NAME [--limit N]
+  remote-sync.sh resync --team NAME --accept-floor SEQUENCE
   remote-sync.sh unblock-read --team NAME --member-id UUID
 
 AGMSG_SYNC_TOKEN is required and is never written to config or argv.`;
@@ -499,7 +500,8 @@ export async function driver(operation, config, input, extra = []) {
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.on("error", reject);
     child.on("close", (code) => {
-      if (code === 0) resolve(parseJsonl(stdout));
+      if (code === 0) resolve(["resync-status", "resync"].includes(operation) ?
+        parseStrictJsonl(stdout) : parseJsonl(stdout));
       else reject(new Error(`storage sync ${operation} failed (${code}): ${stderr.trim()}`));
     });
     child.stdin.end(input.map((record) => `${JSON.stringify(record)}\n`).join(""));
@@ -508,6 +510,68 @@ export async function driver(operation, config, input, extra = []) {
 
 function parseJsonl(value) {
   return value.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+}
+
+function rejectDuplicateJsonKeys(source) {
+  let offset = 0;
+  const whitespace = () => { while (/\s/u.test(source[offset] ?? "")) offset += 1; };
+  const string = () => {
+    const start = offset;
+    if (source[offset] !== '"') throw new Error("driver JSON framing is invalid");
+    offset += 1;
+    while (offset < source.length) {
+      if (source[offset] === "\\") { offset += 2; continue; }
+      if (source[offset] === '"') {
+        offset += 1;
+        return JSON.parse(source.slice(start, offset));
+      }
+      offset += 1;
+    }
+    throw new Error("driver JSON framing is invalid");
+  };
+  const value = () => {
+    whitespace();
+    if (source[offset] === "{") {
+      offset += 1; whitespace();
+      const keys = new Set();
+      if (source[offset] === "}") { offset += 1; return; }
+      for (;;) {
+        const key = string();
+        if (keys.has(key)) throw new Error("driver JSON contains a duplicate key");
+        keys.add(key); whitespace();
+        if (source[offset] !== ":") throw new Error("driver JSON framing is invalid");
+        offset += 1; value(); whitespace();
+        if (source[offset] === "}") { offset += 1; return; }
+        if (source[offset] !== ",") throw new Error("driver JSON framing is invalid");
+        offset += 1; whitespace();
+      }
+    }
+    if (source[offset] === "[") {
+      offset += 1; whitespace();
+      if (source[offset] === "]") { offset += 1; return; }
+      for (;;) {
+        value(); whitespace();
+        if (source[offset] === "]") { offset += 1; return; }
+        if (source[offset] !== ",") throw new Error("driver JSON framing is invalid");
+        offset += 1;
+      }
+    }
+    if (source[offset] === '"') { string(); return; }
+    const start = offset;
+    while (offset < source.length && !/[\s,}\]]/u.test(source[offset])) offset += 1;
+    if (start === offset) throw new Error("driver JSON framing is invalid");
+    JSON.parse(source.slice(start, offset));
+  };
+  value(); whitespace();
+  if (offset !== source.length) throw new Error("driver JSON framing is invalid");
+}
+
+export function parseStrictJsonl(value) {
+  const lines = value.split(/\r?\n/u).filter(Boolean);
+  return lines.map((line) => {
+    rejectDuplicateJsonKeys(line);
+    return JSON.parse(line);
+  });
 }
 
 async function event(name, fields = {}) {
@@ -802,6 +866,85 @@ export function stage2ReadStateSupported(records) {
     throw new Error("driver capability response is invalid");
   }
   return records[0].capabilities.includes("stage2-read-state");
+}
+
+export function stage1ResyncSupported(records) {
+  if (!Array.isArray(records) || records.length !== 1 ||
+      records[0]?.type !== "sync_driver_capabilities" ||
+      !Array.isArray(records[0].capabilities) ||
+      records[0].capabilities.some((value) => typeof value !== "string") ||
+      new Set(records[0].capabilities).size !== records[0].capabilities.length) {
+    throw new Error("driver capability response is invalid");
+  }
+  return records[0].capabilities.includes("stage1-resync");
+}
+
+function strictKeys(value, expected, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      Object.keys(value).sort().join(",") !== [...expected].sort().join(",")) {
+    throw new Error(`${label} shape is invalid`);
+  }
+}
+
+function validDriverGeneration(value) {
+  return typeof value === "string" && Buffer.byteLength(value, "utf8") >= 1 &&
+    Buffer.byteLength(value, "utf8") <= 256 && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function validateResyncAudit(audit, floor, transportCursor, label) {
+  strictKeys(audit, ["expected_transport_cursor", "accepted_floor", "gap_start",
+    "gap_end", "reason"], label);
+  const expected = BigInt(sequence(audit.expected_transport_cursor, `${label} expected cursor`));
+  const accepted = BigInt(sequence(audit.accepted_floor, `${label} accepted floor`));
+  const start = BigInt(sequence(audit.gap_start, `${label} gap start`));
+  const end = BigInt(sequence(audit.gap_end, `${label} gap end`));
+  const current = BigInt(sequence(transportCursor, `${label} transport cursor`));
+  if (audit.accepted_floor !== floor || end !== accepted || start !== expected + 1n ||
+      expected >= accepted || accepted > current || audit.reason !== "retention-gap-accepted") {
+    throw new Error(`${label} is inconsistent`);
+  }
+  return audit;
+}
+
+export function validateResyncStatus(records, floor) {
+  sequence(floor, "accepted floor");
+  if (!Array.isArray(records) || records.length !== 1) {
+    throw new Error("driver must emit exactly one resync status");
+  }
+  const status = records[0];
+  strictKeys(status, ["type", "driver_generation", "transport_cursor", "audit"],
+    "resync status");
+  if (status.type !== "sync_resync_status" || !validDriverGeneration(status.driver_generation)) {
+    throw new Error("resync status is invalid");
+  }
+  sequence(status.transport_cursor, "resync transport cursor");
+  if (status.audit !== null) {
+    validateResyncAudit(status.audit, floor, status.transport_cursor, "resync audit");
+  }
+  return status;
+}
+
+export function validateResyncResult(records, status, floor) {
+  if (!Array.isArray(records) || records.length !== 1) {
+    throw new Error("driver must emit exactly one resync result");
+  }
+  const result = records[0];
+  strictKeys(result, ["type", "driver_generation", "expected_transport_cursor",
+    "transport_cursor", "accepted_floor", "gap_start", "gap_end", "reason"],
+  "resync result");
+  if (result.type !== "sync_resync_result" ||
+      result.driver_generation !== status.driver_generation ||
+      result.transport_cursor !== floor) {
+    throw new Error("resync result is invalid");
+  }
+  validateResyncAudit({
+    expected_transport_cursor: result.expected_transport_cursor,
+    accepted_floor: result.accepted_floor,
+    gap_start: result.gap_start,
+    gap_end: result.gap_end,
+    reason: result.reason,
+  }, floor, result.transport_cursor, "resync result");
+  return result;
 }
 
 export function validateReadStatePage(config, value, pageLimit, pageAfter = null) {
@@ -1155,10 +1298,77 @@ async function reprocessCycle(config, limit) {
     transport_cursor: state.transport_cursor, result: applied[0] ?? null });
 }
 
+function resultFromResyncAudit(status) {
+  return {
+    type: "sync_resync_result",
+    driver_generation: status.driver_generation,
+    expected_transport_cursor: status.audit.expected_transport_cursor,
+    transport_cursor: status.audit.accepted_floor,
+    accepted_floor: status.audit.accepted_floor,
+    gap_start: status.audit.gap_start,
+    gap_end: status.audit.gap_end,
+    reason: status.audit.reason,
+  };
+}
+
+export async function resyncCycle(config, acceptedFloor, dependencies = {}) {
+  const driverCall = dependencies.driverCall ?? driver;
+  const requestCall = dependencies.requestCall ?? request;
+  const eventCall = dependencies.eventCall ?? event;
+  const floor = sequence(acceptedFloor, "accepted floor");
+  const driverCapabilities = await driverCall("capabilities", config, []);
+  if (!stage1ResyncSupported(driverCapabilities)) {
+    throw new Error("storage driver does not advertise stage1-resync");
+  }
+  const capabilities = await requestCall(config, "/v1/capabilities");
+  validateCapabilities(config, capabilities);
+  const status = validateResyncStatus(
+    await driverCall("resync-status", config, [], [floor]), floor);
+  const serverFloor = BigInt(capabilities.min_available_seq);
+  const serverCurrent = BigInt(capabilities.current_seq);
+  if (status.audit !== null) {
+    if (BigInt(floor) > serverFloor || BigInt(status.transport_cursor) > serverCurrent) {
+      throw new Error("recorded resync audit contradicts authenticated server state");
+    }
+    const result = resultFromResyncAudit(status);
+    validateResyncResult([result], status, floor);
+    await eventCall("resync.complete", { disposition: "already-accepted", result });
+    return result;
+  }
+  if (floor !== capabilities.min_available_seq ||
+      BigInt(status.transport_cursor) >= BigInt(floor) || BigInt(floor) > serverCurrent) {
+    throw new Error("accepted floor does not match the active retention gap");
+  }
+  let retentionError;
+  try {
+    await requestCall(config,
+      `/v1/messages?after=${encodeURIComponent(status.transport_cursor)}&limit=1`);
+  } catch (error) {
+    retentionError = error;
+  }
+  const details = retentionError?.body?.error?.details;
+  if (retentionError?.status !== 410 || retentionError?.code !== "resync-required" ||
+      retentionError.body?.min_available_seq !== floor ||
+      details?.after !== status.transport_cursor || details?.min_available_seq !== floor) {
+    throw new Error("server did not reproduce the authenticated retention gap");
+  }
+  const input = [{
+    type: "sync_resync",
+    expected_transport_cursor: status.transport_cursor,
+    min_available_seq: floor,
+    current_seq: capabilities.current_seq,
+    reason: "retention-gap-accepted",
+  }];
+  const result = validateResyncResult(
+    await driverCall("resync", config, input), status, floor);
+  await eventCall("resync.complete", { disposition: "accepted", result });
+  return result;
+}
+
 async function main() {
   const [command, ...rest] = process.argv.slice(2);
   const args = options(rest);
-  if (!["configure", "once", "run", "reprocess", "unblock-read"].includes(command)) {
+  if (!["configure", "once", "run", "reprocess", "resync", "unblock-read"].includes(command)) {
     throw new Error(usage());
   }
   if (command === "configure") { await configure(args); return; }
@@ -1172,6 +1382,10 @@ async function main() {
       type: "sync_read_unblock", member_id: args["member-id"],
     }]);
     await event("read-state.unblocked", { member_id: args["member-id"], result: result[0] ?? null });
+    return;
+  }
+  if (command === "resync") {
+    await resyncCycle(config, args["accept-floor"] ?? "");
     return;
   }
   if (command === "reprocess") { await reprocessCycle(config, limit); return; }
