@@ -64,11 +64,50 @@ or change any other storage state. This is the normative backend-neutral seam;
 the engine never inspects a driver's database directly and never substitutes
 the mutating Stage-1 prepare operation.
 
+The status output is exactly one JSONL object with no duplicate or unknown
+fields. A lookup without an audit is:
+
+```json
+{"type":"sync_resync_status","driver_generation":"018f3f7e-0000-7000-8000-000000000099","transport_cursor":"42","audit":null}
+```
+
+An accepted audit uses this strict shape:
+
+```json
+{"type":"sync_resync_status","driver_generation":"018f3f7e-0000-7000-8000-000000000099","transport_cursor":"100","audit":{"expected_transport_cursor":"42","accepted_floor":"100","gap_start":"43","gap_end":"100","reason":"retention-gap-accepted"}}
+```
+
+`driver_generation` is the non-empty, immutable generation identifier already
+used by Stage 1 and is limited to 256 UTF-8 bytes without control characters.
+All cursor/floor/gap fields are canonical nonnegative decimal strings no greater
+than the signed 64-bit sequence maximum. The driver confines both cursor and
+audit lookup to the argv binding and returned generation.
+
+The engine MUST reject anything other than exactly one record and MUST reject
+duplicate JSON keys, unknown fields at either object level, noncanonical values,
+or a type other than `sync_resync_status`. For a non-null audit it also verifies:
+
+- `audit.accepted_floor` equals the requested argv floor;
+- `audit.gap_end` equals `audit.accepted_floor`;
+- `audit.gap_start` equals `audit.expected_transport_cursor + 1` without
+  overflow;
+- `audit.expected_transport_cursor < audit.accepted_floor <= transport_cursor`;
+  and
+- `audit.reason` is exactly `retention-gap-accepted`.
+
+`audit: null` is the only no-match representation; omitted audit fields or a
+partial object are invalid.
+
 The operation consumes exactly one UTF-8 JSONL record:
 
 ```json
 {"type":"sync_resync","expected_transport_cursor":"42","min_available_seq":"100","current_seq":"123","reason":"retention-gap-accepted"}
 ```
+
+This input is also strict: those five fields are required, no other or duplicate
+fields are allowed, all three sequences follow the canonical signed-BIGINT
+decimal rule, and
+`expected_transport_cursor < min_available_seq <= current_seq`.
 
 In one storage transaction, the driver MUST revalidate the binding and exact
 expected cursor, insert an immutable audit record for the unavailable inclusive
@@ -88,13 +127,24 @@ checkpoints, or read state. In particular:
 - Stage-2 read state independently max-merges the authenticated retention floor
   under ADR 0008.
 
-The transaction emits one `sync_resync_result` with the old cursor, new cursor,
-and accepted gap. If the process crashes after commit but before observing that
-result, the repeated command obtains the same immutable row through status and
-returns the same result without requiring the old cursor as CLI input. After a
-commit, a normal polling cycle starts at the floor and downloads only
-`server_seq > min_available_seq`. No event is fabricated for the unavailable
-range.
+The transaction emits exactly one strict result object:
+
+```json
+{"type":"sync_resync_result","driver_generation":"018f3f7e-0000-7000-8000-000000000099","expected_transport_cursor":"42","transport_cursor":"100","accepted_floor":"100","gap_start":"43","gap_end":"100","reason":"retention-gap-accepted"}
+```
+
+No duplicate, unknown, or missing field is allowed. Its generation must equal
+the preceding status generation, and its decimals/reason must satisfy the same
+predicates as a non-null status audit, with
+`transport_cursor == accepted_floor`. The engine validates the object before
+reporting success.
+
+If the process crashes after commit but before observing that result, the
+repeated command obtains the immutable row through status, constructs this
+exact same result shape, and returns it without requiring the old cursor as CLI
+input. After a commit, a normal polling cycle starts at the floor and downloads
+only `server_seq > min_available_seq`. No event is fabricated for the
+unavailable range.
 
 Drivers without `stage1-resync` remain valid Stage-1 drivers. The engine checks
 the advertised capability before the operator command and fails without a

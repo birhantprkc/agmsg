@@ -345,7 +345,9 @@ message. Resync atomically records an authenticated, operator-accepted retention
 gap and advances only the transport cursor. Together they make result-loss
 retry idempotent without exposing driver storage internals. They never make
 HTTP 410 an automatic polling recovery and never delete local messages or
-independent state layers.
+independent state layers. ADR 0009 pins their exact strict JSONL status, input,
+audit, and result objects, including canonical sequence arithmetic and
+duplicate/unknown-field rejection.
 
 The independent Stage-2 extension from
 [ADR 0008](../adr/0008-stage-2-read-cursor-sync.md) is advertised as
