@@ -1,0 +1,129 @@
+# ADR 0009: Operator-approved retention-gap resynchronization
+
+**Status:** proposed (dogfood contract)
+**Date:** 2026-07-22
+**Deciders:** @fujibee
+
+## Context
+
+The HTTP v1 message stream returns `410 resync-required` when a client's
+transport cursor predates the team's authenticated `min_available_seq`.
+Stage 1 intentionally treats that response as terminal: silently assigning the
+floor to the cursor would claim that unavailable messages had durable local
+outcomes.
+
+Self-hosted operators nevertheless need bounded live-envelope storage. A
+device that was offline beyond retention must be able to resume without
+deleting its local-first messages, existing remote projections, decrypt
+quarantine, or read state. The missing server prefix cannot be reconstructed,
+so recovery must record an explicit acceptance of that loss rather than call it
+a successful import.
+
+## Decision
+
+### Explicit gap acceptance
+
+`remote-sync.sh resync --team NAME --accept-floor SEQUENCE` is the only v1
+operation that may recover a binding from `410 resync-required`. Invocation is
+an operator approval; polling commands never call it automatically.
+
+Before changing local state, the engine MUST:
+
+1. load and validate the existing immutable binding;
+2. obtain an authenticated capability snapshot;
+3. read the driver's current transport cursor without publishing a new
+   envelope;
+4. reproduce `410 resync-required` by requesting that exact cursor;
+5. validate the error binding and require the error floor, capability floor,
+   and `--accept-floor` value to be identical; and
+6. require `transport_cursor < min_available_seq <= current_seq`.
+
+A stale approval, a changed binding, a non-410 response, or a floor that changes
+during those checks is terminal and leaves local state unchanged. The operator
+must inspect the new floor and invoke the command again.
+
+### Driver transaction and audit record
+
+The optional `stage1-resync` capability adds:
+
+```text
+storage_sync_resync <local-team> <server-instance-id> <remote-team-id> <protocol-version>
+```
+
+The operation consumes exactly one UTF-8 JSONL record:
+
+```json
+{"type":"sync_resync","expected_transport_cursor":"42","min_available_seq":"100","current_seq":"123","reason":"retention-gap-accepted"}
+```
+
+In one storage transaction, the driver MUST revalidate the binding and exact
+expected cursor, insert an immutable audit record for the unavailable inclusive
+range `43..100`, and advance the transport cursor to `100`. The audit key
+contains the binding, driver generation, old cursor, and accepted floor so that
+retry is idempotent. A conflicting retry fails without mutation.
+
+The operation MUST NOT delete or rewrite local messages, remote projections,
+wire mappings, acknowledgements, conflicts, quarantine entries, security
+checkpoints, or read state. In particular:
+
+- an unacknowledged local message remains eligible for byte-identical retry;
+- a replay whose wire ID has become a server tombstone still reconciles to its
+  original `server_seq`;
+- existing blocking quarantine remains available to explicit reprocessing; and
+- Stage-2 read state independently max-merges the authenticated retention floor
+  under ADR 0008.
+
+The transaction emits one `sync_resync_result` with the old cursor, new cursor,
+and accepted gap. After it commits, a normal polling cycle starts at the floor
+and downloads only `server_seq > min_available_seq`. No event is fabricated for
+the unavailable range.
+
+Drivers without `stage1-resync` remain valid Stage-1 drivers. The engine checks
+the advertised capability before the operator command and fails without a
+network or local mutation when it is absent.
+
+### Reference-server retention configuration
+
+The reference server accepts optional
+`AGMSG_RETENTION_MAX_LIVE_MESSAGES=<positive integer>`. It is disabled when
+unset. After a successful message batch has its canonical acknowledgements, the
+same transaction and team-row lock advance the floor to
+`max(existing_floor, current_seq - max_live_messages)` when needed, create
+permanent digest tombstones, delete the covered live prefix, advance read
+frontiers, and garbage-collect covered exact reads before commit.
+
+The manual `npm run retain -- TEAM_ID THROUGH_SEQUENCE` operation remains
+available and uses the same transactional primitive. Automatic and manual
+retention therefore serialize with message sequence allocation and cannot
+expose a floor without complete tombstones.
+
+This setting bounds retained envelope payload rows, not all database bytes.
+Permanent UUID/digest tombstones, credentials, membership, policy history, and
+audit records remain durable protocol state. Operators must include that
+metadata in capacity planning.
+
+## Failure and retry semantics
+
+- `once` and `run` continue to stop on 410 and log the authenticated floor.
+- `resync` is safe to retry only with the same expected cursor and floor; an
+  already committed identical audit record returns the same result.
+- A crash before the driver commit changes nothing. A crash after commit leaves
+  the advanced cursor and audit row together, so the next poll resumes safely.
+- Resync never weakens age-v1 anti-rollback checkpoints or cipher policy.
+
+## Consequences
+
+- Offline devices can recover from self-host retention without a destructive
+  local-store replacement.
+- The UI and logs can distinguish imported history from an operator-accepted
+  unavailable interval.
+- Recovery accepts irreversible message loss for the missing server interval;
+  it cannot promise a full snapshot that HTTP v1 does not provide.
+- Live payload retention is configurable while permanent idempotency metadata
+  preserves exactly-once replay behavior.
+
+## References
+
+- [ADR 0005: Stage-1 remote synchronization](0005-stage-1-remote-sync.md)
+- [ADR 0008: Stage-2 read-state synchronization](0008-stage-2-read-cursor-sync.md)
+- [HTTP API v1](../../server/spec/v1.md)
