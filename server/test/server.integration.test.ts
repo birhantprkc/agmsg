@@ -251,6 +251,78 @@ describeDatabase("remote storage HTTP API v1", () => {
     });
   });
 
+  it("max-merges and paginates composite read state", async () => {
+    const exactId = "750e8400-e29b-41d4-a716-446655440002";
+    const firstPage = await app.inject({
+      method: "POST",
+      url: "/v1/read-state/sync",
+      headers,
+      payload: {
+        updates: [{ member_id: memberId, server_seq: "1", exact_wire_ids: [exactId] }],
+        page_after: null,
+        page_limit: 1,
+      },
+    });
+    expect(firstPage.statusCode).toBe(200);
+    expect(firstPage.headers["cache-control"]).toBe("no-store");
+    expect(firstPage.json()).toMatchObject({
+      min_available_seq: "0",
+      current_seq: "2",
+      items: [{ kind: "frontier", member_id: memberId, server_seq: "1" }],
+      next_page_after: { member_id: memberId, kind: "frontier" },
+      has_more: true,
+    });
+
+    const secondPage = await app.inject({
+      method: "POST",
+      url: "/v1/read-state/sync",
+      headers,
+      payload: {
+        updates: [],
+        page_after: firstPage.json().next_page_after,
+        page_limit: 1,
+      },
+    });
+    expect(secondPage.json()).toMatchObject({
+      items: [{ kind: "exact", member_id: memberId, wire_id: exactId }],
+      next_page_after: null,
+      has_more: false,
+    });
+
+    const absorbed = await app.inject({
+      method: "POST",
+      url: "/v1/read-state/sync",
+      headers,
+      payload: {
+        updates: [{ member_id: memberId, server_seq: "2", exact_wire_ids: [] }],
+        page_after: null,
+        page_limit: 10,
+      },
+    });
+    expect(absorbed.json()).toMatchObject({
+      items: [{ kind: "frontier", member_id: memberId, server_seq: "2" }],
+      has_more: false,
+    });
+    const exactCount = await pool.query<{ count: string }>(
+      "SELECT COUNT(*)::text AS count FROM read_exact WHERE team_id=$1",
+      [teamId],
+    );
+    expect(exactCount.rows[0]?.count).toBe("0");
+
+    const future = await app.inject({
+      method: "POST",
+      url: "/v1/read-state/sync",
+      headers,
+      payload: {
+        updates: [{ member_id: memberId, server_seq: "3", exact_wire_ids: [] }],
+        page_after: null,
+        page_limit: 10,
+      },
+    });
+    expect(future.statusCode).toBe(400);
+    expect(future.json().error.code).toBe("invalid-request");
+  });
+
   it("serializes concurrent writers on the team row", async () => {
     const writes = await Promise.all(
       [
@@ -319,6 +391,17 @@ describeDatabase("remote storage HTTP API v1", () => {
     });
     expect(posted.statusCode).toBe(200);
     expect(posted.json().acks[0].server_seq).toBe("5");
+
+    const readAfterRetention = await app.inject({
+      method: "POST",
+      url: "/v1/read-state/sync",
+      headers,
+      payload: { updates: [], page_after: null, page_limit: 10 },
+    });
+    expect(readAfterRetention.json()).toMatchObject({
+      min_available_seq: "4",
+      items: [{ kind: "frontier", member_id: memberId, server_seq: "4" }],
+    });
 
     const belowFloor = await app.inject({
       method: "GET",
@@ -424,6 +507,20 @@ describeDatabase("remote storage HTTP API v1", () => {
       const first = await runProvision();
       expect(JSON.parse(first.stdout)).toMatchObject({ members_revision: "0" });
 
+      await pool.query(
+        `INSERT INTO read_frontiers(team_id, member_id, server_seq)
+         VALUES ($1, $2, 7)`,
+        [provisionTeam, provisionMember],
+      );
+      const reprovisioned = await runProvision();
+      expect(JSON.parse(reprovisioned.stdout)).toMatchObject({ members_revision: "1" });
+      const preservedReadState = await pool.query<{ server_seq: string }>(
+        `SELECT server_seq::text FROM read_frontiers
+          WHERE team_id=$1 AND member_id=$2`,
+        [provisionTeam, provisionMember],
+      );
+      expect(preservedReadState.rows[0]?.server_seq).toBe("7");
+
       await writeFile(
         manifestPath,
         JSON.stringify({
@@ -433,7 +530,13 @@ describeDatabase("remote storage HTTP API v1", () => {
         }),
       );
       const second = await runProvision();
-      expect(JSON.parse(second.stdout)).toMatchObject({ members_revision: "1" });
+      expect(JSON.parse(second.stdout)).toMatchObject({ members_revision: "2" });
+      const retiredReadState = await pool.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM read_frontiers
+          WHERE team_id=$1 AND member_id=$2`,
+        [provisionTeam, provisionMember],
+      );
+      expect(retiredReadState.rows[0]?.count).toBe("0");
 
       await writeFile(
         manifestPath,
