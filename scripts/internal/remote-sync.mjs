@@ -7,6 +7,8 @@ import process from "node:process";
 import { pathToFileURL } from "node:url";
 import { ageExecutableVersion, CipherStateError, openEnvelope,
   readNativeAgeIdentity } from "./sync-cipher.mjs";
+import { parseStrictJsonl } from "./strict-jsonl.mjs";
+export { parseStrictJsonl } from "./strict-jsonl.mjs";
 
 const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -510,68 +512,6 @@ export async function driver(operation, config, input, extra = []) {
 
 function parseJsonl(value) {
   return value.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
-}
-
-function rejectDuplicateJsonKeys(source) {
-  let offset = 0;
-  const whitespace = () => { while (/\s/u.test(source[offset] ?? "")) offset += 1; };
-  const string = () => {
-    const start = offset;
-    if (source[offset] !== '"') throw new Error("driver JSON framing is invalid");
-    offset += 1;
-    while (offset < source.length) {
-      if (source[offset] === "\\") { offset += 2; continue; }
-      if (source[offset] === '"') {
-        offset += 1;
-        return JSON.parse(source.slice(start, offset));
-      }
-      offset += 1;
-    }
-    throw new Error("driver JSON framing is invalid");
-  };
-  const value = () => {
-    whitespace();
-    if (source[offset] === "{") {
-      offset += 1; whitespace();
-      const keys = new Set();
-      if (source[offset] === "}") { offset += 1; return; }
-      for (;;) {
-        const key = string();
-        if (keys.has(key)) throw new Error("driver JSON contains a duplicate key");
-        keys.add(key); whitespace();
-        if (source[offset] !== ":") throw new Error("driver JSON framing is invalid");
-        offset += 1; value(); whitespace();
-        if (source[offset] === "}") { offset += 1; return; }
-        if (source[offset] !== ",") throw new Error("driver JSON framing is invalid");
-        offset += 1; whitespace();
-      }
-    }
-    if (source[offset] === "[") {
-      offset += 1; whitespace();
-      if (source[offset] === "]") { offset += 1; return; }
-      for (;;) {
-        value(); whitespace();
-        if (source[offset] === "]") { offset += 1; return; }
-        if (source[offset] !== ",") throw new Error("driver JSON framing is invalid");
-        offset += 1;
-      }
-    }
-    if (source[offset] === '"') { string(); return; }
-    const start = offset;
-    while (offset < source.length && !/[\s,}\]]/u.test(source[offset])) offset += 1;
-    if (start === offset) throw new Error("driver JSON framing is invalid");
-    JSON.parse(source.slice(start, offset));
-  };
-  value(); whitespace();
-  if (offset !== source.length) throw new Error("driver JSON framing is invalid");
-}
-
-export function parseStrictJsonl(value) {
-  const lines = value.split(/\r?\n/u).filter(Boolean);
-  return lines.map((line) => {
-    rejectDuplicateJsonKeys(line);
-    return JSON.parse(line);
-  });
 }
 
 async function event(name, fields = {}) {

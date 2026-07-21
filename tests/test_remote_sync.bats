@@ -224,8 +224,7 @@ prepare_push() {
     and .type=="sync_resync_status" and .transport_cursor=="0" and .audit==null' >/dev/null
 
   input='{"type":"sync_resync","expected_transport_cursor":"0","min_available_seq":"5","current_seq":"7","reason":"retention-gap-accepted"}'
-  result=$(printf '%s\n' "$input" |
-    storage_sync_resync demo "$SERVER_ID" "$TEAM_ID" 1)
+  result=$(storage_sync_resync demo "$SERVER_ID" "$TEAM_ID" 1 <<< "$input")
   printf '%s\n' "$result" | jq -e '
     keys==["accepted_floor","driver_generation","expected_transport_cursor","gap_end","gap_start","reason","transport_cursor","type"]
     and .type=="sync_resync_result" and .expected_transport_cursor=="0"
@@ -259,6 +258,20 @@ prepare_push() {
   run storage_sync_resync_status demo "$SERVER_ID" "$other" 1 10
   [ "$status" -ne 0 ]
   [ -z "$output" ]
+}
+
+@test "sync contract: resync input rejects duplicate keys and later records" {
+  prepare_push >/dev/null
+  local duplicate multiple db
+  duplicate='{"type":"sync_resync","expected_transport_cursor":"0","min_available_seq":"4","min_available_seq":"5","current_seq":"7","reason":"retention-gap-accepted"}'
+  run storage_sync_resync demo "$SERVER_ID" "$TEAM_ID" 1 <<< "$duplicate"
+  [ "$status" -ne 0 ]
+  multiple=$'{"type":"sync_resync","expected_transport_cursor":"0","min_available_seq":"5","current_seq":"7","reason":"retention-gap-accepted"}\n\n{"type":"sync_resync","expected_transport_cursor":"0","min_available_seq":"6","current_seq":"7","reason":"retention-gap-accepted"}'
+  run storage_sync_resync demo "$SERVER_ID" "$TEAM_ID" 1 <<< "$multiple"
+  [ "$status" -ne 0 ]
+  db=$(agmsg_db_path)
+  [ "$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM sync_resync_audits;" | tr -d '\r')" -eq 0 ]
+  [ "$(agmsg_sqlite "$db" "SELECT transport_cursor FROM sync_bindings;" | tr -d '\r')" = 0 ]
 }
 
 @test "Stage-2 sync exports exact reads across holes and applies remote frontier separately" {

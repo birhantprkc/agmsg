@@ -250,11 +250,12 @@ storage_sync_resync_status() {
 storage_sync_resync() {
   local team="$1" server="$2" remote="$3" protocol="$4"
   _sqlite_sync_valid_binding "$server" "$remote" "$protocol" || return 13
-  _sqlite_sync_schema || return $?
-  local line extra expected floor current reason generation db tl gap_start
-  IFS= read -r line || return 13
-  IFS= read -r extra && [ -n "$extra" ] && return 13
-  [ -n "$line" ] || return 13
+  local line expected floor current reason generation db tl gap_start node_bin strict_parser
+  node_bin="${AGMSG_NODE:-node}"
+  strict_parser="$SKILL_DIR/scripts/internal/strict-jsonl.mjs"
+  command -v "$node_bin" >/dev/null 2>&1 && [ -f "$strict_parser" ] || return 10
+  line=$("$node_bin" "$strict_parser" current_seq expected_transport_cursor \
+    min_available_seq reason type) || return 13
   printf '%s\n' "$line" | jq -e '
     (keys == ["current_seq","expected_transport_cursor","min_available_seq","reason","type"])
     and .type == "sync_resync" and .reason == "retention-gap-accepted"
@@ -271,6 +272,7 @@ storage_sync_resync() {
   [ "$(_sqlite_sync_decimal_le "$floor" "$current")" = 1 ] || return 13
   gap_start=$((10#$expected + 1))
   _sqlite_sync_sequence "$gap_start" || return 13
+  _sqlite_sync_schema || return $?
   generation=$(_sqlite_sync_generation); db="$(_sqlite_db)"; tl="$(_sqlite_lit "$team")"
 
   agmsg_sqlite "$db" "BEGIN IMMEDIATE;
