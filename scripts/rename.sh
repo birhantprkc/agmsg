@@ -101,7 +101,9 @@ if [ -f "$DB" ]; then
   fi
   if [ "$(agmsg_sqlite "$DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_read_members';" | tr -d '\r')" = 1 ]; then
     RENAME_SQL="$RENAME_SQL
-      UPDATE sync_read_members SET agent='$NEW_LIT' WHERE local_team='$TEAM_LIT' AND agent='$OLD_LIT';
+      UPDATE sync_read_members SET agent='$NEW_LIT',
+        name_mismatch=CASE WHEN remote_agent='$NEW_LIT' THEN 0 ELSE 1 END
+        WHERE local_team='$TEAM_LIT' AND agent='$OLD_LIT';
       UPDATE sync_read_aliases SET agent='$NEW_LIT' WHERE local_team='$TEAM_LIT' AND agent='$OLD_LIT';"
   fi
   agmsg_sqlite "$DB" "BEGIN IMMEDIATE;

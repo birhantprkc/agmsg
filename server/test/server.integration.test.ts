@@ -547,6 +547,20 @@ describeDatabase("remote storage HTTP API v1", () => {
         }),
       );
       await expect(runProvision()).rejects.toThrow(/retired/);
+
+      await writeFile(
+        manifestPath,
+        JSON.stringify({
+          team_id: provisionTeam,
+          team_name: "provisioned-team",
+          members: Array.from({ length: 1001 }, (_, index) => ({
+            member_id: `018f3f7e-0000-7000-8000-${String(index).padStart(12, "0")}`,
+            name: `member-${index}`,
+            registrations: [],
+          })),
+        }),
+      );
+      await expect(runProvision()).rejects.toThrow(/too_big|1000|Array/u);
     } finally {
       if (!directory.startsWith(join(tmpdir(), "agmsg-provision-test-"))) {
         throw new Error("refusing to remove an unexpected temporary directory");

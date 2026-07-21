@@ -5,13 +5,16 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   ageSnapshotDigest,
+  consistentReadStateContext,
   driver,
   isRetryable,
   plaintextWriteEligible,
+  readStateCycle,
   readStateUpdateBatches,
   request,
   retainAgeCheckpoint,
   selectWriteProfile,
+  stage2ReadStateSupported,
   validateAckMapping,
   validateAgeConfiguration,
   validateConfiguredAgeIdentities,
@@ -81,6 +84,128 @@ test("Stage-2 roster, update batches, and response pages are canonical", () => {
     items: [{ kind: "frontier", member_id: members[0].member_id, server_seq: "3" }],
     next_page_after: null, has_more: false,
   }, 1), /item is invalid/u);
+  const after = { member_id: members[0].member_id, kind: "frontier" };
+  assert.throws(() => validateReadStatePage(config, {
+    protocol_version: 1, server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id, min_available_seq: "4", current_seq: "9",
+    items: [{ kind: "frontier", member_id: members[0].member_id, server_seq: "7" }],
+    next_page_after: { member_id: members[0].member_id, kind: "frontier" }, has_more: true,
+  }, 1, after), /page order/u);
+  assert.throws(() => validateReadStatePage(config, {
+    protocol_version: 1, server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id, min_available_seq: "4", current_seq: "9",
+    items: [], next_page_after: null, has_more: true,
+  }, 1), /response is invalid/u);
+});
+
+test("Stage-2 capability is optional and blocked members emit no mutation", () => {
+  assert.equal(stage2ReadStateSupported([{
+    type: "sync_driver_capabilities", capabilities: ["stage1-sync"],
+  }]), false);
+  assert.equal(stage2ReadStateSupported([{
+    type: "sync_driver_capabilities", capabilities: ["stage1-sync", "stage2-read-state"],
+  }]), true);
+  const member = { member_id: "018f3f7e-0000-7000-8000-000000000010", name: "worker-1" };
+  assert.deepEqual(readStateUpdateBatches([member], [{
+    type: "sync_read_blocked", member_id: member.member_id,
+    reason: "read-state-limit-exceeded",
+  }]), [[]]);
+});
+
+test("Stage-1-only driver skips the optional Stage-2 network path", async () => {
+  const events = [];
+  await readStateCycle(config, 100, {
+    driverCall: async (operation) => {
+      assert.equal(operation, "capabilities");
+      return [{ type: "sync_driver_capabilities", capabilities: ["stage1-sync"] }];
+    },
+    requestCall: async () => { throw new Error("Stage-2 request must be skipped"); },
+    eventCall: async (name, value) => { events.push([name, value]); },
+  });
+  assert.deepEqual(events, [["read-state.skipped", {
+    reason: "driver-capability-not-advertised",
+  }]]);
+});
+
+test("Stage-2 isolates a limit offender and continues read-only synchronization", async () => {
+  const members = [
+    { member_id: "018f3f7e-0000-7000-8000-000000000010", name: "worker-1" },
+    { member_id: "018f3f7e-0000-7000-8000-000000000020", name: "worker-2" },
+  ];
+  const capabilities = {
+    protocol_version: 1, server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id, min_available_seq: "0", current_seq: "0",
+    next_sequence_boundary: "1", accepted_envelope_versions: [1],
+    write_allowed_ciphers: ["none"], policy_revision: "0", effective_from_seq: "1",
+    max_blob_bytes: "1048576", policy_history: [{ policy_revision: "0",
+      effective_from_seq: "1", accepted_envelope_versions: [1], write_allowed_ciphers: ["none"] }],
+  };
+  const roster = { protocol_version: 1, server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id, min_available_seq: "0", members_revision: "0",
+    members: members.map((member) => ({ ...member, registrations: [] })) };
+  const operations = [];
+  let postCount = 0;
+  await readStateCycle(config, 100, {
+    driverCall: async (operation, _config, input) => {
+      operations.push(operation);
+      if (operation === "capabilities") return [{
+        type: "sync_driver_capabilities", capabilities: ["stage1-sync", "stage2-read-state"],
+      }];
+      if (operation === "read-prepare") return members.map((member) => ({
+        type: "sync_read_frontier", member_id: member.member_id, server_seq: "0",
+      }));
+      if (operation === "read-block") {
+        assert.equal(input[0].member_id, members[0].member_id);
+        return [{ type: "sync_read_blocked", member_id: members[0].member_id,
+          reason: "read-state-limit-exceeded" }];
+      }
+      if (operation === "read-apply") return [{ type: "sync_read_applied", member_count: 2 }];
+      throw new Error(`unexpected driver operation ${operation}`);
+    },
+    requestCall: async (_config, path, init) => {
+      if (path === "/v1/capabilities") return capabilities;
+      if (path === "/v1/members") return roster;
+      assert.equal(path, "/v1/read-state/sync");
+      postCount += 1;
+      const updates = JSON.parse(init.body).updates;
+      if (postCount === 1) {
+        assert.deepEqual(updates.map((update) => update.member_id),
+          members.map((member) => member.member_id));
+        const error = new Error("limit");
+        error.code = "read-state-limit-exceeded";
+        error.body = { error: { details: { member_id: members[0].member_id } } };
+        throw error;
+      }
+      assert.deepEqual(updates.map((update) => update.member_id), [members[1].member_id]);
+      return { protocol_version: 1, server_instance_id: config.server_instance_id,
+        team_id: config.remote_team_id, min_available_seq: "0", current_seq: "0",
+        items: members.map((member) => ({ kind: "frontier",
+          member_id: member.member_id, server_seq: "0" })),
+        next_page_after: null, has_more: false };
+    },
+    eventCall: async () => {},
+  });
+  assert.equal(postCount, 2);
+  assert.ok(operations.includes("read-block"));
+  assert.ok(operations.includes("read-apply"));
+});
+
+test("read-state context refetches a concurrent retention floor", async () => {
+  const capabilities10 = {
+    protocol_version: 1, server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id, min_available_seq: "10", current_seq: "20",
+    next_sequence_boundary: "21", accepted_envelope_versions: [1],
+    write_allowed_ciphers: ["none"], policy_revision: "0", effective_from_seq: "1",
+    max_blob_bytes: "1048576", policy_history: [{ policy_revision: "0",
+      effective_from_seq: "1", accepted_envelope_versions: [1], write_allowed_ciphers: ["none"] }],
+  };
+  const capabilities20 = { ...capabilities10, min_available_seq: "20" };
+  const roster = (floor) => ({ protocol_version: 1,
+    server_instance_id: config.server_instance_id, team_id: config.remote_team_id,
+    min_available_seq: floor, members_revision: "0", members: [] });
+  const replies = [roster("20"), capabilities20, roster("20")];
+  const result = await consistentReadStateContext(config, capabilities10, async () => replies.shift());
+  assert.equal(result.capabilities.min_available_seq, "20");
 });
 
 test("resolved protocol errors enforce the immutable binding", () => {

@@ -432,6 +432,7 @@ export function validateMembers(config, value) {
   }
   const ids = new Set();
   const names = new Set();
+  const registrationIds = new Set();
   let previous = "";
   for (const member of value.members) {
     if (!member || !UUID_V7.test(member.member_id) ||
@@ -439,6 +440,21 @@ export function validateMembers(config, value) {
         !Array.isArray(member.registrations) || ids.has(member.member_id) ||
         names.has(member.name) || (previous && member.member_id <= previous)) {
       throw new Error("members response is not canonical");
+    }
+    let priorRegistration = "";
+    for (const registration of member.registrations) {
+      if (Object.keys(registration).sort().join(",") !==
+          "installation_id,registration_id,type" ||
+          !UUID_V7.test(registration.registration_id) ||
+          !UUID_V7.test(registration.installation_id) ||
+          typeof registration.type !== "string" ||
+          !/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(registration.type) ||
+          registrationIds.has(registration.registration_id) ||
+          (priorRegistration && registration.registration_id <= priorRegistration)) {
+        throw new Error("member registrations are not canonical");
+      }
+      registrationIds.add(registration.registration_id);
+      priorRegistration = registration.registration_id;
     }
     ids.add(member.member_id); names.add(member.name); previous = member.member_id;
   }
@@ -708,6 +724,7 @@ export function readStateUpdateBatches(members, records) {
   const memberIds = new Set(members.map((member) => member.member_id));
   const frontiers = new Map();
   const exact = new Map(members.map((member) => [member.member_id, []]));
+  const blocked = new Map();
   for (const record of records) {
     if (!memberIds.has(record.member_id)) throw new Error("driver emitted an unknown read member");
     if (record.type === "sync_read_frontier") {
@@ -716,12 +733,24 @@ export function readStateUpdateBatches(members, records) {
     } else if (record.type === "sync_read_exact") {
       if (!UUID_V4.test(record.wire_id)) throw new Error("driver emitted an invalid exact wire ID");
       exact.get(record.member_id).push(record.wire_id);
+    } else if (record.type === "sync_read_blocked") {
+      if (blocked.has(record.member_id) ||
+          !["member-name-mismatch", "read-state-limit-exceeded"].includes(record.reason)) {
+        throw new Error("driver emitted an invalid blocked read member");
+      }
+      blocked.set(record.member_id, record.reason);
     } else {
       throw new Error("driver emitted an unknown read-state record");
     }
   }
   const entries = [];
   for (const member of members) {
+    if (blocked.has(member.member_id)) {
+      if (frontiers.has(member.member_id) || exact.get(member.member_id).length > 0) {
+        throw new Error("driver emitted updates for a blocked read member");
+      }
+      continue;
+    }
     const serverSeq = frontiers.get(member.member_id);
     if (serverSeq === undefined) throw new Error("driver omitted a member read frontier");
     const wires = exact.get(member.member_id);
@@ -748,15 +777,28 @@ export function readStateUpdateBatches(members, records) {
   return batches.length > 0 ? batches : [[]];
 }
 
-export function validateReadStatePage(config, value, pageLimit) {
+export function stage2ReadStateSupported(records) {
+  if (!Array.isArray(records) || records.length !== 1 ||
+      records[0]?.type !== "sync_driver_capabilities" ||
+      !Array.isArray(records[0].capabilities) ||
+      records[0].capabilities.some((value) => typeof value !== "string")) {
+    throw new Error("driver capability response is invalid");
+  }
+  return records[0].capabilities.includes("stage2-read-state");
+}
+
+export function validateReadStatePage(config, value, pageLimit, pageAfter = null) {
   validateBinding(config, value);
   const floor = BigInt(sequence(value.min_available_seq, "read-state floor"));
   const current = BigInt(sequence(value.current_seq, "read-state current_seq"));
   if (floor > current || !Array.isArray(value.items) || value.items.length > pageLimit ||
+      (value.has_more === true && value.items.length === 0) ||
       typeof value.has_more !== "boolean") {
     throw new Error("read-state response is invalid");
   }
-  let prior = null;
+  const afterKey = pageAfter === null ? null : [pageAfter.member_id,
+    pageAfter.kind === "frontier" ? 0 : 1, pageAfter.wire_id ?? ""];
+  let prior = afterKey;
   for (const item of value.items) {
     const fields = Object.keys(item).sort().join(",");
     if (!UUID_V7.test(item?.member_id) ||
@@ -783,6 +825,22 @@ export function validateReadStatePage(config, value, pageLimit) {
     throw new Error("read-state next page key is inconsistent");
   }
   return value;
+}
+
+export async function consistentReadStateContext(config, initialCapabilities, fetcher = request) {
+  let capabilities = initialCapabilities;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const roster = await fetcher(config, "/v1/members");
+    const members = validateMembers(config, roster);
+    if (roster.min_available_seq === capabilities.min_available_seq) {
+      return { capabilities, members };
+    }
+    capabilities = await fetcher(config, "/v1/capabilities");
+    validateCapabilities(config, capabilities);
+  }
+  const error = new Error("retention changed while loading the read-state context");
+  error.retryable = true;
+  throw error;
 }
 
 function parseCheckpoint(value) {
@@ -887,45 +945,84 @@ async function configure(args) {
     remote_team_id: config.remote_team_id });
 }
 
-async function readStateCycle(config, limit) {
-  const capabilities = await request(config, "/v1/capabilities");
-  validateCapabilities(config, capabilities);
-  const roster = await request(config, "/v1/members");
-  const members = validateMembers(config, roster);
-  if (roster.min_available_seq !== capabilities.min_available_seq) {
-    throw new Error("members and capabilities retention floors differ");
+export async function readStateCycle(config, limit, dependencies = {}) {
+  const driverCall = dependencies.driverCall ?? driver;
+  const requestCall = dependencies.requestCall ?? request;
+  const eventCall = dependencies.eventCall ?? event;
+  const driverCapabilities = await driverCall("capabilities", config, []);
+  if (!stage2ReadStateSupported(driverCapabilities)) {
+    await eventCall("read-state.skipped", { reason: "driver-capability-not-advertised" });
+    return;
   }
-  const prepared = await driver("read-prepare", config, [{ type: "sync_read_context",
+  const initialCapabilities = await requestCall(config, "/v1/capabilities");
+  validateCapabilities(config, initialCapabilities);
+  const { capabilities, members } = await consistentReadStateContext(
+    config, initialCapabilities, requestCall,
+  );
+  const prepared = await driverCall("read-prepare", config, [{ type: "sync_read_context",
     min_available_seq: capabilities.min_available_seq, current_seq: capabilities.current_seq,
     members }]);
   const batches = readStateUpdateBatches(members, prepared);
   const pageLimit = Math.min(limit, 1000);
   let page;
+  const blockedThisCycle = new Set();
   for (const updates of batches) {
-    page = await request(config, "/v1/read-state/sync", { method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ updates, page_after: null, page_limit: pageLimit }) });
+    let remaining = updates;
+    for (;;) {
+      try {
+        page = await requestCall(config, "/v1/read-state/sync", { method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ updates: remaining, page_after: null, page_limit: pageLimit }) });
+        break;
+      } catch (error) {
+        const memberId = error?.body?.error?.details?.member_id;
+        if (error?.code !== "read-state-limit-exceeded" || !UUID_V7.test(memberId ?? "") ||
+            !members.some((member) => member.member_id === memberId) || blockedThisCycle.has(memberId)) {
+          throw error;
+        }
+        blockedThisCycle.add(memberId);
+        await driverCall("read-block", config, [{ type: "sync_read_block", member_id: memberId,
+          reason: "read-state-limit-exceeded" }]);
+        remaining = remaining.filter((update) => update.member_id !== memberId);
+        await eventCall("read-state.blocked", { member_id: memberId,
+          reason: "read-state-limit-exceeded" });
+      }
+    }
   }
   let pageAfter = null;
   let pageCount = 0;
+  const seenFrontiers = new Set();
   for (;;) {
     if (pageAfter !== null) {
-      page = await request(config, "/v1/read-state/sync", { method: "POST",
+      page = await requestCall(config, "/v1/read-state/sync", { method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ updates: [], page_after: pageAfter, page_limit: pageLimit }) });
     }
-    validateReadStatePage(config, page, pageLimit);
+    validateReadStatePage(config, page, pageLimit, pageAfter);
+    for (const item of page.items) {
+      if (item.kind === "frontier" && seenFrontiers.has(item.member_id)) {
+        throw new Error("read-state stream repeated a member frontier");
+      }
+      if (item.kind === "frontier") seenFrontiers.add(item.member_id);
+    }
     const records = [{ type: "sync_read_snapshot",
       min_available_seq: page.min_available_seq, current_seq: page.current_seq },
     ...page.items.map((item) => item.kind === "frontier" ?
       { type: "sync_read_frontier", member_id: item.member_id, server_seq: item.server_seq } :
       { type: "sync_read_exact", member_id: item.member_id, wire_id: item.wire_id })];
-    const applied = await driver("read-apply", config, records);
+    const applied = await driverCall("read-apply", config, records);
     pageCount += 1;
-    await event("read-state.applied", { page: pageCount, item_count: page.items.length,
+    if (pageCount > 65_536 + members.length + 1) {
+      throw new Error("read-state pagination exceeded the bounded stream size");
+    }
+    await eventCall("read-state.applied", { page: pageCount, item_count: page.items.length,
       result: applied[0] ?? null });
     if (!page.has_more) break;
     pageAfter = page.next_page_after;
+  }
+  if (seenFrontiers.size !== members.length ||
+      members.some((member) => !seenFrontiers.has(member.member_id))) {
+    throw new Error("read-state stream omitted a member frontier");
   }
 }
 

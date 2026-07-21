@@ -219,6 +219,11 @@ is exactly `{"member_id":"...","kind":"exact","wire_id":"..."}`. The key is
 a comparison boundary and need not still exist when the next page is read.
 Unknown and duplicate fields are rejected under the common v1 JSON rules.
 
+HTTP v1 bounds a team roster to 1,000 active members and rejects larger
+operator provisioning documents atomically. The Stage-2 context therefore fits
+in one authenticated roster response; the read-state item stream is still
+paginated because each member can contribute bounded exact exceptions.
+
 In one transaction the server:
 
 1. locks the team row used by message and policy sequencing;
@@ -272,6 +277,14 @@ Member deletion is learned from the separately authenticated roster and retires
 that member's local remote overlay. Clients apply every page monotonically and
 restart at `page_after: null` on the next polling cycle.
 
+Member rename is a two-sided handshake because local storage and the remote
+operator roster cannot change atomically. The driver retains both the locally
+confirmed agent name and the latest authenticated roster name for each immutable
+member ID. While they differ, that member is durably blocked from emitting
+frontier or exact mutations; message and other-member synchronization continue.
+Either remote-first or local-first rename therefore fails closed until both
+names agree. A name mismatch never authorizes advancing a remote frontier.
+
 An empty update list is the read-only synchronization form. Retrying an update
 is idempotent. The engine sends local updates with the first page request and
 uses empty updates for subsequent pages. It validates response binding,
@@ -305,7 +318,11 @@ forbidden.
 ### Explicitly out of scope
 
 Stage 3 server-sent events and wake delivery are not launch requirements and are
-not part of this ADR. Stage 2 continues to use the existing polling loop.
+not part of this ADR. Stage 2 continues to use the existing polling loop. Stage
+3 should treat SSE and mobile wake as one team-scoped notification layer: a
+future iOS client may register an APNs device token, receive a Signal-style
+silent push, then pull, decrypt, and produce a local notification. The server
+still does not inspect recipients or message bodies.
 
 ## Consequences
 

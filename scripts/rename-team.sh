@@ -116,6 +116,15 @@ if [ "$(agmsg_storage_driver)" = jsonl ]; then
   storage_rename_team "$OLD_TEAM" "$NEW_TEAM" >/dev/null
 fi
 
+SYNC_CONFIG_DIR="$(agmsg_storage_dir)/remote-sync"
+if [ -d "$SYNC_CONFIG_DIR" ]; then
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/lib/node.sh"
+  NODE_BIN=$(agmsg_resolve_node)
+  "$NODE_BIN" "$SCRIPT_DIR/internal/rename-sync-config.mjs" \
+    "$(agmsg_storage_dir)" "$OLD_TEAM" "$NEW_TEAM"
+fi
+
 agmsg_lock_release
 # The old dir no longer holds a team (its config moved out); best-effort remove
 # the now-empty dir. A concurrent join to the old name after this point

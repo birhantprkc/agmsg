@@ -253,3 +253,53 @@ prepare_push() {
   db=$(agmsg_db_path)
   [ "$(agmsg_sqlite "$db" "SELECT transport_cursor FROM sync_bindings;" | tr -d '\r')" = 2 ]
 }
+
+@test "Stage-2 rename mismatch blocks remote frontier in either ordering" {
+  local old_context new_context prepared db member
+  member=018f3f7e-0000-7000-8000-000000000010
+  old_context=$(jq -nc --arg member "$member" '
+    {type:"sync_read_context",min_available_seq:"0",current_seq:"0",
+     members:[{member_id:$member,name:"bob"}]}')
+  new_context=$(jq -nc --arg member "$member" '
+    {type:"sync_read_context",min_available_seq:"0",current_seq:"0",
+     members:[{member_id:$member,name:"robert"}]}')
+
+  printf '%s\n' "$old_context" |
+    storage_sync_prepare_read_state demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
+  prepared=$(printf '%s\n' "$new_context" |
+    storage_sync_prepare_read_state demo "$SERVER_ID" "$TEAM_ID" 1)
+  [ "$(printf '%s\n' "$prepared" | jq -r 'select(.type=="sync_read_blocked")|.reason')" = \
+    member-name-mismatch ]
+  [ "$(printf '%s\n' "$prepared" | jq -s '[.[]|select(.type=="sync_read_frontier")]|length')" -eq 0 ]
+
+  db=$(agmsg_db_path)
+  agmsg_sqlite "$db" "UPDATE sync_read_members SET agent='robert',
+    name_mismatch=CASE WHEN remote_agent='robert' THEN 0 ELSE 1 END
+    WHERE local_team='demo' AND member_id='$member';" >/dev/null
+  prepared=$(printf '%s\n' "$old_context" |
+    storage_sync_prepare_read_state demo "$SERVER_ID" "$TEAM_ID" 1)
+  [ "$(printf '%s\n' "$prepared" | jq -r 'select(.type=="sync_read_blocked")|.reason')" = \
+    member-name-mismatch ]
+  [ "$(printf '%s\n' "$prepared" | jq -s '[.[]|select(.type=="sync_read_frontier")]|length')" -eq 0 ]
+}
+
+@test "Stage-2 exact limit block is durable and clears only after safe recomputation" {
+  local context member db result prepared
+  member=018f3f7e-0000-7000-8000-000000000010
+  context=$(jq -nc --arg member "$member" '
+    {type:"sync_read_context",min_available_seq:"0",current_seq:"0",
+     members:[{member_id:$member,name:"bob"}]}')
+  printf '%s\n' "$context" |
+    storage_sync_prepare_read_state demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
+  result=$(jq -nc --arg member "$member" '
+    {type:"sync_read_block",member_id:$member,reason:"read-state-limit-exceeded"}' |
+    storage_sync_block_read_state demo "$SERVER_ID" "$TEAM_ID" 1)
+  [ "$(printf '%s\n' "$result" | jq -r '.reason')" = read-state-limit-exceeded ]
+  db=$(agmsg_db_path)
+  [ "$(agmsg_sqlite "$db" "SELECT blocked_reason FROM sync_read_members WHERE member_id='$member';" | tr -d '\r')" = \
+    read-state-limit-exceeded ]
+  prepared=$(printf '%s\n' "$context" |
+    storage_sync_prepare_read_state demo "$SERVER_ID" "$TEAM_ID" 1)
+  [ "$(printf '%s\n' "$prepared" | jq -s '[.[]|select(.type=="sync_read_frontier")]|length')" -eq 1 ]
+  [ -z "$(agmsg_sqlite "$db" "SELECT blocked_reason FROM sync_read_members WHERE member_id='$member';" | tr -d '\r')" ]
+}

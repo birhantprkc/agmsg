@@ -369,16 +369,23 @@ EOF
   storage_init >/dev/null
   storage_read_cursor_consume oldteam alice 0 >/dev/null
   _sqlite_sync_schema
-  local generation db
+  local generation db store_dir
   generation=$(_sqlite_sync_generation)
   db=$(agmsg_db_path)
+  store_dir=$(agmsg_storage_dir)
   agmsg_sqlite "$db" "INSERT INTO sync_bindings
     (local_team,server_instance_id,remote_team_id,protocol_version,driver_generation)
     VALUES('oldteam','018f3f7e-0000-7000-8000-000000000000',
       '018f3f7e-0000-7000-8000-000000000001',1,'$generation');"
+  mkdir -p "$store_dir/remote-sync"
+  printf '{"local_team":"oldteam","binding":"fixture"}\n' \
+    > "$store_dir/remote-sync/oldteam.json"
+  chmod 600 "$store_dir/remote-sync/oldteam.json"
   bash "$SCRIPTS/rename-team.sh" oldteam newteam
   [ "$(agmsg_sqlite "$db" "SELECT team FROM read_cursors;" | tr -d '\r')" = newteam ]
   [ "$(agmsg_sqlite "$db" "SELECT local_team FROM sync_bindings;" | tr -d '\r')" = newteam ]
+  [ ! -e "$store_dir/remote-sync/oldteam.json" ]
+  [ "$(jq -r '.local_team' "$store_dir/remote-sync/newteam.json")" = newteam ]
 }
 
 @test "rename-team: JSONL keeps the cursor with the renamed event stream" {
@@ -465,13 +472,14 @@ EOF
   db=$(agmsg_db_path)
   agmsg_sqlite "$db" "INSERT INTO sync_read_members
     (local_team,server_instance_id,remote_team_id,protocol_version,
-     driver_generation,member_id,agent)
+     driver_generation,member_id,agent,remote_agent)
     VALUES('myteam','018f3f7e-0000-7000-8000-000000000000',
       '018f3f7e-0000-7000-8000-000000000001',1,'$generation',
-      '018f3f7e-0000-7000-8000-000000000010','claude');"
+      '018f3f7e-0000-7000-8000-000000000010','claude','claude');"
   bash "$SCRIPTS/rename.sh" myteam claude claude-orchestrator
   [ "$(agmsg_sqlite "$db" "SELECT agent FROM read_cursors;" | tr -d '\r')" = claude-orchestrator ]
   [ "$(agmsg_sqlite "$db" "SELECT agent FROM sync_read_members;" | tr -d '\r')" = claude-orchestrator ]
+  [ "$(agmsg_sqlite "$db" "SELECT name_mismatch FROM sync_read_members;" | tr -d '\r')" = 1 ]
 }
 
 @test "rename: JSONL keeps exact reads and cursor with the new agent name" {

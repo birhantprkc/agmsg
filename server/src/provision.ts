@@ -30,7 +30,7 @@ const manifestSchema = z
   .object({
     team_id: uuidV7Schema,
     team_name: teamNameSchema,
-    members: z.array(memberSchema),
+    members: z.array(memberSchema).max(1000),
   })
   .strict();
 
