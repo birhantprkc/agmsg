@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
-import { closeSync, fsyncSync, openSync, readFileSync, writeSync } from "node:fs";
-import { randomBytes, randomUUID } from "node:crypto";
+import { closeSync, fstatSync, fsyncSync, ftruncateSync, openSync, readFileSync,
+  writeSync } from "node:fs";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import process from "node:process";
 import { parseStrictJsonl } from "./strict-jsonl.mjs";
 import { sealEnvelope } from "./sync-cipher.mjs";
@@ -64,11 +65,27 @@ function readRecords(path) {
 
 function appendRecord(path, value) {
   const bytes = Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
-  const fd = openSync(path, "a", 0o600);
+  const fd = openSync(path, "a+", 0o600);
+  const oldSize = fstatSync(fd).size;
   try {
-    const written = writeSync(fd, bytes, 0, bytes.length);
+    let written;
+    const injectedPartial = Number(process.env.AGMSG_SYNC_TEST_PARTIAL_APPEND_BYTES ?? "0");
+    if (Number.isInteger(injectedPartial) && injectedPartial > 0) {
+      written = writeSync(fd, bytes, 0, Math.min(injectedPartial, bytes.length));
+      fail("injected JSONL partial append", 75);
+    }
+    written = writeSync(fd, bytes, 0, bytes.length);
     if (written !== bytes.length) fail("JSONL append was not one complete write");
     fsyncSync(fd);
+  } catch (error) {
+    try {
+      ftruncateSync(fd, oldSize);
+      fsyncSync(fd);
+    } catch (rollbackError) {
+      rollbackError.cause = error;
+      throw rollbackError;
+    }
+    throw error;
   } finally {
     closeSync(fd);
   }
@@ -96,6 +113,18 @@ function envelopeEqual(left, right) {
     left?.key_id === right?.key_id && left?.blob === right?.blob;
 }
 
+function localPayloadDigest(message) {
+  const hash = createHash("sha256");
+  for (const value of [message.local_id, message.from_agent, message.to_agent,
+    message.body, canonicalCreatedAt(message.at)]) {
+    const bytes = Buffer.from(value, "utf8");
+    const length = Buffer.allocUnsafe(4);
+    length.writeUInt32BE(bytes.length);
+    hash.update(length); hash.update(bytes);
+  }
+  return hash.digest("hex");
+}
+
 function currentGeneration(records, path) {
   let generation = null;
   for (const { value } of records) {
@@ -120,13 +149,17 @@ function fold(records, target) {
   const acknowledgements = new Map();
   const quarantineByWire = new Map();
   const wireBySequence = new Map();
+  const conflictsByLocalId = new Map();
+  const conflictsByWire = new Map();
   let transportCursor = "0";
+  let durablePushCursor = "0";
   for (const { value } of records) {
     if (!sameBinding(value, target)) continue;
     if (value.type === "sync_prepare_commit") {
       if (!Array.isArray(value.reservations)) fail("JSONL reservation commit is invalid");
       for (const reservation of value.reservations ?? []) {
         if (!UUID_V4.test(reservation.id) || typeof reservation.local_id !== "string" ||
+            !/^[0-9a-f]{64}$/u.test(reservation.payload_digest) ||
             !reservation.envelope || typeof reservation.driver_generation !== "string") {
           fail("JSONL reservation is invalid");
         }
@@ -134,6 +167,7 @@ function fold(records, target) {
         const priorLocal = reservationsByLocalId.get(reservation.local_id);
         const priorWire = reservationsByWire.get(reservation.id);
         if ((priorLocal && (priorLocal.id !== reservation.id ||
+              priorLocal.payload_digest !== reservation.payload_digest ||
               !envelopeEqual(priorLocal.envelope, reservation.envelope))) ||
             (priorWire && (priorWire.local_id !== reservation.local_id ||
               !envelopeEqual(priorWire.envelope, reservation.envelope)))) {
@@ -145,8 +179,42 @@ function fold(records, target) {
         positions.add(reservation.local_position);
         reservationPositionsByWire.set(reservation.id, positions);
       }
+    } else if (value.type === "sync_conflict_commit") {
+      if (!Array.isArray(value.conflicts) || value.conflicts.length < 1) {
+        fail("JSONL conflict commit is invalid");
+      }
+      for (const conflict of value.conflicts) {
+        if (conflict?.kind === "local_payload_conflict" &&
+            conflict.status === "corrupt_state" &&
+            typeof conflict.local_id === "string" &&
+            /^[0-9a-f]{64}$/u.test(conflict.expected_digest) &&
+            /^[0-9a-f]{64}$/u.test(conflict.observed_digest) &&
+            conflict.expected_digest !== conflict.observed_digest) {
+          conflictsByLocalId.set(conflict.local_id, conflict);
+        } else if (conflict?.kind === "ack_sequence_conflict" &&
+            conflict.status === "corrupt_state" && UUID_V4.test(conflict.id)) {
+          sequence(conflict.expected_server_seq, "conflict expected_server_seq");
+          sequence(conflict.observed_server_seq, "conflict observed_server_seq");
+          if (conflict.expected_server_seq === conflict.observed_server_seq) {
+            fail("JSONL acknowledgement conflict is not conflicting");
+          }
+          conflictsByWire.set(conflict.id, conflict);
+        } else if (conflict?.kind === "ack_wire_conflict" &&
+            conflict.status === "corrupt_state" &&
+            UUID_V4.test(conflict.id) && UUID_V4.test(conflict.expected_id) &&
+            conflict.id !== conflict.expected_id) {
+          sequence(conflict.server_seq, "conflict server_seq");
+          conflictsByWire.set(conflict.id, conflict);
+        } else {
+          fail("JSONL conflict is invalid");
+        }
+      }
     } else if (value.type === "sync_reconcile_commit") {
       if (!Array.isArray(value.acks)) fail("JSONL acknowledgement commit is invalid");
+      sequence(value.push_cursor, "stored push_cursor");
+      if (BigInt(value.push_cursor) < BigInt(durablePushCursor)) {
+        fail("JSONL push cursor moves backwards");
+      }
       for (const ack of value.acks) {
         sequence(ack.server_seq, "stored acknowledgement server_seq");
         sequence(ack.local_position, "stored acknowledgement local_position");
@@ -161,6 +229,7 @@ function fold(records, target) {
         acknowledgements.set(ack.id, ack);
         wireBySequence.set(ack.server_seq, ack.id);
       }
+      durablePushCursor = value.push_cursor;
     } else if (value.type === "sync_pull_commit") {
       sequence(value.transport_cursor, "stored transport_cursor");
       if (BigInt(value.transport_cursor) < BigInt(transportCursor) || !Array.isArray(value.messages)) {
@@ -202,7 +271,8 @@ function fold(records, target) {
     }
   }
   return { reservationsByLocalId, reservationsByWire, acknowledgements,
-    reservationPositionsByWire, quarantineByWire, wireBySequence, transportCursor };
+    reservationPositionsByWire, quarantineByWire, wireBySequence, transportCursor,
+    conflictsByLocalId, conflictsByWire, durablePushCursor };
 }
 
 function localMessages(records, localTeam) {
@@ -212,9 +282,12 @@ function localMessages(records, localTeam) {
 }
 
 function pushCursor(messages, state) {
-  let cursor = "0";
+  let cursor = state.durablePushCursor;
   for (const message of messages) {
+    if (BigInt(message.local_position) <= BigInt(cursor)) continue;
+    if (state.conflictsByLocalId.has(message.local_id)) break;
     const reservation = state.reservationsByLocalId.get(message.local_id);
+    if (reservation && state.conflictsByWire.has(reservation.id)) break;
     if (!reservation || !state.acknowledgements.has(reservation.id)) break;
     cursor = message.local_position;
   }
@@ -247,8 +320,28 @@ function prepare(path, target, limit, inputText) {
   const messages = localMessages(records, target.local_team);
   const pending = [];
   const newReservations = [];
+  const newConflicts = [];
+  const observedDigests = new Map();
+  for (const message of messages) {
+    const digest = localPayloadDigest(message);
+    const priorDigest = observedDigests.get(message.local_id) ??
+      state.reservationsByLocalId.get(message.local_id)?.payload_digest;
+    if (priorDigest && priorDigest !== digest &&
+        !state.conflictsByLocalId.has(message.local_id) &&
+        !newConflicts.some((conflict) => conflict.local_id === message.local_id)) {
+      newConflicts.push({ kind: "local_payload_conflict", status: "corrupt_state",
+        reason: "one local message id has different immutable payloads", local_id: message.local_id,
+        expected_digest: priorDigest, observed_digest: digest });
+    }
+    if (!observedDigests.has(message.local_id)) observedDigests.set(message.local_id, digest);
+  }
+  const newlyConflictedIds = new Set(newConflicts.map((conflict) => conflict.local_id));
   for (const message of messages) {
     if (pending.length >= limit) break;
+    if (state.conflictsByLocalId.has(message.local_id) || newlyConflictedIds.has(message.local_id)) {
+      continue;
+    }
+    const payloadDigest = localPayloadDigest(message);
     const existing = state.reservationsByLocalId.get(message.local_id);
     if (existing && !state.acknowledgements.has(existing.id)) {
       const rebound = { ...existing, driver_generation: generation,
@@ -269,12 +362,17 @@ function prepare(path, target, limit, inputText) {
     if (process.env.AGMSG_SYNC_TEST_ABORT_AFTER_SEAL === "1") fail("aborted after seal", 75);
     const reservation = { driver_generation: generation,
       local_position: message.local_position, local_id: message.local_id,
-      id: wireId, envelope };
+      payload_digest: payloadDigest, id: wireId, envelope };
     pending.push(reservation); newReservations.push(reservation);
   }
   if (newReservations.length > 0) {
     appendRecord(path, { type: "sync_prepare_commit", binding: target,
       driver_generation: generation, reservations: newReservations,
+      committed_at: new Date().toISOString() });
+  }
+  if (newConflicts.length > 0) {
+    appendRecord(path, { type: "sync_conflict_commit", binding: target,
+      driver_generation: generation, conflicts: newConflicts,
       committed_at: new Date().toISOString() });
   }
   process.stdout.write(`${JSON.stringify({ type: "sync_state", driver_generation: generation,
@@ -289,12 +387,6 @@ function prepare(path, target, limit, inputText) {
 function reconcile(path, target, inputText) {
   const acks = parseStrictJsonl(inputText);
   if (acks.length < 1 || acks.length > 1000) fail("reconcile requires 1..1000 acknowledgements");
-  const records = readRecords(path);
-  const generation = currentGeneration(records, path);
-  const refreshed = readRecords(path);
-  const state = fold(refreshed, target);
-  const messages = localMessages(refreshed, target.local_team);
-  const accepted = [];
   const seenPositions = new Set();
   const seenWires = new Set();
   const seenSequences = new Set();
@@ -313,15 +405,55 @@ function reconcile(path, target, inputText) {
     }
     seenPositions.add(ack.local_position); seenWires.add(ack.id);
     seenSequences.add(ack.server_seq); previousSequence = BigInt(ack.server_seq);
+  }
+  const records = readRecords(path);
+  const generation = currentGeneration(records, path);
+  const refreshed = readRecords(path);
+  const state = fold(refreshed, target);
+  const messages = localMessages(refreshed, target.local_team);
+  const accepted = [];
+  const conflicts = [];
+  let conflictDetected = false;
+  for (const ack of acks) {
     const reservation = state.reservationsByWire.get(ack.id);
     if (!reservation || !state.reservationPositionsByWire.get(ack.id)?.has(ack.local_position)) {
       fail("ack does not match a durable reservation");
     }
     const prior = state.acknowledgements.get(ack.id);
-    if (prior && prior.server_seq !== ack.server_seq) fail("ack sequence conflicts with prior state");
+    const sequenceWire = state.wireBySequence.get(ack.server_seq);
+    if (state.conflictsByWire.has(ack.id)) {
+      conflictDetected = true;
+      continue;
+    }
+    if (prior && prior.server_seq !== ack.server_seq) {
+      conflictDetected = true;
+      conflicts.push({ kind: "ack_sequence_conflict", status: "corrupt_state",
+        reason: "one wire id has different immutable server sequences", id: ack.id,
+        expected_server_seq: prior.server_seq,
+        observed_server_seq: ack.server_seq });
+      continue;
+    }
+    if (sequenceWire && sequenceWire !== ack.id) {
+      conflictDetected = true;
+      conflicts.push({ kind: "ack_wire_conflict", status: "corrupt_state",
+        reason: "one server sequence maps to different wire ids", id: ack.id,
+        expected_id: sequenceWire, server_seq: ack.server_seq });
+      continue;
+    }
     accepted.push(ack);
-    state.acknowledgements.set(ack.id, ack);
   }
+  if (conflictDetected) {
+    if (conflicts.length > 0) {
+      appendRecord(path, { type: "sync_conflict_commit", binding: target,
+        driver_generation: generation, conflicts,
+        committed_at: new Date().toISOString() });
+    }
+    for (const conflict of conflicts) state.conflictsByWire.set(conflict.id, conflict);
+    process.stdout.write(`${JSON.stringify({ type: "sync_reconcile_result",
+      push_cursor: pushCursor(messages, state) })}\n`);
+    return;
+  }
+  for (const ack of accepted) state.acknowledgements.set(ack.id, ack);
   if (accepted.length > 0) appendRecord(path, { type: "sync_reconcile_commit",
     binding: target, driver_generation: generation, acks: accepted,
     push_cursor: pushCursor(messages, state), committed_at: new Date().toISOString() });
@@ -354,9 +486,6 @@ function validatePull(records) {
       fail("importable pull message has no projection");
     }
   }
-  if (messages.length > 0 && cursor.next_after !== messages.at(-1).server_seq) {
-    fail("pull cursor does not cover the page");
-  }
   return { messages, cursor: cursor.next_after };
 }
 
@@ -375,6 +504,12 @@ function apply(path, target, inputText) {
       if (BigInt(message.server_seq) !== expected) fail("pull page is not contiguous");
       expected += 1n;
     }
+    if (input.messages.length > 0 && input.cursor !== input.messages.at(-1).server_seq) {
+      fail("pull cursor does not cover the page");
+    }
+  } else if (input.messages.some((message) =>
+    BigInt(message.server_seq) > BigInt(state.transportCursor))) {
+    fail("pull replay exceeds the durable cursor");
   }
   if (input.messages.length === 0 && input.cursor !== state.transportCursor) {
     fail("empty pull page cannot advance the cursor");
@@ -427,6 +562,26 @@ function apply(path, target, inputText) {
   }
 }
 
+function reprocess(path, target, limit) {
+  const records = readRecords(path);
+  const generation = currentGeneration(records, path);
+  const state = fold(readRecords(path), target);
+  process.stdout.write(`${JSON.stringify({ type: "sync_state", driver_generation: generation,
+    transport_cursor: state.transportCursor })}\n`);
+  const candidates = [...state.quarantineByWire.values()]
+    .filter((message) => ["unsupported_cipher", "pending_key", "authentication_failed",
+      "malformed", "policy_violation"].includes(message.status))
+    .sort((left, right) => BigInt(left.server_seq) < BigInt(right.server_seq) ? -1 :
+      BigInt(left.server_seq) > BigInt(right.server_seq) ? 1 : left.id.localeCompare(right.id))
+    .slice(0, limit);
+  for (const message of candidates) {
+    process.stdout.write(`${JSON.stringify({ type: "sync_reprocess_candidate",
+      server_seq: message.server_seq, id: message.id,
+      server_received_at: message.server_received_at, envelope: message.envelope,
+      prior_status: message.status })}\n`);
+  }
+}
+
 async function stdin() {
   const chunks = [];
   for await (const chunk of process.stdin) chunks.push(chunk);
@@ -454,6 +609,12 @@ async function main() {
     reconcile(path, target, input);
   } else if (operation === "apply") {
     apply(path, target, input);
+  } else if (operation === "reprocess") {
+    const limit = Number(extra);
+    if (input.trim() !== "" || !Number.isInteger(limit) || limit < 1 || limit > 1000) {
+      fail("reprocess input or limit is invalid");
+    }
+    reprocess(path, target, limit);
   } else {
     fail("unknown JSONL sync operation", 2);
   }

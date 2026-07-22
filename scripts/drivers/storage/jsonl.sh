@@ -121,16 +121,16 @@ _jsonl_with_lock() {
 # is byte-size based (file-direct I/O is size-bound, FINDINGS.md): ~5 MB ≈ tens of
 # thousands of events. AGMSG_JSONL_ENGINE=jq|duckdb forces a choice (tests/bench).
 _jsonl_use_duckdb() {
+  local log sz; log="$(_jsonl_log)"
+  # Imported messages live inside one atomic sync_pull_commit journal record.
+  # The jq projection understands that nested record; the optional flat DuckDB
+  # query does not. This correctness guard also overrides a forced engine.
+  grep -q '"type":"sync_pull_commit"' "$log" 2>/dev/null && return 1
   case "${AGMSG_JSONL_ENGINE:-}" in
     jq) return 1 ;;
     duckdb) command -v duckdb >/dev/null 2>&1 && return 0 || return 1 ;;
   esac
   command -v duckdb >/dev/null 2>&1 || return 1
-  local log sz; log="$(_jsonl_log)"
-  # Imported messages live inside one atomic sync_pull_commit journal record.
-  # The jq projection understands that nested record; the optional flat DuckDB
-  # query does not, so keep the correctness path once remote state is present.
-  grep -q '"type":"sync_pull_commit"' "$log" 2>/dev/null && return 1
   sz=$(wc -c < "$log" 2>/dev/null | tr -d ' ') || return 1
   [ "${sz:-0}" -ge "${AGMSG_JSONL_DUCKDB_BYTES:-5242880}" ]
 }
@@ -198,6 +198,11 @@ storage_sync_reconcile_push() {
 storage_sync_apply_pull() {
   _jsonl_init_file || return 13
   _jsonl_with_lock _jsonl_sync_exec_locked apply "$@"
+}
+
+storage_sync_reprocess() {
+  _jsonl_init_file || return 13
+  _jsonl_with_lock _jsonl_sync_exec_locked reprocess "$@"
 }
 
 # --- contract: messages -----------------------------------------------------
