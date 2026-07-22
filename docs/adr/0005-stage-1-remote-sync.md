@@ -53,6 +53,34 @@ that preserves the driver's cursor space preserves the generation; replacement
 or reinitialization of that position space creates a new generation. This
 prevents a reused local position from inheriting stale remote state.
 
+### JSONL journal realization (Gate C)
+
+The bundled JSONL driver realizes the same contract without a mutable sidecar
+database. `events.jsonl` is the single append journal for local events and sync
+state. Its Stage-1 local position is the byte offset immediately after the
+originating top-level `message_sent` record, paired with a persistent file
+generation. This sync position is separate from the driver's ordinal delivery
+cursor.
+
+Every Stage-1 operation holds the existing `events.jsonl.lock`, reads a complete
+snapshot through its locked EOF, folds the immutable state records, and appends
+at most one complete transition record with one append write followed by
+`fsync`. Reservation, acknowledgement, quarantine/import outcomes, and the
+transport cursor therefore become durable together. A pull page is one
+`sync_pull_commit`; imported local events are nested in that record and the
+normal inbox/history projection exposes each first committed local event once.
+Replay commits carry no second local event.
+
+Compaction and local rename preserve every sync record and rotate the file
+generation because byte offsets may change. The replacement journal contains
+the new generation before its atomic rename, so there is no rewritten-file /
+old-generation crash window. Durable reservations retain their
+local-ID/wire-ID/envelope identity across that rewrite. Position aliases permit
+an acknowledgement already in flight for the preceding generation to reconcile
+the same reservation, while the current generation's position is used for the
+new contiguous push prefix. A rewrite never creates a new wire ID or envelope
+for an existing reservation.
+
 ### Prepare push
 
 `storage_sync_prepare_push` reads one `sync_prepare` JSONL record from stdin.
@@ -174,8 +202,9 @@ transport cursor automatically.
   synthesizing new wire identities.
 - The transport engine is backend-neutral, while each participating driver can
   make remote reconciliation atomic with its own local message store.
-- SQLite is the initial dogfood backend. JSONL remains local-only until it can
-  provide the same atomic import and cursor guarantees.
+- SQLite and JSONL implement the dogfood contract. JSONL uses its locked,
+  single-record append journal rather than emulating a mutable transaction
+  outside the driver.
 - The client downloads the whole team stream and projects recipients locally;
   the opaque envelope prevents server-side recipient routing.
 

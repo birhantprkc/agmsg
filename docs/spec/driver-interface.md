@@ -318,6 +318,10 @@ storage driver. Bulk input and output are UTF-8 JSONL on stdin/stdout; only the
 non-secret binding identifiers and limits above may use argv. The binding key
 is `(server_instance_id, remote_team_id, protocol_version)`, and every local
 position is additionally paired with the driver's persistent generation.
+The bundled SQLite and JSONL drivers advertise this capability. JSONL uses a
+locked snapshot through EOF plus one fsynced append record per transition; its
+sync local position is a byte offset paired with the file generation, not its
+separate ordinal delivery cursor.
 
 Prepare publishes a wire ID and complete canonical envelope together in one
 durable transaction before emitting it and is re-entrant by local position.
