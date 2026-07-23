@@ -71,33 +71,33 @@ _remote_validate_endpoint() {
 # E2EE bootstrap starts. In a real terminal the choice/identity must therefore
 # come from the controlling TTY; otherwise the secure token path can only see
 # EOF and silently takes the abort branch. Non-interactive callers retain the
-# historical fd-0 fallback. AGMSG_REMOTE_PROMPT_FD is an internal contract-test
-# seam that models a distinct TTY input descriptor without putting secrets in
-# argv or environment values.
+# historical fd-0 fallback.
 _remote_prompt_read() {
-  local output_var="$1" prompt="$2" value="" prompt_fd="${AGMSG_REMOTE_PROMPT_FD:-}"
-  if [ -n "$prompt_fd" ]; then
-    case "$prompt_fd" in
-      [3-9]|[1-9][0-9]*) ;;
-      *)
-        echo "agmsg: invalid internal prompt file descriptor" >&2
-        return 2
-        ;;
-    esac
-    IFS= read -r -u "$prompt_fd" -p "$prompt" value || {
-      printf -v "$output_var" '%s' ""
-      return 1
-    }
-  elif [ -t 2 ]; then
-    IFS= read -r -p "$prompt" value </dev/tty || {
+  local output_var="$1" prompt="$2" silent="${3:-0}" value="" \
+    echo_newline=0 read_flags=(-r)
+  [ "$silent" -eq 1 ] && read_flags+=(-s)
+  if [ -r /dev/tty ] && [ -w /dev/tty ] && ( : </dev/tty ) 2>/dev/null; then
+    echo_newline=1
+    printf '%s' "$prompt" >/dev/tty
+    IFS= read "${read_flags[@]}" value </dev/tty || {
+      [ "$silent" -eq 1 ] && printf '\n' >/dev/tty
       printf -v "$output_var" '%s' ""
       return 1
     }
   else
-    IFS= read -r -p "$prompt" value || {
+    [ -t 0 ] && echo_newline=1
+    IFS= read "${read_flags[@]}" -p "$prompt" value || {
+      [ "$silent" -eq 1 ] && [ "$echo_newline" -eq 1 ] && printf '\n' >&2
       printf -v "$output_var" '%s' ""
       return 1
     }
+  fi
+  if [ "$silent" -eq 1 ] && [ "$echo_newline" -eq 1 ]; then
+    if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+      printf '\n' >/dev/tty
+    else
+      printf '\n' >&2
+    fi
   fi
   printf -v "$output_var" '%s' "$value"
 }
@@ -863,7 +863,7 @@ cmd_connect() {
           echo "  key.sh show $team --reveal-secret"
           echo "and paste its output below."
           local identity
-          _remote_prompt_read identity "Paste identity: " || identity=""
+          _remote_prompt_read identity "Paste identity: " 1 || identity=""
           if [ -z "$identity" ]; then
             echo "agmsg: no identity provided — if the only device that ever held this team's key is gone entirely, there is nothing to import. The historical stream stays permanently unreadable under the lost key, and rotation to start a fresh epoch is not available in this release." >&2
             exit 1

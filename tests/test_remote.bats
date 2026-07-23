@@ -351,13 +351,20 @@ json.dump({
 }
 
 @test "connect: token stdin remains separate from the E2EE generate prompt" {
+  skip_on_windows "PTY-backed secure prompt test requires POSIX controlling-terminal semantics"
   command -v age >/dev/null 2>&1 || skip "age not installed"
-  run bash -c "exec 3<<<'g'; printf 'good-token-enc' | AGMSG_REMOTE_PROMPT_FD=3 bash '$SCRIPTS/remote.sh' connect --endpoint '$ENDPOINT' --token-stdin myteam"
+  token_file="$(mktemp "$BATS_TEST_TMPDIR/remote-token.XXXXXX")"
+  chmod 600 "$token_file"
+  printf '%s' 'good-token-enc' > "$token_file"
+  run python3 "$BATS_TEST_DIRNAME/helpers/run_remote_connect_tty.py" \
+    "$SCRIPTS/remote.sh" "$ENDPOINT" "$token_file" generate
+  rm -f "$token_file"
   [ "$status" -eq 0 ]
   [[ "$output" == *"requires end-to-end encryption"* ]]
   [[ "$output" == *"Generated a new key for team 'myteam'"* ]]
   [[ "$output" == *"Connected: team 'myteam'"* ]]
   [[ "$output" != *"prefer --token-stdin"* ]]
+  [[ "$output" != *"good-token-enc"* ]]
 }
 
 @test "connect: encryption required + existing history still requires an explicit 'i' to import" {
@@ -372,13 +379,22 @@ json.dump({
 }
 
 @test "connect: token stdin remains separate from the E2EE import prompts" {
+  skip_on_windows "PTY-backed secure prompt test requires POSIX controlling-terminal semantics"
   command -v age >/dev/null 2>&1 || skip "age not installed"
   identity=$(age-keygen 2>/dev/null | grep '^AGE-SECRET-KEY-')
-  run bash -c "exec 3<<<$'i\\n$identity\\n'; printf 'good-token-enc' | AGMSG_REMOTE_PROMPT_FD=3 bash '$SCRIPTS/remote.sh' connect --endpoint '$ENDPOINT' --token-stdin myteam"
+  token_file="$(mktemp "$BATS_TEST_TMPDIR/remote-token.XXXXXX")"
+  identity_file="$(mktemp "$BATS_TEST_TMPDIR/remote-identity.XXXXXX")"
+  chmod 600 "$token_file" "$identity_file"
+  printf '%s' 'good-token-enc' > "$token_file"
+  printf '%s' "$identity" > "$identity_file"
+  run python3 "$BATS_TEST_DIRNAME/helpers/run_remote_connect_tty.py" \
+    "$SCRIPTS/remote.sh" "$ENDPOINT" "$token_file" import "$identity_file"
+  rm -f "$token_file" "$identity_file"
   [ "$status" -eq 0 ]
   [[ "$output" == *"Imported key for team 'myteam'"* ]]
   [[ "$output" == *"Connected: team 'myteam'"* ]]
   [[ "$output" != *"prefer --token-stdin"* ]]
+  [[ "$output" != *"$identity"* ]]
 }
 
 @test "connect: encryption required + empty/EOF input on the choice prompt safely aborts (never auto-generates)" {
