@@ -141,13 +141,41 @@ candidate_of() { printf '%s\n' "$1" | jq -c 'select(.type=="sync_push_candidate"
     storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1 | jq -r .push_cursor)
   [ "$after_cursor" = "$before_cursor" ]
   log="$(dirname "$(agmsg_db_path)")/events.jsonl"
-  [ "$(jq -s '[.[]|select(.type=="sync_conflict_commit")|.conflicts[]|
+  [ "$(jq -s '[.[]|select(.type=="sync_reconcile_commit")|.conflicts[]|
     select(.kind=="ack_sequence_conflict" and .expected_server_seq=="1" and
            .observed_server_seq=="2")]|length' "$log")" -eq 1 ]
-  [ "$(jq -s '[.[]|select(.type=="sync_reconcile_commit")]|length' "$log")" -eq 1 ]
+  [ "$(jq -s '[.[]|select(.type=="sync_reconcile_commit")]|length' "$log")" -eq 2 ]
   printf '%s\n' "$second" |
     storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
-  [ "$(jq -s '[.[]|select(.type=="sync_conflict_commit")]|length' "$log")" -eq 1 ]
+  [ "$(jq -s '[.[]|select(.type=="sync_reconcile_commit")]|length' "$log")" -eq 2 ]
+}
+
+@test "jsonl reconcile atomically keeps valid acks beside a conflicting ack" {
+  storage_send demo alice bob first >/dev/null
+  local first first_candidate first_ack second second_candidate batch result log
+  first=$(prepare_push); first_candidate=$(candidate_of "$first")
+  first_ack=$(printf '%s\n' "$first_candidate" | jq -c '
+    {type:"sync_push_ack",local_position,id,server_seq:"1",disposition:"stored"}')
+  printf '%s\n' "$first_ack" |
+    storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
+  storage_send demo alice bob second >/dev/null
+  second=$(prepare_push); second_candidate=$(candidate_of "$second")
+  batch=$(printf '%s\n%s\n' \
+    "$(printf '%s\n' "$second_candidate" | jq -c '
+      {type:"sync_push_ack",local_position,id,server_seq:"2",disposition:"stored"}')" \
+    "$(printf '%s\n' "$first_candidate" | jq -c '
+      {type:"sync_push_ack",local_position,id,server_seq:"3",disposition:"duplicate"}')")
+  result=$(printf '%s\n' "$batch" |
+    storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1)
+  [ "$(printf '%s\n' "$result" | jq -r .push_cursor)" = \
+    "$(printf '%s\n' "$second_candidate" | jq -r .local_position)" ]
+  log="$(dirname "$(agmsg_db_path)")/events.jsonl"
+  jq -e -s '[.[]|select(.type=="sync_reconcile_commit")][-1] |
+    (.acks|length)==1 and (.acks[0].server_seq=="2") and
+    (.conflicts|length)==1 and (.conflicts[0].observed_server_seq=="3")' "$log" >/dev/null
+  run prepare_push
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s\n' "$output" | jq -s '[.[]|select(.type=="sync_push_candidate")]|length')" -eq 0 ]
 }
 
 @test "jsonl prepare durably rejects one local id with different payloads" {
@@ -161,11 +189,33 @@ candidate_of() { printf '%s\n' "$1" | jq -c 'select(.type=="sync_push_candidate"
   run prepare_push
   [ "$status" -eq 0 ]
   [ "$(printf '%s\n' "$output" | jq -s '[.[]|select(.type=="sync_push_candidate")]|length')" -eq 0 ]
-  [ "$(jq -s '[.[]|select(.type=="sync_conflict_commit")|.conflicts[]|
+  [ "$(jq -s '[.[]|select(.type=="sync_prepare_commit")|.conflicts[]|
     select(.kind=="local_payload_conflict")]|length' "$log")" -eq 1 ]
   run prepare_push
   [ "$status" -eq 0 ]
-  [ "$(jq -s '[.[]|select(.type=="sync_conflict_commit")]|length' "$log")" -eq 1 ]
+  [ "$(jq -s '[.[]|select(.type=="sync_prepare_commit")]|length' "$log")" -eq 1 ]
+}
+
+@test "jsonl prepare commits clean reservations and payload conflicts in one transition" {
+  local clean conflict_id at log before
+  clean=$(storage_send demo alice bob clean)
+  conflict_id=$(storage_send demo alice bob first)
+  log="$(dirname "$(agmsg_db_path)")/events.jsonl"
+  at=$(jq -r --arg id "$conflict_id" 'select(.id==$id)|.at' "$log")
+  jq -nc --arg id "$conflict_id" --arg at "$at" '
+    {type:"message_sent",id:$id,team:"demo",from:"alice",to:"bob",body:"second",at:$at}' >> "$log"
+  before=$(cksum "$log")
+  export AGMSG_SYNC_TEST_PARTIAL_APPEND_BYTES=31
+  run prepare_push
+  [ "$status" -eq 75 ]
+  unset AGMSG_SYNC_TEST_PARTIAL_APPEND_BYTES
+  [ "$(cksum "$log")" = "$before" ]
+  run prepare_push
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s\n' "$output" | jq -sr '[.[]|select(.type=="sync_push_candidate")][0].local_id')" = "$clean" ]
+  [ "$(jq -s '[.[]|select(.type=="sync_prepare_commit")]|length' "$log")" -eq 1 ]
+  jq -e -s '[.[]|select(.type=="sync_prepare_commit")][0] |
+    (.reservations|length)==1 and (.conflicts|length)==1' "$log" >/dev/null
 }
 
 @test "jsonl reconcile validates every ack before creating sync state" {
@@ -173,6 +223,11 @@ candidate_of() { printf '%s\n' "$1" | jq -c 'select(.type=="sync_push_candidate"
   log="$(dirname "$(agmsg_db_path)")/events.jsonl"
   run storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1 <<'EOF'
 {"type":"sync_push_ack","local_position":"1","id":"not-a-wire-id","server_seq":"1","disposition":"stored"}
+EOF
+  [ "$status" -ne 0 ]
+  [ "$(jq -s '[.[]|select(.type|startswith("sync_"))]|length' "$log")" -eq 0 ]
+  run storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1 <<'EOF'
+{"type":"sync_push_ack","local_position":"1","id":"550e8400-e29b-41d4-a716-446655440099","server_seq":"1","disposition":"stored"}
 EOF
   [ "$status" -ne 0 ]
   [ "$(jq -s '[.[]|select(.type|startswith("sync_"))]|length' "$log")" -eq 0 ]
@@ -257,6 +312,31 @@ EOF
     jq -s '[.[]|select(.type=="sync_reprocess_candidate")]|length')" -eq 0 ]
 }
 
+@test "jsonl reprocess keyset pages reach candidates beyond a permanent first page" {
+  local records="" page first token second
+  local index wire
+  for index in 1 2 3; do
+    wire=$(printf '550e8400-e29b-41d4-a716-%012d' "$((30 + index))")
+    records="${records}$(jq -nc --arg seq "$index" --arg id "$wire" '
+      {type:"sync_pull_message",server_seq:$seq,id:$id,
+       server_received_at:"2026-07-22T11:04:00.000000Z",
+       envelope:{v:1,cipher:"age-v1",key_id:"epoch-1",blob:"YWdl"},
+       status:"authentication_failed",reason:"permanent in this round",
+       policy_revision:"0",local_security_revision:"0"}')"$'\n'
+  done
+  page="${records}{\"type\":\"sync_pull_cursor\",\"next_after\":\"3\"}"
+  printf '%s\n' "$page" |
+    storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
+  first=$(storage_sync_reprocess demo "$SERVER_ID" "$TEAM_ID" 1 2)
+  [ "$(printf '%s\n' "$first" | jq -s '[.[]|select(.type=="sync_reprocess_candidate")]|length')" -eq 2 ]
+  token=$(printf '%s\n' "$first" | jq -r 'select(.type=="sync_reprocess_page")|.next_after')
+  [ "$(printf '%s\n' "$first" | jq -r 'select(.type=="sync_reprocess_page")|.has_more')" = true ]
+  second=$(storage_sync_reprocess demo "$SERVER_ID" "$TEAM_ID" 1 2 "$token")
+  [ "$(printf '%s\n' "$second" | jq -s '[.[]|select(.type=="sync_reprocess_candidate")]|length')" -eq 1 ]
+  [ "$(printf '%s\n' "$second" | jq -r 'select(.type=="sync_reprocess_candidate")|.server_seq')" = 3 ]
+  [ "$(printf '%s\n' "$second" | jq -r 'select(.type=="sync_reprocess_page")|.has_more')" = false ]
+}
+
 @test "jsonl pull durably rejects a pre-echo server sequence conflict" {
   storage_send demo alice bob outgoing >/dev/null
   local prepared candidate ack conflict page result
@@ -316,6 +396,26 @@ EOF
     storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1)
   [ "$(printf '%s\n' "$result" | jq -r '.push_cursor')" = \
     "$(printf '%s\n' "$new_candidate" | jq -r '.local_position')" ]
+}
+
+@test "jsonl compaction does not reuse a physical push offset as the new generation cursor" {
+  storage_send demo alice bob before-compact >/dev/null
+  local first candidate ack second later result
+  first=$(prepare_push); candidate=$(candidate_of "$first")
+  ack=$(printf '%s\n' "$candidate" | jq -c '
+    {type:"sync_push_ack",local_position,id,server_seq:"1",disposition:"stored"}')
+  printf '%s\n' "$ack" |
+    storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
+  storage_compact >/dev/null
+  storage_send demo alice bob after-compact >/dev/null
+  second=$(prepare_push); later=$(candidate_of "$second")
+  [ "$(printf '%s\n' "$later" | jq -r .local_id)" != "$(printf '%s\n' "$candidate" | jq -r .local_id)" ]
+  ack=$(printf '%s\n' "$later" | jq -c '
+    {type:"sync_push_ack",local_position,id,server_seq:"2",disposition:"stored"}')
+  result=$(printf '%s\n' "$ack" |
+    storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1)
+  [ "$(printf '%s\n' "$result" | jq -r .push_cursor)" = \
+    "$(printf '%s\n' "$later" | jq -r .local_position)" ]
 }
 
 @test "jsonl rewrite crash after new generation append leaves the original journal untouched" {

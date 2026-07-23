@@ -22,14 +22,14 @@ never advance a cursor ahead of durable local state.
 
 ### Optional synchronization extension
 
-A storage driver may advertise the Stage-1 extension and implement these three
+A storage driver may advertise the Stage-1 extension and implement these four
 operations in addition to the ADR 0003 ABI:
 
 ```text
 storage_sync_prepare_push <local-team> <server-instance-id> <remote-team-id> <protocol-version> <limit>
 storage_sync_reconcile_push <local-team> <server-instance-id> <remote-team-id> <protocol-version>
 storage_sync_apply_pull <local-team> <server-instance-id> <remote-team-id> <protocol-version>
-storage_sync_reprocess <local-team> <server-instance-id> <remote-team-id> <protocol-version> <limit>
+storage_sync_reprocess <local-team> <server-instance-id> <remote-team-id> <protocol-version> <limit> [<page-after>]
 ```
 
 The SQLite driver is the Stage-1 implementation. Drivers that do not advertise
@@ -181,6 +181,22 @@ policy and installed identities, then passes the outcomes through apply-pull's
 existing atomic import transition. Reprocessing is explicit rather than part of
 every polling cycle, so a permanently invalid ciphertext cannot cause an
 automatic decrypt loop.
+
+Reprocess output is stable keyset pagination ordered by `(server_seq, wire_id)`.
+Each page contains at most `limit` `sync_reprocess_candidate` records and exactly
+one final `sync_reprocess_page` record:
+
+```json
+{"type":"sync_reprocess_page","next_after":"42:550e8400-e29b-41d4-a716-446655440000","has_more":true}
+```
+
+`next_after` is the canonical decimal server sequence, a colon, and the lowercase
+UUIDv4 wire ID of the last candidate. It is non-null exactly when `has_more` is
+true. The engine supplies it unchanged as the optional `page-after` argument and
+MUST reject a non-advancing, repeated, oversized, or malformed page. One explicit
+reprocess invocation walks pages until `has_more=false`; permanently blocking
+records in an early page therefore cannot starve a later newly recoverable record.
+Transport cursor and driver generation MUST remain unchanged across the walk.
 
 ADR 0009 promotes the previously reserved recovery operation behind a separate
 optional `stage1-resync` capability:

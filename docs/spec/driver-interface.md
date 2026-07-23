@@ -310,7 +310,7 @@ may advertise `capabilities=stage1-sync` from `storage_describe` and implement:
 storage_sync_prepare_push <local-team> <server-instance-id> <remote-team-id> <protocol-version> <limit>
 storage_sync_reconcile_push <local-team> <server-instance-id> <remote-team-id> <protocol-version>
 storage_sync_apply_pull <local-team> <server-instance-id> <remote-team-id> <protocol-version>
-storage_sync_reprocess <local-team> <server-instance-id> <remote-team-id> <protocol-version> <limit>
+storage_sync_reprocess <local-team> <server-instance-id> <remote-team-id> <protocol-version> <limit> [<page-after>]
 ```
 
 The extension is optional: a driver without it remains a conforming local-only
@@ -332,7 +332,10 @@ prefix. Apply-pull atomically quarantines unchanged envelopes, reconciles mapped
 echoes or imports unmapped wire IDs once, and advances the transport cursor only
 after durable local outcomes. Transport, decrypt/import, and read progress are
 independent. Reprocess emits blocking quarantine records for explicit policy/key
-reevaluation without rewinding transport. The complete framing, record schemas,
+reevaluation without rewinding transport. It uses ADR 0005's stable
+`(server_seq,wire_id)` keyset page and mandatory `sync_reprocess_page` trailer,
+so one explicit engine invocation reaches every candidate without an early
+permanent failure starving later records. The complete framing, record schemas,
 crash boundaries, and future reserved operation names are defined by
 [ADR 0005](../adr/0005-stage-1-remote-sync.md).
 

@@ -222,7 +222,7 @@ _jsonl_append() { printf '%s\n' "$1" >> "$(_jsonl_log)"; }
 
 _jsonl_prepare_rotated_generation_locked() {
   local target="$1" log; log="$(_jsonl_log)"
-  grep -q '"type":"sync_generation"' "$log" 2>/dev/null || return 0
+  grep -Eq '"type":"sync_generation"|"driver_generation":' "$log" 2>/dev/null || return 0
   local node helper; node="$(_jsonl_sync_node)"; helper="$(_jsonl_sync_helper)"
   _jsonl_sync_available || return 10
   "$node" "$helper" rotate-generation "$target" >/dev/null
