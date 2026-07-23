@@ -350,6 +350,16 @@ json.dump({
   [ "$status" -eq 0 ]
 }
 
+@test "connect: token stdin remains separate from the E2EE generate prompt" {
+  command -v age >/dev/null 2>&1 || skip "age not installed"
+  run bash -c "exec 3<<<'g'; printf 'good-token-enc' | AGMSG_REMOTE_PROMPT_FD=3 bash '$SCRIPTS/remote.sh' connect --endpoint '$ENDPOINT' --token-stdin myteam"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"requires end-to-end encryption"* ]]
+  [[ "$output" == *"Generated a new key for team 'myteam'"* ]]
+  [[ "$output" == *"Connected: team 'myteam'"* ]]
+  [[ "$output" != *"prefer --token-stdin"* ]]
+}
+
 @test "connect: encryption required + existing history still requires an explicit 'i' to import" {
   command -v age >/dev/null 2>&1 || skip "age not installed"
   bash "$SCRIPTS/join.sh" myteam alice claude-code /tmp/project-a >/dev/null
@@ -359,6 +369,16 @@ json.dump({
   [ "$status" -eq 0 ]
   [[ "$output" == *"Imported key for team 'myteam'"* ]]
   [[ "$output" == *"Connected: team 'myteam'"* ]]
+}
+
+@test "connect: token stdin remains separate from the E2EE import prompts" {
+  command -v age >/dev/null 2>&1 || skip "age not installed"
+  identity=$(age-keygen 2>/dev/null | grep '^AGE-SECRET-KEY-')
+  run bash -c "exec 3<<<$'i\\n$identity\\n'; printf 'good-token-enc' | AGMSG_REMOTE_PROMPT_FD=3 bash '$SCRIPTS/remote.sh' connect --endpoint '$ENDPOINT' --token-stdin myteam"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Imported key for team 'myteam'"* ]]
+  [[ "$output" == *"Connected: team 'myteam'"* ]]
+  [[ "$output" != *"prefer --token-stdin"* ]]
 }
 
 @test "connect: encryption required + empty/EOF input on the choice prompt safely aborts (never auto-generates)" {

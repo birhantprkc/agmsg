@@ -66,6 +66,42 @@ _remote_validate_endpoint() {
   python3 "$SCRIPT_DIR/internal/validate-endpoint.py" "$1"
 }
 
+# Read an interactive value without coupling it to the token transport.
+# `connect --token-stdin` intentionally consumes fd 0 through EOF before the
+# E2EE bootstrap starts. In a real terminal the choice/identity must therefore
+# come from the controlling TTY; otherwise the secure token path can only see
+# EOF and silently takes the abort branch. Non-interactive callers retain the
+# historical fd-0 fallback. AGMSG_REMOTE_PROMPT_FD is an internal contract-test
+# seam that models a distinct TTY input descriptor without putting secrets in
+# argv or environment values.
+_remote_prompt_read() {
+  local output_var="$1" prompt="$2" value="" prompt_fd="${AGMSG_REMOTE_PROMPT_FD:-}"
+  if [ -n "$prompt_fd" ]; then
+    case "$prompt_fd" in
+      [3-9]|[1-9][0-9]*) ;;
+      *)
+        echo "agmsg: invalid internal prompt file descriptor" >&2
+        return 2
+        ;;
+    esac
+    IFS= read -r -u "$prompt_fd" -p "$prompt" value || {
+      printf -v "$output_var" '%s' ""
+      return 1
+    }
+  elif [ -t 2 ]; then
+    IFS= read -r -p "$prompt" value </dev/tty || {
+      printf -v "$output_var" '%s' ""
+      return 1
+    }
+  else
+    IFS= read -r -p "$prompt" value || {
+      printf -v "$output_var" '%s' ""
+      return 1
+    }
+  fi
+  printf -v "$output_var" '%s' "$value"
+}
+
 # --- doctor ------------------------------------------------------------
 
 # Standalone, read-only, always-safe-to-run preflight (ADR 0007 §1): no
@@ -815,7 +851,7 @@ cmd_connect() {
       echo "  (i) Import a key you already have — do this if a teammate gave you one, or if unsure"
       echo "  (a) Abort — don't connect yet"
       local choice
-      read -r -p "[i/g/a] (default: a): " choice || choice=""
+      _remote_prompt_read choice "[i/g/a] (default: a): " || choice=""
       choice="${choice:-a}"
 
       case "$choice" in
@@ -827,7 +863,7 @@ cmd_connect() {
           echo "  key.sh show $team --reveal-secret"
           echo "and paste its output below."
           local identity
-          read -r -p "Paste identity: " identity || identity=""
+          _remote_prompt_read identity "Paste identity: " || identity=""
           if [ -z "$identity" ]; then
             echo "agmsg: no identity provided — if the only device that ever held this team's key is gone entirely, there is nothing to import. The historical stream stays permanently unreadable under the lost key, and rotation to start a fresh epoch is not available in this release." >&2
             exit 1
