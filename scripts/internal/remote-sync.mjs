@@ -1268,8 +1268,20 @@ export async function reprocessCycle(config, limit, dependencies = {}) {
   let after = null;
   let stableState = null;
   let total = 0;
+  let pageCount = 0n;
+  const retentionFloor = BigInt(capabilities.min_available_seq);
+  // Locally retained quarantine may cover both the server-retained suffix and
+  // the unavailable prefix, so the authenticated lifetime sequence space is
+  // floor + (current-floor), rather than only the current retained window.
+  const authenticatedSequenceSpace = retentionFloor +
+    (BigInt(capabilities.current_seq) - retentionFloor);
   const seenTokens = new Set();
+  const seenSequences = new Set();
   for (;;) {
+    pageCount += 1n;
+    if (pageCount > authenticatedSequenceSpace + 1n) {
+      throw new Error("driver reprocess walk exceeds authenticated sequence space");
+    }
     const extra = [String(limit), ...(after === null ? [] : [after])];
     const pending = await driverCall("reprocess", config, [], extra);
     const { state, candidates, page } = validateReprocessDriverPage(pending, limit, after);
@@ -1284,6 +1296,16 @@ export async function reprocessCycle(config, limit, dependencies = {}) {
       const token = reprocessCandidateToken(candidate);
       if (seenTokens.has(token)) throw new Error("driver reprocess repeated a candidate");
       seenTokens.add(token);
+      if (candidate.server_seq === "0") {
+        throw new Error("driver reprocess candidate has no canonical server sequence");
+      }
+      if (seenSequences.has(candidate.server_seq)) {
+        throw new Error("driver reprocess mapped one server sequence to multiple wire ids");
+      }
+      seenSequences.add(candidate.server_seq);
+      if (BigInt(seenSequences.size) > authenticatedSequenceSpace) {
+        throw new Error("driver reprocess candidate count exceeds authenticated sequence space");
+      }
       if (BigInt(candidate.server_seq) > BigInt(capabilities.current_seq)) {
         throw new Error("quarantine sequence exceeds authenticated server state");
       }

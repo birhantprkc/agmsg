@@ -772,19 +772,9 @@ storage_sync_reprocess() {
     FROM sync_bindings WHERE local_team='$tl' AND server_instance_id='$server'
       AND remote_team_id='$remote' AND protocol_version=$protocol
       AND driver_generation='$generation';
-    SELECT json_object('type','sync_reprocess_candidate','server_seq',server_seq,
-      'id',wire_id,'server_received_at',server_received_at,
-      'envelope',json_object('v',envelope_v,'cipher',cipher,'key_id',key_id,'blob',blob),
-      'prior_status',status)
-    FROM sync_quarantine WHERE local_team='$tl' AND server_instance_id='$server'
-      AND remote_team_id='$remote' AND protocol_version=$protocol
-      AND driver_generation='$generation'
-      AND status IN ('unsupported_cipher','pending_key','authentication_failed',
-                     'malformed','policy_violation')
-      $after_sql
-    ORDER BY CAST(server_seq AS INTEGER),wire_id LIMIT $limit;
     WITH candidates AS (
-      SELECT server_seq,wire_id FROM sync_quarantine
+      SELECT server_seq,wire_id,server_received_at,envelope_v,cipher,key_id,blob,status
+        FROM sync_quarantine
        WHERE local_team='$tl' AND server_instance_id='$server'
          AND remote_team_id='$remote' AND protocol_version=$protocol
          AND driver_generation='$generation'
@@ -792,13 +782,26 @@ storage_sync_reprocess() {
                         'malformed','policy_violation')
          $after_sql
        ORDER BY CAST(server_seq AS INTEGER),wire_id LIMIT $((limit + 1))
+    ), output AS (
+      SELECT 0 AS trailer,CAST(server_seq AS INTEGER) AS sequence_order,wire_id,
+        json_object('type','sync_reprocess_candidate','server_seq',server_seq,
+          'id',wire_id,'server_received_at',server_received_at,
+          'envelope',json_object('v',envelope_v,'cipher',cipher,'key_id',key_id,'blob',blob),
+          'prior_status',status) AS record
+      FROM candidates ORDER BY CAST(server_seq AS INTEGER),wire_id LIMIT $limit
+    ), trailer AS (
+      SELECT 1 AS trailer,NULL AS sequence_order,NULL AS wire_id,
+        json_object('type','sync_reprocess_page','next_after',
+          CASE WHEN COUNT(*)>$limit THEN (
+            SELECT server_seq||':'||wire_id FROM candidates
+             ORDER BY CAST(server_seq AS INTEGER),wire_id LIMIT 1 OFFSET $((limit - 1)))
+            ELSE NULL END,
+          'has_more',CASE WHEN COUNT(*)>$limit THEN json('true') ELSE json('false') END
+        ) AS record
+      FROM candidates
     )
-    SELECT json_object('type','sync_reprocess_page','next_after',
-      CASE WHEN COUNT(*)>$limit THEN (
-        SELECT server_seq||':'||wire_id FROM candidates LIMIT 1 OFFSET $((limit - 1)))
-        ELSE NULL END,
-      'has_more',CASE WHEN COUNT(*)>$limit THEN json('true') ELSE json('false') END)
-    FROM candidates;"
+    SELECT record FROM (SELECT * FROM output UNION ALL SELECT * FROM trailer)
+     ORDER BY trailer,sequence_order,wire_id;"
 }
 
 # Derive the remote read frontier and exact wire exceptions from durable local

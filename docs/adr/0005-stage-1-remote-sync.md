@@ -197,6 +197,12 @@ MUST reject a non-advancing, repeated, oversized, or malformed page. One explici
 reprocess invocation walks pages until `has_more=false`; permanently blocking
 records in an early page therefore cannot starve a later newly recoverable record.
 Transport cursor and driver generation MUST remain unchanged across the walk.
+Candidate rows and the page trailer MUST come from one storage snapshot. Across
+the complete walk, each `server_seq` occurs at most once. The engine bounds both
+candidate and page counts by the authenticated lifetime sequence space: the
+locally retained prefix through `min_available_seq` plus the available suffix
+through `current_seq` (with at most one final empty page). This keeps a corrupt
+driver from manufacturing an unbounded walk with ever-changing wire IDs.
 
 ADR 0009 promotes the previously reserved recovery operation behind a separate
 optional `stage1-resync` capability:

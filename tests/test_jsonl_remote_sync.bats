@@ -104,6 +104,29 @@ candidate_of() { printf '%s\n' "$1" | jq -c 'select(.type=="sync_push_candidate"
   [ "$(grep -c '"type":"sync_prepare_commit"' "$log" || true)" -eq 0 ]
 }
 
+@test "jsonl fold accepts pre-integration commits without conflict or digest fields" {
+  storage_send demo alice bob legacy >/dev/null
+  local prepared candidate ack log rewritten later
+  prepared=$(prepare_push); candidate=$(candidate_of "$prepared")
+  ack=$(printf '%s\n' "$candidate" | jq -c '
+    {type:"sync_push_ack",local_position,id,server_seq:"1",disposition:"stored"}')
+  printf '%s\n' "$ack" |
+    storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
+  log="$(dirname "$(agmsg_db_path)")/events.jsonl"
+  rewritten="$BATS_TEST_TMPDIR/legacy-events.jsonl"
+  jq -c 'if .type=="sync_prepare_commit" then del(.conflicts) |
+      .reservations |= map(del(.payload_digest))
+    elif .type=="sync_reconcile_commit" then del(.conflicts) else . end' \
+    "$log" > "$rewritten"
+  mv "$rewritten" "$log"
+  storage_send demo alice bob after-upgrade >/dev/null
+  run prepare_push
+  [ "$status" -eq 0 ]
+  later=$(candidate_of "$output")
+  [ "$(printf '%s\n' "$later" | jq -r .local_id)" != \
+    "$(printf '%s\n' "$candidate" | jq -r .local_id)" ]
+}
+
 @test "jsonl reconcile advances only an acknowledged contiguous byte-offset prefix" {
   storage_send demo alice bob one >/dev/null
   storage_send demo alice bob two >/dev/null
@@ -335,6 +358,15 @@ EOF
   [ "$(printf '%s\n' "$second" | jq -s '[.[]|select(.type=="sync_reprocess_candidate")]|length')" -eq 1 ]
   [ "$(printf '%s\n' "$second" | jq -r 'select(.type=="sync_reprocess_candidate")|.server_seq')" = 3 ]
   [ "$(printf '%s\n' "$second" | jq -r 'select(.type=="sync_reprocess_page")|.has_more')" = false ]
+}
+
+@test "jsonl reprocess rejects a malformed page token before state initialization" {
+  local log before
+  log="$(dirname "$(agmsg_db_path)")/events.jsonl"
+  before=$(cksum "$log")
+  run storage_sync_reprocess demo "$SERVER_ID" "$TEAM_ID" 1 2 malformed-token
+  [ "$status" -ne 0 ]
+  [ "$(cksum "$log")" = "$before" ]
 }
 
 @test "jsonl pull durably rejects a pre-echo server sequence conflict" {

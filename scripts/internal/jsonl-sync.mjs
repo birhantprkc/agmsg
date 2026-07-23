@@ -185,13 +185,15 @@ function fold(records, target) {
   for (const { value } of records) {
     if (!sameBinding(value, target)) continue;
     if (value.type === "sync_prepare_commit") {
-      if (!Array.isArray(value.reservations) || !Array.isArray(value.conflicts)) {
+      if (!Array.isArray(value.reservations) ||
+          (value.conflicts !== undefined && !Array.isArray(value.conflicts))) {
         fail("JSONL reservation commit is invalid");
       }
-      applyConflicts(value.conflicts);
+      applyConflicts(value.conflicts ?? []);
       for (const reservation of value.reservations ?? []) {
         if (!UUID_V4.test(reservation.id) || typeof reservation.local_id !== "string" ||
-            !/^[0-9a-f]{64}$/u.test(reservation.payload_digest) ||
+            (reservation.payload_digest !== undefined &&
+              !/^[0-9a-f]{64}$/u.test(reservation.payload_digest)) ||
             !reservation.envelope || typeof reservation.driver_generation !== "string") {
           fail("JSONL reservation is invalid");
         }
@@ -199,7 +201,9 @@ function fold(records, target) {
         const priorLocal = reservationsByLocalId.get(reservation.local_id);
         const priorWire = reservationsByWire.get(reservation.id);
         if ((priorLocal && (priorLocal.id !== reservation.id ||
-              priorLocal.payload_digest !== reservation.payload_digest ||
+              (priorLocal.payload_digest !== undefined &&
+                reservation.payload_digest !== undefined &&
+                priorLocal.payload_digest !== reservation.payload_digest) ||
               !envelopeEqual(priorLocal.envelope, reservation.envelope))) ||
             (priorWire && (priorWire.local_id !== reservation.local_id ||
               !envelopeEqual(priorWire.envelope, reservation.envelope)))) {
@@ -217,7 +221,8 @@ function fold(records, target) {
       }
       applyConflicts(value.conflicts);
     } else if (value.type === "sync_reconcile_commit") {
-      if (!Array.isArray(value.acks) || !Array.isArray(value.conflicts)) {
+      if (!Array.isArray(value.acks) ||
+          (value.conflicts !== undefined && !Array.isArray(value.conflicts))) {
         fail("JSONL acknowledgement commit is invalid");
       }
       sequence(value.push_cursor, "stored push_cursor");
@@ -235,7 +240,7 @@ function fold(records, target) {
         acknowledgements.set(ack.id, ack);
         wireBySequence.set(ack.server_seq, ack.id);
       }
-      applyConflicts(value.conflicts);
+      applyConflicts(value.conflicts ?? []);
     } else if (value.type === "sync_pull_commit") {
       sequence(value.transport_cursor, "stored transport_cursor");
       if (BigInt(value.transport_cursor) < BigInt(transportCursor) || !Array.isArray(value.messages)) {
@@ -349,7 +354,7 @@ function prepare(path, target, limit, inputText) {
     const existing = state.reservationsByLocalId.get(message.local_id);
     if (existing && !state.acknowledgements.has(existing.id)) {
       const rebound = { ...existing, driver_generation: generation,
-        local_position: message.local_position };
+        local_position: message.local_position, payload_digest: payloadDigest };
       pending.push(rebound);
       if (existing.driver_generation !== generation ||
           existing.local_position !== message.local_position) newReservations.push(rebound);
@@ -568,6 +573,7 @@ function afterReprocessToken(message, after) {
 }
 
 function reprocess(path, target, limit, afterText) {
+  const after = parseReprocessToken(afterText);
   let records = readRecords(path);
   let generation = storedGeneration(records);
   if (!generation) {
@@ -578,7 +584,6 @@ function reprocess(path, target, limit, afterText) {
     records = readRecords(path);
   }
   const state = fold(records, target);
-  const after = parseReprocessToken(afterText);
   process.stdout.write(`${JSON.stringify({ type: "sync_state", driver_generation: generation,
     transport_cursor: state.transportCursor })}\n`);
   const eligible = [...state.quarantineByWire.values()]
