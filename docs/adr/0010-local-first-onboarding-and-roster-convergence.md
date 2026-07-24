@@ -1101,6 +1101,8 @@ secret plaintext; the client never invents a resource result.
 
 ### C. A clean second device adopts canonical member IDs
 
+The canonical second-device flow assumes that the `/agmsg` skill's `not_joined` branch offers `remote connect` as a first-class choice.
+
 A join finalize requires a still-valid clean-target onboarding reservation.
 The local commit atomically materializes the remote `team_id`, team name,
 `members_revision`, complete active/retired member catalog, remote binding, and
