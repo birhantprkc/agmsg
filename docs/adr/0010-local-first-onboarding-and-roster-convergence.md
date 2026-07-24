@@ -261,11 +261,12 @@ credential in its issuer-selected tenant.
 
 A promote token also fixes the promotion resource budget:
 `max_promotion_messages`, `max_promotion_bytes`, initial lease duration, and
-absolute deadline. The reference defaults are 1,000,000 messages, 5 GiB of
-decoded envelope bytes, a 30-minute progress lease, and a 24-hour absolute
+absolute deadline, plus the Stage-2 exact-read limits. The reference defaults
+are 1,000,000 messages, 5 GiB of decoded envelope bytes, 4,096 exact reads per
+member, 65,536 per team, a 30-minute progress lease, and a 24-hour absolute
 deadline; operators may configure lower values but never silently raise them
-after exchange. Finalize rejects a declared snapshot above either quota before
-creating the team.
+after exchange. Finalize rejects a declared snapshot or its precomputed
+post-prefix exact-read count above any quota before creating the team.
 
 The client sends its intended mode during exchange, and the token purpose MUST
 match. A purpose mismatch is terminal and creates no session.
@@ -354,6 +355,8 @@ authenticated policy context needed before the E2EE choice:
     "max_blob_bytes": "1048576",
     "max_promotion_messages": "1000000",
     "max_promotion_bytes": "5368709120",
+    "max_promotion_read_exacts_per_member": "4096",
+    "max_promotion_read_exacts_per_team": "65536",
     "promotion_progress_lease_seconds": "1800",
     "promotion_absolute_deadline_seconds": "86400"
   }
@@ -386,6 +389,10 @@ credential remains bound to
 still perform only its own finalize. It cannot access a prior binding or any
 ordinary operation. Request-time expiry and sweep/revoke use the same mechanism
 as the five-minute no-intent credential; only the hard deadline differs.
+Finalize evaluates expiry at the transaction's session-row validation point,
+after waiting for the lock, so a request started before but validated after the
+deadline cannot activate and implementations do not differ by HTTP arrival
+timing.
 
 The client writes the session ID, onboarding ID, purpose, credential ID,
 provisional secret, origin, server instance, account, and exact exchange
@@ -446,12 +453,13 @@ The promote request contains the local identity document:
       "driver_generation": "driver-defined-generation",
       "cutoff": "42",
       "message_count": "42",
-      "message_digest": "sha256:base64url",
+      "source_message_digest": "sha256:base64url",
       "read_state_count": "7",
-      "read_state_digest": "sha256:base64url",
+      "source_read_state_digest": "sha256:base64url",
+      "translated_exact_count": "2",
       "estimated_bytes": "8192",
       "reserved_bytes": "16384",
-      "snapshot_digest": "sha256:base64url"
+      "source_snapshot_digest": "sha256:base64url"
     }
   }
 }
@@ -751,21 +759,23 @@ The storage-driver promotion ABI returns exactly one strict
   "total_order_version": 1,
   "cutoff": "42",
   "message_count": "42",
-  "message_digest": "sha256:base64url",
+  "source_message_digest": "sha256:base64url",
   "read_state_count": "7",
-  "read_state_digest": "sha256:base64url",
+  "source_read_state_digest": "sha256:base64url",
+  "translated_exact_count": "2",
   "estimated_bytes": "8192",
   "reserved_bytes": "16384",
-  "snapshot_digest": "sha256:base64url"
+  "source_snapshot_digest": "sha256:base64url"
 }
 ```
 
 The descriptor uses canonical bounded strings and nonnegative signed-BIGINT
 decimals, rejects duplicate/unknown fields, and is immutable for the onboarding
-ID. Separately domain-separated message and read-state digests cover the
+ID. Separately domain-separated source message and read-state digests cover the
 canonical ordered local message identities/payload digests and the exact/frontier
-read work that must be preserved. `snapshot_digest` covers both components,
-generation, cutoff, counts, reserved byte budget, and total-order version.
+read work that must be preserved. `source_snapshot_digest` covers both
+components, generation, cutoff, counts, reserved byte budget, translated exact
+count, and total-order version.
 `reserved_bytes` is a conservative upper bound derived from the selected
 envelope profile and each source payload bound, not a best-effort estimate.
 Finalize reserves this value; actual stored decoded envelope bytes must not
@@ -786,6 +796,24 @@ object. A connected binding therefore remains `state: "active"` while
 - `complete`; and
 - a terminal conflict or policy/key block.
 
+The new team's message sequence is promotion-exclusive until
+`backfill_complete`: promote creates it at `current_seq=0`, and only ordered
+snapshot-prefix items may allocate sequences. The promoter's later local writes
+can reserve but cannot POST. Join credentials created during
+backfill are pull-only: message POST and Stage-2 read-state mutation return
+`423 promotion-in-progress`, although local reads may accumulate durable facts
+for later upload. Thus promotion positions map to one contiguous server
+sequence prefix with no interleaved remote writer.
+
+Under that fence, a contiguous local historical read prefix may translate to a
+server frontier only after all covered promotion positions have durable
+server-sequence mappings. Read facts beyond a hole translate to exact wire IDs.
+The driver computes the resulting per-member/team exact counts from the
+immutable promotion order before finalize; counts above the token/capability
+limits fail promotion before team creation. It MUST NOT silently widen a
+frontier or drop exact facts. Join message/read writes become eligible only
+after the server records `backfill_complete`.
+
 Existing Stage-1 encrypt-once, ack reconciliation, and exact retry rules own the
 actual upload. No onboarding endpoint accepts message bodies.
 
@@ -797,8 +825,10 @@ continues the backfill.
 The server keeps a bounded `backfill_pending` lease under the team row from
 promote finalize until completion. It accounts actual decoded envelope bytes
 and distinct promotion messages against the token-reserved limits. The
-30-minute lease renews only after committed new manifest/message progress and
-can never pass the 24-hour absolute deadline. As wire reservations become
+30-minute lease renews only after committed, distinct newly accepted
+message/read manifest entries or decoded envelope bytes; exact page/message
+retries do not renew it. It can never pass the 24-hour absolute deadline. As
+wire reservations become
 durable, the client uploads two bounded, idempotent manifest streams:
 
 - message entries `(promotion_position, wire_id)`; and
@@ -812,29 +842,58 @@ POST /v1/onboarding/{onboarding_id}/backfill-complete
 ```
 
 Each manifest page has at most 1,000 entries and is subject to the 2 MiB control
-request cap. It contains the snapshot digest, canonical decimal page index and
-first position, ordered entries, and page digest. Page indices and positions
-start at zero and are contiguous. An exact page retry returns the stored page
-result; a different digest for an existing index is a conflict. The completion
-request carries the immutable snapshot digest, cutoff, separate declared and
-sealed message/read-state counts and digests, and a driver-produced durable
-mapping proof. Neither endpoint accepts envelope blobs or plaintext.
+request cap. It contains the source snapshot digest, canonical decimal page
+index and first position, ordered translated entries, and a domain-separated
+page digest. Page indices and positions start at zero and are contiguous. An
+exact page retry returns the stored page result; a different digest for an
+existing index is a conflict.
+
+Source and translated digests are deliberately different layers:
+
+1. `source_message_digest`, `source_read_state_digest`, and
+   `source_snapshot_digest` commit the pre-finalize local authority and never
+   contain wire IDs or server sequences;
+2. `translated_message_digest` and `translated_read_state_digest` commit the
+   post-mapping manifests sent to the server; and
+3. the driver-owned `mapping_proof_digest` commits a canonical ordered proof
+   from each source item digest to its translated fact.
+
+Message proof entries are
+`(source_item_digest, promotion_position, wire_id, server_seq)`. Read proof
+entries are
+`(source_read_item_digest, translated_fact_digest, member_id, kind,
+server_seq|wire_id)`; several source reads may intentionally map to one safe
+frontier fact. Each layer has its own fixed domain/version prefix and ordering.
+The strict driver proof result stores source/translated counts and all three
+digest families and is immutable for the onboarding ID.
+
+The completion request carries the source snapshot digest, cutoff, translated
+message/read-state counts and digests, and mapping proof digest. Neither
+endpoint accepts envelope blobs or plaintext.
 
 The completion call succeeds only when:
 
-- each sealed message/read-state manifest count and digest matches its client
-  snapshot component;
+- each sealed translated message/read-state manifest count and digest matches
+  the completion request;
 - every manifest wire ID exists as a live team message or permanent
   idempotency tombstone;
 - the driver reports a durable local-ID-to-wire-ID/server-sequence mapping for
-  every promoted message, with the same ordered count/digest and acknowledged
-  cutoff;
+  every promoted message, with source count equal to the finalized source
+  snapshot count and an acknowledged cutoff;
 - every declared read exact has been promoted through that durable mapping, and
   the server's Stage-2 exact/frontier state covers every read-state manifest
   entry;
-- the client reports the same immutable snapshot descriptor and a contiguous
-  acknowledged cutoff; and
+- the client reports the same immutable source snapshot descriptor, mapping
+  proof digest, and contiguous acknowledged cutoff; and
 - no manifest position is missing or duplicated.
+
+The server can directly verify translated-manifest continuity, message/tombstone
+existence, Stage-2 coverage, counts, and digests. It cannot independently know
+the original local identities. The engine validates the detailed driver proof;
+the server retains the source, translated, and mapping-proof digests in the
+canonical promotion result/status so exact retries cannot substitute another
+translation. A source digest is never compared to or reused as a translated
+manifest digest.
 
 Message mapping, local exact-read alias promotion, and the read-state outbox are
 one local transaction before a read manifest entry becomes uploadable. A
@@ -861,6 +920,13 @@ expired join that did not acknowledge the terminal sequence MUST report that
 complete history is no longer guaranteed and may receive the ordinary 410
 resync-required outcome; it never labels itself complete.
 
+Join issuance is bounded independently from promotion: the reference limits are
+60 join tokens/hour/team, 128 active initial-sync leases/team, and 10,000/tenant,
+with lower operator overrides allowed. Hitting a cap rejects only the new join;
+it never evicts an existing lease. Revoking the credential that owns an
+incomplete lease releases that lease under the team-row lock. Progress may not
+extend any lease beyond its original 24-hour absolute expiry.
+
 The bundled SQLite promotion path MUST include pre-event-log legacy rows rather
 than silently leave them local-only. It may materialize a durable,
 driver-private promotion queue, but it MUST preserve stable local identity,
@@ -877,14 +943,16 @@ After completion, retention still honors initial-sync lease floors.
 If message/byte quota, progress lease, or absolute deadline is exceeded, one
 team-row transaction marks `promotion_failed`, rejects further message writes
 with a terminal promotion error, releases the promotion retention barrier, and
-marks all associated initial-sync leases `expired-incomplete`. Configured
-retention may resume, with their already bounded floor protection lasting no
-longer than the original lease expiry. The team can never claim complete or
-issue new join tokens in that state. The operator runbook revokes the
-credential and explicitly aborts/repairs the incomplete team; expiry alone
-never converts partial history into success. Metrics warn on quota, stalled
-progress, lease expiry, and retained bytes. A future explicit history-window
-product is a separate interface and policy decision.
+marks all associated initial-sync leases
+`failed-incomplete-protected-until-expiry`. Configured retention may resume,
+but continues honoring their floors until each original lease expiry; only then
+does its phase become `expired-incomplete` and its floor become unprotected.
+The team can never claim complete or issue new join tokens in that state. The
+operator runbook revokes the credential and explicitly aborts/repairs the
+incomplete team; expiry alone never converts partial history into success.
+Metrics warn on quota, stalled progress, lease expiry, and retained bytes. A
+future explicit history-window product is a separate interface and policy
+decision.
 
 ### B. Make every externally visible transition retryable
 
@@ -957,8 +1025,9 @@ reservation CAS. An active binding requires null `onboarding` and has
 For a joining binding, `initial_sync` is
 `{lease_id, phase, pinned_floor, terminal_server_seq, transport_cursor,
 expires_at}` with phase `pending`, `complete`, or `expired-incomplete`;
-otherwise it is null. Canonical decimal and strict-null rules are pinned in the
-driver interface.
+promotion failure may first set
+`failed-incomplete-protected-until-expiry`. Otherwise it is null. Canonical
+decimal and strict-null rules are pinned in the driver interface.
 
 Pending onboarding state is never deleted merely because it is old or
 malformed. It is quarantined as private recovery material until server-proven
@@ -1205,7 +1274,10 @@ sequence when team completion occurs; an abandoned promotion hitting progress,
 byte, and hard-deadline limits; an exact legacy read fact whose mapping is
 created after message upload; a roster response-loss retry after local revision
 has already advanced; and a losing unaccepted same-name member attempting to
-act/send/read.
+act/send/read. Manifest fixtures independently mutate source, translated, and
+mapping-proof digests. Backfill fixtures attempt interleaved joiner message/read
+writes and exceed per-member/team exact-read caps; all must fail before an
+unsafe frontier or silent omission is published.
 
 ## References
 
