@@ -97,9 +97,11 @@ response and provisional credential have been atomically written and fsynced.
 | Resource recovery | `onboarding_sessions(onboarding_id)` stored canonical result |
 | Cloud operation observations | Reconciled projections of the server session, never an independent phase machine |
 
-The shared field names, five-minute provisional TTL, storage rigor, and
-single-delivery rules are inherited from cloud v6. ADR 0010 adds only the
-token-bound tenant/policy context, promote/join body, local reservation, and
+The shared field names, storage rigor, and single-delivery rules are inherited
+from cloud v6. TTL is policy-specific while the lifecycle remains shared:
+cloud's no-intent activate keeps its five-minute TTL; human promote/join
+finalize uses a fixed 60-minute TTL. ADR 0010 adds only the token-bound
+tenant/policy context, promote/join body, local reservation, and
 team/roster/backfill result.
 
 ## Local identity model
@@ -146,17 +148,21 @@ placements:
   "members_revision": null,
   "members": {
     "018f3f7e-0000-7000-8000-000000000010": {
-      "name": "worker-1"
+      "name": "worker-1",
+      "registrations": {
+        "018f3f7e-0000-7000-8000-000000000011": {
+          "installation_id": "018f3f7e-0000-7000-8000-000000000012",
+          "type": "codex"
+        }
+      }
     }
   },
   "agents": {
     "worker-1": {
       "member_id": "018f3f7e-0000-7000-8000-000000000010",
-      "registrations": [
+      "placements": [
         {
           "registration_id": "018f3f7e-0000-7000-8000-000000000011",
-          "installation_id": "018f3f7e-0000-7000-8000-000000000012",
-          "type": "codex",
           "project": "/machine-local/path"
         }
       ]
@@ -165,16 +171,22 @@ placements:
 }
 ```
 
-`members` is the portable identity catalog. `agents` contains local placements.
-Machine-local project paths never enter the remote roster. A clean joining
-device materializes the member catalog but does not invent local agent
-registrations for remote machines.
+`members` is the portable identity catalog. It includes opaque canonical
+registration and installation UUIDs plus the registration type because those
+are already remote device identities in HTTP v1. `agents` contains only local
+placements that refer to a portable registration. Machine-local project paths
+never enter the remote roster. A clean joining device materializes the member
+and remote registration catalogs but does not create an `agents` placement for
+another machine.
 
-`registration_id` is a portable identity for one logical agent registration;
-`installation_id` and project path describe its machine-local placement. A
-promotion may include the portable registration identity and its retired/active
-state when needed to preserve historical attribution, but it MUST NOT upload a
-machine path or silently convert a placement into a new member.
+`registration_id` identifies one portable logical agent registration;
+`installation_id` is a portable opaque UUID identifying the installation that
+owns it. Neither contains a hostname, path, or account name; UUIDv7's coarse
+generation-time metadata remains visible as already documented by HTTP v1.
+`type` is the bounded portable agent type.
+Only `project` and placement lifecycle are machine-local. Registration
+visibility, uniqueness, cardinality, retirement, and installation-sharing rules
+are exactly those of HTTP v1; this ADR does not create a second device catalog.
 
 The identity-audit ABI is strict JSON and returns the selected driver and
 generation plus three bounded, canonically ordered sets:
@@ -246,6 +258,14 @@ creation. Finalized/activated records never release a consumed quota slot.
 Concurrent expiry, cancellation, and activation serialize on the same row.
 Thus a stolen promote token can create at most one initial roster and one
 credential in its issuer-selected tenant.
+
+A promote token also fixes the promotion resource budget:
+`max_promotion_messages`, `max_promotion_bytes`, initial lease duration, and
+absolute deadline. The reference defaults are 1,000,000 messages, 5 GiB of
+decoded envelope bytes, a 30-minute progress lease, and a 24-hour absolute
+deadline; operators may configure lower values but never silently raise them
+after exchange. Finalize rejects a declared snapshot above either quota before
+creating the team.
 
 The client sends its intended mode during exchange, and the token purpose MUST
 match. A purpose mismatch is terminal and creates no session.
@@ -325,21 +345,25 @@ authenticated policy context needed before the E2EE choice:
   "tenant_id": "018f3f7e-0000-7000-8000-000000000030",
   "credential_id": "018f3f7e-0000-7000-8000-000000000021",
   "provisional_credential": "agmsg_credential_opaque-value",
-  "expires_at": "2026-07-24T06:05:00.000000Z",
+  "expires_at": "2026-07-24T07:00:00.000000Z",
   "onboarding_policy": {
     "accepted_envelope_versions": [1],
     "write_allowed_ciphers": ["none", "age-v1"],
     "policy_revision": "0",
     "effective_from_seq": "1",
-    "max_blob_bytes": "1048576"
+    "max_blob_bytes": "1048576",
+    "max_promotion_messages": "1000000",
+    "max_promotion_bytes": "5368709120",
+    "promotion_progress_lease_seconds": "1800",
+    "promotion_absolute_deadline_seconds": "86400"
   }
 }
 ```
 
 `onboarding_id` is unique within issuer/origin scope. The exchange row lock
-stores the canonical request digest before returning. Reusing the same ID with
-different input is a conflict. Reusing the same ID with identical input returns
-only the same secret-free session status and
+stores a domain-separated `exchange_request_digest` before returning. Reusing
+the same ID with different input is a conflict. Reusing the same ID with
+identical input returns only the same secret-free session status and
 `409 provisional-credential-already-issued`; it never returns
 `provisional_credential` a second time. A different onboarding ID cannot reuse
 the consumed token.
@@ -354,8 +378,14 @@ policy ceiling, and optional join target.
 before finalize it authenticates exactly its own finalize operation. Status,
 cancel, sync, roster mutation, message, member, read-state, and revoke endpoints
 reject it as not active. The server stores only its domain-separated digest.
-The provisional TTL is five minutes, evaluated on every request rather than by
-sweeper timing; the exact timestamp is returned and clients do not guess it.
+The promote/join provisional TTL is 60 minutes, evaluated on every request
+rather than by sweeper timing; the exact timestamp is returned and clients do
+not guess it. The longer TTL changes neither authority nor secret delivery: the
+credential remains bound to
+`(origin, server_instance_id, account, credential_id, onboarding_id)` and can
+still perform only its own finalize. It cannot access a prior binding or any
+ordinary operation. Request-time expiry and sweep/revoke use the same mechanism
+as the five-minute no-intent credential; only the hard deadline differs.
 
 The client writes the session ID, onboarding ID, purpose, credential ID,
 provisional secret, origin, server instance, account, and exact exchange
@@ -416,7 +446,12 @@ The promote request contains the local identity document:
       "driver_generation": "driver-defined-generation",
       "cutoff": "42",
       "message_count": "42",
-      "digest": "sha256:base64url"
+      "message_digest": "sha256:base64url",
+      "read_state_count": "7",
+      "read_state_digest": "sha256:base64url",
+      "estimated_bytes": "8192",
+      "reserved_bytes": "16384",
+      "snapshot_digest": "sha256:base64url"
     }
   }
 }
@@ -445,10 +480,21 @@ For a new request, one transaction:
 - returns one binding, complete capability snapshot, complete roster snapshot,
   and resulting `members_revision` from the same team-row snapshot.
 
-The server stores `(onboarding_session_id, onboarding_id, request_digest,
-resulting_team_id, credential_id, finalized_at)`. An exact retry returns the
+The server stores `(onboarding_session_id, onboarding_id,
+exchange_request_digest, finalize_request_digest, resulting_team_id,
+credential_id, finalized_at)`. The two digests use different domain/version
+prefixes and are never compared interchangeably. An exact retry returns the
 same canonical response. Reusing either ID with a different request is
 `409 onboarding-conflict`.
+
+The finalize body uses the 2 MiB control-request cap, the existing 1,000 active
+member/team cap, and at most 4,096 permanent identity-history entries.
+Registration limits remain those of HTTP v1. Identity audit rejects an
+oversized catalog before exchange; promotion never truncates it. The server
+stores the bounded canonical finalize result for the lifetime of the team so an
+exact retry remains exact. After explicit team deletion, a permanent compact
+tombstone retains onboarding/session/team/credential IDs and request/result
+digests but no roster body.
 
 The response uses the shared v6 shape:
 
@@ -502,6 +548,13 @@ provisional secret. This server record is the single recovery truth.
 Authorization permits an active, unrevoked credential to replay finalize only
 for its own onboarding ID and exact stored request digest. It does not make
 finalize a general active-credential mutation endpoint.
+
+Hosted provider tooling calls status/cancel with its baseline
+creator-bound own-operation authority. A bare OSS token holder has no such
+account authority: if it lost the provisional secret it waits for request-time
+expiry, while a self-host operator may inspect/cancel through the private admin
+socket. UX and runbooks distinguish these paths and never promise a bare client
+that it can query or cancel an operation it cannot authenticate.
 
 The client validates the response binding, roster, revision, capabilities, and
 onboarding IDs before atomically committing the local binding. A crash after
@@ -652,6 +705,28 @@ desired roster, and digest before network exposure. Response loss retries the
 same immutable entry. A successful stored result is incorporated locally before
 the outbox entry is removed.
 
+A stored retry result is an acknowledgement fact, not permission to roll the
+local roster backward. Local application is monotonic:
+
+- if local revision still equals the mutation's expected revision, apply the
+  stored next snapshot with revision CAS;
+- if local revision is already equal to or greater than the stored result,
+  validate the stored mutation ID/digest/result binding and, when the current
+  revision is not already authenticated, fetch `GET /v1/members`; then record
+  the outbox acknowledgement and keep the newer local snapshot (a later
+  mutation may legitimately have superseded the earlier effect); and
+- never replace a higher local revision with an older stored response.
+
+For a remote-bound team, a newly created member remains
+`pending_remote_acceptance` until its roster mutation is accepted and the
+canonical member ID is incorporated locally. A pending member cannot own an
+active local registration, act/send, create read facts, or enter Stage-1/2.
+Therefore a concurrent first-creator conflict cannot strand published
+messages under the losing ID. Existing accepted members remain usable offline;
+only new identity activation waits for server acceptance. Supporting offline
+messages from unaccepted identities would require the separate explicit
+identity-repair protocol rejected from v1.
+
 ## Sub-decisions
 
 ### A. Promote complete history, not a silent window
@@ -676,17 +751,26 @@ The storage-driver promotion ABI returns exactly one strict
   "total_order_version": 1,
   "cutoff": "42",
   "message_count": "42",
+  "message_digest": "sha256:base64url",
+  "read_state_count": "7",
+  "read_state_digest": "sha256:base64url",
   "estimated_bytes": "8192",
-  "digest": "sha256:base64url"
+  "reserved_bytes": "16384",
+  "snapshot_digest": "sha256:base64url"
 }
 ```
 
 The descriptor uses canonical bounded strings and nonnegative signed-BIGINT
 decimals, rejects duplicate/unknown fields, and is immutable for the onboarding
-ID. Its domain-separated digest covers the canonical ordered local item
-identities, immutable plaintext payload digests, read facts that must be
-preserved, generation, cutoff, count, and total-order version. `snapshot_id` is
-only an opaque correlation value; it is not accepted as a security proof.
+ID. Separately domain-separated message and read-state digests cover the
+canonical ordered local message identities/payload digests and the exact/frontier
+read work that must be preserved. `snapshot_digest` covers both components,
+generation, cutoff, counts, reserved byte budget, and total-order version.
+`reserved_bytes` is a conservative upper bound derived from the selected
+envelope profile and each source payload bound, not a best-effort estimate.
+Finalize reserves this value; actual stored decoded envelope bytes must not
+exceed it. `snapshot_id` is only an opaque correlation value; it is not accepted
+as a security proof.
 
 The bundled drivers define one deterministic promotion order spanning legacy
 rows and the current event log. Stage-1's contiguous push cursor proves
@@ -710,15 +794,20 @@ locally and the durable history snapshot is queued; it does not hold a terminal
 open until an arbitrarily large archive uploads. The ordinary polling engine
 continues the backfill.
 
-The server keeps a `backfill_pending` fact under the team row from promote
-finalize until completion. As wire reservations become durable, the client
-uploads bounded, idempotent manifest pages of
-`(promotion_position, wire_id)`; the server accepts only canonical contiguous
-positions and seals the manifest with a count and digest. The completion call
-is idempotent and succeeds only when:
+The server keeps a bounded `backfill_pending` lease under the team row from
+promote finalize until completion. It accounts actual decoded envelope bytes
+and distinct promotion messages against the token-reserved limits. The
+30-minute lease renews only after committed new manifest/message progress and
+can never pass the 24-hour absolute deadline. As wire reservations become
+durable, the client uploads two bounded, idempotent manifest streams:
+
+- message entries `(promotion_position, wire_id)`; and
+- read-state entries, after durable mapping, as canonical
+  `(member_id, kind=frontier, server_seq)` or
+  `(member_id, kind=exact, wire_id)` facts.
 
 ```http
-PUT /v1/onboarding/{onboarding_id}/backfill-manifest/{page_index}
+PUT /v1/onboarding/{onboarding_id}/backfill-manifest/{kind}/{page_index}
 POST /v1/onboarding/{onboarding_id}/backfill-complete
 ```
 
@@ -727,25 +816,50 @@ request cap. It contains the snapshot digest, canonical decimal page index and
 first position, ordered entries, and page digest. Page indices and positions
 start at zero and are contiguous. An exact page retry returns the stored page
 result; a different digest for an existing index is a conflict. The completion
-request carries the immutable snapshot digest, cutoff, message count, sealed
-manifest count, and manifest digest. Neither endpoint accepts envelope blobs or
-plaintext.
+request carries the immutable snapshot digest, cutoff, separate declared and
+sealed message/read-state counts and digests, and a driver-produced durable
+mapping proof. Neither endpoint accepts envelope blobs or plaintext.
 
 The completion call succeeds only when:
 
-- the manifest count and client snapshot count match;
+- each sealed message/read-state manifest count and digest matches its client
+  snapshot component;
 - every manifest wire ID exists as a live team message or permanent
   idempotency tombstone;
+- the driver reports a durable local-ID-to-wire-ID/server-sequence mapping for
+  every promoted message, with the same ordered count/digest and acknowledged
+  cutoff;
+- every declared read exact has been promoted through that durable mapping, and
+  the server's Stage-2 exact/frontier state covers every read-state manifest
+  entry;
 - the client reports the same immutable snapshot descriptor and a contiguous
   acknowledged cutoff; and
 - no manifest position is missing or duplicated.
 
-The team-row transaction records `backfill_complete` and releases the retention
-barrier atomically. A second device may join while backfill is pending; its
-authenticated join snapshot says `backfill_pending`, returns the pinned
-retention floor and current sequence from one snapshot, and guarantees that
-the remaining suffix will arrive later. It MUST NOT claim that the remote
-history is complete until the server fact changes.
+Message mapping, local exact-read alias promotion, and the read-state outbox are
+one local transaction before a read manifest entry becomes uploadable. A
+blocking quarantine row is never considered projected/read merely because a
+remote frontier covers its sequence. Backfill completion therefore proves both
+message availability and the read facts promised by the snapshot; message
+retention or Stage-2 GC cannot run between those proofs.
+
+The team-row transaction records `backfill_complete` and releases the
+team-wide promotion barrier atomically. A second device may join while backfill
+is pending. Join finalize creates a bounded, credential-scoped
+`initial_sync_lease` containing a random lease ID, the authenticated retention
+floor, backfill generation, current sequence, and expiry. When backfill later
+completes, the lease acquires the manifest's terminal server sequence. The
+joiner periodically posts its durable transport cursor to
+`POST /v1/onboarding/initial-sync/{lease_id}/ack`; the server releases that
+lease only after the cursor covers the terminal sequence.
+
+Retention uses the minimum floor protected by any unexpired initial-sync lease,
+even after the team-wide promotion barrier is released. The reference
+initial-sync lease is 24 hours and is not silently renewed without durable pull
+progress. Its status is `pending`, `complete`, or `expired-incomplete`. An
+expired join that did not acknowledge the terminal sequence MUST report that
+complete history is no longer guaranteed and may receive the ordinary 410
+resync-required outcome; it never labels itself complete.
 
 The bundled SQLite promotion path MUST include pre-event-log legacy rows rather
 than silently leave them local-only. It may materialize a durable,
@@ -755,14 +869,22 @@ local inbox/history projection. A driver that cannot prove a complete stable
 snapshot fails promotion before finalize.
 
 Server retention is suspended at the promote-time floor while
-`backfill_pending`. Retention, manifest completion, tombstone creation,
-delivery deletion, floor advancement, and Stage-2 exact/frontier GC serialize
-on the same team-row lock. Retention may resume only in the transaction that
-records `backfill_complete`; it can never erase the prefix while promotion is
-still proving it. A server may later retain only its configured live window,
-but the client never labels a partial local selection as a complete promotion.
-A future explicit history-window product is a separate interface and policy
-decision.
+`backfill_pending`. Retention, lease renewal/expiry, manifest completion,
+initial-sync acknowledgement, tombstone creation, delivery deletion, floor
+advancement, and Stage-2 exact/frontier GC serialize on the same team-row lock.
+After completion, retention still honors initial-sync lease floors.
+
+If message/byte quota, progress lease, or absolute deadline is exceeded, one
+team-row transaction marks `promotion_failed`, rejects further message writes
+with a terminal promotion error, releases the promotion retention barrier, and
+marks all associated initial-sync leases `expired-incomplete`. Configured
+retention may resume, with their already bounded floor protection lasting no
+longer than the original lease expiry. The team can never claim complete or
+issue new join tokens in that state. The operator runbook revokes the
+credential and explicitly aborts/repairs the incomplete team; expiry alone
+never converts partial history into success. Metrics warn on quota, stalled
+progress, lease expiry, and retained bytes. A future explicit history-window
+product is a separate interface and policy decision.
 
 ### B. Make every externally visible transition retryable
 
@@ -812,19 +934,31 @@ The strict machine-readable status ABI becomes schema version 2:
     "intent": "promote",
     "pending_id": "opaque-local-handle",
     "server_phase": "provisional",
+    "server_result_digest": null,
+    "server_observed_at": "2026-07-24T06:10:00.000000Z",
+    "server_observation": "authenticated-current",
     "local_projection": "provisional-stored"
   },
-  "promotion": null
+  "promotion": null,
+  "initial_sync": null
 }
 ```
 
 `state` is `onboarding`, `active`, or `disconnected`. `onboarding` is required
 only for `onboarding` and reports the last authenticated server observation
 alongside the local projection; it never mutates or overrides the server
-session. An active binding requires null `onboarding` and has `promotion` set to
-null or `{phase, acked, total, blocked_reason}` with phase
-`promoting-roster`, `backfilling-history`, `complete`, or `blocked`.
-Canonical decimal and strict-null rules are pinned in the driver interface.
+session. Offline output sets `server_observation: "stale-offline"` and retains
+the original `server_observed_at` and result digest; it never presents cached
+phase as current truth. An active local state can be established only by a
+full match to the server's finalized result followed by successful local
+reservation CAS. An active binding requires null `onboarding` and has
+`promotion` set to null or `{phase, acked, total, blocked_reason}` with phase
+`promoting-roster`, `backfilling-history`, `complete`, `blocked`, or `failed`.
+For a joining binding, `initial_sync` is
+`{lease_id, phase, pinned_floor, terminal_server_seq, transport_cursor,
+expires_at}` with phase `pending`, `complete`, or `expired-incomplete`;
+otherwise it is null. Canonical decimal and strict-null rules are pinned in the
+driver interface.
 
 Pending onboarding state is never deleted merely because it is old or
 malformed. It is quarantined as private recovery material until server-proven
@@ -918,8 +1052,12 @@ strict record:
   "intent": "join",
   "installation_id": "018f3f7e-0000-7000-8000-000000000012",
   "local_team_name": "example-team",
-  "store_identity": "driver-private-stable-id",
-  "observed_generation": "driver-private-generation-or-absent",
+  "target_locator": {
+    "driver": "sqlite",
+    "canonical_path": "/absolute/private/team-store"
+  },
+  "observed_store_identity": null,
+  "observed_generation": null,
   "prior_binding_digest": null,
   "reservation_generation": "1"
 }
@@ -930,6 +1068,11 @@ stored under the same lock respected by every local team/store mutation path.
 `commit` is a generation CAS that revalidates the target before atomically
 publishing a binding or clean join. `abort` never deletes provisional secret or
 pending recovery material without server cancellation/revocation proof.
+For an absent clean-join store, `target_locator` exists while
+`observed_store_identity` and generation are null. Creation uses no-follow
+opens, validates the parent directory identity/ownership/mode captured by the
+reservation, and atomically publishes the new store identity under the same
+CAS.
 
 The shared fixture suite includes a bundled legacy SQLite store with current
 writes racing snapshot capture, a retired historical member, read facts, and a
@@ -1055,6 +1198,14 @@ Implementation does not begin until adversarial review closes at least:
     and escaping seam established by the storage hardening work;
 11. no team/message/member creation from opaque message contents; and
 12. removal of server-first/raw provisioning from the primary quickstart.
+
+Required adversarial fixtures include: a finalize just before/at/after the
+60-minute expiry; a slow join that has not reached the backfill terminal
+sequence when team completion occurs; an abandoned promotion hitting progress,
+byte, and hard-deadline limits; an exact legacy read fact whose mapping is
+created after message upload; a roster response-loss retry after local revision
+has already advanced; and a losing unaccepted same-name member attempting to
+act/send/read.
 
 ## References
 
