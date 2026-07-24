@@ -54,6 +54,11 @@ We choose a **surgical rewrite of the onboarding state machine**, not an
 additive `promote` endpoint on the current one-shot exchange and not a rewrite
 of remote synchronization.
 
+“Surgical” describes the subsystem boundary, not the amount of connect code
+reused. The existing one-shot connect commit/pending path is replaced end to
+end by the shared provisional/finalize path; Stage-1, Stage-2, envelope,
+credential-storage, revoke, and binding-validation contracts are retained.
+
 The one user action, `agmsg remote connect`, performs one of two strictly
 separated operations:
 
@@ -64,11 +69,38 @@ separated operations:
   identity catalog, current roster revision, policy, and retained history. It
   does not create or merge a remote team.
 
-Internally, connect uses a two-phase protocol. Exchange creates a short-lived
-onboarding session and a future credential secret. Finalize atomically promotes
-or joins the team and activates that same secret as the long-lived credential.
-The CLI durably stores the pending session before finalize. The user still runs
-one command.
+Internally, connect uses the same two-call state machine as cloud CLI v6.
+Exchange creates an onboarding session and single-delivers a short-lived
+**provisional credential**. After the CLI durably stores that exact secret,
+finalize atomically promotes or joins the team and changes that same credential
+from provisional to active. Cloud v6's no-intent `activate` is the degenerate
+case of this operation: **activate is a subset of finalize**, not a second state
+machine. The user still runs one command.
+
+The credential and team have deliberately different recovery semantics:
+
+- the credential is a secret, delivered once and never fetched or reissued;
+- the team, roster, and canonical result are resources, converging
+  idempotently on `onboarding_id`.
+
+There is no one-round-trip shortcut. Finalize MUST NOT occur until the exchange
+response and provisional credential have been atomically written and fsynced.
+
+### Cloud v6 crosswalk
+
+| Cloud CLI v6 | Local-first onboarding |
+| --- | --- |
+| Provisional credential, delivered once | The same `provisional_credential` and credential slot |
+| `POST /v1/device/activate` | Degenerate finalize with no team intent; no separate lifecycle |
+| `POST /v1/onboarding/finalize` | Intent union adds promote/join resource body, then performs the same provisional-to-active transition |
+| Secret recovery | Local durable credential slot only; never server re-fetch/reissue |
+| Resource recovery | `onboarding_sessions(onboarding_id)` stored canonical result |
+| Cloud operation observations | Reconciled projections of the server session, never an independent phase machine |
+
+The shared field names, five-minute provisional TTL, storage rigor, and
+single-delivery rules are inherited from cloud v6. ADR 0010 adds only the
+token-bound tenant/policy context, promote/join body, local reservation, and
+team/roster/backfill result.
 
 ## Local identity model
 
@@ -86,11 +118,19 @@ disconnect, storage compaction, or remote rebind.
 An existing v1 local configuration is upgraded under the existing team-config
 lock:
 
-1. generate and durably write one `team_id`;
-2. generate and durably write one `member_id` for every current agent name;
-3. give every local registration stable `registration_id` and
+1. audit the complete selected store, including current configuration, event
+   history, legacy message rows, read facts, and retired-name history, and
+   produce an explicit identity-audit result;
+2. resolve every active and historical principal to a durable member identity;
+   unresolved names stop the migration for operator mapping or creation of an
+   explicit retired member -- they are never inferred from opaque message
+   projections;
+3. generate and durably write one `team_id`;
+4. generate and durably write one `member_id` for every resolved current or
+   retired principal that does not already have a portable identity;
+5. give every local registration stable `registration_id` and
    `installation_id` values; and
-4. only then expose the upgraded identity document to onboarding.
+6. only then expose the upgraded identity document to onboarding.
 
 The upgrade is one atomic config replacement. A crash before replacement
 publishes no IDs; a crash after replacement reuses every published ID.
@@ -130,10 +170,35 @@ Machine-local project paths never enter the remote roster. A clean joining
 device materializes the member catalog but does not invent local agent
 registrations for remote machines.
 
+`registration_id` is a portable identity for one logical agent registration;
+`installation_id` and project path describe its machine-local placement. A
+promotion may include the portable registration identity and its retired/active
+state when needed to preserve historical attribution, but it MUST NOT upload a
+machine path or silently convert a placement into a new member.
+
+The identity-audit ABI is strict JSON and returns the selected driver and
+generation plus three bounded, canonically ordered sets:
+
+- `active`: resolved `(normalized_name, member_id)` identities;
+- `retired`: historical `(normalized_name, member_id)` identities required by
+  messages or read facts; and
+- `unresolved`: principals with evidence references that require explicit
+  operator resolution.
+
+Promotion is ineligible while `unresolved` is non-empty. The audit result and
+the promotion snapshot descriptor are bound to the same driver generation.
+
 `members_revision` is null until the first successful promote or join finalize.
 Afterward it is the last server revision durably incorporated locally. Pending
 local roster operations live in a separate durable outbox; they do not
 speculatively increment the server revision.
+
+Local registration lifecycle does not own the portable catalog. `leave` and
+registration reset remove only the selected local placement/registration; even
+the last local registration MUST NOT delete the members catalog, remote binding,
+remote key state, identity history, or team configuration. Deleting the local
+team is a separate explicit operation with binding-generation CAS and remote
+recovery/revoke warnings.
 
 ### First creator is canonical
 
@@ -155,15 +220,32 @@ alias the two members. The operator may rename an unaccepted local member and
 retry. Deleting or rewriting a member that already owns local messages or read
 facts requires a separate explicit repair design.
 
+A rename retains `member_id` and enqueues a complete roster mutation. Local and
+remote names may differ while that mutation is pending; Stage-2 read-state
+publication for that member remains fail-closed until the authenticated roster
+and local catalog agree, as required by ADR 0008.
+
 ## Connect mode selection
 
 Pairing tokens have one immutable purpose:
 
 - a **promote token** is a single-use capability to create exactly one team on
-  the server. It is server/account scoped, not org-wide, cannot select or modify
-  an existing team, and expires after 15 minutes;
+  the server. It is bound at issuance to exactly one immutable `tenant_id`, the
+  issuer account, a maximum allowed onboarding policy, and one reserved
+  team-quota slot. It cannot select a tenant, modify an existing team, or create
+  more than one team, and expires after 15 minutes;
 - a **join token** is scoped to exactly one existing immutable team and one
-  device join.
+  immutable tenant and authorizes one device join.
+
+Token purpose, tenant, issuer, policy ceiling, quota reservation, and optional
+team binding are copied into the server-side onboarding record and are not
+client-selectable. Final activation derives all of them from that record. A
+promote reservation is released exactly once on pre-activation expiry or
+successful cancellation, and is consumed exactly once by successful team
+creation. Finalized/activated records never release a consumed quota slot.
+Concurrent expiry, cancellation, and activation serialize on the same row.
+Thus a stolen promote token can create at most one initial roster and one
+credential in its issuer-selected tenant.
 
 The client sends its intended mode during exchange, and the token purpose MUST
 match. A purpose mismatch is terminal and creates no session.
@@ -175,13 +257,34 @@ match. A purpose mismatch is terminal and creates no session.
 | Existing local team without an exact prior binding | join | Reject: both sides are populated |
 | No local team/config/store | promote | Reject: there is no local authority to promote |
 
+The local decision is made under a durable onboarding reservation, not by a
+one-time filesystem precheck. Before the first network call, connect locks the
+installation/team registry and atomically records:
+
+- the intent and client onboarding ID;
+- the normalized local team name;
+- the selected absolute store identity and driver generation;
+- the installation identity; and
+- the observed absence or exact prior-binding generation.
+
+All local team creation, join, send, store initialization, rename, and binding
+replacement paths MUST honor that reservation. Final local materialization is a
+compare-and-swap against the reservation generation and revalidates the target
+store identity. If another process changes the target, connect does not
+materialize or merge anything; it preserves the pending server recovery record
+and cancels or revokes it when safe. Because the server cannot observe a local
+filesystem, `both-sides-populated` is a local terminal result, never a server
+error.
+
 An exact-ID recovery of an interrupted prior promotion is a retry, not a merge.
 A disconnected local team with a prior binding may reattach only when the join
 token names that exact `server_instance_id` and `team_id`, the locally retained
-member IDs descend from that binding, and the ordinary revision reconciliation
-finds no identity conflict. This is lifecycle recovery under ADR 0007, not a
-third creation mode. A local team with no proof of that prior binding cannot use
-a join token merely because its display name or claimed team ID matches.
+member IDs descend from that binding, and the onboarding reservation names the
+same local store identity and binding generation. Ordinary revision
+reconciliation must find no identity conflict. This is lifecycle recovery
+under ADR 0007, not a third creation mode. A local team with no proof of that
+prior tuple cannot use a join token merely because its display name or claimed
+team ID matches.
 
 For promote, an explicit local team is required unless the CLI can identify
 exactly one eligible local team without prompting. Provider tooling MUST pass
@@ -190,9 +293,9 @@ the default local name and the existing local-name override remains available.
 
 ## Onboarding protocol
 
-### Phase 1: exchange a pairing token for a pending session
+### Phase 1: exchange a pairing token for a provisional credential
 
-`POST /v1/pairing/exchange` remains the only endpoint that receives the opaque
+`POST /v1/onboarding/exchange` is the only endpoint that receives the opaque
 pairing token. Its strict request becomes:
 
 ```json
@@ -208,7 +311,9 @@ with the local onboarding intent before network exposure. `intent` is
 `promote` or `join`.
 
 A successful exchange consumes the token and creates an
-`onboarding_sessions` row, not an active team credential. The response contains:
+`onboarding_sessions` row plus a provisional credential, not an active team
+credential. The response uses the cloud v6 core field names plus the
+authenticated policy context needed before the E2EE choice:
 
 ```json
 {
@@ -217,44 +322,64 @@ A successful exchange consumes the token and creates an
   "onboarding_session_id": "018f3f7e-0000-7000-8000-000000000020",
   "onboarding_id": "550e8400-e29b-41d4-a716-446655440000",
   "intent": "promote",
+  "tenant_id": "018f3f7e-0000-7000-8000-000000000030",
   "credential_id": "018f3f7e-0000-7000-8000-000000000021",
-  "credential": "agmsg_credential_opaque-value",
-  "expires_at": "2026-07-24T06:30:00.000000Z",
+  "provisional_credential": "agmsg_credential_opaque-value",
+  "expires_at": "2026-07-24T06:05:00.000000Z",
   "onboarding_policy": {
     "accepted_envelope_versions": [1],
     "write_allowed_ciphers": ["none", "age-v1"],
+    "policy_revision": "0",
+    "effective_from_seq": "1",
     "max_blob_bytes": "1048576"
   }
 }
 ```
 
-For join, the response also identifies the token's existing `remote_team_id`.
-For promote, no remote team exists yet, so the response MUST NOT manufacture a
-team binding.
+`onboarding_id` is unique within issuer/origin scope. The exchange row lock
+stores the canonical request digest before returning. Reusing the same ID with
+different input is a conflict. Reusing the same ID with identical input returns
+only the same secret-free session status and
+`409 provisional-credential-already-issued`; it never returns
+`provisional_credential` a second time. A different onboarding ID cannot reuse
+the consumed token.
 
-The returned credential secret is the future long-lived device secret, but
-before finalize it authenticates only the finalize and onboarding-status
-endpoints. Sync, roster mutation, message, member, read-state, and revoke
-endpoints reject it as not active. The server stores only its domain-separated
-digest. The reference session expires 30 minutes after exchange; the exact
-timestamp is returned and clients do not guess it.
+For join, the strict response union also has `remote_team_id` and the complete
+current capability/public-epoch snapshot; promote forbids that field because no
+remote team exists yet. The authenticated response header and response bind the
+`server_instance_id`, `onboarding_id`, intent, immutable tenant, token purpose,
+policy ceiling, and optional join target.
 
-The client writes the session ID, onboarding ID, purpose, credential ID, secret,
-endpoint, and exact exchange response into its private pending store before it
-calls finalize. Binding JSON remains secret-free.
+`provisional_credential` is the future long-lived device secret, but
+before finalize it authenticates exactly its own finalize operation. Status,
+cancel, sync, roster mutation, message, member, read-state, and revoke endpoints
+reject it as not active. The server stores only its domain-separated digest.
+The provisional TTL is five minutes, evaluated on every request rather than by
+sweeper timing; the exact timestamp is returned and clients do not guess it.
+
+The client writes the session ID, onboarding ID, purpose, credential ID,
+provisional secret, origin, server instance, account, and exact exchange
+response into the cloud-v6 provisional credential slot before it calls
+finalize. The slot key is
+`(origin, account, role="provisional", credential_id)`. It uses a `0700`
+directory, `0600` file, atomic replacement, file and directory fsync,
+`O_NOFOLLOW`, bounded strict parsing, and lock/CAS. Binding JSON remains
+secret-free.
 
 If the exchange response is lost before the client stores it, the short-lived
-session expires without creating a team or active credential. The operator may
-issue a new token. This failure no longer creates an unknown live device
-credential or orphan team.
+provisional credential expires and is revoked without creating a team or active
+credential. No API re-delivers the secret. The own-operation status/cancel API
+may prove and clean the abandoned operation, after which the operator issues a
+new token. This failure creates neither an active device credential nor an
+orphan team.
 
 ### Phase 2: idempotent finalize
 
-The pending credential authenticates:
+The provisional credential authenticates:
 
 ```http
 POST /v1/onboarding/finalize
-Authorization: Bearer <pending credential>
+Authorization: Bearer <provisional credential>
 Agmsg-Protocol-Version: 1
 Content-Type: application/json
 ```
@@ -265,32 +390,57 @@ The promote request contains the local identity document:
 {
   "onboarding_id": "550e8400-e29b-41d4-a716-446655440000",
   "intent": "promote",
-  "team": {
-    "team_id": "018f3f7e-0000-7000-8000-000000000001",
-    "team_name": "example-team",
-    "members_revision": null,
-    "members": []
-  },
-  "history": {
-    "mode": "all",
-    "snapshot_id": "driver-defined-opaque-id",
-    "message_count": "0"
+  "body": {
+    "local_team_id": "018f3f7e-0000-7000-8000-000000000001",
+    "canonical_roster": {
+      "team_name": "example-team",
+      "members_revision": null,
+      "members": [
+        {
+          "member_id": "018f3f7e-0000-7000-8000-000000000010",
+          "name": "worker-1",
+          "registrations": [
+            {
+              "registration_id": "018f3f7e-0000-7000-8000-000000000011",
+              "installation_id": "018f3f7e-0000-7000-8000-000000000012",
+              "type": "codex"
+            }
+          ]
+        }
+      ],
+      "identity_history": []
+    },
+    "history_snapshot_metadata": {
+      "mode": "all",
+      "snapshot_id": "driver-defined-opaque-id",
+      "driver_generation": "driver-defined-generation",
+      "cutoff": "42",
+      "message_count": "42",
+      "digest": "sha256:base64url"
+    }
   }
 }
 ```
 
-The join request contains only the onboarding ID, `intent: "join"`, and the
-local installation ID. The join target comes exclusively from the token; the
-client cannot substitute a team ID.
+The join request contains the onboarding ID, `intent: "join"`, and an empty
+`body`. The join target comes exclusively from the token; the client cannot
+substitute a tenant or team ID.
 
-Finalize locks the onboarding session. It canonicalizes and hashes the exact
-request. In one transaction it:
+Finalize first resolves the credential and locks the onboarding session. After
+binding and syntax validation, it looks up the stored canonical request digest
+and result for `onboarding_id` **before** applying current expiry, cancellation,
+policy, or revision checks. An exact completed retry returns the stored result;
+a different digest is `409 onboarding-conflict`. A new request then validates
+that the provisional credential is unexpired and uncancelled.
+
+For a new request, one transaction:
 
 - for promote, verifies that the team ID and normalized name are unused, creates
-  the team with the token's policy, applies the initial roster and permanent
-  identity history, activates the pending credential for that team, and marks
-  the session finalized;
-- for join, locks the token-selected existing team, activates the pending
+  the team in the token-bound tenant with the token's policy, consumes the
+  reserved quota slot, applies the complete initial roster and permanent active
+  and retired identity history, changes the provisional credential to active
+  for that team, and marks the session finalized;
+- for join, locks the token-selected existing team, activates the provisional
   credential for it, and marks the session finalized; and
 - returns one binding, complete capability snapshot, complete roster snapshot,
   and resulting `members_revision` from the same team-row snapshot.
@@ -300,15 +450,58 @@ resulting_team_id, credential_id, finalized_at)`. An exact retry returns the
 same canonical response. Reusing either ID with a different request is
 `409 onboarding-conflict`.
 
-The credential secret is not returned again by finalize because the client
-already durably holds it. Finalize promotes that exact secret digest into the
-ordinary `credentials` table. There is no second secret and no response-loss
-orphan.
+The response uses the shared v6 shape:
+
+```json
+{
+  "credential_id": "018f3f7e-0000-7000-8000-000000000021",
+  "state": "active",
+  "team_id": "018f3f7e-0000-7000-8000-000000000001",
+  "canonical_roster": {},
+  "capability": {}
+}
+```
+
+The secret is not returned again because the client already durably holds it.
+Finalize activates that exact digest; there is no second secret.
 
 An unfinalized expired session cannot create a team and returns
-`410 onboarding-session-expired`. A finalized session remains available for
-exact result recovery after its original expiry; expiry MUST NOT make a
-committed result locally unrecoverable.
+`410 provisional-credential-expired`. A finalized session's resource result
+remains available to its creator through own-operation status after the
+provisional TTL, but no API re-delivers its secret.
+
+Cancellation, finalization, expiry, and revocation have a strict precedence:
+
+1. an exact finalized retry returns the stored resource result while its active
+   credential remains valid;
+2. finalization and pre-finalize cancellation are mutually exclusive row-lock
+   transitions;
+3. expiry or cancellation prevents a new finalize and releases an unconsumed
+   quota reservation;
+4. revocation of an active credential never rolls the session back, revives the
+   secret, or deletes the created team;
+5. after revocation, baseline own-operation status may prove the finalized
+   `(tenant_id, team_id, credential_id, result_digest)`, but the client MUST
+   quarantine local recovery material and MUST NOT commit a usable binding for
+   the revoked secret; exact reattach requires a fresh join token bound to that
+   same tuple.
+
+`POST /v1/onboarding/status/{onboarding_id}/cancel` with a strict empty body
+cancels only an unfinalized session and is idempotent. It is authorized only by
+the issuer's narrow own-operation cleanup authority. Finalize/cancel races
+serialize on the session row.
+
+`GET /v1/onboarding/status/{onboarding_id}` returns one strict, secret-free
+record containing `onboarding_session_id`, `onboarding_id`, `intent`,
+`tenant_id`, `phase` (`provisional`, `finalized`, `cancelled`, or `expired`),
+`credential_id`, `credential_state` (`provisional`, `active`, `revoked`, or
+`expired`), `expires_at`, `team_id` or null, and `result_digest` or null. It is
+authorized by the issuer's own-operation status authority, not by the
+provisional secret. This server record is the single recovery truth.
+
+Authorization permits an active, unrevoked credential to replay finalize only
+for its own onboarding ID and exact stored request digest. It does not make
+finalize a general active-credential mutation endpoint.
 
 The client validates the response binding, roster, revision, capabilities, and
 onboarding IDs before atomically committing the local binding. A crash after
@@ -318,42 +511,75 @@ result.
 Onboarding responses use `Cache-Control: no-store`, strict UTF-8 JSON,
 duplicate/unknown-field rejection, bounded bodies and headers, no redirects,
 and the existing protocol-header rules. Access logs, APM, and traces MUST redact
-pairing tokens, pending credentials, and response bodies.
+pairing tokens, provisional credentials, and response bodies.
 
-The minimum error contract is:
+The minimum shared error contract is:
 
 | HTTP | Code | Meaning and client action |
 | --- | --- | --- |
 | 401 | `invalid-pairing-token` | Unknown token; stop and request another |
 | 401 | `invalid-onboarding-credential` | Pending secret is absent or invalid; stop |
 | 409 | `pairing-token-consumed` | Token was already exchanged; recover a locally stored session or reissue after the old session expires |
-| 409 | `onboarding-intent-conflict` | Token purpose and local mode differ; no automatic fallback |
+| 409 | `provisional-credential-already-issued` | The same onboarding ID already received its one secret delivery; use the durable local slot or issuer status/cancel, never request the secret again |
+| 403 | `onboarding-intent-conflict` | Token purpose and local mode differ; no automatic fallback |
+| 403 | `onboarding-policy-violation` | Requested policy/epoch exceeds or relaxes the token-bound policy |
+| 404 | `join-team-not-found` | The immutable token-scoped team is absent; stop |
 | 409 | `onboarding-conflict` | An onboarding/session ID was reused with different canonical input; stop |
 | 409 | `team-identity-conflict` | Promote collided with an existing team ID or normalized name; never adopt it implicitly |
-| 409 | `both-sides-populated` | Join target is not clean; do not merge |
 | 410 | `pairing-token-expired` | Token expired before exchange; request another |
-| 410 | `onboarding-session-expired` | Unfinalized session expired; preserve recovery audit, then request another |
+| 410 | `provisional-credential-expired` | Unfinalized provisional expired; prove cleanup, preserve audit, then request another |
+| 410 | `onboarding-cancelled` | The unfinalized session was cancelled; never finalize it |
+| 429 | `rate-limited` | Retry only after the authenticated response's bounded `Retry-After` |
 
 Transport loss and retryable `5xx` preserve the existing exact-request retry
 rules. Definitive `409` and `410` outcomes are not busy-retried.
 
+`both-sides-populated` is a local terminal code emitted before exchange or by
+the final local reservation CAS. It is not an HTTP error because the server
+cannot attest to local cleanliness.
+
+All UUID fields are lowercase canonical strings: client idempotency keys use
+UUIDv4; team, member, registration, installation, session, and credential IDs
+use UUIDv7 unless an existing referenced protocol fixes another opaque type.
+Requests and stored digests use strict RFC 8785 JCS with a domain/version
+prefix. JSON duplicate/unknown fields, lone surrogates, non-NFC identity text,
+noncanonical decimal strings, and values outside the shared HTTP-v1 byte and
+cardinality limits are rejected before mutation. Onboarding bodies are bounded
+independently of message bodies; large history is represented by the bounded
+snapshot/manifest protocol, never an unbounded finalize document.
+
 ### E2EE insertion point
 
-The exchange response's onboarding policy is the input to the existing
-`none`/`age-v1` branch. Private age identities stay local and never enter either
-onboarding request.
+The exchange response's onboarding policy is authenticated server input, not a
+client trust anchor. Before promotion, the CLI must already have a
+team-ID-scoped, append-only local minimum-security history and, for `age-v1`, a
+retained epoch checkpoint established by explicit human or provider policy.
+The effective write policy is the intersection of that local minimum and the
+token/session policy. A `none`-only client facing an E2EE-required minimum
+stops; it never treats a permissive or substituted server response as authority
+to downgrade.
 
 For promotion into an E2EE-required policy, connect completes the existing
 generate/import/abort key flow before finalize and includes only the approved
-public epoch snapshot or its pinned reference in the initial team document.
-For join, finalize returns the current public epoch metadata. Missing private
-key material does not weaken policy: the binding may complete, but ciphertext
-remains in `pending_key` quarantine until the existing key-import and reprocess
-flow succeeds.
+public epoch snapshot or its pinned reference in the initial team document. The
+snapshot binds at least `team_id`, `onboarding_id`, token-bound policy revision,
+epoch revision/generation, and the retained previous digest. Between exchange
+and finalize the client requires a full match of policy revision, capability
+boundary, and public epoch digest; relaxation, substitution, or rollback is
+terminal. Private age identities and plaintext stay local and never enter an
+onboarding request, access log, trace, or error.
+
+For join, finalize returns the current public epoch metadata. Until the joining
+client establishes or imports the trusted epoch checkpoint, it may durably
+download ciphertext but MUST keep it in `pending_key` quarantine and MUST NOT
+project, display, or advance read state. Missing private key material never
+weakens policy.
 
 The exact epoch-authority wire document remains owned by the age-v1 profile; this
 ADR does not invent a second key format or put key distribution in roster
-state.
+state. The encrypt-once publication rule, anti-rollback checkpoint, epoch
+cutover fence, and three-layer quarantine rules from the age-v1 profile remain
+normative.
 
 ## Convergent roster API
 
@@ -383,22 +609,36 @@ machine-local path.
 
 The server locks the team row and:
 
-1. compares `expected_members_revision`;
-2. validates every immutable identity and permanent name/ID history rule;
-3. atomically replaces the current roster;
-4. increments `members_revision`; and
-5. records the mutation ID, canonical request digest, and resulting revision.
+1. validates the binding, strict shape, canonical UUIDs, and canonical request
+   digest;
+2. looks up `roster_mutation_id` before revision comparison: the same digest
+   returns its stored resulting revision, roster digest, and canonical snapshot
+   even if later mutations have advanced the team; a different digest is
+   `409 roster-mutation-conflict`;
+3. only for a new mutation ID, compares `expected_members_revision`;
+4. validates every immutable identity and permanent name/ID history rule;
+5. atomically replaces the current roster and team display name;
+6. increments the single shared `members_revision`; and
+7. records the mutation ID, canonical request digest, resulting revision,
+   complete canonical roster digest, and response snapshot.
 
-An exact mutation retry returns the same revision and snapshot. Reusing the
-mutation ID with different bytes is `409 roster-mutation-conflict`. A stale
-expected revision is `409 members-revision-conflict` and includes the current
-revision and roster digest; the client refetches `GET /v1/members` before any
-rebase.
+Canonical mutation bytes are RFC 8785 JCS over a domain/version-separated
+strict schema; canonical lowercase UUIDs, UTF-8 scalar/NFC rules, and protocol
+cardinality/byte bounds apply before hashing. Team display-name changes share
+the roster revision domain. An exact mutation retry returns the originally
+stored result, not the current roster. A stale new mutation is
+`409 members-revision-conflict` and includes the current revision and roster
+digest; the client refetches `GET /v1/members` before any rebase.
 
 There is no administrator credential tier in this protocol. Every active team
 credential may submit a roster mutation. This makes credential compromise a
 roster-integrity risk as well as a message/read-availability risk; documentation
 and revocation UX MUST say so.
+
+Member lifecycle and device credential lifecycle are independent. Retiring or
+removing a member does not silently revoke credentials, and revoking a
+credential does not delete or retire a member. Operators perform and audit
+those mutations separately.
 
 The local CLI remains the only product-facing team/member creation and mutation
 surface. It updates the local identity catalog and a durable roster outbox in
@@ -407,23 +647,59 @@ A revision conflict is never resolved by last-writer-wins. Disjoint changes may
 be replayed on a freshly fetched roster; identity/name conflicts stop
 fail-closed for explicit local resolution.
 
+Each outbox entry stores the mutation ID, expected revision, complete canonical
+desired roster, and digest before network exposure. Response loss retries the
+same immutable entry. A successful stored result is incorporated locally before
+the outbox entry is removed.
+
 ## Sub-decisions
 
 ### A. Promote complete history, not a silent window
 
 Promotion captures one durable storage-driver snapshot boundary and backfills
 every shareable local message at or before that boundary. Messages created
-after the boundary follow normal Stage-1 ordering. The CLI shows the message
-count and estimated bytes before finalize; it does not silently choose a recent
-window.
+after the boundary may be accepted into the local store and durably reserve an
+envelope, but MUST NOT be posted or acknowledged ahead of the promotion
+snapshot. The snapshot is an authoritative prefix of the binding's Stage-1
+push stream. The CLI shows the message count and estimated bytes before
+finalize; it does not silently choose a recent window.
 
-The driver records a stable promotion snapshot ID, generation, cutoff, count,
-and digest before finalize. Stage-1's contiguous push cursor proves completion
-through that cutoff. `remote status` distinguishes:
+The storage-driver promotion ABI returns exactly one strict
+`promotion_snapshot` record:
+
+```json
+{
+  "type": "promotion_snapshot",
+  "snapshot_id": "driver-private-opaque-id",
+  "store_identity": "driver-private-stable-id",
+  "driver_generation": "driver-private-generation",
+  "total_order_version": 1,
+  "cutoff": "42",
+  "message_count": "42",
+  "estimated_bytes": "8192",
+  "digest": "sha256:base64url"
+}
+```
+
+The descriptor uses canonical bounded strings and nonnegative signed-BIGINT
+decimals, rejects duplicate/unknown fields, and is immutable for the onboarding
+ID. Its domain-separated digest covers the canonical ordered local item
+identities, immutable plaintext payload digests, read facts that must be
+preserved, generation, cutoff, count, and total-order version. `snapshot_id` is
+only an opaque correlation value; it is not accepted as a security proof.
+
+The bundled drivers define one deterministic promotion order spanning legacy
+rows and the current event log. Stage-1's contiguous push cursor proves
+completion through the snapshot cutoff. The engine may prepare later items, but
+its POST selector enforces the cutoff barrier until every earlier promotion
+position has a durable canonical acknowledgement. `remote status` keeps the
+existing binding lifecycle `state` separate from a new `promotion`
+object. A connected binding therefore remains `state: "active"` while
+`promotion.phase` distinguishes:
 
 - `promoting-roster`;
 - `backfilling-history (acked/total)`;
-- `connected`; and
+- `complete`; and
 - a terminal conflict or policy/key block.
 
 Existing Stage-1 encrypt-once, ack reconciliation, and exact retry rules own the
@@ -432,8 +708,44 @@ actual upload. No onboarding endpoint accepts message bodies.
 `connect` reports success once the binding and canonical roster are committed
 locally and the durable history snapshot is queued; it does not hold a terminal
 open until an arbitrarily large archive uploads. The ordinary polling engine
-continues the backfill. A second device may join while backfill is in progress
-and will converge as later server sequences arrive.
+continues the backfill.
+
+The server keeps a `backfill_pending` fact under the team row from promote
+finalize until completion. As wire reservations become durable, the client
+uploads bounded, idempotent manifest pages of
+`(promotion_position, wire_id)`; the server accepts only canonical contiguous
+positions and seals the manifest with a count and digest. The completion call
+is idempotent and succeeds only when:
+
+```http
+PUT /v1/onboarding/{onboarding_id}/backfill-manifest/{page_index}
+POST /v1/onboarding/{onboarding_id}/backfill-complete
+```
+
+Each manifest page has at most 1,000 entries and is subject to the 2 MiB control
+request cap. It contains the snapshot digest, canonical decimal page index and
+first position, ordered entries, and page digest. Page indices and positions
+start at zero and are contiguous. An exact page retry returns the stored page
+result; a different digest for an existing index is a conflict. The completion
+request carries the immutable snapshot digest, cutoff, message count, sealed
+manifest count, and manifest digest. Neither endpoint accepts envelope blobs or
+plaintext.
+
+The completion call succeeds only when:
+
+- the manifest count and client snapshot count match;
+- every manifest wire ID exists as a live team message or permanent
+  idempotency tombstone;
+- the client reports the same immutable snapshot descriptor and a contiguous
+  acknowledged cutoff; and
+- no manifest position is missing or duplicated.
+
+The team-row transaction records `backfill_complete` and releases the retention
+barrier atomically. A second device may join while backfill is pending; its
+authenticated join snapshot says `backfill_pending`, returns the pinned
+retention floor and current sequence from one snapshot, and guarantees that
+the remaining suffix will arrive later. It MUST NOT claim that the remote
+history is complete until the server fact changes.
 
 The bundled SQLite promotion path MUST include pre-event-log legacy rows rather
 than silently leave them local-only. It may materialize a durable,
@@ -442,10 +754,15 @@ recipient read facts, and a deterministic total order without duplicating
 local inbox/history projection. A driver that cannot prove a complete stable
 snapshot fails promotion before finalize.
 
-Server retention remains independent. A server may later retain only its
-configured live window, but the client never labels a partial local selection
-as a complete promotion. A future explicit history-window product is a separate
-interface and policy decision.
+Server retention is suspended at the promote-time floor while
+`backfill_pending`. Retention, manifest completion, tombstone creation,
+delivery deletion, floor advancement, and Stage-2 exact/frontier GC serialize
+on the same team-row lock. Retention may resume only in the transaction that
+records `backfill_complete`; it can never erase the prefix while promotion is
+still proving it. A server may later retain only its configured live window,
+but the client never labels a partial local selection as a complete promotion.
+A future explicit history-window product is a separate interface and policy
+decision.
 
 ### B. Make every externally visible transition retryable
 
@@ -455,33 +772,83 @@ The required crash outcomes are:
 | --- | --- |
 | Before local identity upgrade commit | No published new IDs |
 | After identity upgrade commit | Exact IDs reused |
-| Before exchange response is stored | Expiring pending server session only; no team or active credential |
-| After pending session store, before finalize | Retry exact finalize |
+| Before exchange response is stored | Expiring provisional only; no team or active credential; secret is never reissued |
+| After provisional slot store, before finalize | Retry exact finalize with the stored secret |
 | After finalize commit, before response/local binding commit | Retry returns identical binding and roster |
-| During local binding commit | Server result remains recoverable through pending session |
+| During local binding commit | Server canonical result remains recoverable by onboarding ID; local projection remains pending |
+| Finalize/cancel race | Row-lock winner is terminal; loser observes the stored outcome |
+| Credential revoked after finalize but before local commit | Status proves the resource result, local secret is quarantined, and no usable binding is committed |
 | During history seal/reserve | Existing Stage-1 pre-publication abandon or exact-envelope reuse |
 | After message POST, before ack reconcile | Exact wire/envelope replay and canonical ack |
 
-Pending onboarding state is never deleted merely because it is old or malformed.
-It is quarantined as private recovery material until expiry plus server-confirmed
-session cancellation, successful finalize, or explicit operator cleanup after
-credential/team inventory.
+Cloud `onboarding_sessions(onboarding_id)` is the sole authority for phase and
+resource result. The local onboarding reservation, provisional credential file,
+and pending binding are durable projections; none independently advances the
+server phase. `remote status --json` correlates them by `onboarding_id` and
+reports discrepancies, but it never elects a local projection as truth.
+
+For this flow, ADR 0007's token-hash-derived pending implementation is replaced,
+not treated as the new authority. The public pending-management ABI keeps an
+opaque `pending_id`, but its internal key is
+`(onboarding_id, onboarding_session_id, reservation_generation)`. Legacy
+token-hash pending records are quarantine/cleanup material and are never
+auto-promoted. The connect write-pending, commit, abort, and CAS recheck paths
+are rewritten around the shared session and cloud-v6 provisional-credential
+slot.
+
+The strict machine-readable status ABI becomes schema version 2:
+
+```json
+{
+  "schema_version": 2,
+  "local_team": "example-team",
+  "endpoint": "https://example.invalid",
+  "server_instance_id": "018f3f7e-0000-7000-8000-000000000000",
+  "remote_team_id": null,
+  "credential_id": "018f3f7e-0000-7000-8000-000000000021",
+  "state": "onboarding",
+  "onboarding": {
+    "onboarding_id": "550e8400-e29b-41d4-a716-446655440000",
+    "intent": "promote",
+    "pending_id": "opaque-local-handle",
+    "server_phase": "provisional",
+    "local_projection": "provisional-stored"
+  },
+  "promotion": null
+}
+```
+
+`state` is `onboarding`, `active`, or `disconnected`. `onboarding` is required
+only for `onboarding` and reports the last authenticated server observation
+alongside the local projection; it never mutates or overrides the server
+session. An active binding requires null `onboarding` and has `promotion` set to
+null or `{phase, acked, total, blocked_reason}` with phase
+`promoting-roster`, `backfilling-history`, `complete`, or `blocked`.
+Canonical decimal and strict-null rules are pinned in the driver interface.
+
+Pending onboarding state is never deleted merely because it is old or
+malformed. It is quarantined as private recovery material until server-proven
+cancellation, successful finalize plus local commit, or explicit operator
+cleanup after credential/team inventory. The server never stores recoverable
+secret plaintext; the client never invents a resource result.
 
 ### C. A clean second device adopts canonical member IDs
 
-A join finalize requires that the local target team config and selected store do
-not exist. It atomically materializes the remote `team_id`, team name,
-`members_revision`, and complete member catalog locally before enabling sync.
-It then pulls from the authenticated retention floor.
+A join finalize requires a still-valid clean-target onboarding reservation.
+The local commit atomically materializes the remote `team_id`, team name,
+`members_revision`, complete active/retired member catalog, remote binding, and
+reservation completion marker before enabling sync. It then pulls from the
+authenticated retention floor.
 
 The pull does not create local agent placements. When the user later runs the
 local join/act-as flow with an existing normalized member name, the CLI reuses
 the pulled canonical `member_id` and creates only a new registration. It MUST
 NOT mint a second member ID for that name.
 
-If any local team config, local history, independent member catalog, or
-non-empty target store already exists, join refuses. V1 does not compare and
-merge both sides. This restriction is what makes automatic adoption safe.
+If any local team config, local history, independent member catalog, non-empty
+target store, changed driver generation, or competing reservation exists, join
+refuses locally before exchange or at its final local CAS. V1 does not compare
+and merge both sides. This restriction is what makes automatic adoption safe.
 
 ### D. Demote raw server operations to escape hatches
 
@@ -497,6 +864,15 @@ The reference admin `token issue` command may remain as the self-host token
 delivery mechanism, but promote-token issuance takes no team name or roster and
 cannot itself create a team.
 
+Self-host token issuance is authorized by an explicitly local operator
+boundary: a Unix-domain admin socket restricted to the server OS account, or an
+offline root/admin secret read from a private file or fd. It is never exposed
+as an unauthenticated public HTTP route. Issuance binds tenant, issuer,
+purpose, policy ceiling, and quota reservation, writes an audit record, and
+prints the raw token exactly once to stdout. Hosted issuance uses the
+authenticated account/tenant control plane but produces the same token
+contract.
+
 `provision.js` becomes an explicitly low-level client of the same
 `PUT /v1/members` endpoint. It requires an ordinary team credential,
 `expected_members_revision`, and `roster_mutation_id`; it receives no privileged
@@ -508,6 +884,58 @@ mutation-id, or read-state invariants. Reference documentation removes it from
 normal setup and warns that the server must be stopped and invariants audited
 before any emergency database repair.
 
+## Driver and local-commit ABIs
+
+Implementation requires three explicit seams; none may be replaced by the
+engine reading a bundled driver's private database or by the CLI inferring
+state from files it does not own.
+
+### Identity audit
+
+`storage_sync_identity_audit` takes the selected local team/store identity and
+returns the strict active/retired/unresolved result defined in the local
+identity section. It is read-only, snapshot-bound, canonical, and side-effect
+free. `storage_sync_identity_apply` may publish an operator-approved resolution,
+but only under generation CAS and in the same transaction as the v2 identity
+catalog migration.
+
+### Promotion snapshot
+
+`storage_sync_promotion_snapshot` creates or returns the immutable snapshot
+descriptor defined in sub-decision A. Reentry for the same onboarding ID and
+input returns the same descriptor. A different input is a conflict. The
+driver's prepare selector exposes promotion position and enforces the cutoff
+barrier without changing the existing exact-envelope retry contract.
+
+### Local onboarding reservation and commit
+
+The CLI-owned `local_onboarding_reserve/status/commit/abort` seam stores a
+strict record:
+
+```json
+{
+  "onboarding_id": "550e8400-e29b-41d4-a716-446655440000",
+  "intent": "join",
+  "installation_id": "018f3f7e-0000-7000-8000-000000000012",
+  "local_team_name": "example-team",
+  "store_identity": "driver-private-stable-id",
+  "observed_generation": "driver-private-generation-or-absent",
+  "prior_binding_digest": null,
+  "reservation_generation": "1"
+}
+```
+
+The record is versioned, byte-bounded, duplicate/unknown-field rejecting, and
+stored under the same lock respected by every local team/store mutation path.
+`commit` is a generation CAS that revalidates the target before atomically
+publishing a binding or clean join. `abort` never deletes provisional secret or
+pending recovery material without server cancellation/revocation proof.
+
+The shared fixture suite includes a bundled legacy SQLite store with current
+writes racing snapshot capture, a retired historical member, read facts, and a
+clean target racing local initialization. Both track implementations consume
+the same fixtures and strict schemas.
+
 ## Ownership boundary
 
 The implementation is split by contract, not by file convenience.
@@ -515,11 +943,12 @@ The implementation is split by contract, not by file convenience.
 ### Server/sync track (aggie-co2)
 
 - HTTP/spec changes for onboarding exchange/finalize and roster mutation;
-- `onboarding_sessions`, pending-to-active credential transition, mutation
+- `onboarding_sessions`, provisional-to-active credential transition, mutation
   dedupe, team/roster transaction, and capability snapshot;
 - reference-server token purposes and admin/quickstart demotion;
 - sync-engine promotion snapshot/backfill orchestration and status;
-- SQLite/JSONL promotion boundary, including legacy SQLite history; and
+- `storage_sync_identity_audit` and
+  `storage_sync_promotion_snapshot`, including legacy SQLite history; and
 - protocol/integration tests for crash, response loss, concurrency, identity
   conflicts, and full backfill.
 
@@ -528,8 +957,8 @@ The implementation is split by contract, not by file convenience.
 - local config v2 and atomic UUID migration;
 - `join`/`team` member catalog versus local registration behavior;
 - `remote connect` local-exists/clean-target detection and intent selection;
-- durable pending onboarding session, exact finalize retry, and local binding
-  commit;
+- `local_onboarding_reserve/status/commit/abort`, cloud-v6 provisional
+  credential slot integration, exact finalize retry, and local binding commit;
 - clean-device roster materialization and same-name member-ID reuse; and
 - human UX for promote progress, join refusal, conflicts, and recovery.
 
@@ -544,7 +973,8 @@ server-first onboarding flow.
 
 - Existing active dogfood bindings remain usable for sync while the new flow is
   developed.
-- New onboarding uses only the new session/finalize protocol after cutover.
+- New onboarding uses only the shared cloud-v6
+  exchange/provisional/finalize protocol after cutover.
 - There is no automatic conversion of an old consumed pairing token.
 - Draft servers may offer a temporary feature flag for tests, but published v1
   documents one canonical local-first flow.
@@ -584,14 +1014,15 @@ server-first onboarding flow.
   for hosted and self-hosted deployments.
 - Positive: immutable member IDs exist before messages are promoted, so roster,
   read state, and future device registration share one identity anchor.
-- Positive: response loss cannot leave an unknown active credential or orphan
-  team; finalize is exactly retryable.
+- Positive: secret response loss leaves only an expiring provisional, while
+  resource response loss converges to the same team and roster; no secret is
+  reissued.
 - Positive: current Stage-1, Stage-2, and E2EE work remains the transport and
   confidentiality foundation.
 - Negative: local team configuration needs a versioned identity migration and a
   member-catalog/registration split.
-- Negative: onboarding requires a new pending-session table and an incompatible
-  pairing exchange response.
+- Negative: onboarding requires a new session/provisional state and an
+  incompatible pairing exchange response.
 - Negative: full legacy-history promotion requires additional bundled-driver
   work before existing SQLite installations are genuinely supported.
 - Negative: ordinary device credentials can mutate the roster, increasing the
@@ -604,17 +1035,26 @@ server-first onboarding flow.
 
 Implementation does not begin until adversarial review closes at least:
 
-1. exchange/finalize response-loss, expiry, cancellation, and concurrent retry;
-2. promote-token authority and inability to modify existing teams;
-3. join-token team binding and clean-target proof;
-4. initial roster and credential activation in one team transaction;
-5. roster mutation idempotency, revision races, name/ID conflicts, and
-   retirement;
-6. atomic local UUID migration and same-name canonical adoption;
-7. full event-log plus legacy SQLite snapshot and Stage-1 completion proof;
-8. E2EE-required promote/join without private-key or plaintext leakage;
-9. no team/message/member creation from opaque message contents; and
-10. removal of server-first/raw provisioning from the primary quickstart.
+1. shared cloud-v6 exchange/provisional/finalize response-loss, expiry,
+   cancellation, revocation, and concurrent retry;
+2. tenant/issuer/policy/quota-bound promote-token authority and inability to
+   modify existing teams;
+3. join-token team binding plus local reservation/CAS clean-target proof;
+4. complete active/retired identity audit and initial roster, team, quota, and
+   credential activation in one team transaction;
+5. roster mutation stored-result-before-revision ordering, revision races,
+   name/ID conflicts, outbox retry, and retirement;
+6. atomic local UUID migration, registration/member separation, and same-name
+   canonical adoption;
+7. full event-log plus legacy SQLite promotion snapshot, strict cutoff ordering,
+   manifest proof, retention barrier, and server `backfill_complete`;
+8. E2EE-required promote/join with local minimum policy, anti-rollback
+   checkpoint, and no private-key or plaintext leakage;
+9. strict identity-audit, promotion-snapshot, and local-reservation ABI fixtures;
+10. every new SQL interpolation point uses the shared strict parameterization
+    and escaping seam established by the storage hardening work;
+11. no team/message/member creation from opaque message contents; and
+12. removal of server-first/raw provisioning from the primary quickstart.
 
 ## References
 
