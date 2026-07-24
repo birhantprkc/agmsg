@@ -805,9 +805,21 @@ backfill are pull-only: message POST and Stage-2 read-state mutation return
 for later upload. Thus promotion positions map to one contiguous server
 sequence prefix with no interleaved remote writer.
 
+This fence is server-enforced, not merely an engine selector. While
+`backfill_pending`, the ordinary message POST and ordinary Stage-2 mutation
+endpoints return `423 promotion-in-progress` for **every** credential, including
+the promoter. The only write exceptions are the manifest-first promotion
+endpoints defined below. A raw client holding the ordinary credential cannot
+insert a post-cutoff envelope into the prefix.
+
 Under that fence, a contiguous local historical read prefix may translate to a
 server frontier only after all covered promotion positions have durable
 server-sequence mappings. Read facts beyond a hole translate to exact wire IDs.
+The prefix is computed independently for each member over the promotion items
+visible to that member: every covered item must have a durable read fact, and
+the prefix stops at the first unread, quarantined, unmapped, or unresolved
+identity item. A global local-position maximum is never treated as a member
+frontier.
 The driver computes the resulting per-member/team exact counts from the
 immutable promotion order before finalize; counts above the token/capability
 limits fail promotion before team creation. It MUST NOT silently widen a
@@ -825,19 +837,21 @@ continues the backfill.
 The server keeps a bounded `backfill_pending` lease under the team row from
 promote finalize until completion. It accounts actual decoded envelope bytes
 and distinct promotion messages against the token-reserved limits. The
-30-minute lease renews only after committed, distinct newly accepted
-message/read manifest entries or decoded envelope bytes; exact page/message
-retries do not renew it. It can never pass the 24-hour absolute deadline. As
-wire reservations become
+30-minute lease renews only after committed, distinct newly stored message
+bytes or newly validated read-state coverage; allowlist reservation alone and
+exact page/message retries do not renew it. It can never pass the 24-hour
+absolute deadline. As wire reservations become
 durable, the client uploads two bounded, idempotent manifest streams:
 
-- message entries `(promotion_position, wire_id)`; and
+- message allowlist entries
+  `(promotion_position, wire_id, immutable_envelope_digest, decoded_size)`; and
 - read-state entries, after durable mapping, as canonical
   `(member_id, kind=frontier, server_seq)` or
   `(member_id, kind=exact, wire_id)` facts.
 
 ```http
 PUT /v1/onboarding/{onboarding_id}/backfill-manifest/{kind}/{page_index}
+POST /v1/onboarding/{onboarding_id}/backfill/messages
 POST /v1/onboarding/{onboarding_id}/backfill-complete
 ```
 
@@ -847,6 +861,51 @@ index and first position, ordered translated entries, and a domain-separated
 page digest. Page indices and positions start at zero and are contiguous. An
 exact page retry returns the stored page result; a different digest for an
 existing index is a conflict.
+
+Message allowlist pages MUST be registered before their envelope POST. The
+dedicated promotion POST has a strict body:
+
+```json
+{
+  "source_snapshot_digest": "sha256:base64url",
+  "first_position": "0",
+  "messages": [
+    {
+      "promotion_position": "0",
+      "id": "550e8400-e29b-41d4-a716-446655440000",
+      "envelope": {
+        "v": 1,
+        "cipher": "none",
+        "key_id": null,
+        "blob": "base64"
+      }
+    }
+  ]
+}
+```
+
+Under the same team-row lock used by ordinary POST allocation, the server:
+
+1. authenticates the exact promoter credential and onboarding/session;
+2. validates the immutable source snapshot digest and current
+   `backfill_pending` lease;
+3. resolves every input position against the sealed allowlist and verifies wire
+   ID, canonical envelope digest, decoded size, input order, and quota;
+4. returns the stored original acknowledgement for an already fulfilled exact
+   position, rejecting any payload mismatch;
+5. requires every new item to begin at the next unfulfilled position and be a
+   contiguous batch with no gap, unmanifested wire ID, or duplicate position;
+6. performs the existing envelope policy/idempotency checks, allocates sequence
+   numbers in position order, and atomically marks each allowlist entry
+   fulfilled with its server sequence and actual byte count; and
+7. commits acknowledgements in request order.
+
+Because the team starts at sequence zero and all ordinary writes are fenced,
+position `P` must receive server sequence `P+1`; any contrary stored state is
+terminal corruption. A manifest-before-message crash leaves an unfulfilled
+bounded allowlist entry. Message-before-manifest is impossible. Exact retry,
+response-loss replay, echo reconciliation, and a retained tombstone converge on
+the same position and original sequence.
 
 Source and translated digests are deliberately different layers:
 
@@ -894,6 +953,11 @@ the server retains the source, translated, and mapping-proof digests in the
 canonical promotion result/status so exact retries cannot substitute another
 translation. A source digest is never compared to or reused as a translated
 manifest digest.
+
+The read-state manifest endpoint is the only Stage-2 write exception during
+promotion. It applies a page only after every referenced message mapping is
+fulfilled and validates the safe frontier/exact rules; ordinary Stage-2 writes
+from promoter and joiners remain fenced until `backfill_complete`.
 
 Message mapping, local exact-read alias promotion, and the read-state outbox are
 one local transaction before a read manifest entry becomes uploadable. A
@@ -1277,7 +1341,9 @@ has already advanced; and a losing unaccepted same-name member attempting to
 act/send/read. Manifest fixtures independently mutate source, translated, and
 mapping-proof digests. Backfill fixtures attempt interleaved joiner message/read
 writes and exceed per-member/team exact-read caps; all must fail before an
-unsafe frontier or silent omission is published.
+unsafe frontier or silent omission is published. Server-gate fixtures attempt a
+promoter ordinary POST, message-before-manifest, manifest position gap,
+post-cutoff wire ID, response-loss retry, and envelope-digest mismatch.
 
 ## References
 
