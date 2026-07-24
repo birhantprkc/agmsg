@@ -186,7 +186,11 @@ printf '%s' "$TOKEN" | ~/.agents/skills/agmsg/scripts/remote.sh connect --endpoi
 
 # Show connection state. With no <team>, lists every locally-known
 # connected team (and whether each still needs a local encryption key).
-~/.agents/skills/agmsg/scripts/remote.sh status [<team>]
+# --json emits a strict, secret-free machine-readable object instead of
+# the human text above (ADR 0007 addendum) — for a driver correlating its
+# own operation-status record against the local binding, not for a human
+# to read; prefer the plain form above in normal use.
+~/.agents/skills/agmsg/scripts/remote.sh status [<team>] [--json]
 
 # Disconnect a team: revokes the credential server-side (best-effort —
 # local state is always cleared even if the server is unreachable), then
@@ -198,6 +202,18 @@ printf '%s' "$TOKEN" | ~/.agents/skills/agmsg/scripts/remote.sh connect --endpoi
 # state change — safe to run any time, and the thing to point a user at
 # when troubleshooting a missing dependency.
 ~/.agents/skills/agmsg/scripts/remote.sh doctor [<team>]
+
+# List (and, if orphaned, clean up) a `connect` exchange that succeeded
+# server-side but never finished committing locally — e.g. the process died
+# between the exchange call and writing local state (ADR 0007 addendum).
+# pending_id is an opaque, content-derived key; abort always works on it
+# alone, even for a record whose content doesn't fully validate (a
+# separately quarantined record — see remote.sh's own comments — is not
+# enumerated or abortable here; that's a human/admin recovery path). Not a
+# normal-use command — this exists for a driver doing its own crash
+# recovery, not for a human to run routinely.
+~/.agents/skills/agmsg/scripts/remote.sh pending list [--json]
+~/.agents/skills/agmsg/scripts/remote.sh pending abort <pending_id>
 
 # Generate the first age-v1 key for a team (single-writer onboarding only —
 # NOT the multi-writer cutover protocol, and NOT key rotation — see below).
@@ -224,6 +240,21 @@ canonical epoch-snapshot shape), so it's held back rather than shipping a
 protection that isn't actually there. Do not suggest it as a working
 command.
 
+```bash
+# Read-only, secret-free enumeration of every locally known team (ADR 0007
+# family addition), across every registered project — unlike `team.sh
+# <team>` above, which shows one team's members. --json emits a strict,
+# versioned object ({schema_version, teams: [{name, team_id, scope,
+# binding_state, onboarding_state, promote_eligible, blocked_reason}]});
+# team_id/onboarding_state/promote_eligible/blocked_reason are placeholders
+# ahead of ADR 0010 (local-first onboarding) — see team-list.sh's own
+# header comment before relying on their exact values. --scope all (the
+# default) is the only correct basis for an automated "is this ambiguous"
+# decision; --scope project is a human-facing convenience filter, never a
+# substitute for `all` in that decision.
+~/.agents/skills/agmsg/scripts/team-list.sh [--json] [--scope all|project] [<project_path>]
+```
+
 Slash-command surface (SKILL.md / per-type templates), same mapping
 pattern as every command above:
 
@@ -241,6 +272,7 @@ Additional dependencies beyond bash/sqlite3 (only needed if these commands
 are used): `curl` (the exchange/revoke calls), `python3` (parsing the
 exchange response), and `age`/`age-keygen` (E2EE — `remote.sh doctor`
 checks for these and `key.sh`'s own commands refuse to run without them).
+`team-list.sh` needs only `python3`.
 
 ## Sandbox compatibility (Claude Code)
 
