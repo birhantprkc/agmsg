@@ -32,6 +32,14 @@ a naive review of "the response has the right fields" — and would
 otherwise vanish for good once re-serialized (e.g. by the pending-file
 writer). An exact top-level and `capabilities` field allow-list closes
 the same gap for fields this validator doesn't otherwise look at.
+
+--metadata-only: same full validation, but the `credential` field is
+never written to stdout at all (the other fields keep their positions,
+shifted up by one). For a caller that only needs to know whether a
+record's content validates and to read its non-secret fields — e.g.
+`remote pending list` — printing the credential to stdout would put it
+in that caller's own captured output/temp file even though the caller
+never intends to use it.
 """
 import json
 import re
@@ -125,6 +133,7 @@ def validate_envelope_versions(value, label):
 
 
 def main():
+    metadata_only = "--metadata-only" in sys.argv[1:]
     raw_bytes = sys.stdin.buffer.read(MAX_RESPONSE_BYTES + 1)
     if len(raw_bytes) > MAX_RESPONSE_BYTES:
         fail("response body exceeds its byte limit")
@@ -243,7 +252,6 @@ def main():
 
     caps_json = json.dumps(caps)
     fields = [
-        credential,
         credential_id,
         server_instance_id,
         remote_team_id,
@@ -253,6 +261,8 @@ def main():
         ",".join(ciphers),
         current_seq,
     ]
+    if not metadata_only:
+        fields.insert(0, credential)
     for f in fields:
         # Reject every ASCII control character (0x00-0x1F, 0x7F), not
         # just newline (E3) — a raw tab/CR/etc. reaching a downstream
