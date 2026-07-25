@@ -46,6 +46,21 @@ the existing team key. Identifier, key-domain, protocol-resource, and log-path
 namespaces remain non-conflicting with future containers; envelopes and cipher
 profiles are versioned, and exports preserve which container produced them.
 
+### Legacy state must acquire its local identity exactly once
+
+Existing team configurations predate the opaque local team identity and contain
+only a mutable name. Migration assigns one local team UUID exactly once and
+commits every local reference to that identity through an atomic staging-and-
+flip or a resumable migration with equivalent crash guarantees. Collision,
+partial migration, or contradictory retry state fails closed.
+
+Rename, promotion, and member mutation cannot begin until the identity migration
+is complete. Export and import preserve the local team ID; intentionally copying
+or forking a team creates a new ID instead of cloning authority. The migration
+implementation and recovery contract must land in the same train as this
+decision; the architecture is not accepted without a path for existing teams.
+UUID version, field names, and storage mechanics remain specification details.
+
 ### Names never become identity
 
 Rename preserves `member_id`, historical sender/recipient attribution, read
@@ -76,6 +91,17 @@ Local identity history remains authoritative when a local team is first
 promoted. The server validates and records the mapping but does not infer a
 different roster from display names or opaque message projections.
 
+### Authorization evolution is additive and fail-closed
+
+V1 defines no member roles or permission fields. Member records and the roster
+mutation protocol remain additively extensible for a future authorization
+model, without guessing that model's fields now.
+
+An authenticated authorization rejection is a definitive mutation outcome.
+Clients never reinterpret an unknown denial as retryable success, resolve it by
+last-writer-wins, or apply an optimistic local roster mutation after rejection.
+The eventual wire spelling belongs in the versioned protocol specification.
+
 ### Lifecycle operations do not collapse domains
 
 Leaving or deleting the last local agent placement does not delete the portable
@@ -94,6 +120,9 @@ reconciliation protocol; matching display names are insufficient.
   transfer old read facts and message attribution to a different principal.
 - **Remote ID as local authority.** Reconnecting to a replacement service would
   redefine the identity of local history.
+- **Partial legacy migration.** A crash assigns an ID to team `main` before
+  migrating read and history references. Retry assigns or adopts another ID,
+  splitting old messages and the remote mapping across two team identities.
 - **CAS before mutation dedupe.** A successful mutation whose response was lost
   would retry against a newer revision and report conflict instead of its
   stored success.
@@ -104,6 +133,9 @@ reconciliation protocol; matching display names are insufficient.
   messages or reads that no accepted principal can later own.
 - **Merge by name.** Two populated stores may use the same name for different
   principals and histories; last-writer-wins would silently rewrite one truth.
+- **Authorization denial as retry.** A future server denies rename by policy,
+  but an old client retries or commits its optimistic local rename, diverging
+  authorization and historical identity.
 
 ## Rejected alternatives
 
@@ -111,6 +143,8 @@ reconciliation protocol; matching display names are insufficient.
   reinterpret history.
 - **Remote team ID as the local team ID.** Rejected because local authority
   exists before connection and must survive rebind.
+- **Lazy team-ID assignment during promotion.** Rejected because crash retry
+  could split legacy references or derive local authority from the remote ID.
 - **One catalog containing registrations, installations, and placements.**
   Rejected because portable identity and machine-local lifecycle have different
   authority and privacy.
@@ -124,12 +158,16 @@ reconciliation protocol; matching display names are insufficient.
 ## Consequences
 
 - Rename, reconnect, and device replacement preserve historical meaning.
+- Existing name-only teams require a fail-closed, crash-safe identity migration
+  in the same delivery train.
 - Roster storage must retain stable IDs and ordered active/retired identity
   history.
 - New members on remote-bound teams may wait for server acceptance before use.
 - Local placement cleanup cannot double as team or member deletion.
 - Multi-owner collaboration, if introduced later, is additive rather than a
   reinterpretation of existing single-owner teams.
+- Future authorization can extend the roster protocol without making legacy
+  clients treat denial as success.
 
 ## Normative design and specifications
 
