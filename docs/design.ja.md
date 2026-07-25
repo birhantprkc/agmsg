@@ -121,7 +121,7 @@ Agent responds → Stop hook fires → check-inbox.sh runs
 | `check-inbox.sh` | フックのエントリポイント — クールダウン、チェック、通知 |
 | `config.sh` | ユーザー設定（YAML）の読み書き |
 
-すべてのスクリプトは `bash` と `sqlite3` のみを使用する。python3 依存はない。
+上記のスクリプトはすべて **core** 依存階層に属する: `bash` と `sqlite3` のみで、python3 は不要。全体像は下記の「依存関係」を参照 — E2EE（`key.sh`）と remote（`remote.sh`、`team-list.sh`）は、その機能を使うインストールにのみ、それぞれ追加のバイナリを要求する。
 
 ## インストールレイアウト
 
@@ -148,8 +148,32 @@ Claude Code コマンドは別途 `~/.claude/commands/<cmd>.md` にインスト�
 
 ## 依存関係
 
-- **bash** — シェル
-- **sqlite3** — データベースおよび JSON 操作（JSON1 拡張）
-- **awk/sed** — テキスト処理（設定、TOML 編集）
+依存関係は使う機能の範囲に閉じる — 全部をまとめて要求するのではなく、
+local-only のインストールは最小限のままで、各機能階層はその一つ下の
+階層の上に必要な分だけを積み増す（koitの裁定、2026-07-25:「依存は機能の
+範囲に閉じる」）。
 
-python3 も node も、ネットワークもデーモンも不要。
+- **core（local-onlyのメッセージング）** — `bash`、`sqlite3`（JSON1拡張
+  経由のデータベース操作とJSON操作）、`awk`/`sed`（設定・TOML編集）。
+  `send`/`inbox`/`history`/`team`/`join`/`leave`/`rename` など、ローカルの
+  SQLiteストアとしかやり取りしないもの全てをカバーする。python3もネット
+  ワークもデーモンも不要。
+- **E2EE（エンドツーエンド暗号化されたチーム鍵）** — coreに加えて
+  `age`/`age-keygen`（`key.sh`）。暗号化された鍵プロファイルを使うチーム
+  にのみ必要。
+- **remote（複数端末間の同期）** — coreに加えて `python3`（`remote.sh`、
+  `team-list.sh`、およびそれらが使う`scripts/internal/*.py`ヘルパー群 —
+  応答/設定の厳密な検証をbashで再実装せずPythonで行っている）。チームを
+  同期サービスへ接続する場合にのみ必要。remote階層の各エントリポイントは
+  最初のpython3呼び出しの前に必ず`agmsg_require_python3`
+  （`scripts/lib/require-python3.sh`）を呼び、python3が無ければ即座に
+  インストール方法つきのメッセージで失敗する — `key.sh`の既存の`age`前段
+  チェックと同じ形。これは単に分かりやすいエラーのためだけではない:
+  macOSでXcode Command Line Toolsが未導入の状態で素の`python3`を呼び出す
+  と、通常の「見つかりません」エラーではなくOS自体のCLTインストール
+  ダイアログが起動してしまうため、存在確認には`command -v python3`
+  （PATHを調べるだけで実行はしない）を使い、確認のために`python3`自体を
+  実行することは絶対に避けなければならない。
+
+nodeと常駐デーモンはどの階層でも不要。coreだけならネットワーク通信も
+一切発生しない。remote階層はその定義上、ネットワーク通信を行う。

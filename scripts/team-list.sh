@@ -106,6 +106,10 @@ SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEAMS_DIR="$SKILL_DIR/teams"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/resolve-project.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/require-python3.sh"
+
+agmsg_require_python3 "team list" || exit 1
 
 # An explicitly empty override (AGMSG_TEAM_LIST_MAX_TEAMS=) falls back to
 # the 10000 default via bash's `:-`, same as leaving it unset — this is

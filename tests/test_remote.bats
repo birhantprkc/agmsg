@@ -979,3 +979,47 @@ VALUES ('remote-pending.$key', $owner_pid, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
   [ "$status" -ne 0 ]
   [[ "$output" == *"Usage:"* ]]
 }
+
+# --- python3 preflight (dependency tiering: remote = +python3) -------------
+
+@test "remote status: fails fast with an install message when python3 is absent, never hangs" {
+  local no_py3; no_py3="$(path_without_python3)"
+  run env PATH="$no_py3" bash "$SCRIPTS/remote.sh" status
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"requires python3"* ]]
+  [[ "$output" == *"brew install python3"* ]]
+}
+
+@test "remote connect: fails fast with an install message when python3 is absent" {
+  local no_py3; no_py3="$(path_without_python3)"
+  run env PATH="$no_py3" bash "$SCRIPTS/remote.sh" connect testteam https://example.invalid tok
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"requires python3"* ]]
+}
+
+@test "remote disconnect: fails fast with an install message when python3 is absent" {
+  local no_py3; no_py3="$(path_without_python3)"
+  run env PATH="$no_py3" bash "$SCRIPTS/remote.sh" disconnect testteam
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"requires python3"* ]]
+}
+
+@test "remote pending: fails fast with an install message when python3 is absent" {
+  local no_py3; no_py3="$(path_without_python3)"
+  run env PATH="$no_py3" bash "$SCRIPTS/remote.sh" pending list
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"requires python3"* ]]
+}
+
+@test "remote doctor: still runs without python3, and reports it as a failed check (not a crash)" {
+  local no_py3; no_py3="$(path_without_python3)"
+  run env PATH="$no_py3" bash "$SCRIPTS/remote.sh" doctor
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"[ ] python3 on PATH"* ]]
+  [[ "$output" == *"Some checks failed"* ]]
+}
+
+@test "remote doctor: reports python3 as present when it is available" {
+  run bash "$SCRIPTS/remote.sh" doctor
+  [[ "$output" == *"[x] python3 on PATH"* ]]
+}

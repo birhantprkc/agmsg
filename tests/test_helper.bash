@@ -89,3 +89,21 @@ setup_live_owner() {
   mkdir -p "$run_dir"
   echo "$sid" > "$run_dir/cc-instance.$$"
 }
+
+# A PATH containing only `bash` and `dirname` (real binaries, via symlink)
+# -- enough to exec bash itself (so `env PATH=... bash script.sh` doesn't
+# fail on "bash: command not found" before the script even starts) and for
+# remote.sh/team-list.sh to resolve SCRIPT_DIR/SKILL_DIR and reach their
+# agmsg_require_python3 preflight check, but with no `python3` findable via
+# `command -v`. Used to test the preflight check itself fails fast with a
+# clear message instead of ever invoking python3 (see
+# lib/require-python3.sh) -- deliberately NOT built by filtering the real
+# PATH's directories, so it can't accidentally still contain a python3
+# from some other directory.
+path_without_python3() {
+  local dir
+  dir="$(mktemp -d)"
+  ln -s "$(command -v bash)" "$dir/bash"
+  ln -s "$(command -v dirname)" "$dir/dirname"
+  printf '%s' "$dir"
+}

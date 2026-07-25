@@ -141,7 +141,11 @@ must track the same resolved project); direct shell invocations and
 | `check-inbox.sh` | Hook entry point — cooldown, check, notify |
 | `config.sh` | Read/write user config (YAML) |
 
-All scripts use only `bash` and `sqlite3`. No python3 dependency.
+The scripts listed above are all in the **core** dependency tier: `bash`
+and `sqlite3` only, no python3. See Dependencies below for the full
+tiered picture — E2EE (`key.sh`) and remote (`remote.sh`, `team-list.sh`)
+add their own binaries on top of core, only for installs that use those
+features.
 
 ## Install Layout
 
@@ -168,8 +172,32 @@ Claude Code command is installed separately to `~/.claude/commands/<cmd>.md`.
 
 ## Dependencies
 
-- **bash** — shell
-- **sqlite3** — database and JSON manipulation (JSON1 extension)
-- **awk/sed** — text processing (config, TOML editing)
+Dependencies are scoped to which features you use, not installed
+up front as one bundle — a local-only install stays minimal, and each
+feature tier adds exactly what it needs on top of the one below it
+(koit's ruling, 2026-07-25: "dependencies stay closed to the scope of the
+feature that needs them").
 
-No python3, no node, no network, no daemon.
+- **core (local-only messaging)** — `bash`, `sqlite3` (database and JSON
+  manipulation via the JSON1 extension), `awk`/`sed` (config, TOML
+  editing). Covers `send`/`inbox`/`history`/`team`/`join`/`leave`/`rename`
+  and everything else that only talks to the local SQLite store. No
+  python3, no network, no daemon.
+- **E2EE (end-to-end-encrypted team keys)** — core, plus `age`/`age-keygen`
+  (`key.sh`). Only needed if a team uses an encrypted key profile.
+- **remote (cross-machine sync)** — core, plus `python3` (`remote.sh`,
+  `team-list.sh`, and their `scripts/internal/*.py` helpers, which do
+  strict response/config validation in Python rather than reimplementing
+  that logic in bash). Only needed if a team connects to the sync
+  service. Every remote-tier entry point calls `agmsg_require_python3`
+  (`scripts/lib/require-python3.sh`) before its first `python3`
+  invocation and fails fast with an install message if it's absent —
+  modeled on `key.sh`'s existing `age` preflight check. This matters
+  beyond a clean error: on macOS, invoking a bare `python3` when Xcode
+  Command Line Tools aren't installed triggers the OS's own CLT-install
+  dialog rather than a normal "not found" error, so the check MUST use
+  `command -v python3` (which only inspects PATH) and never execute
+  `python3` itself to test for its presence.
+
+No node and no persistent daemon at any tier. The core tier alone makes no
+network calls; the remote tier does, by definition.

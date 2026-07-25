@@ -36,6 +36,8 @@ source "$SCRIPT_DIR/lib/storage.sh"
 source "$SCRIPT_DIR/lib/registry-lock.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/validate.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/require-python3.sh"
 
 TEAMS_DIR="$CONNECTION_ROOT/teams"
 CRED_ROOT="$CONNECTION_ROOT/run/remote-credentials"
@@ -134,10 +136,9 @@ cmd_doctor() {
   local team="${1:-}"
   echo "Checking prerequisites${team:+ for team '$team'}..."
   echo
+  local failed=0
   if command -v age >/dev/null 2>&1 && command -v age-keygen >/dev/null 2>&1; then
     echo "  [x] age / age-keygen on PATH"
-    echo
-    echo "All checks passed."
   else
     echo "  [ ] age / age-keygen on PATH"
     echo
@@ -146,8 +147,26 @@ cmd_doctor() {
     echo "  Debian/Ubuntu:         sudo apt install age"
     echo "  Windows (winget):      winget install FiloSottile.age"
     echo "See https://github.com/FiloSottile/age for other install methods."
+    failed=1
+  fi
+  echo
+  if command -v python3 >/dev/null 2>&1; then
+    echo "  [x] python3 on PATH"
+  else
+    echo "  [ ] python3 on PATH"
     echo
-    echo "1 check failed."
+    echo "'python3' is required for the remote connect feature and was not found on this device. Install it, then retry:"
+    echo "  macOS (Homebrew):      brew install python3"
+    echo "  macOS (Xcode tools):   xcode-select --install"
+    echo "  Debian/Ubuntu:         sudo apt install python3"
+    echo "  Windows (winget):      winget install Python.Python.3"
+    failed=1
+  fi
+  echo
+  if [ "$failed" -eq 0 ]; then
+    echo "All checks passed."
+  else
+    echo "Some checks failed. See above."
     exit 1
   fi
 }
@@ -1345,11 +1364,11 @@ cmd_disconnect() {
 }
 
 case "${1:-}" in
-  connect) shift; cmd_connect "$@" ;;
-  status) shift; cmd_status "$@" ;;
-  disconnect) shift; cmd_disconnect "$@" ;;
+  connect) shift; agmsg_require_python3 "remote connect" || exit 1; cmd_connect "$@" ;;
+  status) shift; agmsg_require_python3 "remote status" || exit 1; cmd_status "$@" ;;
+  disconnect) shift; agmsg_require_python3 "remote disconnect" || exit 1; cmd_disconnect "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;
-  pending) shift; cmd_pending "$@" ;;
+  pending) shift; agmsg_require_python3 "remote pending" || exit 1; cmd_pending "$@" ;;
   *)
     echo "Usage: remote.sh <connect|status|disconnect|doctor|pending> ..." >&2
     exit 1 ;;

@@ -245,3 +245,20 @@ json_field() {
   [[ "$output" == *"myteam"* ]]
   [[ "$output" == *"none"* ]]
 }
+
+# --- python3 preflight (dependency tiering: remote = +python3) -------------
+
+@test "team list: fails fast with an install message when python3 is absent, never hangs (--json)" {
+  local no_py3; no_py3="$(path_without_python3)"
+  run env PATH="$no_py3" bash "$SCRIPTS/team-list.sh" --json
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"requires python3"* ]]
+  [[ "$output" == *"brew install python3"* ]]
+}
+
+@test "team list: fails fast with an install message when python3 is absent (human mode)" {
+  local no_py3; no_py3="$(path_without_python3)"
+  run env PATH="$no_py3" bash "$SCRIPTS/team-list.sh"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"requires python3"* ]]
+}
