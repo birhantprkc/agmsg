@@ -168,7 +168,7 @@ If argument is "reset":
 1. Run: `~/.agents/skills/__SKILL_NAME__/scripts/reset.sh "$(pwd)" grok-build`
 2. Tell the user the result.
 
-If argument starts with "remote connect" (ADR 0007 — cloud/self-hosted sync connection):
+If argument starts with "remote connect" (cloud/self-hosted sync connection):
 1. Parse `--endpoint <url>` and an optional `<team>`/`--force`.
 2. **Do not ask the user to paste the token into this chat, and do not run this command yourself.** The token must never enter this session's own transcript — constructing and running a command that embeds it (even piped to `--token-stdin`) would do exactly that, since the command text itself becomes part of this session's tool-call record. Instead, tell the user to run this directly in their own terminal:
    ```

@@ -1,8 +1,10 @@
-# ADR 0005: Stage-1 local-first remote synchronization
+# Stage-1 local-first remote synchronization specification
 
-**Status:** proposed (dogfood contract)
-**Date:** 2026-07-20
-**Deciders:** @fujibee
+**Status:** dogfood specification
+**Last updated:** 2026-07-25
+
+The irreversible architectural decisions behind this contract are recorded in
+[ADR 0005: Remote synchronization contract](../adr/0005-remote-sync-contract.md).
 
 ## Context
 
@@ -204,7 +206,7 @@ locally retained prefix through `min_available_seq` plus the available suffix
 through `current_seq` (with at most one final empty page). This keeps a corrupt
 driver from manufacturing an unbounded walk with ever-changing wire IDs.
 
-ADR 0009 promotes the previously reserved recovery operation behind a separate
+The retention-gap specification promotes the previously reserved recovery operation behind a separate
 optional `stage1-resync` capability:
 
 ```text
@@ -212,7 +214,7 @@ storage_sync_resync       # operator-approved recovery after HTTP 410
 ```
 
 HTTP 410 remains terminal during normal Stage-1 polling. Only the explicit
-operator command defined by ADR 0009 may transactionally record the unavailable
+operator command defined by the retention-gap specification may transactionally record the unavailable
 gap and advance to an authenticated retention floor; the engine never resets a
 transport cursor automatically.
 
@@ -233,6 +235,7 @@ transport cursor automatically.
 ## References
 
 - [HTTP API v1](../../server/spec/v1.md)
-- [ADR 0003: storage-axis ABI and scope](0003-storage-axis-driver-abi-and-scope.md)
-- [ADR 0009: retention-gap resynchronization](0009-retention-gap-resynchronization.md)
+- [ADR 0003: storage-axis ABI and scope](../adr/0003-storage-axis-driver-abi-and-scope.md)
+- [Retention-gap resynchronization](retention-gap-resynchronization.md)
+- [ADR 0005: Remote synchronization contract](../adr/0005-remote-sync-contract.md)
 - Issue #441 (local-first cross-machine replication proposal)

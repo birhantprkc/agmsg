@@ -1,8 +1,10 @@
-# ADR 0009: Operator-approved retention-gap resynchronization
+# Operator-approved retention-gap resynchronization specification
 
-**Status:** proposed (dogfood contract)
-**Date:** 2026-07-22
-**Deciders:** @fujibee
+**Status:** dogfood specification
+**Last updated:** 2026-07-25
+
+The irreversible cursor and audit semantics behind this operation are recorded
+in [ADR 0005: Remote synchronization contract](../adr/0005-remote-sync-contract.md).
 
 ## Context
 
@@ -125,7 +127,7 @@ checkpoints, or read state. In particular:
   original `server_seq`;
 - existing blocking quarantine remains available to explicit reprocessing; and
 - Stage-2 read state independently max-merges the authenticated retention floor
-  under ADR 0008.
+  under the read-state synchronization specification.
 
 The transaction emits exactly one strict result object:
 
@@ -199,6 +201,8 @@ live-row count without logging envelopes or credentials.
 
 ## References
 
-- [ADR 0005: Stage-1 remote synchronization](0005-stage-1-remote-sync.md)
-- [ADR 0008: Stage-2 read-state synchronization](0008-stage-2-read-cursor-sync.md)
+- [Stage-1 remote synchronization](stage-1-remote-sync.md)
+- [Stage-2 read-state synchronization](read-state-synchronization.md)
+- [ADR 0005: Remote synchronization contract](../adr/0005-remote-sync-contract.md)
+- [ADR 0006: Composite read-state frontier](../adr/0006-composite-read-state-frontier.md)
 - [HTTP API v1](../../server/spec/v1.md)

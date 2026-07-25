@@ -1,8 +1,10 @@
-# ADR 0006: E2EE as a first-class server property
+# Cipher-independent opaque-envelope server specification
 
-**Status:** proposed (dogfood contract)
-**Date:** 2026-07-21
-**Deciders:** @fujibee
+**Status:** dogfood specification
+**Last updated:** 2026-07-25
+
+The irreversible architectural decision behind this schema is recorded in
+[ADR 0005: Remote synchronization contract](../adr/0005-remote-sync-contract.md).
 
 ## Context
 
@@ -68,7 +70,7 @@ layer whose capabilities do not depend on whether an envelope is encrypted.
 
 Server-visible metadata is not private. Team membership, wire IDs, sequence,
 receipt time, cipher/key epoch, blob size, and traffic patterns remain visible;
-this ADR does not claim otherwise.
+this specification does not claim otherwise.
 
 ## Rejected alternative
 

@@ -1,8 +1,13 @@
-# ADR 0010: Local-first onboarding and convergent rosters
+# Local-first onboarding and convergent roster design
 
-**Status:** proposed (design gate)
-**Date:** 2026-07-24
-**Deciders:** @fujibee
+**Status:** design gate
+**Last updated:** 2026-07-25
+**Owner:** @fujibee
+
+This is an editable onboarding and protocol design, not an architecture
+decision record. Persistent member, roster, installation, and local/remote
+identity semantics are recorded in
+[ADR 0007: Stable member and roster identity](../adr/0007-stable-member-and-roster-identity.md).
 
 ## Context
 
@@ -41,12 +46,12 @@ must not be discarded:
 - Stage-2 read-state separation; and
 - the `none` and `age-v1` envelope profiles.
 
-This ADR replaces only the team-establishment portion of onboarding. It
-supersedes ADR 0007's assumptions that every pairing token is already
+This design replaces only the team-establishment portion of onboarding. It
+supersedes the earlier remote-connect design assumptions that every pairing token is already
 team-scoped, that exchange immediately returns an active credential binding,
-and that the console or reference-server admin creates the team. ADR 0007's
+and that the console or reference-server admin creates the team. The earlier design's
 command shape, secret handling, status, doctor, disconnect/revoke, and key
-handling remain in force unless this ADR says otherwise.
+handling remain in force unless this design says otherwise.
 
 ## Decision
 
@@ -100,7 +105,7 @@ response and provisional credential have been atomically written and fsynced.
 The shared field names, storage rigor, and single-delivery rules are inherited
 from cloud v6. TTL is policy-specific while the lifecycle remains shared:
 cloud's no-intent activate keeps its five-minute TTL; human promote/join
-finalize uses a fixed 60-minute TTL. ADR 0010 adds only the token-bound
+finalize uses a fixed 60-minute TTL. This design adds only the token-bound
 tenant/policy context, promote/join body, local reservation, and
 team/roster/backfill result.
 
@@ -186,7 +191,7 @@ generation-time metadata remains visible as already documented by HTTP v1.
 `type` is the bounded portable agent type.
 Only `project` and placement lifecycle are machine-local. Registration
 visibility, uniqueness, cardinality, retirement, and installation-sharing rules
-are exactly those of HTTP v1; this ADR does not create a second device catalog.
+are exactly those of HTTP v1; this design does not create a second device catalog.
 
 The identity-audit ABI is strict JSON and returns the selected driver and
 generation plus three bounded, canonically ordered sets:
@@ -235,7 +240,8 @@ facts requires a separate explicit repair design.
 A rename retains `member_id` and enqueues a complete roster mutation. Local and
 remote names may differ while that mutation is pending; Stage-2 read-state
 publication for that member remains fail-closed until the authenticated roster
-and local catalog agree, as required by ADR 0008.
+and local catalog agree, as required by the
+[composite read-state frontier](../adr/0006-composite-read-state-frontier.md).
 
 ## Connect mode selection
 
@@ -303,7 +309,7 @@ token names that exact `server_instance_id` and `team_id`, the locally retained
 member IDs descend from that binding, and the onboarding reservation names the
 same local store identity and binding generation. Ordinary revision
 reconciliation must find no identity conflict. This is lifecycle recovery
-under ADR 0007, not a third creation mode. A local team with no proof of that
+under the remote-connect lifecycle, not a third creation mode. A local team with no proof of that
 prior tuple cannot use a join token merely because its display name or claimed
 team ID matches.
 
@@ -1041,7 +1047,7 @@ and pending binding are durable projections; none independently advances the
 server phase. `remote status --json` correlates them by `onboarding_id` and
 reports discrepancies, but it never elects a local projection as truth.
 
-For this flow, ADR 0007's token-hash-derived pending implementation is replaced,
+For this flow, the earlier token-hash-derived pending implementation is replaced,
 not treated as the new authority. The public pending-management ABI keeps an
 opaque `pending_id`, but its internal key is
 `(onboarding_id, onboarding_session_id, reservation_generation)`. Legacy
@@ -1256,7 +1262,7 @@ server-first onboarding flow.
 - There is no automatic conversion of an old consumed pairing token.
 - Draft servers may offer a temporary feature flag for tests, but published v1
   documents one canonical local-first flow.
-- ADR 0007 is updated to point its superseded creation/exchange sections here;
+- the remote-connect design points its superseded creation/exchange sections here;
   its unaffected security and UX requirements remain normative.
 
 ## Rejected alternatives
@@ -1349,8 +1355,11 @@ post-cutoff wire ID, response-loss retry, and envelope-digest mismatch.
 
 ## References
 
-- [ADR 0005: Stage-1 remote sync](0005-stage-1-remote-sync.md)
-- [ADR 0006: E2EE-first-class server schema](0006-e2ee-first-class-server-schema.md)
-- [ADR 0007: Remote connect onboarding UX](0007-remote-connect-onboarding-ux.md)
-- [ADR 0008: Stage-2 read-state synchronization](0008-stage-2-read-cursor-sync.md)
+- [ADR 0005: Remote synchronization contract](../adr/0005-remote-sync-contract.md)
+- [ADR 0006: Composite read-state frontier](../adr/0006-composite-read-state-frontier.md)
+- [ADR 0007: Stable member and roster identity](../adr/0007-stable-member-and-roster-identity.md)
+- [Remote connect onboarding design](remote-connect-onboarding.md)
+- [Stage-1 remote synchronization](../spec/stage-1-remote-sync.md)
+- [Cipher-independent opaque-envelope server schema](../spec/server-opaque-envelope.md)
+- [Stage-2 read-state synchronization](../spec/read-state-synchronization.md)
 - [HTTP API v1](../../server/spec/v1.md)

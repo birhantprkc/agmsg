@@ -41,7 +41,7 @@ _key_cred_dir() {
 
 # Refuse to proceed without a working age/age-keygen — this is the same
 # preflight `remote.sh connect` runs before its own key-bootstrap prompt
-# (ADR 0007 §8), duplicated here since key.sh can also be invoked directly
+# (remote-connect onboarding design), duplicated here since key.sh can also be invoked directly
 # (e.g. `key.sh import` ahead of ever running `connect`).
 _key_require_age() {
   if ! command -v age >/dev/null 2>&1 || ! command -v age-keygen >/dev/null 2>&1; then
@@ -65,7 +65,7 @@ _key_read_config_field() {
 }
 
 # Short, human-comparable digest of a recipient string (SSH-key-fingerprint
-# style grouping) — for the H7 "fingerprint verification" step (ADR 0007 §8):
+# style grouping) — for the H7 fingerprint-verification step:
 # two people compare this same short string over a separate channel.
 _key_fingerprint() {
   printf '%s' "$1" | shasum -a 256 | cut -c1-16 | sed 's/\(....\)/\1-/g;s/-$//'
@@ -227,7 +227,7 @@ cmd_show() {
   fi
 
   # Refused outright in agent mode — no TTY, no reveal, no override
-  # (ADR 0007 secret-hygiene: this is the one place a raw secret can reach
+  # (remote-connect secret hygiene: this is the one place a raw secret can reach
   # stdout, so it must be harder to trigger than the rest of the CLI).
   if [ ! -t 0 ] || [ ! -t 1 ]; then
     echo "agmsg: --reveal-secret requires an interactive terminal and is refused in agent mode." >&2

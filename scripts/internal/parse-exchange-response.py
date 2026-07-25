@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Strictly validate a pairing-exchange response before remote.sh mutates
-any local state (ADR 0007 review finding B6). Reads the raw response body
+any local state (remote-connect review finding B6). Reads the raw response body
 on stdin; on success prints one field per line to stdout (credential,
 credential_id, server_instance_id, remote_team_id, remote_team_name,
 protocol_version, capabilities JSON, write_allowed_ciphers joined by
@@ -21,11 +21,11 @@ spliced into the revoke endpoint's path, so accepting a looser value here
 would both split client/server validation and risk path/query injection.
 
 This same validator is also used to re-check a previously-saved pending
-record before resuming a commit from it (ADR 0007 review finding R5) — a
+record before resuming a commit from it (remote-connect review finding R5) — a
 pending file is not inherently more trustworthy than a fresh response.
 
 Duplicate JSON object keys and unrecognized fields are both rejected
-(ADR 0007 review finding D4): plain `json.loads` silently keeps only the
+(remote-connect review finding D4): plain `json.loads` silently keeps only the
 LAST occurrence of a duplicated key with no signal that a duplicate ever
 existed, which a malicious/buggy server could use to smuggle a value past
 a naive review of "the response has the right fields" — and would

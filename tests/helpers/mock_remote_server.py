@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal mock of the ADR 0007 pairing-exchange + revoke endpoints, for
+"""Minimal mock of the remote-connect pairing-exchange + revoke endpoints, for
 bats tests exercising scripts/remote.sh without a real server. Not part of
 the shipped product — test-only.
 

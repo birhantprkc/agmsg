@@ -1,22 +1,27 @@
-# ADR 0007: Remote connect onboarding UX
+# Remote connect onboarding design
 
-**Status:** accepted — §1/§1a-§1c/§8's four key commands (generate/show/
+**Status:** implemented dogfood design — §1/§1a-§1c/§8's four key commands (generate/show/
 import) and §0-§7's connect/status/disconnect/doctor are approved and
 implemented (this PR). `key request`/`approve` (device-pairing key
 delivery) and `key rotate` remain NOT READY — see §8 — and are explicitly
 out of this PR's scope pending their own follow-up design/review passes.
 **Date:** 2026-07-21 (implementation landed 2026-07-23)
-**Deciders:** @fujibee
+**Owner:** @fujibee
+
+This is an editable product and CLI design, not an architecture decision
+record. Persistent binding, credential, key-custody, and synchronization
+semantics are recorded in the relevant ADRs and versioned specifications.
 
 ## Context
 
 The landing page commits to: *"Connect a team. One token links a team to your
-cloud org. That is the whole setup."* This ADR turns that promise into an
+cloud org. That is the whole setup."* This design turns that promise into an
 actual CLI (and companion cloud-console) design, sitting on top of the
-Stage-1 remote sync ABI ([ADR 0005](0005-stage-1-remote-sync.md), draft PR
+Stage-1 remote sync ABI
+([specification](../spec/stage-1-remote-sync.md), draft PR
 #450, `storage_sync_prepare_push` / `storage_sync_reconcile_push` /
 `storage_sync_apply_pull`) and the rebased storage-axis driver contract
-([ADR 0003](0003-storage-axis-driver-abi-and-scope.md)).
+([ADR 0003](../adr/0003-storage-axis-driver-abi-and-scope.md)).
 
 This was an **interface addition** (a new command surface, a new
 credential storage location, a new team-config field), reviewed and
@@ -127,7 +132,7 @@ multi-team-disambiguation prompt to design.
 ### 1a. Onboarding paths: agent-driven (Path A) vs. console-driven (Path B)
 
 **Boundary: this is provider tooling's design, not this OSS repo's
-implementation scope. This ADR names no specific product** — only the
+implementation scope. This design names no specific product** — only the
 contract: some **provider tooling** (a vendor CLI, or a vendor console)
 owns login, org/team management, and pairing-token acquisition, then
 simply **calls this repo's unmodified §1-5 `connect`**
@@ -140,7 +145,7 @@ already specify; it has no awareness of whatever login flow happened
 upstream of that token, and doesn't need to. A **self-hosted server's own
 admin command**, issuing a token directly with no "login" concept at all,
 is exactly as valid a token-issuing entity as any hosted provider tooling
-— this ADR treats the two as peers, not a primary path and a fallback.
+— this design treats the two as peers, not a primary path and a fallback.
 The design below is kept here as **context for why the boundary sits
 where it does**, not as OSS-implemented scope:
 
@@ -281,7 +286,7 @@ completeness since all four were reviewed together:**
 There are multiple ways this codebase gets installed, with more
 plausibly coming: `install.sh` directly, `npx agmsg install`, a possible
 future default via the separate skills-CLI effort (`#201` — not this
-ADR's to decide), and an existing CC-plugin form. A bare PATH shim in
+architecture decisions to decide), and an existing CC-plugin form. A bare PATH shim in
 `install.sh` only covers the first case, so it's rejected. **Decision:**
 the npm bootstrapper (the existing `agmsg` package) gains subcommand
 passthrough, so `npx agmsg remote connect ...` works identically
@@ -341,7 +346,8 @@ IDs.
    note), `server_instance_id`, `remote_team_id` (the cloud team's
    identifier), a human-readable cloud team name (used as the local
    team's default name when `<team>` was not given), `protocol_version`,
-   and the capability document (per ADR 0005's `GET /v1/capabilities`
+   and the capability document (per the Stage-1 specification's
+   `GET /v1/capabilities`
    shape: `accepted_envelope_versions`, `write_allowed_ciphers`,
    `policy_revision`, `effective_from_seq`, `max_blob_bytes`).
 4. The **secret is written to an engine-side credential store, never to
@@ -367,7 +373,7 @@ IDs.
    (`capabilities=stage1-sync`) driver for that team specifically — this is
    a **per-team** setting, not the machine-wide `storage` config key
    `docs/spec/driver-interface.md` §4 currently describes. That per-team
-   override did not exist before Stage-1 sync; this ADR's implementation
+   override did not exist before Stage-1 sync; this design's implementation
    will need a small, additive change to how the active driver is resolved
    (per-team lookup falling back to the machine-wide default), not a
    contract change to the driver ABI itself.
@@ -417,8 +423,8 @@ IDs.
   not be reached to revoke this credential — if this device may be
   compromised, revoke it from the console/admin side directly." The
   revoke endpoint's own wire shape is a server-side implementation detail
-  this ADR does not own (mirrors §3.2's stance on the exchange endpoint
-  itself) — this ADR only fixes that `disconnect` must attempt it, keyed
+  this design does not own (mirrors §3.2's stance on the exchange endpoint
+  itself) — this design only fixes that `disconnect` must attempt it, keyed
   by `credential_id`, in this best-effort order.
 
 ### 5. Failure UX (local-first, doesn't break)
@@ -429,7 +435,7 @@ IDs.
 - **Already connected, server later unreachable**: this is exactly the
   case Stage-1 sync's local-first design already exists for — sends and
   reads keep working against the local store; the sync client's own
-  polling/retry loop (ADR 0005) is what's degraded, not agmsg itself.
+  polling/retry loop is what's degraded, not agmsg itself.
   `remote status <team>` surfaces this plainly (e.g. "connected, last
   synced 4m ago, N messages pending push" vs. "connected, in sync") so a
   user who notices something feels stale has one command that tells them
@@ -447,7 +453,7 @@ IDs.
 profile — see `docs/spec/age-v1-profile.md`), so this is no longer a future
 placeholder — it is concretized below and in §8.** The `age-v1` profile
 itself (envelope framing, recipient-set epochs, the multi-writer cutover
-protocol) is already pinned; this ADR only designs the **onboarding-time**
+protocol) is already pinned; this design only covers the **onboarding-time**
 slice of it — generating or importing the *first* key for a device, not
 rotating keys across an already-multi-writer team (see §8's explicit scope
 line).
@@ -516,15 +522,15 @@ team" screen** that:
 - When the target team requires encryption, the copy-paste block also
   carries a conditional "install `age` first if you don't have it" line,
   using the **exact** OS-specific install commands §8 pins in the CLI's
-  own preflight message — this is the one piece of console copy this ADR
+  own preflight message — this is the one piece of console copy this design
   does fix precisely (not layout, just this wording), since the whole
   point of pinning it is that the CLI's error text and the console's
   pre-emptive hint must never say two different things for the same
   missing dependency.
 - Alignment note: the exact screen layout/copy, and the concrete hosted
   endpoint value it fills in, are a console (desktop-app-adjacent) surface
-  this ADR has no authority over — that design belongs to whoever owns the
-  cloud console/onboarding surface, reviewed independently. This ADR fixes
+  this design has no authority over — that work belongs to whoever owns the
+  cloud console/onboarding surface, reviewed independently. This document fixes
   only the **contract** the console and CLI must agree on: that the CLI
   takes `--endpoint <url> <token> [<team>]` with no default, what the
   token encodes/expires like, and what the exchange response shape is
@@ -553,7 +559,7 @@ me my key", not "show me my remote status").
 pattern every existing command uses** — there is no unified `agmsg`
 dispatcher on `$PATH` today (the npm package's `bin` is an install-time
 bootstrapper, not a runtime front-door; see the separate, undecided
-`#201` front-door-CLI effort, which this ADR does not depend on).
+`#201` front-door-CLI effort, which this design does not depend on).
 `remote` (§1) already used this shape; an earlier draft of this section
 didn't, and is corrected here to match.
 
@@ -630,7 +636,7 @@ Alternatives).
    multi-device distribution is exactly the piece deferred to the future
    multi-writer design.
 
-Two operational notes this ADR states explicitly rather than leaving
+Two operational notes this design states explicitly rather than leaving
 implicit, since they're easy to get wrong once and hard to notice:
 
 - **New-member history visibility is a deliberate choice, not automatic.**
@@ -640,7 +646,7 @@ implicit, since they're easy to get wrong once and hard to notice:
   hires shouldn't see old history", but it only happens if whoever
   onboards them chooses to share just the latest epoch rather than the
   full keyring. `key show` should make it possible to select this (e.g. a
-  future `--epoch <key_id>` scoping flag), but this ADR does not commit to
+  future `--epoch <key_id>` scoping flag), but this design does not commit to
   that flag's exact shape — only that the choice must be possible and
   is not automatic.
 - **Incident response is two commands, not one, and both matter.** If a
@@ -756,7 +762,7 @@ the key exist.
   a plain file. Keychain integration remains a plausible **future,
   explicitly opt-in** hardening flag for a user who only ever runs agmsg
   interactively on a single desktop session with no background watcher —
-  not something this ADR designs now.
+  not something this document designs now.
 - **Honest threat model:** on a single-user machine, protecting the key
   file alone is close to security theater — the key and the decrypted
   plaintext message history (and, in most setups, the local sqlite/jsonl
@@ -780,7 +786,7 @@ the key exist.
 
 **`key request` / `key approve` (renamed from `send`/`receive`) —
 device-pairing key delivery. STATUS: NOT READY — under redesign, split
-off as a separate follow-on track, not part of this ADR's launch scope.**
+off as a separate follow-on track, not part of this design's launch scope.**
 An internal adversarial design review found five separate, fundamental problems
 with the design as first drafted below (one-directional authentication
 only — a malicious server or writer could inject a fake team key toward
@@ -847,7 +853,7 @@ Flow:
    the team's ongoing key material).
 
 Constraints this design is built under (stated explicitly, not
-negotiable within this ADR):
+negotiable within this design):
 
 1. **Zero new cryptography.** The whole mechanism is age's existing
    recipient-encryption feature, reused. No new key-exchange protocol,
@@ -862,7 +868,7 @@ negotiable within this ADR):
    from being visually confused with each other) determine whether the
    MITM defense in step 2 actually holds. This needs its own adversarial
    review pass, the same way the `age-v1` profile itself got one (see
-   References) — this ADR proposes the flow's *skeleton* and explicitly
+   References) — this design proposes the flow's *skeleton* and explicitly
    defers the code's cryptographic shape to that review, rather than
    asserting a strawman as final.
 4. **Manual `key show --reveal-secret` / `key import` remain**, permanently
@@ -964,23 +970,24 @@ negotiable within this ADR):
   which is marginally more to write in docs/README than a bare-token
   example would have been.
 - Neutral: the cloud-console screen itself, and the concrete hosted
-  endpoint value, are explicitly out of this ADR's authority (contract
+  endpoint value, are explicitly out of this design's authority (contract
   only) pending review from whoever owns that surface.
 - Neutral: `key generate`/`show`/`import` cover onboarding (first key,
   first device) only. Removing/adding a device from an already-multi-writer
   team, and any UI for the `age-v1` profile's quiesce/fence/commit
   rotation barrier, are explicitly deferred to a follow-up design — this
-  ADR does not claim to have solved key rotation.
+  design does not claim to have solved key rotation.
 
 ## References
 
-- Builds on [ADR 0003](0003-storage-axis-driver-abi-and-scope.md) and
-  [ADR 0005](0005-stage-1-remote-sync.md) (draft PR #450).
+- Builds on [ADR 0003](../adr/0003-storage-axis-driver-abi-and-scope.md) and
+  [Stage-1 synchronization specification](../spec/stage-1-remote-sync.md)
+  (draft PR #450).
 - [`docs/spec/age-v1-profile.md`](../spec/age-v1-profile.md) (approved
   cipher profile, commit `eea3307`) — the key format, epoch model, and
   multi-writer cutover protocol §8 is scoped against.
 - Internal adversarial design review, rounds 1 (sync gates A-G) and 2 (E2EE
-  gates H1-H8) — the profile this ADR's §6/§8 defer to.
+  gates H1-H8) — the profile this design's §6/§8 defer to.
 - Standing policy: any interface addition requires explicit maintainer
   approval of the design doc before implementation (this document).
 - Implementation-time adversarial security review of `scripts/remote.sh`/

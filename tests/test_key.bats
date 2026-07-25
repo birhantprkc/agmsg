@@ -12,7 +12,7 @@ teardown() {
   teardown_test_env
 }
 
-# key.sh needs the real `age`/`age-keygen` binaries (ADR 0007 §8) — skip
+# key.sh needs the real `age`/`age-keygen` binaries — skip
 # gracefully rather than failing when they're not installed on the runner.
 skip_if_no_age() {
   command -v age >/dev/null 2>&1 && command -v age-keygen >/dev/null 2>&1 || skip "age/age-keygen not installed"
