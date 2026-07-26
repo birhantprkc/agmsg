@@ -19,7 +19,8 @@ source "$(cd "$(dirname "$0")" && pwd)/lib/compat.sh"
 #     whose agent name matches — useful for `actas` exclusive role mode.
 #   - Inbox and monitor share the driver's persistent per-(team,agent) read
 #     cursor. A restart resumes from consumed state, and a fresh watcher delivers
-#     existing unread messages instead of jumping over them. See ADR 0008.
+#     existing unread messages instead of jumping over them. See the
+#     read-state synchronization specification.
 #   - Polls the SQLite DB at AGMSG_WATCH_INTERVAL seconds (default 5, also
 #     overridable via the delivery.monitor.poll_interval config key).
 #   - Emits one line per new message:

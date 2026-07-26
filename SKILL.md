@@ -169,7 +169,7 @@ Do NOT manually edit config files. Always use join.sh. If the name was recently 
 ~/.agents/skills/agmsg/scripts/despawn.sh <team> <from> <name> [--force] [--timeout N]
 ```
 
-### Remote sync & end-to-end encryption (ADR 0007)
+### Remote sync & end-to-end encryption
 
 Connects a local team to a cloud/self-hosted sync endpoint and manages the
 team's `age-v1` encryption key. Additive to everything above — a team works
@@ -297,4 +297,4 @@ The allowlist merges across scopes and takes effect immediately — no restart n
 - **Teams**: `~/.agents/skills/agmsg/teams/<name>/config.json`
 - **Concurrency**: WAL allows multiple readers + 1 writer without conflicts
 - **No daemon**: Direct DB access via `sqlite3` CLI
-- **Dependencies**: bash, sqlite3 (no python3 required) for core messaging; `remote`/`key` (ADR 0007) additionally need `curl`, `python3`, and `age`/`age-keygen`, but only if those commands are used
+- **Dependencies**: bash, sqlite3 (no python3 required) for core messaging; `remote`/`key` additionally need `curl`, `python3`, and `age`/`age-keygen`, but only if those commands are used

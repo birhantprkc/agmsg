@@ -1,8 +1,10 @@
-# ADR 0008: Stage-2 read-state synchronization
+# Stage-2 read-state synchronization specification
 
-**Status:** proposed (dogfood contract)
-**Date:** 2026-07-21
-**Deciders:** @fujibee
+**Status:** dogfood specification
+**Last updated:** 2026-07-25
+
+The irreversible read-state semantics behind this contract are recorded in
+[ADR 0006: Composite read-state frontier](../adr/0006-composite-read-state-frontier.md).
 
 ## Context
 
@@ -325,7 +327,7 @@ forbidden.
 ### Explicitly out of scope
 
 Stage 3 server-sent events and wake delivery are not launch requirements and are
-not part of this ADR. Stage 2 continues to use the existing polling loop. Stage
+not part of this specification. Stage 2 continues to use the existing polling loop. Stage
 3 should treat SSE and mobile wake as one team-scoped notification layer: a
 future iOS client may register an APNs device token, receive a Signal-style
 silent push, then pull, decrypt, and produce a local notification. The server
@@ -345,6 +347,7 @@ still does not inspect recipients or message bodies.
 
 ## References
 
-- [ADR 0003: storage-axis ABI](0003-storage-axis-driver-abi-and-scope.md)
-- [ADR 0005: Stage-1 remote sync](0005-stage-1-remote-sync.md)
+- [ADR 0003: storage-axis ABI](../adr/0003-storage-axis-driver-abi-and-scope.md)
+- [Stage-1 remote synchronization](stage-1-remote-sync.md)
+- [ADR 0005: Remote synchronization contract](../adr/0005-remote-sync-contract.md)
 - [HTTP API v1](../../server/spec/v1.md)

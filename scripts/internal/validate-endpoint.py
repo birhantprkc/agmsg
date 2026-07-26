@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strictly validate a --endpoint value (ADR 0007 review finding R2).
+"""Strictly validate a --endpoint value (remote-connect review finding R2).
 
 A naive shell glob/prefix check (`case $endpoint in http://127.0.0.1*)`)
 is bypassable: `http://127.0.0.1.evil.com`, `http://localhost.evil.com`,

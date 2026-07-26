@@ -9,9 +9,9 @@ set -euo pipefail
 #   remote.sh pending list [--json]
 #   remote.sh pending abort <pending_id>
 #
-# Team-scoped cloud/self-hosted sync connection (ADR 0007). The OSS CLI never
+# Team-scoped cloud/self-hosted sync connection. The OSS CLI never
 # assumes or defaults to any particular server — <endpoint> is always
-# required. Login/token acquisition is out of this repo's scope (ADR 0007
+# required. Login/token acquisition is out of this repo's scope (remote-connect
 # §1a-§1c) — some provider tooling (or a self-hosted server's own admin
 # command) obtains the token; this script only ever receives one.
 #
@@ -82,7 +82,7 @@ _remote_ensure_team() {
 
 # Reject a non-HTTPS endpoint (token/credential would cross the wire in
 # plaintext) except for loopback, which self-host/dev setups need without a
-# cert (ADR 0007 review findings B6/R2). Delegates to a real URL parser —
+# cert (remote-connect review findings B6/R2). Delegates to a real URL parser —
 # a shell glob/prefix check here was bypassable by
 # http://127.0.0.1.evil.com, http://localhost.evil.com, and the userinfo
 # trick http://localhost@evil.com, all of which matched a naive
@@ -130,7 +130,7 @@ _remote_prompt_read() {
 
 # --- doctor ------------------------------------------------------------
 
-# Standalone, read-only, always-safe-to-run preflight (ADR 0007 §1): no
+# Standalone, read-only, always-safe-to-run preflight: no
 # token, no state change, safe whether or not the team is already connected.
 # Currently just the age-binary-presence check (§8) — the natural home for
 # any future preflight check added later.
@@ -1093,7 +1093,7 @@ cmd_connect() {
   fi
   unset credential
 
-  # E2EE insertion point (ADR 0007 §6/§8): only when the capability response
+  # E2EE insertion point: only when the capability response
   # actually requires encryption and no local key exists yet for this team.
   local needs_encryption=0
   case ",$write_allowed_ciphers," in
@@ -1337,7 +1337,7 @@ cmd_disconnect() {
 
   # Server-side revoke first, local cleanup always — local deletion alone
   # does not stop the credential from continuing to authenticate
-  # server-side (ADR 0007 §4).
+  # server-side (remote-connect lifecycle).
   local revoke_ok=0
   if [ -f "$cred_file" ] && [ -n "$endpoint" ] && [ "$endpoint" != "null" ] && [ -n "$credential_id" ] && [ "$credential_id" != "null" ]; then
     credential="$(python3 -c "import json,sys; print(json.load(open('$cred_file')).get('credential',''))" 2>/dev/null)"

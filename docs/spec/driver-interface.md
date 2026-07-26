@@ -332,15 +332,16 @@ prefix. Apply-pull atomically quarantines unchanged envelopes, reconciles mapped
 echoes or imports unmapped wire IDs once, and advances the transport cursor only
 after durable local outcomes. Transport, decrypt/import, and read progress are
 independent. Reprocess emits blocking quarantine records for explicit policy/key
-reevaluation without rewinding transport. It uses ADR 0005's stable
+reevaluation without rewinding transport. It uses the Stage-1 specification's stable
 `(server_seq,wire_id)` keyset page and mandatory `sync_reprocess_page` trailer,
 so one explicit engine invocation reaches every candidate without an early
 permanent failure starving later records. The complete framing, record schemas,
 crash boundaries, and future reserved operation names are defined by
-[ADR 0005](../adr/0005-stage-1-remote-sync.md).
+[Stage-1 synchronization specification](stage-1-remote-sync.md).
 
 A driver may additionally advertise `stage1-resync` and implement the explicit
-operator recovery contract from [ADR 0009](../adr/0009-retention-gap-resynchronization.md):
+operator recovery contract from the
+[retention-gap resynchronization specification](retention-gap-resynchronization.md):
 
 ```text
 storage_sync_resync_status <local-team> <server-instance-id> <remote-team-id> <protocol-version> <accepted-floor>
@@ -352,12 +353,12 @@ message. Resync atomically records an authenticated, operator-accepted retention
 gap and advances only the transport cursor. Together they make result-loss
 retry idempotent without exposing driver storage internals. They never make
 HTTP 410 an automatic polling recovery and never delete local messages or
-independent state layers. ADR 0009 pins their exact strict JSONL status, input,
+independent state layers. The retention-gap specification pins their exact strict JSONL status, input,
 audit, and result objects, including canonical sequence arithmetic and
 duplicate/unknown-field rejection.
 
-The independent Stage-2 extension from
-[ADR 0008](../adr/0008-stage-2-read-cursor-sync.md) is advertised as
+The independent Stage-2 extension from the
+[read-state synchronization specification](read-state-synchronization.md) is advertised as
 `capabilities=stage1-sync,stage2-read-state` and adds:
 
 ```text
