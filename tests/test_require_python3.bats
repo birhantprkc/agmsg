@@ -105,6 +105,96 @@ EOF
   [[ "$output" != *"SHOULD NEVER RUN"* ]]
 }
 
+# --- co1 delta review P1: symlink resolution ---------------------------------
+# `command -v python3` can resolve through a symlink (e.g. ~/bin/python3 ->
+# /usr/bin/python3) whose literal string is NOT "/usr/bin/python3", even
+# though executing it still reaches the trampoline. These tests point
+# _agmsg_python3_trampoline_path at a disposable fixture instead of the
+# real /usr/bin/python3 (which must never be created, deleted, or
+# depended on) and build real symlink chains to it, proving the
+# resolution logic follows relative AND multi-hop hops to the physical
+# target before comparing -- never by executing python3.
+
+@test "python3_usable: a symlink (one hop) to the trampoline still triggers the CLT check" {
+  local root; root="$(mktemp -d)"
+  mkdir -p "$root/usr/bin" "$root/home/bin"
+  : > "$root/usr/bin/python3"
+  ln -s "$root/usr/bin/python3" "$root/home/bin/python3"
+
+  _agmsg_python3_trampoline_path() { printf '%s' "$root/usr/bin/python3"; }
+  _agmsg_python3_resolved_path() { printf '%s' "$root/home/bin/python3"; }
+  _agmsg_platform() { printf 'Darwin'; }
+  local fakebin; fakebin="$(mktemp -d)"
+  cat > "$fakebin/xcode-select" <<'EOF'
+#!/usr/bin/env bash
+exit 2
+EOF
+  chmod +x "$fakebin/xcode-select"
+  PATH="$fakebin:$PATH" run agmsg_python3_usable
+  [ "$status" -ne 0 ]
+}
+
+@test "python3_usable: a multi-hop relative-then-absolute symlink chain to the trampoline still triggers the CLT check" {
+  local root; root="$(mktemp -d)"
+  mkdir -p "$root/usr/bin" "$root/home/bin" "$root/home/other"
+  : > "$root/usr/bin/python3"
+  ln -s "$root/usr/bin/python3" "$root/home/other/python3"
+  ln -s "../other/python3" "$root/home/bin/python3"
+
+  _agmsg_python3_trampoline_path() { printf '%s' "$root/usr/bin/python3"; }
+  _agmsg_python3_resolved_path() { printf '%s' "$root/home/bin/python3"; }
+  _agmsg_platform() { printf 'Darwin'; }
+  local fakebin; fakebin="$(mktemp -d)"
+  cat > "$fakebin/xcode-select" <<'EOF'
+#!/usr/bin/env bash
+exit 2
+EOF
+  chmod +x "$fakebin/xcode-select"
+  PATH="$fakebin:$PATH" run agmsg_python3_usable
+  [ "$status" -ne 0 ]
+}
+
+@test "python3_usable: a real (non-symlinked) Homebrew-shaped python3 is usable even with CLT absent" {
+  local root; root="$(mktemp -d)"
+  mkdir -p "$root/usr/bin" "$root/opt/homebrew/bin"
+  : > "$root/usr/bin/python3"
+  : > "$root/opt/homebrew/bin/python3"
+
+  _agmsg_python3_trampoline_path() { printf '%s' "$root/usr/bin/python3"; }
+  _agmsg_python3_resolved_path() { printf '%s' "$root/opt/homebrew/bin/python3"; }
+  _agmsg_platform() { printf 'Darwin'; }
+  local fakebin; fakebin="$(mktemp -d)"
+  cat > "$fakebin/xcode-select" <<'EOF'
+#!/usr/bin/env bash
+exit 2
+EOF
+  chmod +x "$fakebin/xcode-select"
+  # xcode-select must never even run -- the resolved path's canonical
+  # target genuinely differs from the trampoline fixture.
+  PATH="$fakebin:$PATH" run agmsg_python3_usable
+  [ "$status" -eq 0 ]
+}
+
+@test "python3_usable: a symlink to the trampoline is fine when CLT IS installed" {
+  local root; root="$(mktemp -d)"
+  mkdir -p "$root/usr/bin" "$root/home/bin"
+  : > "$root/usr/bin/python3"
+  ln -s "$root/usr/bin/python3" "$root/home/bin/python3"
+
+  _agmsg_python3_trampoline_path() { printf '%s' "$root/usr/bin/python3"; }
+  _agmsg_python3_resolved_path() { printf '%s' "$root/home/bin/python3"; }
+  _agmsg_platform() { printf 'Darwin'; }
+  local fakebin; fakebin="$(mktemp -d)"
+  cat > "$fakebin/xcode-select" <<'EOF'
+#!/usr/bin/env bash
+echo "/Library/Developer/CommandLineTools"
+exit 0
+EOF
+  chmod +x "$fakebin/xcode-select"
+  PATH="$fakebin:$PATH" run agmsg_python3_usable
+  [ "$status" -eq 0 ]
+}
+
 # --- agmsg_require_python3: the user-facing wrapper -------------------------
 
 @test "require_python3: prints an install message and fails when not usable" {

@@ -38,6 +38,8 @@ source "$SCRIPT_DIR/lib/registry-lock.sh"
 source "$SCRIPT_DIR/lib/validate.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/require-python3.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/node.sh"
 
 TEAMS_DIR="$CONNECTION_ROOT/teams"
 CRED_ROOT="$CONNECTION_ROOT/run/remote-credentials"
@@ -155,11 +157,24 @@ cmd_doctor() {
   else
     echo "  [ ] python3 on PATH"
     echo
-    echo "'python3' is required for the remote connect feature and was not found on this device. Install it, then retry:"
+    echo "'python3' is required for the remote control plane (connect/status/disconnect/pending) and was not found on this device. Install it, then retry:"
     echo "  macOS (Homebrew):      brew install python3"
     echo "  macOS (Xcode tools):   xcode-select --install"
     echo "  Debian/Ubuntu:         sudo apt install python3"
     echo "  Windows (winget):      winget install Python.Python.3"
+    failed=1
+  fi
+  echo
+  if agmsg_node_usable; then
+    echo "  [x] node on PATH"
+  else
+    echo "  [ ] node on PATH"
+    echo
+    echo "'node' is required for the remote sync data plane (remote-sync.sh) and was not found on this device. Install it, then retry:"
+    echo "  macOS (Homebrew):      brew install node"
+    echo "  Debian/Ubuntu:         sudo apt install nodejs"
+    echo "  Windows (winget):      winget install OpenJS.NodeJS"
+    echo "See https://nodejs.org for other install methods."
     failed=1
   fi
   echo

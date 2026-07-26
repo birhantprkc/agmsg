@@ -209,25 +209,34 @@ either).
   Worse, `command -v python3` alone cannot detect this case — Apple ships
   a `/usr/bin/python3` trampoline that genuinely exists on PATH even
   without CLT installed, so a plain PATH check reports success right up
-  until something actually executes it. The check additionally consults
+  until something actually executes it. A raw string comparison against
+  `/usr/bin/python3` isn't enough either: PATH can resolve python3
+  through a symlink (e.g. `~/bin/python3 -> /usr/bin/python3`) whose
+  literal text differs from the trampoline path even though executing it
+  still reaches the trampoline, so the resolved path is followed through
+  every symlink hop — relative or absolute, portable to BSD/macOS
+  `readlink`, which has no `-f`/canonicalize flag — to its physical
+  target before comparing. The check additionally consults
   `xcode-select -p` (a real, always-present, non-interactive binary that
-  only inspects installed-tool state) whenever python3 resolves to
-  exactly `/usr/bin/python3` on Darwin — python3 itself is never executed
-  to probe for its own usability, on any platform, under any
-  circumstance; "try running it and see what happens" is exactly the
-  category of fix this exists to avoid.
+  only inspects installed-tool state) whenever that canonical target is
+  `/usr/bin/python3` on Darwin — python3 itself is never executed to
+  probe for its own usability, on any platform, under any circumstance;
+  "try running it and see what happens" is exactly the category of fix
+  this exists to avoid.
 - **remote sync data plane (the Stage-1 polling sync client)** — core,
   plus `node` (`remote-sync.sh` execs `internal/remote-sync.mjs` and its
   companion `.mjs` helpers via `AGMSG_SYNC_NODE_BIN`/`agmsg_resolve_node`).
   A second, independent reason a remote-connected team needs Node,
   separate from the control plane's python3 need above.
 
-`doctor` (`remote.sh doctor`) checks `age` and `python3`, sharing the same
-judgment helper (`agmsg_python3_usable`) that the control-plane preflight
-uses, so the diagnostic display and the actual gate can never disagree.
-It does not yet check `node` for the sync data plane — a gap, not a
-design choice; `remote-sync.sh` still fails with whatever raw error
-`agmsg_resolve_node`'s fallback produces if Node is missing.
+`doctor` (`remote.sh doctor`) checks `age`, `python3`, and `node`, sharing
+the same judgment helpers (`agmsg_python3_usable`, `agmsg_node_usable`)
+that the actual preflight gates use, so the diagnostic display and the
+gates can never disagree. `agmsg_node_usable` (`scripts/lib/node.sh`)
+reuses `agmsg_resolve_node`'s own resolution contract (`AGMSG_NODE`
+override, version-manager paths, PATH) rather than a separate raw
+`command -v node` check, so doctor's judgment of "usable" always matches
+what `remote-sync.sh` itself would actually try to run.
 
 No persistent daemon at any tier. The core tier alone makes no network
 calls; the remote tiers do, by definition.

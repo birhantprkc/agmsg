@@ -184,10 +184,17 @@ Claude Code コマンドは別途 `~/.claude/commands/<cmd>.md` にインスト�
   ことに、`command -v python3`だけではこれを検出できない —
   AppleはCLT未導入でもPATH上に実在する`/usr/bin/python3`トランポリンを
   同梱しているため、単純なPATHチェックは、実際に何かがそれを実行する
-  その瞬間まで「成功」を報告し続ける。このチェックは、python3の解決先が
-  Darwin上でちょうど`/usr/bin/python3`である場合に限り、追加で
-  `xcode-select -p`（インストール済みツールの状態を調べるだけの、実在し
-  常に存在する非対話的なバイナリ）を確認する。python3自体は、いかなる
+  その瞬間まで「成功」を報告し続ける。`/usr/bin/python3`という文字列との
+  単純な比較でも不十分: PATHはシンボリックリンク経由でpython3を解決する
+  ことがあり（例: `~/bin/python3 -> /usr/bin/python3`）、リンク先を実行
+  すればトランポリンに到達するにも関わらず、その解決結果の文字列自体は
+  トランポリンのパスと異なる。そのため解決されたパスは、相対・絶対を問わず
+  全てのシンボリックリンクのホップを辿り（`-f`/canonicalize相当のフラグが
+  無いBSD/macOSの`readlink`にも対応できる形で）、実体パスへ到達してから
+  比較する。このチェックは、その実体パスがDarwin上でちょうど
+  `/usr/bin/python3`である場合に限り、追加で`xcode-select -p`
+  （インストール済みツールの状態を調べるだけの、実在し常に存在する
+  非対話的なバイナリ）を確認する。python3自体は、いかなる
   プラットフォームでも、いかなる状況でも、自身の使用可否を確認する目的
   で実行されることは無い — 「試しに実行してみて様子を見る」という類の
   解決策こそ、このチェックが避けようとしているものそのものである。
@@ -197,9 +204,11 @@ Claude Code コマンドは別途 `~/.claude/commands/<cmd>.md` にインスト�
   ヘルパー群をexecする）。上記control planeのpython3必要性とは別の、
   独立したNode依存理由。
 
-`doctor`（`remote.sh doctor`）は`age`と`python3`を確認し、control plane
-の前段チェックと同じ判定helper（`agmsg_python3_usable`）を共有するため、
-診断表示と実際のゲートが食い違うことはない。ただし`node`（sync data
-plane向け）はまだ確認していない — 設計上の意図ではなく単なる欠落で、
-Nodeが無い場合`remote-sync.sh`は`agmsg_resolve_node`のfallbackが生成する
-生のエラーのまま失敗する。
+`doctor`（`remote.sh doctor`）は`age`・`python3`・`node`を確認し、実際の
+ゲートと同じ判定helper（`agmsg_python3_usable`、`agmsg_node_usable`）を
+共有するため、診断表示とゲートが食い違うことはない。
+`agmsg_node_usable`（`scripts/lib/node.sh`）は独自の単純な`command -v
+node`判定を新設するのではなく、`agmsg_resolve_node`自体の解決契約
+（`AGMSG_NODE`override、version-manager paths、PATH）をそのまま再利用
+しているため、doctorの「使用可能」判定は`remote-sync.sh`が実際に試みる
+ものと常に一致する。

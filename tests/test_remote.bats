@@ -1023,3 +1023,27 @@ VALUES ('remote-pending.$key', $owner_pid, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
   run bash "$SCRIPTS/remote.sh" doctor
   [[ "$output" == *"[x] python3 on PATH"* ]]
 }
+
+# --- co1 delta review P1: doctor must also check node (sync data plane) ----
+# Node is a SEPARATE, independent dependency from python3 (remote sync data
+# plane vs. remote control plane) -- doctor claiming "All checks passed"
+# with age+python3 present but node missing would contradict reality, since
+# remote-sync.sh cannot run without node.
+
+@test "remote doctor: reports node as a failed check (not silently ignored) when unusable, and does not claim overall success" {
+  run env AGMSG_NODE=/definitely/does/not/exist/node bash "$SCRIPTS/remote.sh" doctor
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"[ ] node on PATH"* ]]
+  [[ "$output" == *"Some checks failed"* ]]
+}
+
+@test "remote doctor: reports node as present when it resolves to a usable binary" {
+  run bash "$SCRIPTS/remote.sh" doctor
+  [[ "$output" == *"[x] node on PATH"* ]]
+}
+
+@test "remote doctor: passes overall only when age, python3, AND node are all usable" {
+  run bash "$SCRIPTS/remote.sh" doctor
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"All checks passed."* ]]
+}
