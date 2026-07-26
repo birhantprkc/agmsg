@@ -475,3 +475,60 @@ _wait_pidfile() {
   [ "$started" -eq 1 ]
   ! grep -q "Usage: watch.sh" "$out"
 }
+
+# Shifted-argument guard: some launcher shells (grok monitor tool re-eval) DROP
+# a quoted-but-empty first argument entirely, so the watcher is invoked as
+# `watch.sh <project> <type> <name>` — agent_type receives an agent name, the
+# subscription resolves to zero pairs, and pre-guard the watcher kept polling
+# silently while delivering nothing. It must fail loudly instead.
+@test "watch: shifted arguments (agent name in the type slot) fail loudly instead of running with zero subscriptions" {
+  run bash "$SCRIPTS/watch.sh" "$PROJ" claude-code alice
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"ERROR: unknown agent type 'alice'"* ]]
+  [[ "$output" == *"shifted"* ]]
+  # It never armed: no pidfile was written for any derived id.
+  ! ls "$TEST_SKILL_DIR/run"/watch.*.pid >/dev/null 2>&1
+}
+
+# A shifted THREE-argument launch (no active_name) leaves only two arguments.
+# The old ${3:?} guard died on stderr, which a monitor tool consuming stdout
+# never surfaces — the failure must land on stdout instead.
+@test "watch: shifted three-arg launch (missing agent_type) fails loudly on stdout" {
+  local out rc=0
+  out="$(bash "$SCRIPTS/watch.sh" "$PROJ" claude-code 2>/dev/null)" || rc=$?
+  [ "$rc" -ne 0 ]
+  [[ "$out" == *"ERROR: watch.sh needs"* ]]
+  [[ "$out" == *"shifted"* ]]
+  ! ls "$TEST_SKILL_DIR/run"/watch.*.pid >/dev/null 2>&1
+}
+
+# A path-like value in the type slot must be rejected outright, not fed to the
+# registry where it would concatenate into a filesystem path and could resolve
+# to a builtin manifest (e.g. ../types/claude-code).
+@test "watch: path-like agent type is rejected outright" {
+  run bash "$SCRIPTS/watch.sh" sid-path "$PROJ" "../types/claude-code"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"ERROR: invalid agent type"* ]]
+  ! ls "$TEST_SKILL_DIR/run"/watch.*.pid >/dev/null 2>&1
+}
+
+# The caller-side companion of the guard above: command templates pass the
+# sentinel "-" ("${GROK_SESSION_ID:--}") instead of a droppable empty string.
+# watch.sh must fold "-" into the same generated-fallback path as "" (#236).
+@test "watch: sentinel '-' session_id resolves like an empty one" {
+  local out="$BATS_TEST_TMPDIR/dash-sid.out"
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" - "$PROJ" claude-code alice >"$out" 2>&1 3>&- &
+  local pid=$!
+  # Folded to empty => a generated fallback id, so a watch.agmsg-*.pid appears.
+  local i started=0
+  for i in $(seq 1 25); do
+    if ls "$TEST_SKILL_DIR/run"/watch.agmsg-*.pid >/dev/null 2>&1; then started=1; break; fi
+    sleep 0.2
+  done
+  kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+  [ "$started" -eq 1 ]
+  # No literal "-" session id leaked into the run dir key space.
+  ! ls "$TEST_SKILL_DIR/run"/watch.-*.pid >/dev/null 2>&1
+  ! grep -q "Usage: watch.sh" "$out"
+  ! grep -q "ERROR: unknown agent type" "$out"
+}
