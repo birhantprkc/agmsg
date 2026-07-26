@@ -7,8 +7,10 @@ import {
   ageSnapshotDigest,
   consistentReadStateContext,
   configure,
+  cycle,
   driver,
   isRetryable,
+  runLoop,
   loadConfig,
   plaintextWriteEligible,
   parseStrictJsonl,
@@ -893,4 +895,237 @@ test("configured native identity must belong to its epoch recipient manifest", a
   } finally {
     await rm(root, { recursive: true });
   }
+});
+
+// ---- adaptive sync catch-up (adaptive-sync-catchup design) ----
+
+test("runLoop: push saturation drives catch-up (no wait), a drained cycle returns to the steady interval", async () => {
+  const sleeps = [];
+  const limitsSeen = [];
+  const saturationScript = [true, true, false]; // two catch-up cycles, then drained
+  let i = 0;
+  await assert.rejects(() => runLoop(config, {}, {
+    cycleCall: async (_config, limits) => {
+      limitsSeen.push(limits);
+      if (i >= saturationScript.length) { const stop = new Error("stop"); stop.retryable = false; throw stop; }
+      return { pushSaturated: saturationScript[i++] };
+    },
+    sleepCall: async (ms) => { sleeps.push(ms); },
+    isRetryableCall: (error) => error.retryable === true,
+    eventCall: async () => {},
+  }), /stop/);
+  // Only the drained (non-saturated) cycle waits, and it waits the 5s steady interval.
+  assert.deepEqual(sleeps, [5000]);
+  // First cycle starts steady (100); saturation lifts push to 1000; a drained cycle drops back to 100.
+  assert.equal(limitsSeen[0].pushLimit, 100);
+  assert.equal(limitsSeen[1].pushLimit, 1000);
+  assert.equal(limitsSeen[2].pushLimit, 1000);
+  assert.equal(limitsSeen[3].pushLimit, 100);
+  // Pull is always large regardless of cadence.
+  assert.ok(limitsSeen.every((limits) => limits.pullLimit === 1000));
+});
+
+test("runLoop: a retryable failure always backs off exponentially, even after entering catch-up (no hot loop)", async () => {
+  const sleeps = [];
+  let i = 0;
+  await assert.rejects(() => runLoop(config, {}, {
+    cycleCall: async () => {
+      i += 1;
+      if (i === 1) return { pushSaturated: true }; // enter catch-up (would otherwise skip the wait)
+      if (i <= 3) { const net = new Error("net"); net.retryable = true; throw net; } // two retryable failures
+      const stop = new Error("stop"); stop.retryable = false; throw stop;
+    },
+    sleepCall: async (ms) => { sleeps.push(ms); },
+    isRetryableCall: (error) => error.retryable === true,
+    eventCall: async () => {},
+  }), /stop/);
+  // Cycle 1 saturated -> no wait; then two failures back off 1s, 2s despite catch-up being engaged.
+  assert.deepEqual(sleeps, [1000, 2000]);
+});
+
+test("runLoop: an explicit --limit caps both push and pull page sizes, even in catch-up", async () => {
+  const limitsSeen = [];
+  await assert.rejects(() => runLoop(config, { limit: 50 }, {
+    cycleCall: async (_config, limits) => {
+      limitsSeen.push(limits);
+      if (limitsSeen.length === 1) return { pushSaturated: true }; // would jump to 1000 without a ceiling
+      const stop = new Error("stop"); stop.retryable = false; throw stop;
+    },
+    sleepCall: async () => {},
+    isRetryableCall: (error) => error.retryable === true,
+    eventCall: async () => {},
+  }), /stop/);
+  for (const limits of limitsSeen) {
+    assert.equal(limits.pushLimit, 50);
+    assert.equal(limits.pullLimit, 50);
+  }
+});
+
+test("cycle: a large pull page (backlog present) is requested and accepted at pullLimit — trap 1 regression", async () => {
+  const capabilities = {
+    protocol_version: 1, server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id, team_name: "demo", min_available_seq: "0",
+    current_seq: "500", next_sequence_boundary: "501", accepted_envelope_versions: [1],
+    write_allowed_ciphers: ["none"], policy_revision: "0", effective_from_seq: "1",
+    max_blob_bytes: "1048576", policy_history: [{ policy_revision: "0",
+      effective_from_seq: "1", accepted_envelope_versions: [1],
+      write_allowed_ciphers: ["none"] }],
+  };
+  // 500 contiguous messages — larger than the steady 100 page. If the pull
+  // validation still read a 100-sized limit, this would throw "pull page is
+  // invalid"; a normal (no-backlog) test never receives a page this big.
+  const messages = Array.from({ length: 500 }, (_unused, index) => ({
+    id: `550e8400-e29b-41d4-a716-${String(index + 1).padStart(12, "0")}`,
+    server_seq: String(index + 1),
+    envelope: { v: 1, cipher: "none", key_id: null, blob: "e30=" },
+  }));
+  let pullPath = null;
+  const result = await cycle(config, { pushLimit: 100, pullLimit: 1000 }, {
+    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    requestCall: async (_config, path) => {
+      if (path === "/v1/capabilities") return capabilities;
+      if (path.startsWith("/v1/messages?after=")) { pullPath = path; return { messages, next_after: "500", has_more: false }; }
+      throw new Error(`unexpected request ${path}`);
+    },
+    driverCall: async (operation) => {
+      if (operation === "prepare") {
+        return [{ type: "sync_state", driver_generation: "018f3f7e-0000-7000-8000-000000000099", transport_cursor: "0" }];
+      }
+      if (operation === "apply") return [{ type: "sync_apply_result", transport_cursor: "500", corrupt_count: 0 }];
+      throw new Error(`unexpected driver op ${operation}`);
+    },
+    evaluateCall: async () => ({ status: "imported", policy_revision: "0", local_security_revision: "0" }),
+    logApplyCall: async () => {},
+    eventCall: async () => {},
+    readStateCycleCall: async () => {},
+  });
+  // The request used the large pull limit, and the 500-message page was accepted (no throw).
+  assert.match(pullPath, /limit=1000/);
+  // No push candidates were prepared, so push is not saturated.
+  assert.equal(result.pushSaturated, false);
+});
+
+// ---- pushSaturated is computed by cycle itself (B2 test gate) ----
+// These exercise cycle's own `writeProfile.eligible && candidates.length ===
+// pushLimit`; the runLoop tests above hand-write pushSaturated, so without
+// these a broken signal in cycle would leave every adaptive test green.
+
+function capsFor(writeCiphers) {
+  return {
+    protocol_version: 1, server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id, team_name: "demo", min_available_seq: "0",
+    current_seq: "0", next_sequence_boundary: "1", accepted_envelope_versions: [1],
+    write_allowed_ciphers: writeCiphers, policy_revision: "0", effective_from_seq: "1",
+    max_blob_bytes: "1048576", policy_history: [{ policy_revision: "0",
+      effective_from_seq: "1", accepted_envelope_versions: [1], write_allowed_ciphers: writeCiphers }],
+  };
+}
+function pushCandidateRecord(n) {
+  return { type: "sync_push_candidate", local_position: String(n),
+    id: `550e8400-e29b-41d4-a716-${String(n).padStart(12, "0")}`,
+    envelope: { v: 1, cipher: "none", key_id: null, blob: "e30=" } };
+}
+async function runCycleWithPush({ writeCiphers, candidateCount, pushLimit }) {
+  const capabilities = capsFor(writeCiphers);
+  const prepared = [
+    { type: "sync_state", driver_generation: "018f3f7e-0000-7000-8000-000000000099", transport_cursor: "0" },
+    ...Array.from({ length: candidateCount }, (_unused, index) => pushCandidateRecord(index + 1)),
+  ];
+  let posted = false;
+  let reconcileCalled = false;
+  const result = await cycle(config, { pushLimit, pullLimit: 1000 }, {
+    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    requestCall: async (_config, path, init) => {
+      if (path === "/v1/capabilities") return capabilities;
+      if (path === "/v1/messages" && init?.method === "POST") {
+        posted = true;
+        const body = JSON.parse(init.body);
+        return { acks: body.messages.map((message, index) => ({ id: message.id, server_seq: String(index + 1), disposition: "stored" })) };
+      }
+      if (path.startsWith("/v1/messages?after=")) return { messages: [], next_after: "0", has_more: false };
+      throw new Error(`unexpected request ${path}`);
+    },
+    driverCall: async (operation) => {
+      if (operation === "prepare") return prepared;
+      if (operation === "reconcile") { reconcileCalled = true; return [{ type: "sync_reconcile_result" }]; }
+      if (operation === "apply") return [{ type: "sync_apply_result", transport_cursor: "0", corrupt_count: 0 }];
+      throw new Error(`unexpected driver op ${operation}`);
+    },
+    evaluateCall: async () => ({ status: "imported" }),
+    logApplyCall: async () => {},
+    eventCall: async () => {},
+    readStateCycleCall: async () => {},
+  });
+  return { result, posted, reconcileCalled };
+}
+
+test("cycle: pushSaturated is true only for an eligible, full push page (B2 wiring)", async () => {
+  const full = await runCycleWithPush({ writeCiphers: ["none"], candidateCount: 2, pushLimit: 2 });
+  assert.equal(full.result.pushSaturated, true);
+  assert.equal(full.posted, true);
+});
+
+test("cycle: pushSaturated is false for an eligible short push page (B2 wiring)", async () => {
+  const short = await runCycleWithPush({ writeCiphers: ["none"], candidateCount: 1, pushLimit: 2 });
+  assert.equal(short.result.pushSaturated, false);
+});
+
+test("cycle: pushSaturated is false when the write profile is ineligible, even with a full-shaped page (B2 wiring)", async () => {
+  // ["age-v1"] with no "none" makes the plaintext profile ineligible.
+  const blocked = await runCycleWithPush({ writeCiphers: ["age-v1"], candidateCount: 2, pushLimit: 2 });
+  assert.equal(blocked.result.pushSaturated, false);
+  assert.equal(blocked.posted, false); // ineligible profile never POSTs
+  assert.equal(blocked.reconcileCalled, false);
+});
+
+test("cycle: a batch that fails after prepare re-sends the same candidates and converges on duplicate acks (B3, design-mandated)", async () => {
+  const capabilities = capsFor(["none"]);
+  const candidateIds = ["550e8400-e29b-41d4-a716-000000000001", "550e8400-e29b-41d4-a716-000000000002"];
+  let reconciled = false;
+  let postAttempts = 0;
+  let reconcileAcks = null;
+  const postedIdsPerAttempt = [];
+  const deps = {
+    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    requestCall: async (_config, path, init) => {
+      if (path === "/v1/capabilities") return capabilities;
+      if (path === "/v1/messages" && init?.method === "POST") {
+        postAttempts += 1;
+        const body = JSON.parse(init.body);
+        postedIdsPerAttempt.push(body.messages.map((message) => message.id));
+        if (postAttempts === 1) { const error = new Error("network"); error.retryable = true; throw error; }
+        return { acks: body.messages.map((message, index) => ({ id: message.id, server_seq: String(index + 1), disposition: "duplicate" })) };
+      }
+      if (path.startsWith("/v1/messages?after=")) return { messages: [], next_after: "0", has_more: false };
+      throw new Error(`unexpected request ${path}`);
+    },
+    driverCall: async (operation, _config, input) => {
+      if (operation === "prepare") {
+        // The same candidates are offered until they are reconciled; a failed
+        // POST leaves reconcile unrun, so the next cycle re-prepares them.
+        return [{ type: "sync_state", driver_generation: "018f3f7e-0000-7000-8000-000000000099", transport_cursor: "0" },
+          ...(reconciled ? [] : candidateIds.map((id, index) => ({ type: "sync_push_candidate",
+            local_position: String(index + 1), id, envelope: { v: 1, cipher: "none", key_id: null, blob: "e30=" } })))];
+      }
+      if (operation === "reconcile") { reconciled = true; reconcileAcks = input; return [{ type: "sync_reconcile_result" }]; }
+      if (operation === "apply") return [{ type: "sync_apply_result", transport_cursor: "0", corrupt_count: 0 }];
+      throw new Error(`unexpected driver op ${operation}`);
+    },
+    evaluateCall: async () => ({ status: "imported" }),
+    logApplyCall: async () => {},
+    eventCall: async () => {},
+    readStateCycleCall: async () => {},
+  };
+  // Cycle 1: POST fails after prepare -> cycle throws, reconcile is NOT run.
+  await assert.rejects(() => cycle(config, { pushLimit: 100, pullLimit: 1000 }, deps), /network/);
+  assert.equal(reconciled, false);
+  // Cycle 2: the same candidates are re-prepared, the POST succeeds with
+  // duplicate acks, and reconcile receives exactly those ids in order.
+  await cycle(config, { pushLimit: 100, pullLimit: 1000 }, deps);
+  assert.equal(postAttempts, 2);
+  // Both attempts posted the SAME range of candidate ids (the "same range" the
+  // design mandates), and reconcile received exactly those ids as duplicates.
+  assert.deepEqual(postedIdsPerAttempt, [candidateIds, candidateIds]);
+  assert.deepEqual(reconcileAcks.map((ack) => ack.id), candidateIds);
+  assert.ok(reconcileAcks.every((ack) => ack.disposition === "duplicate"));
 });

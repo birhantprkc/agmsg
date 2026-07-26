@@ -1270,44 +1270,66 @@ export async function readStateCycle(config, limit, dependencies = {}) {
   }
 }
 
-async function cycle(config, limit) {
-  const ready = await health(config.server_url);
+// A single sync cycle: push one page (up to pushLimit) + drain the pull side
+// to exhaustion. pushLimit and pullLimit are decoupled — the pull page is
+// sized generously so a large pull backlog drains in few round-trips, while
+// pushLimit follows the adaptive cadence (see runLoop). Returns
+// `{ pushSaturated }`: true when a FULL push page was prepared (more remains
+// to push), which is the loop's catch-up signal. Dependency-injectable for
+// tests (adaptive-sync-catchup design).
+export async function cycle(config, { pushLimit, pullLimit }, dependencies = {}) {
+  const healthCall = dependencies.healthCall ?? health;
+  const requestCall = dependencies.requestCall ?? request;
+  const driverCall = dependencies.driverCall ?? driver;
+  const eventCall = dependencies.eventCall ?? event;
+  const evaluateCall = dependencies.evaluateCall ?? evaluatePull;
+  const logApplyCall = dependencies.logApplyCall ?? logApplyOutcomes;
+  const readStateCycleCall = dependencies.readStateCycleCall ?? readStateCycle;
+
+  const ready = await healthCall(config.server_url);
   if (ready.server_instance_id !== config.server_instance_id) throw new Error("health server instance changed");
-  const capabilities = await request(config, "/v1/capabilities");
+  const capabilities = await requestCall(config, "/v1/capabilities");
   validateCapabilities(config, capabilities);
-  await event("capabilities", { team: config.local_team, current_seq: capabilities.current_seq,
+  await eventCall("capabilities", { team: config.local_team, current_seq: capabilities.current_seq,
     policy_revision: capabilities.policy_revision });
 
   const writeProfile = selectWriteProfile(config, capabilities);
-  const prepared = await driver("prepare", config, [{ type: "sync_prepare", envelope_v: 1,
+  const prepared = await driverCall("prepare", config, [{ type: "sync_prepare", envelope_v: 1,
     cipher: writeProfile.profile, key_id: writeProfile.key_id ?? null,
     recipients: writeProfile.recipients ?? [], max_blob_bytes: Number(capabilities.max_blob_bytes),
-    allow_new: writeProfile.eligible }], [String(limit)]);
+    allow_new: writeProfile.eligible }], [String(pushLimit)]);
   const state = prepared.find((record) => record.type === "sync_state");
   const candidates = prepared.filter((record) => record.type === "sync_push_candidate");
   if (!state) throw new Error("driver omitted sync_state");
   sequence(state.transport_cursor, "transport_cursor");
-  await event("push.prepared", { count: candidates.length, local_positions: candidates.map((item) => item.local_position),
+  await eventCall("push.prepared", { count: candidates.length, local_positions: candidates.map((item) => item.local_position),
     wire_ids: candidates.map((item) => item.id) });
 
   if (!writeProfile.eligible) {
-    await event("push.blocked", { reason: writeProfile.reason });
+    await eventCall("push.blocked", { reason: writeProfile.reason });
   } else if (candidates.length > 0) {
-    const posted = await request(config, "/v1/messages", { method: "POST",
+    const posted = await requestCall(config, "/v1/messages", { method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ messages: candidates.map(({ id, envelope }) => ({ id, envelope })) }) });
     const ackRecords = validateAckMapping(candidates, posted.acks);
-    await event("push.ack", { acks: ackRecords.map(({ id, server_seq, disposition }) => ({ id, server_seq, disposition })) });
-    const reconciled = await driver("reconcile", config, ackRecords);
-    await event("push.reconciled", { result: reconciled[0] ?? null });
+    await eventCall("push.ack", { acks: ackRecords.map(({ id, server_seq, disposition }) => ({ id, server_seq, disposition })) });
+    const reconciled = await driverCall("reconcile", config, ackRecords);
+    await eventCall("push.reconciled", { result: reconciled[0] ?? null });
   }
+  // A full push page (and eligible) means at least a full page was available,
+  // so the loop treats it as "more remains" and stays in catch-up. An exactly-
+  // full page (remainder 0) costs one extra probe cycle that finds nothing —
+  // safe. Not eligible, or a short page, = push is drained.
+  const pushSaturated = writeProfile.eligible && candidates.length === pushLimit;
 
   let cursor = state.transport_cursor;
   let pullCapabilities = capabilities;
   for (;;) {
-    const page = await request(config, `/v1/messages?after=${encodeURIComponent(cursor)}&limit=${limit}`);
+    // Trap 1: the request param AND this validation must both use pullLimit —
+    // fixing only one makes a legitimate full page throw "pull page is invalid".
+    const page = await requestCall(config, `/v1/messages?after=${encodeURIComponent(cursor)}&limit=${pullLimit}`);
     sequence(page.next_after, "next_after");
-    if (!Array.isArray(page.messages) || page.messages.length > limit || typeof page.has_more !== "boolean") {
+    if (!Array.isArray(page.messages) || page.messages.length > pullLimit || typeof page.has_more !== "boolean") {
       throw new Error("pull page is invalid");
     }
     let expected = BigInt(cursor) + 1n;
@@ -1321,7 +1343,7 @@ async function cycle(config, limit) {
       throw new Error("pull page cursor/has_more is inconsistent");
     }
     if (BigInt(page.next_after) > BigInt(pullCapabilities.current_seq)) {
-      pullCapabilities = await request(config, "/v1/capabilities");
+      pullCapabilities = await requestCall(config, "/v1/capabilities");
       validateCapabilities(config, pullCapabilities);
       if (BigInt(page.next_after) > BigInt(pullCapabilities.current_seq)) {
         throw new Error("capability history does not cover the pull page");
@@ -1329,19 +1351,71 @@ async function cycle(config, limit) {
     }
     const records = [];
     for (const message of page.messages) {
-      const evaluated = await evaluatePull(config, pullCapabilities, message);
+      const evaluated = await evaluateCall(config, pullCapabilities, message);
       records.push({ type: "sync_pull_message", ...message, ...evaluated });
     }
     records.push({ type: "sync_pull_cursor", next_after: page.next_after });
-    await event("pull.received", { after: cursor, next_after: page.next_after,
+    await eventCall("pull.received", { after: cursor, next_after: page.next_after,
       messages: page.messages.map((message) => ({ id: message.id, server_seq: message.server_seq })) });
-    const applied = await driver("apply", config, records);
-    await logApplyOutcomes(config, records, applied);
-    await event("pull.applied", { result: applied[0] ?? null });
+    const applied = await driverCall("apply", config, records);
+    await logApplyCall(config, records, applied);
+    await eventCall("pull.applied", { result: applied[0] ?? null });
     cursor = page.next_after;
     if (!page.has_more) break;
   }
-  await readStateCycle(config, limit);
+  await readStateCycleCall(config, pullLimit, dependencies);
+  return { pushSaturated };
+}
+
+// Adaptive catch-up loop (adaptive-sync-catchup design). Steady state is
+// byte-for-byte the old behaviour: push a 100-page, wait `interval`. When a
+// push page saturates (a full page prepared → backlog), the loop switches to
+// catch-up: push at 1000 with NO inter-cycle wait, until a cycle is no longer
+// saturated. The 100-vs-1000 page-size gap is itself the hysteresis band, so
+// there is no threshold to flap around. Failure backoff is INDEPENDENT of the
+// cadence: after any retryable failure the loop always backs off (exponential,
+// capped), so a machine that can't reach the server never hot-loops even while
+// catch-up would otherwise skip the wait.
+export async function runLoop(config, options, dependencies = {}) {
+  const cycleCall = dependencies.cycleCall ?? cycle;
+  const sleepCall = dependencies.sleepCall ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const eventCall = dependencies.eventCall ?? event;
+  const isRetryableCall = dependencies.isRetryableCall ?? isRetryable;
+
+  // An explicit --limit is a ceiling for BOTH push and pull (request size /
+  // memory / slow-link timeout); only the default lets the loop go large.
+  const ceiling = options.limit !== undefined ? Math.min(1000, options.limit) : null;
+  const steadyIntervalMs = (options.interval ?? 5) * 1000;
+  const STEADY_PUSH_LIMIT = 100;
+  const LARGE_LIMIT = 1000;
+  const BASE_BACKOFF_MS = 1000;
+  const MAX_BACKOFF_MS = 60000;
+
+  let catchUp = false; // start steady; the first cycle reveals any backlog
+  let consecutiveFailures = 0;
+  for (;;) {
+    const pushLimit = ceiling ?? (catchUp ? LARGE_LIMIT : STEADY_PUSH_LIMIT);
+    const pullLimit = ceiling ?? LARGE_LIMIT;
+    try {
+      const result = await cycleCall(config, { pushLimit, pullLimit }, dependencies);
+      consecutiveFailures = 0;
+      catchUp = result?.pushSaturated === true;
+      // catch-up removes the wait ONLY between successful, progress-making
+      // cycles; steady keeps the interval. --interval never applies in
+      // catch-up (a saturated cycle is moving real data, not empty-polling).
+      if (!catchUp) await sleepCall(steadyIntervalMs);
+    } catch (error) {
+      // Best-effort: a logging failure must not abort failure handling or the
+      // backoff below (event() can throw when AGMSG_SYNC_LOG_FILE append fails).
+      try {
+        await eventCall("cycle.error", { message: error.message, code: error.code ?? null });
+      } catch { /* logging is best-effort */ }
+      if (!isRetryableCall(error)) throw error;
+      consecutiveFailures += 1;
+      const backoffMs = Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2 ** (consecutiveFailures - 1));
+      await sleepCall(backoffMs); // always back off after a failure, in either cadence
+    }
+  }
 }
 
 function reprocessCandidateToken(candidate) {
@@ -1559,17 +1633,18 @@ async function main() {
     return;
   }
   if (command === "reprocess") { await reprocessCycle(config, limit); return; }
-  if (command === "once") { await cycle(config, limit); return; }
+  // An explicit --limit caps both push and pull; the default lets pull go large.
+  const explicitCeiling = args.limit !== undefined ? Math.min(1000, limit) : null;
+  if (command === "once") {
+    await cycle(config, { pushLimit: explicitCeiling ?? 100, pullLimit: explicitCeiling ?? 1000 });
+    return;
+  }
   const interval = Number(args.interval ?? 5);
   if (!Number.isFinite(interval) || interval < 0.2) throw new Error("interval must be at least 0.2 seconds");
-  for (;;) {
-    try { await cycle(config, limit); }
-    catch (error) {
-      await event("cycle.error", { message: error.message, code: error.code ?? null });
-      if (!isRetryable(error)) throw error;
-    }
-    await new Promise((resolve) => setTimeout(resolve, interval * 1000));
-  }
+  await runLoop(config, {
+    limit: args.limit !== undefined ? limit : undefined,
+    interval: args.interval !== undefined ? interval : undefined,
+  });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
