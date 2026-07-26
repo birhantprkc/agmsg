@@ -150,7 +150,7 @@ cmd_doctor() {
     failed=1
   fi
   echo
-  if command -v python3 >/dev/null 2>&1; then
+  if agmsg_python3_usable; then
     echo "  [x] python3 on PATH"
   else
     echo "  [ ] python3 on PATH"
