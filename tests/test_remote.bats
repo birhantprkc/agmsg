@@ -179,7 +179,7 @@ restart_mock_server() {
 
 @test "connect: credential file is 0600 and never appears in team config.json" {
   bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
-  perms=$(stat -f "%Lp" "$SCRIPTS/../run/remote-credentials/myteam.json" 2>/dev/null || stat -c "%a" "$SCRIPTS/../run/remote-credentials/myteam.json")
+  perms=$(stat -c "%a" "$SCRIPTS/../run/remote-credentials/myteam.json" 2>/dev/null || stat -f "%Lp" "$SCRIPTS/../run/remote-credentials/myteam.json")
   [ "$perms" = "600" ]
   run grep -c "session-credential" "$SCRIPTS/../teams/myteam/config.json"
   [ "$output" -eq 0 ]
@@ -466,7 +466,7 @@ json.dump({
   local quarantined=("$pending_dir/$key.json.unverified."*)
   [ "${#quarantined[@]}" -eq 1 ]
   [ -f "${quarantined[0]}" ]
-  mode=$(stat -f '%Lp' "${quarantined[0]}" 2>/dev/null || stat -c '%a' "${quarantined[0]}")
+  mode=$(stat -c '%a' "${quarantined[0]}" 2>/dev/null || stat -f '%Lp' "${quarantined[0]}")
   [ "$mode" = "600" ]
   recovered_id=$(python3 -c "import json; p=json.load(open('${quarantined[0]}')); print(json.loads(p['raw_response_text'])['credential_id'])")
   [ "$recovered_id" = "018f3f7e-8888-7000-8000-000000000008" ]
@@ -1043,6 +1043,9 @@ VALUES ('remote-pending.$key', $owner_pid, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 }
 
 @test "remote doctor: passes overall only when age, python3, AND node are all usable" {
+  command -v age >/dev/null 2>&1 && command -v age-keygen >/dev/null 2>&1 \
+    && command -v python3 >/dev/null 2>&1 && command -v node >/dev/null 2>&1 \
+    || skip "all doctor prerequisites are not installed"
   run bash "$SCRIPTS/remote.sh" doctor
   [ "$status" -eq 0 ]
   [[ "$output" == *"All checks passed."* ]]

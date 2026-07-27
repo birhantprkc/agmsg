@@ -186,6 +186,8 @@ route_get() {
         return
       fi
       local team="$1"
+      # Validate before the value is used by the members filesystem path.
+      agmsg_validate_team_name "$team" || exit 1
       shift
       local sub="${1:?Usage: api.sh get teams <team> members|messages ...}"
       shift
