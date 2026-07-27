@@ -340,8 +340,16 @@ while true; do
         DELIVERED_IDS+=("$id")
       done <<< "$ROWS"
       if [ -n "$FINAL_CURSOR" ]; then
-        storage_read_cursor_consume "$pair_team" "$pair_agent" "$FINAL_CURSOR" \
-          "${DELIVERED_IDS[@]}" >/dev/null 2>&1 || true
+        # Bash 3 with `set -u` treats an empty array expansion as unbound. A
+        # cursor-only page is valid, so advance it without optional IDs in that
+        # case (and preserve exact delivered IDs when there are any).
+        if [ "${#DELIVERED_IDS[@]}" -gt 0 ]; then
+          storage_read_cursor_consume "$pair_team" "$pair_agent" "$FINAL_CURSOR" \
+            "${DELIVERED_IDS[@]}" >/dev/null 2>&1 || true
+        else
+          storage_read_cursor_consume "$pair_team" "$pair_agent" "$FINAL_CURSOR" \
+            >/dev/null 2>&1 || true
+        fi
       fi
       if [ -n "$DESPAWN_TARGET" ]; then
         "$SCRIPT_DIR/reset.sh" "$PROJECT_PATH" "$AGENT_TYPE" "$DESPAWN_TARGET" "$SESSION_ID" >/dev/null 2>&1 || true
