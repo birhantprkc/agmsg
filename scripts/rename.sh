@@ -17,8 +17,12 @@ source "$SCRIPT_DIR/lib/registry-lock.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/validate.sh"
 agmsg_validate_team_name "$TEAM" || exit 1
+agmsg_validate_agent_name "$OLD_NAME" || exit 1
+agmsg_validate_agent_name "$NEW_NAME" || exit 1
 TEAMS_DIR="$SCRIPT_DIR/../teams"
 DB="$(agmsg_db_path)"
+OLD_NAME_SQL=$(agmsg_sqlesc "$OLD_NAME")
+NEW_NAME_SQL=$(agmsg_sqlesc "$NEW_NAME")
 TEAM_CONFIG="$TEAMS_DIR/$TEAM/config.json"
 
 if [ ! -f "$TEAM_CONFIG" ]; then
@@ -34,24 +38,24 @@ agmsg_lock_acquire "$TEAMS_DIR/$TEAM" || exit 1
 CONFIG_ESCAPED=$(sed "s/'/''/g" "$TEAM_CONFIG")
 
 # Check old exists
-OLD_VAL=$(agmsg_sqlite_mem ".param set :json '$CONFIG_ESCAPED'" \
-  "SELECT json_extract(:json, '$.agents.$OLD_NAME');")
+OLD_VAL=$(agmsg_sqlite_mem \
+  "SELECT json_extract('$CONFIG_ESCAPED', '\$.agents.' || '$OLD_NAME_SQL');")
 if [ -z "$OLD_VAL" ] || [ "$OLD_VAL" = "null" ]; then
   echo "Agent $OLD_NAME not in team $TEAM"
   exit 1
 fi
 
 # Check new doesn't exist
-NEW_VAL=$(agmsg_sqlite_mem ".param set :json '$CONFIG_ESCAPED'" \
-  "SELECT json_extract(:json, '$.agents.$NEW_NAME');")
+NEW_VAL=$(agmsg_sqlite_mem \
+  "SELECT json_extract('$CONFIG_ESCAPED', '\$.agents.' || '$NEW_NAME_SQL');")
 if [ -n "$NEW_VAL" ] && [ "$NEW_VAL" != "null" ]; then
   echo "Agent $NEW_NAME already exists in team $TEAM"
   exit 1
 fi
 
 # Rename: set new key with old value, remove old key
-UPDATED=$(agmsg_sqlite_mem ".param set :json '$CONFIG_ESCAPED'" \
-  "SELECT json_remove(json_set(:json, '$.agents.$NEW_NAME', json_extract(:json, '$.agents.$OLD_NAME')), '$.agents.$OLD_NAME');")
+UPDATED=$(agmsg_sqlite_mem \
+  "SELECT json_remove(json_set('$CONFIG_ESCAPED', '\$.agents.' || '$NEW_NAME_SQL', json_extract('$CONFIG_ESCAPED', '\$.agents.' || '$OLD_NAME_SQL')), '\$.agents.' || '$OLD_NAME_SQL');")
 
 # Tombstone the old name so a later join/actas can't silently revive it (#360):
 # a CLI's slash-command history can resubmit `/agmsg actas <old_name>` well
@@ -61,8 +65,6 @@ UPDATED=$(agmsg_sqlite_mem ".param set :json '$CONFIG_ESCAPED'" \
 # the old name) so a name containing a single quote can't break the JSON path
 # expression the way `$.agents.$OLD_NAME` above requires it not to — from/to
 # are bound as ordinary SQL string values, never spliced into a path.
-OLD_NAME_SQL=$(agmsg_sqlesc "$OLD_NAME")
-NEW_NAME_SQL=$(agmsg_sqlesc "$NEW_NAME")
 RENAMED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 UPDATED_ESCAPED=$(printf '%s' "$UPDATED" | sed "s/'/''/g")
 UPDATED=$(agmsg_sqlite_mem ".param set :json '$UPDATED_ESCAPED'" \
