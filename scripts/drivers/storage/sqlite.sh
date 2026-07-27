@@ -180,9 +180,12 @@ storage_send() {
   # CREATE TABLE/INDEX statements — on EVERY send serializes badly under a
   # concurrent first-write fan-out and lost rows past the busy_timeout. The common
   # path is now a single INSERT; only a missing table pays the init + retry.
-  if ! agmsg_sqlite "$db" "$insert" >/dev/null 2>&1; then
+  # Keep message bodies out of argv. Linux can impose a much smaller effective
+  # argv ceiling than macOS, so a valid large local message must travel on
+  # sqlite3's stdin rather than as the final command-line SQL argument.
+  if ! printf '%s\n' "$insert" | agmsg_sqlite "$db" >/dev/null 2>&1; then
     storage_init >/dev/null
-    agmsg_sqlite "$db" "$insert" >/dev/null 2>&1 || return 1
+    printf '%s\n' "$insert" | agmsg_sqlite "$db" >/dev/null 2>&1 || return 1
   fi
   printf '%s\n' "$id"
 }
