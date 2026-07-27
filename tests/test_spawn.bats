@@ -22,9 +22,13 @@ EOF
   chmod +x "$STUB_BIN/record.sh"
   export PATH="$STUB_BIN:$PATH"
 
-  # Never inherit a real tmux server from the test runner — force the
-  # OS-terminal path, which we redirect into record.sh via a {cmd} template.
+  # Never inherit a real tmux server or herdr env from the test runner —
+  # force the OS-terminal path, which we redirect into record.sh via a {cmd}
+  # template. Unsetting HERDR_ENV/HERDR_PANE_ID is critical when the test
+  # runner itself is inside herdr: a real herdr pane split would affect the
+  # live session.
   unset TMUX
+  unset HERDR_ENV HERDR_PANE_ID HERDR_WORKSPACE_ID
   export AGMSG_TERMINAL="$STUB_BIN/record.sh {cmd}"
 
   export PROJ="$TEST_SKILL_DIR/proj"
@@ -948,4 +952,194 @@ EOF
   # ...and the bare boot path is still the launched command.
   run grep -E 'split-window .* /.*boot-' "$cap"
   [ "$status" -eq 0 ]
+}
+
+# --- herdr placement ---
+
+# Helper: set up a fake herdr binary that records calls and returns canned JSON.
+_setup_fake_herdr() {
+  local herdr_stub="$STUB_BIN/herdr"
+  export HERDR_CALL_LOG="$TEST_SKILL_DIR/herdr-calls.log"
+  cat > "$herdr_stub" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$HERDR_CALL_LOG"
+# Responses are overridable so a test can hand back a differently shaped
+# document (reordered keys, nested fields, extra pane objects) without
+# rewriting the stub.
+DEFAULT_SPLIT='{"id":"cli:pane:split","result":{"pane":{"pane_id":"wT:pN","tab_id":"wT:tA"},"type":"pane_info"}}'
+DEFAULT_TAB='{"id":"cli:tab:create","result":{"root_pane":{"pane_id":"wT:pR","tab_id":"wT:tN"},"tab":{"tab_id":"wT:tN","label":"test"},"type":"tab_created"}}'
+case "$1/$2" in
+  pane/split)
+    printf '%s\n' "${HERDR_SPLIT_RESPONSE:-$DEFAULT_SPLIT}"
+    ;;
+  pane/rename|pane/run|pane/close)
+    echo '{"id":"cli:pane:'"$2"'","result":{"type":"ok"}}'
+    ;;
+  tab/create)
+    printf '%s\n' "${HERDR_TAB_RESPONSE:-$DEFAULT_TAB}"
+    ;;
+  tab/close)
+    echo '{"id":"cli:tab:close","result":{"type":"ok"}}'
+    ;;
+  *)
+    echo '{"error":"unknown stub call: '"$*"'}' >&2
+    exit 1
+    ;;
+esac
+STUB
+  chmod +x "$herdr_stub"
+  export HERDR_ENV=1
+  export HERDR_PANE_ID="wT:pSelf"
+  export HERDR_WORKSPACE_ID="wT"
+  # Clear the terminal template so spawn does not take the template path.
+  unset AGMSG_TERMINAL
+  # Ensure the run/ directory exists for placement records.
+  mkdir -p "$TEST_SKILL_DIR/run"
+}
+
+@test "spawn: herdr split — launches in a herdr pane with herdr: placement record" {
+  _setup_fake_herdr
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"spawned claude-code 'alice' in herdr"* ]]
+
+  # herdr was called: pane split, pane rename, pane run.
+  grep -q "pane split wT:pSelf --direction right --no-focus" "$HERDR_CALL_LOG"
+  grep -q "pane rename wT:pN alice" "$HERDR_CALL_LOG"
+  grep -q "pane run wT:pN" "$HERDR_CALL_LOG"
+
+  # Placement record uses herdr: scheme tag.
+  local rec="$TEST_SKILL_DIR/run/spawn.myteam__alice"
+  [ -f "$rec" ]
+  local rec_id
+  IFS=$'\t' read -r rec_id _ _ < "$rec"
+  [ "$rec_id" = "herdr:wT:pN" ]
+}
+
+@test "spawn: herdr split --split v maps to --direction down" {
+  _setup_fake_herdr
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait --split v
+  [ "$status" -eq 0 ]
+  grep -q "pane split wT:pSelf --direction down --no-focus" "$HERDR_CALL_LOG"
+}
+
+@test "spawn: herdr --window uses tab create and extracts root_pane pane_id" {
+  _setup_fake_herdr
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait --window
+  [ "$status" -eq 0 ]
+  grep -q "tab create --workspace wT --label alice" "$HERDR_CALL_LOG"
+  grep -q "pane run wT:pR" "$HERDR_CALL_LOG"
+
+  local rec="$TEST_SKILL_DIR/run/spawn.myteam__alice"
+  [ -f "$rec" ]
+  local rec_id
+  IFS=$'\t' read -r rec_id _ _ < "$rec"
+  [ "$rec_id" = "herdr:wT:pR" ]
+}
+
+@test "spawn: herdr --window falls back to split when HERDR_WORKSPACE_ID is unset" {
+  _setup_fake_herdr
+  unset HERDR_WORKSPACE_ID
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait --window
+  [ "$status" -eq 0 ]
+  # Fell back to split, not tab create.
+  ! grep -q "tab create" "$HERDR_CALL_LOG"
+  grep -q "pane split" "$HERDR_CALL_LOG"
+}
+
+@test "spawn: tmux takes priority over herdr (backward compat for tmux-inside-herdr)" {
+  _setup_fake_herdr
+  # Set $TMUX so the tmux path wins; re-set the terminal template so the test
+  # doesn't actually run tmux (use the stub recorder).
+  export TMUX="/tmp/fake,1,0"
+  export AGMSG_TERMINAL="$STUB_BIN/record.sh {cmd}"
+  # Provide a tmux stub that just records the call.
+  cat > "$STUB_BIN/tmux" <<'TMUXSTUB'
+#!/usr/bin/env bash
+case "$1" in
+  split-window) echo "%99" ;;
+  select-pane|set-window-option) ;;
+esac
+TMUXSTUB
+  chmod +x "$STUB_BIN/tmux"
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"in tmux"* ]]
+  # herdr was NOT called.
+  [ ! -f "$HERDR_CALL_LOG" ] || ! grep -q "pane split" "$HERDR_CALL_LOG"
+}
+
+# --- herdr response parsing: address the pane id by path, never by position ---
+#
+# herdr's replies are structured JSON, so key order and neighbouring objects
+# are not part of the contract. Reading the id positionally (last "pane_id" in
+# the text, or the first one inside a `[^}]*` window) silently selects a
+# different pane when the shape shifts — spawn would then rename that pane, run
+# the boot script in it, and persist its id as the placement record. These fix
+# the shapes that break positional matching.
+
+_spawn_recorded_id() {
+  local rec="$TEST_SKILL_DIR/run/spawn.myteam__alice" id
+  [ -f "$rec" ] || return 1
+  IFS=$'\t' read -r id _ _ < "$rec"
+  printf '%s' "$id"
+}
+
+@test "spawn: herdr split picks result.pane.pane_id even when another pane object follows it" {
+  _setup_fake_herdr
+  # A second pane object after the target: a trailing-match reader takes
+  # wT:pWRONG and would drive the wrong pane.
+  export HERDR_SPLIT_RESPONSE='{"id":"cli:pane:split","result":{"pane":{"pane_id":"wT:pRIGHT"},"neighbor":{"pane_id":"wT:pWRONG"}},"type":"pane_info"}'
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait
+  [ "$status" -eq 0 ]
+  grep -q "pane run wT:pRIGHT" "$HERDR_CALL_LOG"
+  ! grep -q "wT:pWRONG" "$HERDR_CALL_LOG"
+  [ "$(_spawn_recorded_id)" = "herdr:wT:pRIGHT" ]
+}
+
+@test "spawn: herdr split tolerates reordered keys in the pane object" {
+  _setup_fake_herdr
+  export HERDR_SPLIT_RESPONSE='{"result":{"type":"pane_info","pane":{"tab_id":"wT:tA","cwd":"/x","pane_id":"wT:pLAST"}},"id":"cli:pane:split"}'
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait
+  [ "$status" -eq 0 ]
+  [ "$(_spawn_recorded_id)" = "herdr:wT:pLAST" ]
+}
+
+@test "spawn: herdr --window reads root_pane.pane_id past a nested object" {
+  _setup_fake_herdr
+  # `scroll` and `agent_session` are real herdr fields that sort before
+  # pane_id; a `[^}]*` window stops at the first closing brace and misses it.
+  export HERDR_TAB_RESPONSE='{"id":"cli:tab:create","result":{"root_pane":{"agent_session":{"kind":"id"},"scroll":{"offset_from_bottom":0},"pane_id":"wT:pNESTED"},"tab":{"tab_id":"wT:tN","pane_id":"wT:pTABWRONG"},"type":"tab_created"}}'
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait --window
+  [ "$status" -eq 0 ]
+  grep -q "pane run wT:pNESTED" "$HERDR_CALL_LOG"
+  ! grep -q "wT:pTABWRONG" "$HERDR_CALL_LOG"
+  [ "$(_spawn_recorded_id)" = "herdr:wT:pNESTED" ]
+}
+
+@test "spawn: herdr split fails closed on a malformed or unusable response" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  local body
+  # Not JSON at all; the right path missing; and a non-string value. None may
+  # be treated as a usable pane id, and none may leave a placement record.
+  for body in 'not json at all {{{' \
+              '{"id":"cli:pane:split","result":{"type":"ok"}}' \
+              '{"result":{"pane":{"pane_id":42}}}'; do
+    _setup_fake_herdr
+    export HERDR_SPLIT_RESPONSE="$body"
+    run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"could not read result.pane.pane_id"* ]]
+    [ ! -f "$TEST_SKILL_DIR/run/spawn.myteam__alice" ]
+    # Nothing was renamed or run against a guessed id.
+    ! grep -q "pane run" "$HERDR_CALL_LOG"
+  done
 }
