@@ -67,11 +67,11 @@ UPDATED=$(agmsg_sqlite_mem \
 # are bound as ordinary SQL string values, never spliced into a path.
 RENAMED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 UPDATED_ESCAPED=$(printf '%s' "$UPDATED" | sed "s/'/''/g")
-UPDATED=$(agmsg_sqlite_mem ".param set :json '$UPDATED_ESCAPED'" \
-  "SELECT json_set(:json, '\$.renamed',
+UPDATED=$(agmsg_sqlite_mem \
+  "SELECT json_set('$UPDATED_ESCAPED', '\$.renamed',
      json_insert(
-       CASE WHEN json_type(json_extract(:json, '\$.renamed')) = 'array'
-            THEN json_extract(:json, '\$.renamed') ELSE json('[]') END,
+       CASE WHEN json_type(json_extract('$UPDATED_ESCAPED', '\$.renamed')) = 'array'
+            THEN json_extract('$UPDATED_ESCAPED', '\$.renamed') ELSE json('[]') END,
        '\$[#]', json_object('from', '$OLD_NAME_SQL', 'to', '$NEW_NAME_SQL', 'at', '$RENAMED_AT')
      )
    );")
