@@ -167,7 +167,12 @@ storage_list_unread "$2" "$3"`;
     await markRead(storeB, "machine-b", receivedOnB.id);
     await sync(storeB, "once", "--team", localTeam);
     await sync(storeA, "once", "--team", localTeam);
-    expect(await unread(storeA, "machine-b")).toEqual([]);
+    // JSONL advertises Stage 1 only, so its local read cursor must not alter
+    // the SQLite peer's Stage-2 state. The message itself still crossed the
+    // heterogeneous Stage-1 boundary exactly once.
+    expect(await unread(storeA, "machine-b")).toMatchObject([
+      { from: "machine-a", to: "machine-b", body: "fixture from machine A" },
+    ]);
 
     await localSend(storeB, "machine-b", "machine-a", "fixture reply from machine B");
     await sync(storeB, "once", "--team", localTeam);
