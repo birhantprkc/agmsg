@@ -318,13 +318,13 @@ _seed_role_record() {
 JSON
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" stop-test "$TEST_PROJECT" claude-code 3>&- &
   local watch_pid=$!
-  sleep 1
+  wait_for_file "$TEST_SKILL_DIR/run/watch.stop-test.pid"
   [ -f "$TEST_SKILL_DIR/run/watch.stop-test.pid" ]
   run bash "$SCRIPTS/delivery.sh" stop
   [[ "$output" =~ "Killed 1 watch" ]]
   [[ "$output" =~ "AGMSG-DIRECTIVE" ]]
   [ ! -f "$TEST_SKILL_DIR/run/watch.stop-test.pid" ]
-  sleep 1
+  wait_for_pid_exit "$watch_pid"
   ! kill -0 "$watch_pid" 2>/dev/null
 }
 
@@ -371,7 +371,7 @@ JSON
   # A live claude-code watcher for this project.
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" cc-sess "$TEST_PROJECT" claude-code 3>&- &
   local watch_pid=$!
-  sleep 1
+  wait_for_file "$TEST_SKILL_DIR/run/watch.cc-sess.pid"
   [ -f "$TEST_SKILL_DIR/run/watch.cc-sess.pid" ]
   # Switching a DIFFERENT type's delivery in the SAME project must not touch it.
   run bash "$SCRIPTS/delivery.sh" set turn copilot "$TEST_PROJECT"
@@ -389,12 +389,12 @@ JSON
 JSON
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" cc-sess2 "$TEST_PROJECT" claude-code 3>&- &
   local watch_pid=$!
-  sleep 1
+  wait_for_file "$TEST_SKILL_DIR/run/watch.cc-sess2.pid"
   [ -f "$TEST_SKILL_DIR/run/watch.cc-sess2.pid" ]
   run bash "$SCRIPTS/delivery.sh" set off claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
   [ ! -f "$TEST_SKILL_DIR/run/watch.cc-sess2.pid" ]
-  sleep 1
+  wait_for_pid_exit "$watch_pid"
   ! kill -0 "$watch_pid" 2>/dev/null
 }
 
@@ -411,7 +411,7 @@ JSON
 JSON
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sp-sess "$sp" claude-code 3>&- &
   local watch_pid=$!
-  sleep 1
+  wait_for_file "$TEST_SKILL_DIR/run/watch.sp-sess.pid"
   [ -f "$TEST_SKILL_DIR/run/watch.sp-sess.pid" ]
   # Another type's set turn in the SAME space-containing project: must NOT kill it.
   run bash "$SCRIPTS/delivery.sh" set turn copilot "$sp"
@@ -422,7 +422,7 @@ JSON
   run bash "$SCRIPTS/delivery.sh" set off claude-code "$sp"
   [ "$status" -eq 0 ]
   [ ! -f "$TEST_SKILL_DIR/run/watch.sp-sess.pid" ]
-  sleep 1
+  wait_for_pid_exit "$watch_pid"
   ! kill -0 "$watch_pid" 2>/dev/null
 }
 
@@ -437,10 +437,10 @@ JSON
 
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sigterm-test "$TEST_PROJECT" claude-code 3>&- &
   local pid=$!
-  sleep 1
+  wait_for_file "$TEST_SKILL_DIR/run/watch.sigterm-test.pid"
   [ -f "$TEST_SKILL_DIR/run/watch.sigterm-test.pid" ]
   kill -TERM "$pid"
-  sleep 1
+  wait_for_pid_exit "$pid"
   ! kill -0 "$pid" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/watch.sigterm-test.pid" ]
 }
@@ -520,7 +520,7 @@ JSON
   [ -f "$pidfile" ]
   prev_p=$(cat "$pidfile")
   kill "$prev_p"
-  sleep 1
+  wait_for_pid_exit "$prev_p"
   ! kill -0 "$prev_p" 2>/dev/null
 }
 
@@ -621,12 +621,22 @@ has_session_end() {
 # --- session-end.sh behavior ---
 
 @test "session-end.sh kills the watcher matching session_id and removes pidfile" {
-  mkdir -p "$TEST_SKILL_DIR/run"
-  sleep 30 3>&- &
+  # The fixture must be a REAL watcher. session-end.sh only kills a pid whose
+  # command line still looks like watch.sh (pid-recycling safety, see its
+  # comment), so the `sleep 30` stand-in this used to launch could never be
+  # killed — and the assertion passed anyway, so the test never checked what its
+  # name claims. Converting the wait to a poll is what surfaced it: polling
+  # reports the process is still there, where the single post-sleep check did
+  # not.
+  mkdir -p "$TEST_SKILL_DIR/teams/myteam"
+  cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
+{"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
+JSON
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sess-A "$TEST_PROJECT" claude-code 3>&- &
   local target_pid=$!
-  echo "$target_pid" > "$TEST_SKILL_DIR/run/watch.sess-A.pid"
+  wait_for_file "$TEST_SKILL_DIR/run/watch.sess-A.pid"
   echo '{"session_id":"sess-A"}' | bash "$SCRIPTS/session-end.sh" claude-code "$TEST_PROJECT"
-  sleep 1
+  wait_for_pid_exit "$target_pid"
   ! kill -0 "$target_pid" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/watch.sess-A.pid" ]
 }
@@ -985,11 +995,17 @@ JSON
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" t-sid "$TEST_PROJECT" claude-code bob > /tmp/agmsg-as-bob 2>&1 3>&- &
   local pid=$!
   # High-water-mark = MAX(id) at startup, so prior messages aren't replayed.
-  # Insert NEW messages and wait for several poll iterations.
-  sleep 1
+  # The watermark file is written the moment that mark is taken, so waiting for
+  # it — rather than a fixed second — is what actually makes the inserts below
+  # land after the mark.
+  wait_for_file "$TEST_SKILL_DIR/run/watch.t-sid.watermark"
   sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'system', 'alice', 'new-for-alice');"
   sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'system', 'bob', 'new-for-bob');"
-  sleep 3
+  # new-for-bob is the LAST row inserted, so by the time it has been delivered
+  # the watcher has necessarily scanned past new-for-alice. That is what makes
+  # the "alice never arrived" assertion below a real check; the fixed `sleep 3`
+  # it replaces only assumed enough poll iterations had gone by.
+  wait_for_file_contains /tmp/agmsg-as-bob "new-for-bob"
   kill -TERM "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null || true
 
@@ -1081,7 +1097,7 @@ JSON
   # is resolved at launch and not re-evaluated each poll.
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" t-static "$TEST_PROJECT" claude-code > /tmp/agmsg-static 2>&1 3>&- &
   local pid=$!
-  sleep 1
+  wait_for_file "$TEST_SKILL_DIR/run/watch.t-static.watermark"
 
   # Join `bob` to the same (project, type) after the watcher is running.
   bash "$SCRIPTS/join.sh" myteam bob claude-code "$TEST_PROJECT"
@@ -1091,7 +1107,13 @@ JSON
   sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'sys', 'alice', 'for-alice-static');"
   sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'sys', 'bob',   'for-bob-static');"
 
-  sleep 3
+  # A sentinel for alice inserted AFTER bob's row. Its arrival proves the
+  # watcher has already scanned past for-bob-static, which is what makes "bob
+  # never arrived" an assertion rather than a guess. Waiting on
+  # for-alice-static instead would not: it precedes bob's row, so seeing it
+  # says nothing about whether bob's had been reached yet.
+  sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'sys', 'alice', 'static-sentinel');"
+  wait_for_file_contains /tmp/agmsg-static "static-sentinel"
   kill -TERM "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null || true
 
@@ -1120,13 +1142,14 @@ JSON
   local pid_a=$!
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sid-b "$proj_b" claude-code 3>&- &
   local pid_b=$!
-  sleep 1
+  wait_for_file "$TEST_SKILL_DIR/run/watch.sid-a.pid"
+  wait_for_file "$TEST_SKILL_DIR/run/watch.sid-b.pid"
   [ -f "$TEST_SKILL_DIR/run/watch.sid-a.pid" ]
   [ -f "$TEST_SKILL_DIR/run/watch.sid-b.pid" ]
 
   run bash "$SCRIPTS/delivery.sh" set turn claude-code "$proj_a"
   [ "$status" -eq 0 ]
-  sleep 1
+  wait_for_pid_exit "$pid_a"
 
   # Target project A: watcher killed, pidfile removed.
   ! kill -0 "$pid_a" 2>/dev/null
@@ -1158,11 +1181,12 @@ JSON
   local pid_a=$!
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" off-b "$proj_b" claude-code 3>&- &
   local pid_b=$!
-  sleep 1
+  wait_for_file "$TEST_SKILL_DIR/run/watch.off-a.pid"
+  wait_for_file "$TEST_SKILL_DIR/run/watch.off-b.pid"
 
   run bash "$SCRIPTS/delivery.sh" set off claude-code "$proj_a"
   [ "$status" -eq 0 ]
-  sleep 1
+  wait_for_pid_exit "$pid_a"
 
   ! kill -0 "$pid_a" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/watch.off-a.pid" ]
@@ -1190,11 +1214,19 @@ JSON
   local pid_a=$!
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" stop-b "$proj_b" claude-code 3>&- &
   local pid_b=$!
-  sleep 1
+  wait_for_file "$TEST_SKILL_DIR/run/watch.stop-a.pid"
+  wait_for_file "$TEST_SKILL_DIR/run/watch.stop-b.pid"
 
   run bash "$SCRIPTS/delivery.sh" stop
   [[ "$output" =~ "Killed 2 watch" ]]
-  sleep 1
+  # BOTH watchers must be waited for. `stop` sends TERM to each and returns;
+  # the order they actually die in is not guaranteed, so waiting only on A and
+  # asserting B in the same breath races B's exit trap. The `sleep 1` this
+  # replaced happened to cover both — the two other project-scoped tests above
+  # wait on one pid only because their second watcher is asserted to still be
+  # ALIVE, which needs no grace period.
+  wait_for_pid_exit "$pid_a"
+  wait_for_pid_exit "$pid_b"
   ! kill -0 "$pid_a" 2>/dev/null
   ! kill -0 "$pid_b" 2>/dev/null
 
@@ -1946,6 +1978,11 @@ EOF
     > "$rollout_dir/rollout-2020-01-01T00-00-00-stale-by-name-uuid.jsonl"
   printf '%s\n' "{\"type\":\"session_meta\",\"payload\":{\"id\":\"newer-by-name-uuid\",\"cwd\":\"$TEST_PROJECT\"}}" \
     > "$rollout_dir/rollout-2026-06-17T00-00-00-newer-by-name-uuid.jsonl"
+  # Stays a real sleep. This is not waiting for a process to settle — it is
+  # separating two mtimes far enough apart that the code under test can order
+  # them, and filesystem timestamp granularity is a whole second on some of the
+  # filesystems CI runs on. There is no condition to poll for: the thing being
+  # waited on is the clock itself.
   sleep 1
   touch "$rollout_dir/rollout-2020-01-01T00-00-00-stale-by-name-uuid.jsonl"
 
@@ -2045,7 +2082,7 @@ EOF
 JSON
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" hermes-preserve-test "$TEST_PROJECT" claude-code 3>&- &
   local watch_pid=$!
-  sleep 1
+  wait_for_file "$TEST_SKILL_DIR/run/watch.hermes-preserve-test.pid"
   [ -f "$TEST_SKILL_DIR/run/watch.hermes-preserve-test.pid" ]
 
   run bash "$SCRIPTS/delivery.sh" set off hermes "$TEST_PROJECT"
