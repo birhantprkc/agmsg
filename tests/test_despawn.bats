@@ -67,6 +67,13 @@ _is_unread_for_alice() {
     storage_list_unread team alice | grep -Fq "$1" )
 }
 
+_control_row_exists_for_alice() {
+  ( # shellcheck disable=SC1090
+    source "$SCRIPTS/lib/storage.sh"
+    agmsg_storage_load
+    storage_history team alice | grep -F '"to":"alice"' | grep -Fq '"body":"ctrl:despawn"' )
+}
+
 @test "despawn: graceful — ctrl:despawn control row is marked read (does not linger as unread)" {
   bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
   bash "$SCRIPTS/join.sh" team leader claude-code "$PROJ" >/dev/null
@@ -84,6 +91,7 @@ _is_unread_for_alice() {
   # The ctrl:despawn row itself must not be left permanently unread — a
   # broad (non-actas) watcher that later scans this project's inbox must not
   # see it resurface as a "new" message (2026-07-19 review finding).
+  _control_row_exists_for_alice
   ! _is_unread_for_alice "ctrl:despawn"
 
   kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
