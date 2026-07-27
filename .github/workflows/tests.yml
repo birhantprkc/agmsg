@@ -35,6 +35,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # Number of parallel bats shards per OS. The matrix and the shard helper must
+  # stay in lockstep; the stable summary job below verifies that they do.
+  SHARD_TOTAL: 4
+
 jobs:
   # Cheap gate: is this PR's diff entirely documentation? Pushes to main always
   # run the full suite (docs_only=false) — main must stay fully verified.
@@ -92,18 +97,15 @@ jobs:
           echo "server_changed=$server_changed" >> "$GITHUB_OUTPUT"
           echo "sync_changed=$sync_changed" >> "$GITHUB_OUTPUT"
 
-  bats:
-    name: bats (${{ matrix.os }})
+  bats-shard:
+    name: bats (${{ matrix.os }} ${{ matrix.shard }}/4)
     needs: changes
     # Run even if `changes` somehow failed/was skipped — fail open to the full
     # suite rather than leaving this REQUIRED check unreported (which would
     # block the PR). When changes failed, docs_only is empty → heavy steps run.
     if: ${{ !cancelled() }}
     runs-on: ${{ matrix.os }}
-    # Bound a hung runner/test without cutting off the slower macOS suite. The
-    # full suite now exceeds 15 min on macOS as coverage has grown; 25 min still
-    # fails fast compared with GitHub's 6h default. bats-windows has its own
-    # timeout; this covers ubuntu/macos.
+    # A shard has generous headroom under this cap; a timeout is a genuine hang.
     timeout-minutes: 25
     strategy:
       # Cover both GNU (Linux) and BSD (macOS) userlands — the scripts shell out
@@ -111,12 +113,29 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
 
       - name: Docs-only change — skipping suite
         if: needs.changes.outputs.docs_only == 'true'
         run: echo "Diff is documentation-only; skipping the bats suite and reporting green to satisfy the required check."
+
+      - name: Compute this shard's test files
+        if: needs.changes.outputs.docs_only != 'true'
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          if [ "$SHARD" -gt "$SHARD_TOTAL" ]; then
+            echo "::error::matrix shard $SHARD exceeds SHARD_TOTAL=$SHARD_TOTAL"
+            exit 1
+          fi
+          .github/scripts/shard-tests.sh "$SHARD" "$SHARD_TOTAL" > shard-files.txt
+          if [ ! -s shard-files.txt ]; then
+            echo "::error::shard $SHARD of $SHARD_TOTAL was assigned no test files"
+            exit 1
+          fi
 
       - name: Ensure sqlite3 is available (Linux)
         if: runner.os == 'Linux' && needs.changes.outputs.docs_only != 'true'
@@ -140,9 +159,64 @@ jobs:
           sqlite3 --version
           bats --version
 
-      - name: Run bats suite
+      - name: Run bats suite (this shard)
         if: needs.changes.outputs.docs_only != 'true'
-        run: bats --print-output-on-failure tests/
+        run: xargs bats --print-output-on-failure < shard-files.txt
+
+      - name: Record which files this shard ran
+        if: needs.changes.outputs.docs_only != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bats-manifest-${{ matrix.os }}-${{ matrix.shard }}
+          path: shard-files.txt
+          retention-days: 1
+
+  # Keep the required check name stable even if the shard count changes.
+  bats:
+    name: bats
+    needs: [changes, bats-shard]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check shard results
+        env:
+          RESULT: ${{ needs.bats-shard.result }}
+        run: |
+          set -euo pipefail
+          case "$RESULT" in
+            success) ;;
+            skipped) echo "::error::the bats shards did not run"; exit 1 ;;
+            *) echo "::error::the bats shards did not all pass (result: $RESULT)"; exit 1 ;;
+          esac
+
+      - name: Docs-only change — no shard manifests to verify
+        if: needs.changes.outputs.docs_only == 'true'
+        run: echo "Diff is documentation-only; shard manifests are not expected."
+
+      - name: Download shard manifests
+        if: needs.changes.outputs.docs_only != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bats-manifest-*
+          path: manifests
+
+      - name: Verify the shards covered the whole suite
+        if: needs.changes.outputs.docs_only != 'true'
+        run: |
+          set -euo pipefail
+          expected="$(find tests -maxdepth 1 -name '*.bats' | LC_ALL=C sort)"
+          status=0
+          for os in ubuntu-latest macos-latest; do
+            actual="$(cat manifests/bats-manifest-"$os"-*/shard-files.txt | LC_ALL=C sort)"
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::$os shards do not exactly cover tests/*.bats"
+              status=1
+            fi
+          done
+          exit "$status"
 
   # The age-v1 vectors are shared normative fixtures. Exercise them with the
   # pinned standard age implementation instead of accepting only mock crypto

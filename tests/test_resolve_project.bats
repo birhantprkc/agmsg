@@ -24,6 +24,10 @@ setup() {
 
   # shellcheck disable=SC1090
   source "$SKILL_DIR/scripts/lib/resolve-project.sh"
+  # Real gc_stale callers load _agmsg_pid_alive via actas-lock.sh; mirror that so
+  # the GC exercises the real liveness path, not its missing-helper guard.
+  # shellcheck disable=SC1090
+  source "$SKILL_DIR/scripts/lib/instance-id.sh"
 }
 
 teardown() {
@@ -202,6 +206,40 @@ JSON
   [ -f "$(agmsg_project_marker_path "$$")" ]
 }
 
+# EPERM-aware GC: under the sandbox `kill -0` on a live pid returns EPERM. Reading
+# that as dead would delete a live session's marker; only ESRCH drops it. `kill`
+# is stubbed to script each errno string (real EPERM is hard to force).
+
+@test "marker-gc: keeps a marker whose pid is EPERM-live (sandbox)" {
+  skip_on_windows "POSIX kill path; Windows uses tasklist (#134)"
+  agmsg_write_project_marker 4242 "$ROOT"
+  kill() { echo "bash: kill: (4242) - Operation not permitted" >&2; return 1; }
+  agmsg_marker_gc_stale
+  [ -f "$(agmsg_project_marker_path 4242)" ]
+}
+
+@test "marker-gc: drops a marker whose pid is ESRCH-dead" {
+  skip_on_windows "POSIX kill path; Windows uses tasklist (#134)"
+  agmsg_write_project_marker 4242 "$ROOT"
+  kill() { echo "bash: kill: (4242) - No such process" >&2; return 1; }
+  agmsg_marker_gc_stale
+  [ ! -f "$(agmsg_project_marker_path 4242)" ]
+}
+
+@test "marker-gc: skips (keeps marker) when _agmsg_pid_alive is unavailable" {
+  # Guard: without the helper, GC must skip rather than `|| rm -f` a live marker.
+  # Isolated shell sources ONLY resolve-project.sh, so the helper is truly absent.
+  agmsg_write_project_marker 4242 "$ROOT"
+  run bash -c '
+    export SKILL_DIR="'"$SKILL_DIR"'"
+    source "$SKILL_DIR/scripts/lib/resolve-project.sh"
+    declare -F _agmsg_pid_alive >/dev/null && { echo "helper unexpectedly present"; exit 2; }
+    agmsg_marker_gc_stale
+  '
+  [ "$status" -eq 0 ]
+  [ -f "$(agmsg_project_marker_path 4242)" ]
+}
+
 # --- pid-recycling guard ---
 
 @test "pid-is-agent: a live non-agent process is not trusted" {
@@ -214,7 +252,7 @@ JSON
 
 @test "pid-is-agent: excludes a 'claude daemon run' process even though argv0 matches" {
   skip_on_windows "process argv faking via exec -a (#349)"
-  bash -c 'exec -a "claude daemon run --json-path /tmp/agmsg-test-daemon.json" sleep 5' &
+  bash -c 'exec -a "claude daemon run --json-path /tmp/agmsg-test-daemon.json" sleep 5' 3>&- &
   local p=$!
   sleep 0.3
   run agmsg_pid_is_agent "$p" claude-code
@@ -228,7 +266,7 @@ JSON
   # so it must NOT be an exclusion signal on its own — only "daemon run"
   # identifies the daemon. This is the actual reported shape:
   # ".../claude/versions/2.1.199 --bg-spare ...".
-  bash -c 'exec -a "2.1.199 --bg-spare" sleep 5' &
+  bash -c 'exec -a "2.1.199 --bg-spare" sleep 5' 3>&- &
   local p=$!
   sleep 0.3
   run agmsg_pid_is_agent "$p" claude-code
@@ -238,7 +276,7 @@ JSON
 
 @test "pid-is-agent: accepts a version-named claude-code session binary" {
   skip_on_windows "process argv faking via exec -a (#349)"
-  bash -c 'exec -a "2.1.199" sleep 5' &
+  bash -c 'exec -a "2.1.199" sleep 5' 3>&- &
   local p=$!
   sleep 0.3
   run agmsg_pid_is_agent "$p" claude-code
@@ -248,7 +286,7 @@ JSON
 
 @test "pid-is-agent: accepts a version-named session binary under a full versions/ path" {
   skip_on_windows "process argv faking via exec -a (#349)"
-  bash -c 'exec -a "/home/x/.local/share/claude/versions/2.1.199" sleep 5' &
+  bash -c 'exec -a "/home/x/.local/share/claude/versions/2.1.199" sleep 5' 3>&- &
   local p=$!
   sleep 0.3
   run agmsg_pid_is_agent "$p" claude-code
@@ -258,7 +296,7 @@ JSON
 
 @test "pid-is-agent: a version-named binary is NOT accepted for a non-claude-code type" {
   skip_on_windows "process argv faking via exec -a (#349)"
-  bash -c 'exec -a "2.1.199" sleep 5' &
+  bash -c 'exec -a "2.1.199" sleep 5' 3>&- &
   local p=$!
   sleep 0.3
   run agmsg_pid_is_agent "$p" codex
@@ -318,7 +356,7 @@ JSON
   # Launch the actas watcher (ACTIVE_NAME=alice) from a subdir; without
   # resolution it would see no registration and exit immediately.
   bash "$SKILL_DIR/scripts/watch.sh" sid-w "$ROOT/sub/deep" claude-code alice \
-    >"$BATS_TEST_TMPDIR/w.out" 2>&1 &
+    >"$BATS_TEST_TMPDIR/w.out" 2>&1 3>&- &
   local wpid=$!
   sleep 1
   # A resolving watcher is still alive in its poll loop; an unresolved one has

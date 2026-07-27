@@ -316,7 +316,7 @@ _seed_role_record() {
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
 JSON
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" stop-test "$TEST_PROJECT" claude-code &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" stop-test "$TEST_PROJECT" claude-code 3>&- &
   local watch_pid=$!
   sleep 1
   [ -f "$TEST_SKILL_DIR/run/watch.stop-test.pid" ]
@@ -330,7 +330,7 @@ JSON
 
 @test "delivery stop: skips pid whose command line is not watch.sh (pid recycling safety)" {
   mkdir -p "$TEST_SKILL_DIR/run"
-  sleep 30 &
+  sleep 30 3>&- &
   local unrelated_pid=$!
   echo "$unrelated_pid" > "$TEST_SKILL_DIR/run/watch.stale-sess.pid"
   run bash "$SCRIPTS/delivery.sh" stop
@@ -369,7 +369,7 @@ JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
 JSON
   # A live claude-code watcher for this project.
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" cc-sess "$TEST_PROJECT" claude-code &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" cc-sess "$TEST_PROJECT" claude-code 3>&- &
   local watch_pid=$!
   sleep 1
   [ -f "$TEST_SKILL_DIR/run/watch.cc-sess.pid" ]
@@ -387,7 +387,7 @@ JSON
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
 JSON
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" cc-sess2 "$TEST_PROJECT" claude-code &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" cc-sess2 "$TEST_PROJECT" claude-code 3>&- &
   local watch_pid=$!
   sleep 1
   [ -f "$TEST_SKILL_DIR/run/watch.cc-sess2.pid" ]
@@ -409,7 +409,7 @@ JSON
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$sp"}]}}}
 JSON
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sp-sess "$sp" claude-code &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sp-sess "$sp" claude-code 3>&- &
   local watch_pid=$!
   sleep 1
   [ -f "$TEST_SKILL_DIR/run/watch.sp-sess.pid" ]
@@ -435,7 +435,7 @@ JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
 JSON
 
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sigterm-test "$TEST_PROJECT" claude-code &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sigterm-test "$TEST_PROJECT" claude-code 3>&- &
   local pid=$!
   sleep 1
   [ -f "$TEST_SKILL_DIR/run/watch.sigterm-test.pid" ]
@@ -501,7 +501,7 @@ JSON
   mkdir -p "$TEST_SKILL_DIR/run"
 
   # Stand in for the previous watcher: a sleep that updates its own pidfile.
-  sleep 30 &
+  sleep 30 3>&- &
   local prev_pid=$!
   echo "$prev_pid" > "$TEST_SKILL_DIR/run/watch.session-A.pid"
   # Pin the cc-instance state to "session-A" for a fake CC pid we control.
@@ -622,7 +622,7 @@ has_session_end() {
 
 @test "session-end.sh kills the watcher matching session_id and removes pidfile" {
   mkdir -p "$TEST_SKILL_DIR/run"
-  sleep 30 &
+  sleep 30 3>&- &
   local target_pid=$!
   echo "$target_pid" > "$TEST_SKILL_DIR/run/watch.sess-A.pid"
   echo '{"session_id":"sess-A"}' | bash "$SCRIPTS/session-end.sh" claude-code "$TEST_PROJECT"
@@ -633,7 +633,7 @@ has_session_end() {
 
 @test "session-end.sh leaves other sessions' watchers alone" {
   mkdir -p "$TEST_SKILL_DIR/run"
-  sleep 30 &
+  sleep 30 3>&- &
   local other_pid=$!
   echo "$other_pid" > "$TEST_SKILL_DIR/run/watch.sess-B.pid"
   echo '{"session_id":"sess-A"}' | bash "$SCRIPTS/session-end.sh" claude-code "$TEST_PROJECT"
@@ -696,7 +696,7 @@ JSON
 JSON
   bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT" >/dev/null
   mkdir -p "$TEST_SKILL_DIR/run"
-  sleep 30 &
+  sleep 30 3>&- &
   local alive_pid=$!
   echo "$alive_pid" > "$TEST_SKILL_DIR/run/watch.live-session.pid"
   # Bind this watcher to a live CC instance (use $$ as a stand-in).
@@ -711,7 +711,7 @@ JSON
 @test "emit monitor directive: skips when a live watcher already exists for this session" {
   mkdir -p "$TEST_SKILL_DIR/run"
   # Spawn a live process and pretend it's our watcher for this session_id.
-  sleep 30 &
+  sleep 30 3>&- &
   local live_pid=$!
   CLAUDE_CODE_SESSION_ID="live-test-sid"
   export CLAUDE_CODE_SESSION_ID
@@ -927,8 +927,8 @@ EOF
   cat > "$bindir/timeout" <<'EOF'
 #!/usr/bin/env bash
 secs="$1"; shift
-("$@") & cmd_pid=$!
-( sleep "$secs"; kill "$cmd_pid" 2>/dev/null ) & watchdog_pid=$!
+("$@") 3>&- & cmd_pid=$!
+( sleep "$secs"; kill "$cmd_pid" 2>/dev/null ) 3>&- & watchdog_pid=$!
 if wait "$cmd_pid" 2>/dev/null; then
   kill "$watchdog_pid" 2>/dev/null
   exit 0
@@ -948,7 +948,7 @@ EOF
   # reproduce this: bash waits for every pipeline member, so it looks like a
   # hang even when the hook itself exits immediately.
   { printf '%s' '{"stop_hook_active":false,"session_id":"repro-381"}'; sleep 300; } \
-    3>&- 4>&- > "$fifo" &
+    3>&- 4>&- > "" &
   local writer_pid="$!"
 
   local newpath="$bindir:$PATH"
@@ -982,7 +982,7 @@ JSON
   sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'system', 'alice', 'for-alice');"
   sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'system', 'bob', 'for-bob');"
 
-  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" t-sid "$TEST_PROJECT" claude-code bob > /tmp/agmsg-as-bob 2>&1 &
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" t-sid "$TEST_PROJECT" claude-code bob > /tmp/agmsg-as-bob 2>&1 3>&- &
   local pid=$!
   # The watcher seeds its cursor from the storage tip at startup, so prior
   # messages aren't replayed. Send NEW messages through the facade (storage_send
@@ -1019,7 +1019,7 @@ JSON
   mkdir -p "$TEST_SKILL_DIR/run"
 
   # Orphan: watcher referenced by a cc-instance.<dead-pid> file.
-  sleep 30 &
+  sleep 30 3>&- &
   local orphan_pid=$!
   echo "$orphan_pid" > "$TEST_SKILL_DIR/run/watch.orphan-sid.pid"
   # Use a PID that's almost certainly not in use as the dead CC ancestor.
@@ -1028,7 +1028,7 @@ JSON
 
   # Untracked watcher: no cc-instance points to it. Conservative semantics
   # leave it alone (we have no evidence the CC is dead).
-  sleep 30 &
+  sleep 30 3>&- &
   local untracked_pid=$!
   echo "$untracked_pid" > "$TEST_SKILL_DIR/run/watch.untracked-sid.pid"
 
@@ -1055,7 +1055,7 @@ JSON
   # The session moved from one CC pid to another (claude --continue / resume).
   # cc-instance.<dead> still references the same session_id as
   # cc-instance.<live>. The watcher must NOT be killed.
-  sleep 30 &
+  sleep 30 3>&- &
   local watcher_pid=$!
   echo "$watcher_pid" > "$TEST_SKILL_DIR/run/watch.shared-sid.pid"
   local dead_cc=999999
@@ -1080,7 +1080,7 @@ JSON
 
   # Watcher starts with only `alice` registered. Default subscription set
   # is resolved at launch and not re-evaluated each poll.
-  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" t-static "$TEST_PROJECT" claude-code > /tmp/agmsg-static 2>&1 &
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" t-static "$TEST_PROJECT" claude-code > /tmp/agmsg-static 2>&1 3>&- &
   local pid=$!
   sleep 1
 
@@ -1117,9 +1117,9 @@ JSON
 {"name":"team-b","agents":{"bob":{"registrations":[{"type":"claude-code","project":"$proj_b"}]}}}
 JSON
 
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sid-a "$proj_a" claude-code &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sid-a "$proj_a" claude-code 3>&- &
   local pid_a=$!
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sid-b "$proj_b" claude-code &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sid-b "$proj_b" claude-code 3>&- &
   local pid_b=$!
   sleep 1
   [ -f "$TEST_SKILL_DIR/run/watch.sid-a.pid" ]
@@ -1155,9 +1155,9 @@ JSON
 {"name":"team-b","agents":{"bob":{"registrations":[{"type":"claude-code","project":"$proj_b"}]}}}
 JSON
 
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" off-a "$proj_a" claude-code &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" off-a "$proj_a" claude-code 3>&- &
   local pid_a=$!
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" off-b "$proj_b" claude-code &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" off-b "$proj_b" claude-code 3>&- &
   local pid_b=$!
   sleep 1
 
@@ -1187,9 +1187,9 @@ JSON
 {"name":"team-b","agents":{"bob":{"registrations":[{"type":"claude-code","project":"$proj_b"}]}}}
 JSON
 
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" stop-a "$proj_a" claude-code &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" stop-a "$proj_a" claude-code 3>&- &
   local pid_a=$!
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" stop-b "$proj_b" claude-code &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" stop-b "$proj_b" claude-code 3>&- &
   local pid_b=$!
   sleep 1
 
@@ -1641,7 +1641,7 @@ EOF
   bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
   mkdir -p "$TEST_SKILL_DIR/run"
 
-  sleep 60 &
+  sleep 60 3>&- &
   local bpid=$!
   # shellcheck disable=SC2064  # capture the current child pid for EXIT cleanup
   trap "kill $bpid 2>/dev/null || true" EXIT
@@ -1805,7 +1805,7 @@ EOF
   printf '#!/usr/bin/env bash\necho real\n' > "$other_bin/codex"
   chmod +x "$other_bin/codex"
 
-  sleep 60 &
+  sleep 60 3>&- &
   local bpid=$!
   # shellcheck disable=SC2064  # capture the current child pid for EXIT cleanup
   trap "kill $bpid 2>/dev/null || true" EXIT
@@ -1834,7 +1834,7 @@ EOF
   bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
   mkdir -p "$TEST_SKILL_DIR/run"
 
-  sleep 60 &
+  sleep 60 3>&- &
   local bpid=$!
   # shellcheck disable=SC2064  # capture the current child pid for EXIT cleanup
   trap "kill $bpid 2>/dev/null || true" EXIT
@@ -1952,7 +1952,7 @@ EOF
   bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
   mkdir -p "$TEST_SKILL_DIR/run"
   # Stand in for a live bridge with a real process we can check kill -0 against.
-  sleep 60 &
+  sleep 60 3>&- &
   local bpid=$!
   echo "$bpid" > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid"
   echo "pid=$bpid" > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.meta"
@@ -2020,7 +2020,7 @@ EOF
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
 JSON
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" hermes-preserve-test "$TEST_PROJECT" claude-code &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" hermes-preserve-test "$TEST_PROJECT" claude-code 3>&- &
   local watch_pid=$!
   sleep 1
   [ -f "$TEST_SKILL_DIR/run/watch.hermes-preserve-test.pid" ]

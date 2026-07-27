@@ -174,7 +174,7 @@ _wait_for_file_contains() {
   # the composite instance id) makes that deterministic. Cross-restart
   # redelivery itself is covered by "watch: restart delivers messages that
   # arrived while the watcher was down".
-  local sesspid; sleep 600 & sesspid=$!
+  local sesspid; sleep 600 3>&- & sesspid=$!
   local iid="sess-liveness.$sesspid"
   local pf="$TEST_SKILL_DIR/run/watch.$iid.pid"
   local out="$TEST_SKILL_DIR/liveness-delivery.log"
@@ -366,7 +366,7 @@ _wait_pidfile() {
   # whose session pid is dead, so use real stand-in session processes rather
   # than fabricated pids (which would pass or fail by accident of what pid
   # happens to exist on the host).
-  local sp1 sp2; sleep 600 & sp1=$!; sleep 600 & sp2=$!
+  local sp1 sp2; sleep 600 3>&- & sp1=$!; sleep 600 3>&- & sp2=$!
   local pf1="$TEST_SKILL_DIR/run/watch.shared.$sp1.pid"
   local pf2="$TEST_SKILL_DIR/run/watch.shared.$sp2.pid"
 
@@ -397,7 +397,7 @@ _wait_pidfile() {
   # liveness guard (#67) exits any watcher whose embedded session pid is dead, so
   # a fabricated dead pid (the old "solo.2002") would self-exit before the
   # relaunch could be observed. Use a real stand-in session process instead.
-  local sesspid; sleep 600 & sesspid=$!
+  local sesspid; sleep 600 3>&- & sesspid=$!
   local iid="solo.$sesspid"
   local pf="$TEST_SKILL_DIR/run/watch.$iid.pid"
 
