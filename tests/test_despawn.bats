@@ -57,12 +57,14 @@ teardown() {
   kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
 }
 
-# read_at for the most recent message with the given body, empty if unread.
-_read_at_for_body() {
+# The current driver owns read state; a consumed control row must not appear in
+# the recipient's unread view, regardless of whether the backend has legacy
+# `messages.read_at` storage.
+_is_unread_for_alice() {
   ( # shellcheck disable=SC1090
     source "$SCRIPTS/lib/storage.sh"
-    agmsg_sqlite "$(agmsg_db_path)" \
-      "SELECT read_at FROM messages WHERE body='$1' ORDER BY id DESC LIMIT 1;" )
+    agmsg_storage_load
+    storage_list_unread team alice | grep -Fq "$1" )
 }
 
 @test "despawn: graceful — ctrl:despawn control row is marked read (does not linger as unread)" {
@@ -82,7 +84,7 @@ _read_at_for_body() {
   # The ctrl:despawn row itself must not be left permanently unread — a
   # broad (non-actas) watcher that later scans this project's inbox must not
   # see it resurface as a "new" message (2026-07-19 review finding).
-  [ -n "$(_read_at_for_body "ctrl:despawn")" ]
+  ! _is_unread_for_alice "ctrl:despawn"
 
   kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
 }

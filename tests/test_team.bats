@@ -582,8 +582,8 @@ EOF
   [[ ! "$output" =~ "syntax error" ]]
   [[ ! "$output" =~ ".parameter" ]]
   run bash "$SCRIPTS/team.sh" myteam
-  [[ "$output" =~ "$new" ]]
-  [[ ! "$output" =~ "$old" ]]
+  [[ "$output" == *"$new"* ]]
+  [[ "$output" != *"$old"* ]]
 }
 
 @test "rename: rejects an old/new agent name containing path-hazard characters" {
