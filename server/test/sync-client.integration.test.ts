@@ -95,7 +95,9 @@ describeDatabase("Stage-1 polling sync client", () => {
     return {
       ...process.env,
       AGMSG_STORAGE_PATH: store,
-      AGMSG_STORAGE_DRIVER: "sqlite",
+      // This is intentionally a heterogeneous two-device rehearsal. The
+      // client-facing sync contract must not depend on either local driver.
+      AGMSG_STORAGE_DRIVER: store === storeA ? "sqlite" : "jsonl",
       AGMSG_SYNC_CONNECTION_DIR: connectionRoot,
       AGMSG_SYNC_LOCAL_ROSTER_FILE: rosterFile,
       AGMSG_NODE: process.execPath,
@@ -150,7 +152,7 @@ storage_list_unread "$2" "$3"`;
     return result.stdout.trim().split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
   }
 
-  it("synchronizes two isolated AGMSG_STORAGE_PATH stores without echo duplicates", async () => {
+  it("synchronizes SQLite and JSONL stores without echo duplicates", async () => {
     await localSend(storeA, "machine-a", "machine-b", "fixture from machine A");
     const pushedA = await sync(storeA, "once", "--team", localTeam);
     expect(pushedA.stdout).toContain('"event":"push.ack"');
