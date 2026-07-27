@@ -2,6 +2,7 @@ import Fastify, {
   type FastifyInstance,
   type FastifyRequest,
 } from "fastify";
+import fp from "fastify-plugin";
 import * as duplicateKeyJson from "json-dup-key-validator";
 import type { Pool } from "pg";
 import { ZodError, z } from "zod";
@@ -105,6 +106,30 @@ export function createApp(pool: Pool, config: Config): FastifyInstance {
     bodyLimit: MAX_REQUEST_BYTES,
   });
 
+  void app.register(dataPlane, { pool, config });
+  return app;
+}
+
+// The v1 protocol data plane — its content-type parser, hooks, error handling,
+// and routes — as a registerable Fastify plugin, so the reference server can be
+// embedded as a sub-app in another Fastify host, not only run standalone.
+//
+// `fastify-plugin` keeps the parser/hooks/error handler applied to the
+// registration context (so a standalone createApp answers byte-for-byte as
+// before, unknown-route 404s included); a host that wants isolation registers
+// this inside its own encapsulating scope.
+//
+// Embedding contract: the plugin owns the responses for the v1 routes it
+// registers, and their content-type parsing, protocol header, and error
+// mapping. Everything else — unknown routes, and the host's own routes — is the
+// host's responsibility, by contract, not by accident. Register before
+// ready()/listen(); routes are not introspectable until then (register runs
+// asynchronously).
+async function dataPlaneRoutes(
+  app: FastifyInstance,
+  opts: { pool: Pool; config: Config },
+): Promise<void> {
+  const { pool, config } = opts;
   app.removeContentTypeParser("application/json");
   app.addContentTypeParser(
     "application/json",
@@ -205,7 +230,7 @@ export function createApp(pool: Pool, config: Config): FastifyInstance {
     return getMessages(pool, teamId, parseSequence(query.after), query.limit);
   });
 
-  app.post("/v1/messages", async (request) => {
+  app.post("/v1/messages", { bodyLimit: MAX_REQUEST_BYTES }, async (request) => {
     const teamId = await scopedTeamId(pool, request);
     const body = postMessagesSchema.parse(request.body);
     return postMessages(pool, teamId, body.messages,
@@ -215,7 +240,7 @@ export function createApp(pool: Pool, config: Config): FastifyInstance {
       });
   });
 
-  app.post("/v1/read-state/sync", async (request, reply) => {
+  app.post("/v1/read-state/sync", { bodyLimit: MAX_REQUEST_BYTES }, async (request, reply) => {
     emptyQuerySchema.parse(request.query);
     const teamId = await scopedTeamId(pool, request);
     const body = readStateSyncSchema.parse(request.body);
@@ -223,7 +248,7 @@ export function createApp(pool: Pool, config: Config): FastifyInstance {
     return syncReadState(pool, teamId, body);
   });
 
-  app.post("/v1/pairing/exchange", async (request, reply) => {
+  app.post("/v1/pairing/exchange", { bodyLimit: MAX_REQUEST_BYTES }, async (request, reply) => {
     requireProtocol(request);
     emptyQuerySchema.parse(request.query);
     const body = pairingExchangeSchema.parse(request.body);
@@ -231,7 +256,7 @@ export function createApp(pool: Pool, config: Config): FastifyInstance {
     return exchangePairingToken(pool, body.token);
   });
 
-  app.post("/v1/credentials/:credentialId/revoke", async (request, reply) => {
+  app.post("/v1/credentials/:credentialId/revoke", { bodyLimit: MAX_REQUEST_BYTES }, async (request, reply) => {
     emptyQuerySchema.parse(request.query);
     z.undefined().parse(request.body);
     const params = credentialParamsSchema.parse(request.params);
@@ -252,12 +277,22 @@ export function createApp(pool: Pool, config: Config): FastifyInstance {
     reply.header("Cache-Control", "no-store");
     return revokeCredential(pool, authenticated.teamId, params.credentialId);
   });
-
-  return app;
 }
 
+export const dataPlane = fp(dataPlaneRoutes, {
+  name: "agmsg-data-plane",
+  fastify: "5.x",
+});
+
 function requestLog(reply: { log: { error: (value: unknown) => void } }, error: unknown) {
-  reply.log.error(error);
+  // Log a safe, structured record rather than the raw Error: when the plugin is
+  // embedded in another host, that host's logger may not redact, so the plugin
+  // must not hand it an object that could carry sensitive fields. The class name
+  // is enough to correlate an internal-error 500 with its cause in the source.
+  reply.log.error({
+    event: "internal-error",
+    error_name: error instanceof Error ? error.name : typeof error,
+  });
 }
 
 function statusCode(error: unknown): number | undefined {
