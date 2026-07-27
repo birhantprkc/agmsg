@@ -65,7 +65,7 @@ describeDatabase("Stage-1 polling sync client", () => {
       `INSERT INTO team_policy_history
          (team_id,policy_revision,effective_from_seq,
           accepted_envelope_versions,write_allowed_ciphers)
-       VALUES($1,0,1,ARRAY[1],ARRAY['none']::TEXT[])`,
+       VALUES($1,0,1,ARRAY[1],ARRAY['none','age-v1']::TEXT[])`,
       [crossTeamId],
     );
     await pool.query(
