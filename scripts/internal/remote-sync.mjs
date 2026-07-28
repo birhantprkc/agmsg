@@ -483,11 +483,23 @@ function endpoint(base, path) {
 
 export async function request(config, path, init = {}) {
   const token = await readConnectedCredential(config);
+  return send(config, path, init, { Authorization: `Bearer ${token}` });
+}
+
+// The pull routes carry no credential, for the reason /v1/connect has none:
+// reaching the server is the permission. Everything after the header -- the
+// protocol check, the binding validation, the retryable classification -- is
+// the same, so it is shared rather than written twice.
+export async function requestPublic(config, path, init = {}) {
+  return send(config, path, init, {});
+}
+
+async function send(config, path, init, authHeaders) {
   const headers = {
     ...init.headers,
     "Agmsg-Protocol-Version": PROTOCOL,
     "Agmsg-Team-ID": config.remote_team_id,
-    Authorization: `Bearer ${token}`,
+    ...authHeaders,
   };
   const url = endpoint(config.server_url, path);
   let response;
@@ -1616,13 +1628,106 @@ export async function resyncCycle(config, acceptedFloor, dependencies = {}) {
   return result;
 }
 
+// A machine that has none of this taking a team from the server. It is not a
+// cycle: there is no local team to reconcile against, no push side, and no
+// credential. What it shares with the normal pull is the part that must not
+// diverge -- evaluatePull decides what may be imported, and the driver applies
+// the same records.
+export async function pullBootstrap(args) {
+  const team = requireName(args.team, "team");
+  const teamId = args["team-id"] ?? "";
+  if (!UUID_V7.test(teamId)) throw new Error("team-id must be a canonical UUIDv7");
+  const serverUrl = args.endpoint ?? "";
+  if (!serverUrl) throw new Error("endpoint is required");
+  const limit = Number(args.limit ?? 1000);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new Error("limit must be 1..1000");
+
+  // Fetched before a config exists, so this one call validates itself rather
+  // than going through the binding checks the rest of the pull relies on.
+  const snapshot = await publicSnapshot(serverUrl, teamId);
+  const config = {
+    format_version: 1,
+    local_team: team,
+    server_url: serverUrl,
+    server_instance_id: snapshot.server_instance_id,
+    remote_team_id: snapshot.team_id,
+    protocol_version: Number(PROTOCOL),
+    cipher_profile: "none",
+    local_security_history: [{
+      local_security_revision: "0", effective_from_seq: "1",
+      minimum_security_mode: "plaintext-allowed",
+    }],
+  };
+  await event("pull.bootstrap.snapshot", {
+    team_id: snapshot.team_id, team_name: snapshot.team_name,
+    members: snapshot.members.length, min_available_seq: snapshot.min_available_seq,
+  });
+
+  let cursor = String(snapshot.min_available_seq ?? "0");
+  let imported = 0;
+  for (;;) {
+    const page = await requestPublic(config,
+      `/v1/teams/${teamId}/messages?after=${cursor}&limit=${limit}`);
+    const records = [];
+    for (const message of page.messages) {
+      records.push({ type: "sync_pull_message", ...message,
+        ...(await evaluatePull(config, snapshot, message)) });
+    }
+    records.push({ type: "sync_pull_cursor", next_after: page.next_after });
+    const applied = await driver("apply", config, records);
+    await event("pull.bootstrap.applied", {
+      after: cursor, next_after: page.next_after,
+      messages: page.messages.length, result: applied[0] ?? null,
+    });
+    imported += page.messages.length;
+    cursor = page.next_after;
+    if (!page.has_more) break;
+  }
+  process.stdout.write(`${JSON.stringify({
+    type: "pull_bootstrap_result", team: config.local_team,
+    team_id: config.remote_team_id, team_name: snapshot.team_name,
+    server_instance_id: config.server_instance_id,
+    members: snapshot.members, imported,
+  })}\n`);
+}
+
+async function publicSnapshot(serverUrl, teamId) {
+  let response;
+  try {
+    response = await fetch(endpoint(serverUrl, `/v1/teams/${teamId}`), {
+      headers: { "Agmsg-Protocol-Version": PROTOCOL },
+      redirect: "error", signal: AbortSignal.timeout(15_000),
+    });
+  } catch (error) {
+    error.retryable = true;
+    throw error;
+  }
+  if (response.headers.get("agmsg-protocol-version") !== PROTOCOL) {
+    throw new Error("response protocol version mismatch");
+  }
+  const body = await response.json();
+  if (!response.ok) {
+    const error = new Error(`HTTP ${response.status} ${body?.error?.code ?? "unknown-error"}`);
+    error.status = response.status;
+    throw error;
+  }
+  if (body.team_id !== teamId || !UUID_V7.test(body.server_instance_id ?? "") ||
+      !Array.isArray(body.members)) {
+    throw new Error("team snapshot is not bound to the requested team");
+  }
+  return body;
+}
+
 async function main() {
   const [command, ...rest] = process.argv.slice(2);
   const args = options(rest);
-  if (!["configure", "once", "run", "reprocess", "resync", "unblock-read"].includes(command)) {
+  if (!["configure", "once", "run", "reprocess", "resync", "unblock-read",
+        "pull-bootstrap"].includes(command)) {
     throw new Error(usage());
   }
   if (command === "configure") { await configure(args); return; }
+  // Before any local team exists, so it cannot go through loadConfig.
+  if (command === "pull-bootstrap") { await pullBootstrap(args); return; }
   const team = requireName(args.team, "team");
   const limit = Number(args.limit ?? 100);
   if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new Error("limit must be 1..1000");
