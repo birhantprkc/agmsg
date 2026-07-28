@@ -55,7 +55,11 @@ import "./App.css";
 
 export type Member = { name: string; types: string[]; project: string };
 type Message = {
-  id: number;
+  // Opaque. api.sh's contract: "Every id (message ids included) is a JSON
+  // string, never a bare number." Event-log ids are UUIDs; only the legacy
+  // table's were integers. Used as a React key and as the paging cursor,
+  // neither of which needs it to be ordered or numeric.
+  id: string;
   team: string;
   from: string;
   to: string;
@@ -638,7 +642,7 @@ export default function App() {
   // Cozy grouping: collapse runs of consecutive messages with the same from→to
   // into one header + stacked bodies (Slack/Discord style), so short bursts stay
   // light while long messages still line up.
-  const groups: { key: number; from: string; to: string; items: Message[] }[] = [];
+  const groups: { key: string; from: string; to: string; items: Message[] }[] = [];
   for (const m of roomMessages) {
     const last = groups[groups.length - 1];
     if (last && last.from === m.from && last.to === m.to) last.items.push(m);
