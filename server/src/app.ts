@@ -28,6 +28,7 @@ import {
   connectTeam,
   getCapabilities,
   getMembers,
+  getTeamSnapshot,
   getMessages,
   health,
   postMessages,
@@ -37,6 +38,7 @@ import {
 const emptyQuerySchema = z.object({}).strict();
 const pairingExchangeSchema = z.object({ token: z.string().min(32).max(256) }).strict();
 const credentialParamsSchema = z.object({ credentialId: uuidV7Schema }).strict();
+const teamParamsSchema = z.object({ teamId: uuidV7Schema }).strict();
 
 function requireProtocol(request: FastifyRequest): void {
   const version = request.headers["agmsg-protocol-version"];
@@ -267,6 +269,30 @@ async function dataPlaneRoutes(
     const body = connectSchema.parse(request.body);
     reply.header("Cache-Control", "no-store");
     return connectTeam(pool, body);
+  });
+
+  // The other half of connect: a second machine takes a team it does not have.
+  // Scoped by the id in the path rather than by a credential, for the reason
+  // /v1/connect has none — reaching the server is the permission. Knowing a
+  // team_id is therefore enough to read a team, which the design records as
+  // accepted for this minimum rather than overlooked.
+  app.get("/v1/teams/:teamId", async (request, reply) => {
+    requireProtocol(request);
+    emptyQuerySchema.parse(request.query);
+    const params = teamParamsSchema.parse(request.params);
+    reply.header("Cache-Control", "no-store");
+    return getTeamSnapshot(pool, params.teamId);
+  });
+
+  // History is paged rather than returned whole: a team that has been running
+  // is thousands of messages, and the caller already has to handle a cursor
+  // because retention can move min_available_seq under it mid-pull.
+  app.get("/v1/teams/:teamId/messages", async (request, reply) => {
+    requireProtocol(request);
+    const params = teamParamsSchema.parse(request.params);
+    const query = messagesQuerySchema.parse(request.query);
+    reply.header("Cache-Control", "no-store");
+    return getMessages(pool, params.teamId, parseSequence(query.after), query.limit);
   });
 
   app.post("/v1/credentials/:credentialId/revoke", { bodyLimit: MAX_REQUEST_BYTES }, async (request, reply) => {

@@ -750,6 +750,101 @@ _remote_commit() {
   agmsg_write_atomic "$cfg" "$updated"
 }
 
+# Extract one field from a JSON document held in a variable. The file-based
+# reader above cannot be used: this document is the engine's stdout, and
+# writing it out just to read it back would put a team snapshot on disk for no
+# reason.
+_remote_json_field() {
+  local doc="$1" path="$2" escaped
+  escaped=$(printf '%s' "$doc" | sed "s/'/''/g")
+  agmsg_sqlite_mem "SELECT COALESCE(json_extract('$escaped', '$path'), '');"
+}
+
+_remote_json_fragment() {
+  local doc="$1" path="$2" escaped
+  escaped=$(printf '%s' "$doc" | sed "s/'/''/g")
+  agmsg_sqlite_mem "SELECT COALESCE(json_extract('$escaped', '$path'), '[]');"
+}
+
+# Writes the local team for a pull. Unlike _remote_ensure_team this does NOT
+# mint a team_id: the id and every member id came from the server and are
+# recorded as they arrived. Minting here would give one team two identities,
+# which is the whole reason ids exist.
+_remote_write_pulled_team() {
+  local team="$1" team_id="$2" members="$3" cfg agents initial
+  cfg="$(_remote_team_config "$team")"
+  mkdir -p "$TEAMS_DIR/$team"
+  agmsg_lock_acquire "$TEAMS_DIR/$team" || return 1
+  # The roster arrives as an array and is stored keyed by name, the shape
+  # join.sh already writes, so team.sh and the delivery paths read it unchanged.
+  agents=$(agmsg_sqlite_mem "
+    SELECT COALESCE(json_group_object(json_extract(value, '\$.name'),
+             json_object('member_id', json_extract(value, '\$.member_id'),
+                         'registrations', json_array())), json_object())
+      FROM json_each('$(printf '%s' "$members" | sed "s/'/''/g")');")
+  initial=$(agmsg_sqlite_mem "
+    SELECT json_object('name','$(_agmsg_sqlesc "$team")',
+                       'team_id','$(_agmsg_sqlesc "$team_id")',
+                       'agents', json('$(printf '%s' "$agents" | sed "s/'/''/g")'),
+                       'created_at','$(date -u +%Y-%m-%dT%H:%M:%SZ)');")
+  agmsg_write_atomic "$cfg" "$initial"
+  agmsg_lock_release
+}
+
+# The other half of connect: this machine takes a team it does not have.
+cmd_pull() {
+  local endpoint="" team_id="" team="" positional=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --endpoint) endpoint="${2:?--endpoint requires a value}"; shift 2 ;;
+      --endpoint=*) endpoint="${1#--endpoint=}"; shift ;;
+      --team-id) team_id="${2:?--team-id requires a value}"; shift 2 ;;
+      --team-id=*) team_id="${1#--team-id=}"; shift ;;
+      *) positional+=("$1"); shift ;;
+    esac
+  done
+  : "${endpoint:?Usage: remote.sh pull --endpoint <url> --team-id <uuid> <team>}"
+  : "${team_id:?Usage: remote.sh pull --endpoint <url> --team-id <uuid> <team>}"
+  _remote_validate_endpoint "$endpoint" || exit 1
+  endpoint="${endpoint%/}"
+  team="${positional[0]:-}"
+  [ -n "$team" ] || { echo "agmsg: pull requires a local team name" >&2; exit 1; }
+  agmsg_validate_team_name "$team" || exit 1
+
+  # Refused for the reason git refuses a non-fast-forward push: two teams that
+  # each grew their own history do not become one by pointing at the same
+  # remote. A second machine arrives empty and clones.
+  local cfg existing
+  cfg="$(_remote_team_config "$team")"
+  if [ -f "$cfg" ]; then
+    existing="$(agmsg_sqlite "$(agmsg_db_path "$team")" \
+      "SELECT COUNT(*) FROM events WHERE type='message_sent';" 2>/dev/null | tr -d '\r')"
+    case "$existing" in ''|*[!0-9]*) existing=0 ;; esac
+    if [ "$existing" -gt 0 ]; then
+      echo "agmsg: local team '$team' already has history; pull clones into an empty team" >&2
+      exit 1
+    fi
+  fi
+
+  local result pulled_id pulled_name imported members
+  result="$(AGMSG_SYNC_CONNECTION_DIR="$CONNECTION_ROOT" \
+    "$SCRIPT_DIR/remote-sync.sh" pull-bootstrap \
+      --team "$team" --team-id "$team_id" --endpoint "$endpoint")" || {
+    echo "agmsg: pull failed" >&2; exit 1; }
+  result="$(printf '%s\n' "$result" | grep '"pull_bootstrap_result"' | tail -1)"
+  [ -n "$result" ] || { echo "agmsg: pull produced no result" >&2; exit 1; }
+
+  pulled_id="$(_remote_json_field "$result" '$.team_id')"
+  pulled_name="$(_remote_json_field "$result" '$.team_name')"
+  imported="$(_remote_json_field "$result" '$.imported')"
+  members="$(_remote_json_fragment "$result" '$.members')"
+  [ "$pulled_id" = "$team_id" ] || {
+    echo "agmsg: server answered with a different team id" >&2; exit 1; }
+
+  _remote_write_pulled_team "$team" "$pulled_id" "$members" || exit 1
+  echo "Pulled '$pulled_name' into local team '$team' ($imported message(s))."
+}
+
 cmd_connect() {
   local endpoint="" token="" token_stdin=0 team="" force=0 positional=() \
     expected_old_credential_id=""
@@ -1381,6 +1476,7 @@ cmd_disconnect() {
 
 case "${1:-}" in
   connect) shift; agmsg_require_python3 "remote connect" || exit 1; cmd_connect "$@" ;;
+  pull) shift; agmsg_require_python3 "remote pull" || exit 1; cmd_pull "$@" ;;
   status) shift; agmsg_require_python3 "remote status" || exit 1; cmd_status "$@" ;;
   disconnect) shift; agmsg_require_python3 "remote disconnect" || exit 1; cmd_disconnect "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;

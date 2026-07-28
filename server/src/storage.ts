@@ -806,6 +806,53 @@ export async function connectTeam(
   });
 }
 
+async function roster(
+  client: PoolClient,
+  teamId: string,
+): Promise<Record<string, unknown>[]> {
+  const members = await client.query<{ member_id: string; name: string }>(
+    `SELECT member_id::text, name FROM members
+      WHERE team_id = $1 ORDER BY member_id`,
+    [teamId],
+  );
+  const registrations = await client.query<{
+    registration_id: string;
+    member_id: string;
+    installation_id: string;
+    type: string;
+  }>(
+    `SELECT registration_id::text, member_id::text, installation_id::text, type
+       FROM registrations WHERE team_id = $1
+      ORDER BY registration_id`,
+    [teamId],
+  );
+  return members.rows.map((member) => ({
+    member_id: member.member_id,
+    name: member.name,
+    registrations: registrations.rows
+      .filter((registration) => registration.member_id === member.member_id)
+      .map(({ member_id: _memberId, ...registration }) => registration),
+  }));
+}
+
+// Everything a machine that has none of this needs before it can read history:
+// which team it is, who is in it, and what the server will accept. One
+// repeatable-read transaction, so the roster and the capabilities it is
+// interpreted under cannot come from two different moments.
+export async function getTeamSnapshot(
+  pool: Pool,
+  teamId: string,
+): Promise<Record<string, unknown>> {
+  return inTransaction(
+    pool,
+    async (client) => {
+      const snapshot = await capabilitySnapshot(client, teamId);
+      return { ...snapshot, members: await roster(client, teamId) };
+    },
+    { readOnly: true, repeatableRead: true },
+  );
+}
+
 export async function getMembers(
   pool: Pool,
   teamId: string,
@@ -816,32 +863,10 @@ export async function getMembers(
       const serverId = await serverInstanceId(client);
       const team = await teamRow(client, teamId);
       if (!team) throw notFound(serverId, teamId);
-      const members = await client.query<{ member_id: string; name: string }>(
-        `SELECT member_id::text, name FROM members
-          WHERE team_id = $1 ORDER BY member_id`,
-        [teamId],
-      );
-      const registrations = await client.query<{
-        registration_id: string;
-        member_id: string;
-        installation_id: string;
-        type: string;
-      }>(
-        `SELECT registration_id::text, member_id::text, installation_id::text, type
-           FROM registrations WHERE team_id = $1
-          ORDER BY registration_id`,
-        [teamId],
-      );
       return {
         ...common(serverId, team),
         members_revision: team.members_revision,
-        members: members.rows.map((member) => ({
-          member_id: member.member_id,
-          name: member.name,
-          registrations: registrations.rows
-            .filter((registration) => registration.member_id === member.member_id)
-            .map(({ member_id: _memberId, ...registration }) => registration),
-        })),
+        members: await roster(client, teamId),
       };
     },
     { readOnly: true, repeatableRead: true },
