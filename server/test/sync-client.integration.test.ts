@@ -118,11 +118,13 @@ describeDatabase("Stage-1 polling sync client", () => {
     await rm(root, { recursive: true });
   });
 
-  // Stores are per team. A store root no longer holds one messages.db for
-  // everybody — that file still exists there and is now the runtime/lock store,
-  // so reading it finds a real database with none of these tables in it.
-  function teamStore(store: string, team = localTeam) {
-    return join(store, "teams", team, "messages.db");
+  // Where a team's rows live depends on its layout driver. These teams are on
+  // the default `shared` layout — nothing here connects through a path that
+  // moves them — so this is the one store, the same file the client writes.
+  // A team that had moved would answer differently, which is why this asks
+  // rather than spelling the path out at each call site.
+  function teamStore(store: string, _team = localTeam) {
+    return join(store, "messages.db");
   }
 
   function environment(store: string) {
@@ -149,8 +151,9 @@ describeDatabase("Stage-1 polling sync client", () => {
   }
 
   async function localSend(store: string, from: string, to: string, body: string, team = localTeam) {
-    // storage_init takes the team: stores are per team, so initializing without
-    // one reaches the resolver with an empty selector and fails under set -u.
+    // storage_init takes the team even on the shared layout: which store to
+    // initialize is a question about a team, and calling it without one reaches
+    // the resolver with an empty selector and fails under set -u.
     const script = `. "$1/scripts/lib/storage.sh"
 agmsg_storage_load
 storage_init "$2" >/dev/null
