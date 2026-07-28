@@ -198,8 +198,111 @@ fn bash_command() -> Result<std::process::Command, String> {
     Ok(cmd)
 }
 
+/// THE ONE PLACE the app decides where a message store lives.
+///
+/// Kept as a single function on purpose: the storage layout is under
+/// discussion (shared store by default, per-team for connected teams), and
+/// when that lands this is the only thing that moves. Do not join a store
+/// path anywhere else — the reason this file needed fixing at all is that a
+/// layout change had nothing to break.
+///
+/// Also note what it does NOT decide: which tables to read. That is
+/// [`MESSAGES_SINCE_SQL`], and it is a separate axis — pointing at the right
+/// file and reading the right tables broke independently, in that order.
 fn db_path() -> PathBuf {
     agmsg_base().join("db/messages.db")
+}
+
+/// New messages, from the event log and the legacy table together.
+///
+/// The read rule mirrors `storage_history()` in
+/// `scripts/drivers/storage/sqlite.sh`, deliberately, and
+/// `messages_match_the_shell_facade` asserts the two agree rather than
+/// leaving "deliberately" as a claim. `src` breaks ties between a legacy row
+/// and an event-log row carrying the same timestamp, so the two spaces
+/// interleave in one stable order — legacy first, matching the facade.
+///
+/// Two cursors because there are two id spaces: `events.seq` and the legacy
+/// `messages.id` autoincrement. They are unrelated counters, both starting
+/// at 1, so a single high-water mark would skip rows in whichever table was
+/// behind.
+const MESSAGES_SINCE_SQL: &str = "\
+    SELECT id, team, from_agent, to_agent, body, at, src, ord FROM (
+      SELECT id AS id, team, from_agent, to_agent, body, at AS at,
+             1 AS src, seq AS ord
+        FROM events
+       WHERE type='message_sent' AND seq > ?1
+      UNION ALL
+      SELECT CAST(id AS TEXT) AS id, team, from_agent, to_agent, body,
+             created_at AS at, 0 AS src, id AS ord
+        FROM messages
+       WHERE id > ?2
+    )
+    ORDER BY at ASC, src ASC, ord ASC";
+
+/// The same read against a store built before the event log, where `events`
+/// does not exist and the whole query above fails to prepare.
+const MESSAGES_SINCE_LEGACY_ONLY_SQL: &str = "\
+    SELECT CAST(id AS TEXT) AS id, team, from_agent, to_agent, body,
+           created_at AS at, 0 AS src, id AS ord
+      FROM messages
+     WHERE id > ?2
+     ORDER BY at ASC, ord ASC";
+
+/// Where each of the two id spaces has been read up to.
+#[derive(Clone, Copy, Default)]
+struct Cursors {
+    /// `events.seq`
+    seq: i64,
+    /// legacy `messages.id`
+    legacy_id: i64,
+}
+
+/// Reads rows newer than `cursors` and advances it past them.
+///
+/// A store that predates the event log has no `events` table, and one built
+/// by a current `storage_init` always has both — so the query is attempted
+/// whole and, if `events` is missing, retried against the legacy table
+/// alone. That is the released layout today: this machine's own store has
+/// `messages` with 6,285 rows and no `events` table at all.
+fn read_new_messages(
+    conn: &rusqlite::Connection,
+    cursors: &mut Cursors,
+) -> Result<Vec<Message>, rusqlite::Error> {
+    let run = |sql: &str| -> Result<Vec<(Message, i64, i64)>, rusqlite::Error> {
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(rusqlite::params![cursors.seq, cursors.legacy_id], |r| {
+            Ok((
+                Message {
+                    id: r.get(0)?,
+                    team: r.get(1)?,
+                    from: r.get(2)?,
+                    to: r.get(3)?,
+                    body: r.get(4)?,
+                    created_at: r.get(5)?,
+                },
+                r.get::<_, i64>(6)?,
+                r.get::<_, i64>(7)?,
+            ))
+        })?;
+        rows.collect()
+    };
+
+    let rows = match run(MESSAGES_SINCE_SQL) {
+        Ok(rows) => rows,
+        Err(_) => run(MESSAGES_SINCE_LEGACY_ONLY_SQL)?,
+    };
+
+    let mut out = Vec::with_capacity(rows.len());
+    for (msg, src, ord) in rows {
+        if src == 1 {
+            cursors.seq = cursors.seq.max(ord);
+        } else {
+            cursors.legacy_id = cursors.legacy_id.max(ord);
+        }
+        out.push(msg);
+    }
+    Ok(out)
 }
 
 fn open_ro() -> Result<rusqlite::Connection, String> {
@@ -212,7 +315,17 @@ fn open_ro() -> Result<rusqlite::Connection, String> {
 
 #[derive(Clone, Serialize)]
 pub struct Message {
-    pub id: i64,
+    /// Opaque, per `api.sh`'s own contract: "Every id (message ids included)
+    /// is a JSON string, never a bare number — ids are opaque per the driver
+    /// interface spec, and today's sqlite integer ids are no exception."
+    ///
+    /// This was `i64`, which held only while every id came from the legacy
+    /// `messages` table's INTEGER PRIMARY KEY. Event-log ids are UUIDs
+    /// (`019faa2a-48ae-7067-bb7d-ace26fd8a6df`), so parsing them as an
+    /// integer failed — and because the parse sat inside a `filter_map`,
+    /// every event-log message was dropped without a trace. Ordering does
+    /// not depend on this value; the store returns rows already ordered.
+    pub id: String,
     pub team: String,
     pub from: String,
     pub to: String,
@@ -565,27 +678,30 @@ pub fn agmsg_members(team: String) -> Result<Vec<Member>, String> {
 pub fn agmsg_messages(
     team: String,
     limit: Option<u32>,
-    before_id: Option<i64>,
+    // Opaque, like the id it pages from — `api.sh` deliberately does not
+    // numeric-filter this one, "since event-log ids are UUIDs, not numeric".
+    before_id: Option<String>,
 ) -> Result<Vec<Message>, String> {
     let limit_s = limit.unwrap_or(30).to_string();
     let mut args = vec!["get", "teams", &team, "messages", "--limit", &limit_s];
-    let before_id_s;
-    if let Some(id) = before_id {
-        before_id_s = id.to_string();
+    if let Some(id) = before_id.as_deref() {
         args.push("--before-id");
-        args.push(&before_id_s);
+        args.push(id);
     }
     let raw = run_script("api.sh", &args)?;
+    // Every row is kept. The previous version parsed the id as an integer
+    // inside a filter_map, so a message whose id was not numeric vanished
+    // rather than surfacing as an error — which is every event-log message.
     Ok(parse_jsonl::<ApiMessage>(&raw)
         .into_iter()
-        .filter_map(|m| Some(Message {
-            id: m.id.parse().ok()?,
+        .map(|m| Message {
+            id: m.id,
             team: m.team,
             from: m.from,
             to: m.to,
             body: m.body,
             created_at: m.created_at,
-        }))
+        })
         .collect())
 }
 
@@ -701,36 +817,26 @@ pub fn start_watcher(app: AppHandle) {
                 Err(_) => thread::sleep(Duration::from_millis(800)),
             }
         };
-        let mut last_id: i64 = conn
-            .query_row("SELECT COALESCE(MAX(id),0) FROM messages", [], |r| r.get(0))
-            .unwrap_or(0);
+        // Start at the current end of both id spaces: the room loads its own
+        // history separately, so replaying it here would double every
+        // message already on screen.
+        let mut cursors = Cursors {
+            seq: conn
+                .query_row("SELECT COALESCE(MAX(seq),0) FROM events", [], |r| r.get(0))
+                .unwrap_or(0),
+            legacy_id: conn
+                .query_row("SELECT COALESCE(MAX(id),0) FROM messages", [], |r| r.get(0))
+                .unwrap_or(0),
+        };
         loop {
-            let new_rows: Vec<Message> = {
-                let mut stmt = match conn.prepare(
-                    "SELECT id, team, from_agent, to_agent, body, created_at FROM messages \
-                     WHERE id>?1 ORDER BY id",
-                ) {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-                let mapped = stmt.query_map(rusqlite::params![last_id], |r| {
-                    Ok(Message {
-                        id: r.get(0)?,
-                        team: r.get(1)?,
-                        from: r.get(2)?,
-                        to: r.get(3)?,
-                        body: r.get(4)?,
-                        created_at: r.get(5)?,
-                    })
-                });
-                match mapped {
-                    Ok(it) => it.filter_map(|r| r.ok()).collect(),
-                    Err(_) => Vec::new(),
+            // A read failure is transient here (a WAL checkpoint, a store
+            // being recreated), not a reason to end the thread — the previous
+            // version returned on a prepare error and the session went
+            // silently dead for the rest of its life.
+            if let Ok(new_rows) = read_new_messages(&conn, &mut cursors) {
+                for m in new_rows {
+                    let _ = app.emit("agmsg-message", m);
                 }
-            };
-            for m in new_rows {
-                last_id = m.id.max(last_id);
-                let _ = app.emit("agmsg-message", m);
             }
             thread::sleep(Duration::from_millis(800));
         }
@@ -1003,5 +1109,113 @@ mod tests {
         assert!(native_proj.is_dir(), "native project dir should be created");
         let got = std::fs::read_to_string(dir.path().join("arg4.txt")).unwrap();
         assert_eq!(got, msys_proj, "join.sh $4 should be the MSYS form");
+    }
+
+    /// Builds a store the way `storage_init` does: the event log plus the
+    /// legacy table beside it, at the path [`super::db_path`] resolves to.
+    fn store_with(base: &std::path::Path, events: &[(&str, &str)], legacy: &[&str]) {
+        let db = base.join("db");
+        std::fs::create_dir_all(&db).unwrap();
+        let conn = rusqlite::Connection::open(db.join("messages.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE events (
+               seq INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL,
+               id TEXT NOT NULL, team TEXT, from_agent TEXT, to_agent TEXT,
+               body TEXT, msg_id TEXT, agent TEXT, at TEXT NOT NULL);
+             CREATE TABLE messages (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, team TEXT NOT NULL,
+               from_agent TEXT NOT NULL, to_agent TEXT NOT NULL, body TEXT NOT NULL,
+               created_at TEXT NOT NULL, read_at TEXT);",
+        )
+        .unwrap();
+        for (id, at) in events {
+            conn.execute(
+                "INSERT INTO events(type,id,team,from_agent,to_agent,body,at) \
+                 VALUES ('message_sent',?1,'t','leader','worker','from the event log',?2)",
+                rusqlite::params![id, at],
+            )
+            .unwrap();
+        }
+        for at in legacy {
+            conn.execute(
+                "INSERT INTO messages(team,from_agent,to_agent,body,created_at) \
+                 VALUES ('t','leader','worker','from the legacy table',?1)",
+                rusqlite::params![at],
+            )
+            .unwrap();
+        }
+    }
+
+    /// The one test that goes red if any of the three independent failures
+    /// comes back. Each of them was silent: the store opened, the query ran,
+    /// the parse "succeeded" by discarding rows, and the app showed nothing
+    /// while reporting no error at all.
+    ///
+    /// - **wrong path** — reading somewhere other than [`super::db_path`]
+    ///   finds no store, so nothing arrives.
+    /// - **legacy table only** — the UUID-keyed row is missing.
+    /// - **id treated as a number** — the UUID row is the one that
+    ///   disappears, because it is the only id that is not numeric.
+    ///
+    /// It exercises the watcher's own reader, not a copy of its SQL.
+    #[test]
+    #[serial]
+    fn a_sent_message_reaches_the_app_from_both_the_event_log_and_the_legacy_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set("AGMSG_APP_BASE", &dir.path().to_string_lossy());
+        store_with(
+            dir.path(),
+            &[("019faa2a-48ae-7067-bb7d-ace26fd8a6df", "2026-07-28T10:00:01Z")],
+            &["2026-07-28T10:00:00Z"],
+        );
+
+        let conn = super::open_ro().expect("the store db_path() resolves to must open");
+        let mut cursors = super::Cursors::default();
+        let got = super::read_new_messages(&conn, &mut cursors).expect("read");
+
+        let ids: Vec<&str> = got.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["1", "019faa2a-48ae-7067-bb7d-ace26fd8a6df"],
+            "both rows must arrive, oldest first — a UUID id means the event \
+             log is being read, and losing it is how this broke before"
+        );
+        assert_eq!(got[1].body, "from the event log");
+
+        // A second poll returns nothing: both cursors advanced, and a
+        // shared one would have skipped whichever table was behind.
+        let again = super::read_new_messages(&conn, &mut cursors).expect("read");
+        assert!(again.is_empty(), "already-seen rows must not be re-emitted");
+    }
+
+    /// The released layout: a store from before the event log has no `events`
+    /// table at all, so the whole UNION fails to prepare. History must still
+    /// come through — the machine this was written on has 6,285 such rows.
+    #[test]
+    #[serial]
+    fn history_still_arrives_from_a_store_that_predates_the_event_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set("AGMSG_APP_BASE", &dir.path().to_string_lossy());
+        let db = dir.path().join("db");
+        std::fs::create_dir_all(&db).unwrap();
+        let conn = rusqlite::Connection::open(db.join("messages.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, team TEXT NOT NULL,
+               from_agent TEXT NOT NULL, to_agent TEXT NOT NULL, body TEXT NOT NULL,
+               created_at TEXT NOT NULL, read_at TEXT);
+             INSERT INTO messages(team,from_agent,to_agent,body,created_at)
+               VALUES ('t','leader','worker','older than the event log',
+                       '2026-06-01T00:00:00Z');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = super::open_ro().unwrap();
+        let mut cursors = super::Cursors::default();
+        let got = super::read_new_messages(&conn, &mut cursors).expect("read");
+
+        assert_eq!(got.len(), 1, "a pre-event-log store must not read as empty");
+        assert_eq!(got[0].body, "older than the event log");
     }
 }
