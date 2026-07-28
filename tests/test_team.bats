@@ -150,10 +150,13 @@ EOF
   [[ "$output" =~ "bob" ]]
 }
 
-@test "leave: removes team dir when last member leaves" {
+@test "leave: retains an id-bearing team when its last member leaves" {
   bash "$SCRIPTS/join.sh" myteam alice claude-code /tmp/proj
   bash "$SCRIPTS/leave.sh" myteam alice
-  [ ! -d "$TEST_SKILL_DIR/teams/myteam" ]
+  [ -f "$TEST_SKILL_DIR/teams/myteam/config.json" ]
+  [ -f "$TEST_SKILL_DIR/teams/myteam/roster.jsonl" ]
+  [ "$(sqlite_mem "SELECT json_array_length(
+    json_extract(readfile('$(rf "$TEST_SKILL_DIR/teams/myteam/config.json")'), '\$.agents'));")" -eq 0 ]
 }
 
 @test "leave: an agent name containing a single quote doesn't break the underlying SQL statement (#87-class)" {
@@ -350,12 +353,13 @@ EOF
   [[ "$output" =~ "agent=alice" ]]
 }
 
-@test "reset: removes agent when last registration is cleared" {
+@test "reset: retires the member when its last registration is cleared" {
   bash "$SCRIPTS/join.sh" myteam alice claude-code /tmp/proj-a
   run bash "$SCRIPTS/reset.sh" /tmp/proj-a claude-code alice
   [ "$status" -eq 0 ]
   [[ "$output" =~ "removed 1 registration" ]]
-  [ ! -d "$TEST_SKILL_DIR/teams/myteam" ]
+  [ -f "$TEST_SKILL_DIR/teams/myteam/config.json" ]
+  [ -f "$TEST_SKILL_DIR/teams/myteam/roster.jsonl" ]
 }
 
 @test "reset: an explicit agent_id containing a single quote doesn't break the underlying SQL statement (#87-class)" {
@@ -366,7 +370,8 @@ EOF
   [[ ! "$output" =~ "syntax error" ]]
   [[ ! "$output" =~ ".parameter" ]]
   [[ "$output" =~ "removed 1 registration" ]]
-  [ ! -d "$TEST_SKILL_DIR/teams/myteam" ]
+  [ -f "$TEST_SKILL_DIR/teams/myteam/config.json" ]
+  [ -f "$TEST_SKILL_DIR/teams/myteam/roster.jsonl" ]
 }
 
 @test "reset: rejects an explicit agent_id containing path-hazard characters" {
@@ -623,27 +628,22 @@ EOF
   [[ ! "$output" =~ "claude " ]]
 }
 
-@test "join: --force still revives a renamed-away name when explicitly requested" {
+@test "join: --force cannot reassign a renamed-away identity name" {
   bash "$SCRIPTS/join.sh" myteam claude claude-code /tmp/proj
   bash "$SCRIPTS/rename.sh" myteam claude claude-orchestrator
   run bash "$SCRIPTS/join.sh" myteam claude claude-code /tmp/proj --force
-  [ "$status" -eq 0 ]
-  [[ "$output" =~ "Joined team myteam as claude" ]]
-  run bash "$SCRIPTS/team.sh" myteam
-  [[ "$output" =~ "claude-orchestrator" ]]
-  [[ "$output" =~ "claude " ]]
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "permanently bound" ]]
 }
 
-@test "join: after --force revives a name, a later normal join for it no longer needs --force" {
-  # Once --force deliberately reuses a renamed-away name, that identity's
-  # tombstone must be cleared — otherwise every subsequent registration
-  # (e.g. adding a second project) would keep hitting the same guard forever.
+@test "join: a rejected forced reassignment leaves the rename tombstone intact" {
   bash "$SCRIPTS/join.sh" myteam claude claude-code /tmp/proj
   bash "$SCRIPTS/rename.sh" myteam claude claude-orchestrator
-  bash "$SCRIPTS/join.sh" myteam claude claude-code /tmp/proj --force
+  run bash "$SCRIPTS/join.sh" myteam claude claude-code /tmp/proj --force
+  [ "$status" -ne 0 ]
   run bash "$SCRIPTS/join.sh" myteam claude claude-code /tmp/proj-2
-  [ "$status" -eq 0 ]
-  [[ "$output" =~ "Joined team myteam as claude" ]]
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "was renamed to 'claude-orchestrator'" ]]
 }
 
 @test "join: joining the new name after a rename succeeds normally" {

@@ -107,6 +107,42 @@ test("none and age-v1 profiles share one seal/open registry", async () => {
   }
 });
 
+test("legacy messages remain discriminator-free while roster mutations use kind", async () => {
+  const base = {
+    type: "sync_seal",
+    envelope_v: 1,
+    cipher: "none",
+    key_id: null,
+    recipients: [],
+    max_blob_bytes: 1_048_576,
+    wire_id: manifest.binding.wire_id,
+    team_id: manifest.binding.team_id,
+    protocol_version: 1,
+  };
+  const legacy = sealEnvelope({ ...base, projection: manifest.canonical_message });
+  const legacyPlaintext = Buffer.from(legacy.blob, "base64").toString("utf8");
+  assert.equal(legacyPlaintext, JSON.stringify(manifest.canonical_message));
+  assert.equal(JSON.parse(legacyPlaintext).kind, undefined);
+
+  const roster = {
+    kind: "member_renamed",
+    mutation_id: "018f3f7e-0000-7000-8000-000000000010",
+    member_id: "018f3f7e-0000-7000-8000-000000000011",
+    from: "alice",
+    to: "carol",
+    occurred_at: "2026-07-28T23:00:00.000000Z",
+  };
+  const rosterEnvelope = sealEnvelope({
+    ...base,
+    wire_id: "550e8400-e29b-41d4-a716-446655440001",
+    projection: roster,
+  });
+  assert.deepEqual(await openEnvelope({
+    envelope: rosterEnvelope,
+    max_blob_bytes: 1_048_576,
+  }), roster);
+});
+
 test("age-v1 accepts only native X25519 identity files", () => {
   const teamA = nativeAgeIdentity(Buffer.from(`${manifest.recipient_sets.team_a.identity}\n`));
   assert.equal(teamA.recipient, manifest.recipient_sets.team_a.recipient);
