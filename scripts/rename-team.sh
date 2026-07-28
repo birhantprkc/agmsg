@@ -27,7 +27,7 @@ source "$SCRIPT_DIR/lib/validate.sh"
 agmsg_validate_team_name "$OLD_TEAM" || exit 1
 agmsg_validate_team_name "$NEW_TEAM" || exit 1
 TEAMS_DIR="$SCRIPT_DIR/../teams"
-DB="$(agmsg_db_path)"
+DB="$(agmsg_db_path "$OLD_TEAM")"
 OLD_DIR="$TEAMS_DIR/$OLD_TEAM"
 NEW_DIR="$TEAMS_DIR/$NEW_TEAM"
 

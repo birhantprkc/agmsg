@@ -38,7 +38,41 @@ agmsg_storage_dir() {
   printf '%s\n' "$skill_dir/db"
 }
 
-# Echo the full path to messages.db, in a form the sqlite3 binary can open.
+# Echo the full path to the message store, in a form the sqlite3 binary can open.
+#
+# Takes a team SELECTOR, and every message-store caller must pass one. The
+# selector is an input to resolution — it is NOT the storage identity, and it is
+# NOT where the path comes from: today every selector resolves to the same file,
+# and that is deliberate. When message stores are actually split per team, only
+# this function changes; if a permanent per-team key is ever introduced, it is
+# resolved from the selector HERE, so a display name never becomes a path.
+#
+# The argument is required rather than optional on purpose. An optional one
+# leaves two ways to reach the store, and a preparation that is only half
+# applied is worse than none: at split time it would be impossible to tell which
+# callers had been converted.
+agmsg_db_path() {
+  local team="${1-}"
+  if [ -z "$team" ]; then
+    echo "Error: agmsg_db_path requires a team selector" >&2
+    return 1
+  fi
+  _agmsg_db_file
+}
+
+# The store that is NOT team-scoped, and the only resolver allowed to take no
+# selector. Two things live in the same file today that are not message data:
+# the runtime `locks` table (its resources are project-scoped — there is no team
+# to pass), and the install-time bootstrap of the legacy `messages` table.
+#
+# Separating the two resolvers is what keeps `agmsg_db_path` single-meaning. It
+# is a seam, not a parallel accessor family: when message stores split per team,
+# runtime state does not follow them, and this resolution does not change.
+# Splitting the physical file is a separate change.
+_agmsg_runtime_db_path() { _agmsg_db_file; }
+
+# Shared by both resolvers while they still name the same file.
+#
 # On Windows, sqlite3.exe is a native binary that cannot open a Git Bash path
 # like /c/Users/.../db/messages.db: open() fails, so inbox/send/watch all fail
 # to reach the store and the team goes silent (#197, reported by vhsvhafmwf).
@@ -46,13 +80,38 @@ agmsg_storage_dir() {
 # the shell's `[ -f "$db" ]` test AND sqlite3.exe accept — unlike -w's backslash
 # form (C:\Users\...), which the surrounding shell quoting/tests mishandle.
 # No-op off Windows (cygpath absent). Mirrors agmsg_sql_readfile_path's pattern.
-agmsg_db_path() {
+_agmsg_db_file() {
   local db
   db="$(agmsg_storage_dir)/messages.db"
   if command -v cygpath >/dev/null 2>&1; then
     db=$(cygpath -m "$db" 2>/dev/null || printf '%s' "$db")
   fi
   printf '%s\n' "$db"
+}
+
+# The storage selector for a list of <team>:<agent> pairs, shared by every
+# driver so one rule has one implementation.
+#
+# All pairs must name the SAME team. That is not a limitation being introduced
+# here — the only production caller has always passed exactly one pair — but it
+# is enforced rather than assumed, because the multi-team form has no answer
+# once stores are actually split: a per-team store has no single monotonic
+# cursor for a watch call to return. Choosing between a single-team ABI and a
+# composite cursor belongs to that change, and failing loudly here stops a
+# multi-team caller from appearing meanwhile and settling it by default.
+agmsg_pair_team() {
+  local p first="" t
+  for p in "$@"; do
+    t="${p%%:*}"
+    [ -n "$t" ] && [ "$t" != "$p" ] || { echo "storage: not a team:agent pair: $p" >&2; return 1; }
+    if [ -z "$first" ]; then first="$t"
+    elif [ "$t" != "$first" ]; then
+      echo "storage: one call cannot span teams ($first, $t)" >&2
+      return 1
+    fi
+  done
+  [ -n "$first" ] || { echo "storage: no team:agent pair given" >&2; return 1; }
+  printf '%s' "$first"
 }
 
 # Run sqlite3 against the message store with a busy_timeout, so a writer that
@@ -122,7 +181,7 @@ agmsg_runtime_lock_acquire() {
   resource="$1"; owner_pid="$2"; expected_owner="${3:-}"
   case "$owner_pid:$expected_owner" in *[!0-9:]*) return 1 ;; esac
   agmsg_storage_ensure_initialized || return 1
-  db="$(agmsg_db_path)"
+  db="$(_agmsg_runtime_db_path)"
   resource_sql="$(_agmsg_runtime_lock_resource_sql "$resource")"
   agmsg_sqlite "$db" <<SQL | tr -d '\r'
 CREATE TABLE IF NOT EXISTS locks (
@@ -142,7 +201,7 @@ SQL
 agmsg_runtime_lock_owner() {
   local resource_sql
   resource_sql="$(_agmsg_runtime_lock_resource_sql "$1")"
-  agmsg_sqlite "$(agmsg_db_path)" \
+  agmsg_sqlite "$(_agmsg_runtime_db_path)" \
     "SELECT owner_pid FROM locks WHERE resource = '$resource_sql';" 2>/dev/null \
     | tr -d '\r'
 }
@@ -156,7 +215,7 @@ agmsg_runtime_lock_release() {
   local resource_sql
   case "$2" in *[!0-9]*|'') return 1 ;; esac
   resource_sql="$(_agmsg_runtime_lock_resource_sql "$1")"
-  agmsg_sqlite "$(agmsg_db_path)" \
+  agmsg_sqlite "$(_agmsg_runtime_db_path)" \
     "DELETE FROM locks WHERE resource = '$resource_sql' AND owner_pid = $2;" \
     >/dev/null 2>&1 || true
 }

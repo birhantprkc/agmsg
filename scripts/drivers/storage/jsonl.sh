@@ -30,7 +30,19 @@ _JSONL_DRIVER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)
 _JSONL_SYNC_HELPER_DEFAULT="$_JSONL_DRIVER_DIR/../../internal/jsonl-sync.mjs"
 
 _jsonl_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-_jsonl_log() { printf '%s\n' "$(dirname "$(agmsg_db_path)")/events.jsonl"; }
+# The storage selector for the call in progress. Every contract entry point below
+# sets it before touching the log; _jsonl_log is the only reader.
+#
+# A variable rather than a parameter on ~20 internal helpers, and safe for one
+# specific reason: it is only ever read DOWNWARD. Helpers run in this shell, and
+# a `$( )` inside them inherits it. Nothing writes it back up — that direction
+# does not survive a subshell, and relying on it is how caches and counters get
+# silently thrown away.
+#
+# Unset is a loud failure, not a silent wrong store: agmsg_db_path rejects an
+# empty selector.
+_JSONL_TEAM=""
+_jsonl_log() { printf '%s\n' "$(dirname "$(agmsg_db_path "$_JSONL_TEAM")")/events.jsonl"; }
 _jsonl_read_cursors() {
   local log; log="$(_jsonl_log)"
   printf '%s\n' "$(dirname "$log")/read-cursors.tsv"
@@ -147,20 +159,26 @@ storage_check() {
 }
 
 storage_describe() {
+  _JSONL_TEAM="$1"
+  # The selector is optional HERE and only here: describe reports driver
+  # metadata, and the capabilities caller has no team to name. The path line
+  # is the only team-dependent part, so it is reported only when a specific
+  # store was asked about. This is not a second way to reach the store.
   printf 'name=jsonl\n'
   printf 'backend=append-only JSONL event log (jq; duckdb opt-in accelerator)\n'
-  printf 'log=%s\n' "$(_jsonl_log)"
+  [ -z "${1-}" ] || printf 'log=%s\n' "$(_jsonl_log)"
   if _jsonl_sync_available; then printf 'capabilities=stage1-sync\n'; fi
 }
 
 storage_init() {
+  _JSONL_TEAM="$1"
   _jsonl_init_file
   echo ok
 }
 
 # Does a store already exist? (does NOT create one.) The log is the store, so a
 # read call-site can answer "no messages yet" without lazily creating events.jsonl.
-storage_store_exists() { [ -f "$(_jsonl_log)" ]; }
+storage_store_exists() { _JSONL_TEAM="$1"; [ -f "$(_jsonl_log)" ]; }
 
 # --- optional Stage-1 remote synchronization -------------------------------
 
@@ -186,21 +204,25 @@ _jsonl_sync_exec_locked() {
 }
 
 storage_sync_prepare_push() {
+  _JSONL_TEAM="$1"
   _jsonl_init_file || return 13
   _jsonl_with_lock _jsonl_sync_exec_locked prepare "$@"
 }
 
 storage_sync_reconcile_push() {
+  _JSONL_TEAM="$1"
   _jsonl_init_file || return 13
   _jsonl_with_lock _jsonl_sync_exec_locked reconcile "$@"
 }
 
 storage_sync_apply_pull() {
+  _JSONL_TEAM="$1"
   _jsonl_init_file || return 13
   _jsonl_with_lock _jsonl_sync_exec_locked apply "$@"
 }
 
 storage_sync_reprocess() {
+  _JSONL_TEAM="$1"
   _jsonl_init_file || return 13
   _jsonl_with_lock _jsonl_sync_exec_locked reprocess "$@"
 }
@@ -208,6 +230,7 @@ storage_sync_reprocess() {
 # --- contract: messages -----------------------------------------------------
 
 storage_send() {
+  _JSONL_TEAM="$1"
   local team="$1" from="$2" to="$3" body="$4"
   local id at line; id="$(_jsonl_uuid7)"; at="$(_jsonl_now)"
   _jsonl_init_file
@@ -229,6 +252,7 @@ _jsonl_prepare_rotated_generation_locked() {
 }
 
 storage_list_unread() {
+  _JSONL_TEAM="$1"
   _jsonl_init_file || return 1
   _jsonl_with_lock _jsonl_list_unread_locked "$@"
 }
@@ -285,6 +309,7 @@ _jsonl_unread_duckdb() {
 }
 
 storage_read_cursor_get() {
+  _JSONL_TEAM="$1"
   local team="$1" agent="$2" f
   _jsonl_init_file || return 1
   f="$(_jsonl_read_cursors)"
@@ -329,6 +354,7 @@ _jsonl_read_cursor_consume_locked() {
 }
 
 storage_read_cursor_consume() {
+  _JSONL_TEAM="$1"
   local team="$1" agent="$2" target="$3"; shift 3
   case "$target" in ''|*[!0-9]*) echo runtime_error; return 13 ;; esac
   _jsonl_init_file || { echo runtime_error; return 13; }
@@ -338,6 +364,7 @@ storage_read_cursor_consume() {
 }
 
 storage_mark_read_batch() {
+  _JSONL_TEAM="$1"
   local team="$1" agent="$2"; shift 2
   [ $# -gt 0 ] || { echo ok; return 0; }
   local tip; tip=$(storage_watch_tip "$team:$agent") || { echo runtime_error; return 13; }
@@ -366,6 +393,7 @@ _jsonl_mark() {
 # --- contract: watch (delivery cursor §2.2) ---------------------------------
 
 storage_watch_tip() {
+  _JSONL_TEAM="$(agmsg_pair_team "$@")" || return 13
   _jsonl_init_file || return 1
   _jsonl_with_lock _jsonl_watch_tip_locked
 }
@@ -380,6 +408,7 @@ _jsonl_watch_tip_locked() {
 }
 
 storage_watch_after() {
+  _JSONL_TEAM="$(agmsg_pair_team "${@:2}")" || return 13
   _jsonl_init_file || return 1
   _jsonl_with_lock _jsonl_watch_after_locked "$@"
 }
@@ -413,6 +442,7 @@ _jsonl_watch_after_locked() {
 # --- contract: history ------------------------------------------------------
 
 storage_history() {
+  _JSONL_TEAM="$1"
   _jsonl_init_file || return 1
   _jsonl_with_lock _jsonl_history_locked "$@"
 }
@@ -437,6 +467,7 @@ _jsonl_history_locked() {
 # --- contract: export / import / compact ------------------------------------
 
 storage_export() {
+  _JSONL_TEAM="$1"; shift
   _jsonl_init_file || return 1
   _jsonl_with_lock _jsonl_export_locked "$@"
 }
@@ -451,6 +482,7 @@ _jsonl_export_locked() {
 }
 
 storage_import() {
+  _JSONL_TEAM="$1"; shift
   local file="$1"; [ -f "$file" ] || return 1
   _jsonl_init_file
   _jsonl_with_lock _jsonl_import_do "$file"
@@ -460,6 +492,7 @@ _jsonl_import_do() {
 }
 
 storage_compact() {
+  _JSONL_TEAM="$1"
   _jsonl_init_file
   _jsonl_with_lock _jsonl_compact_do || { echo runtime_error; return 13; }
   echo ok
@@ -507,6 +540,7 @@ _jsonl_rename_agent_locked() {
 }
 
 storage_rename_agent() {
+  _JSONL_TEAM="$1"
   _jsonl_init_file || { echo runtime_error; return 13; }
   _jsonl_with_lock _jsonl_rename_agent_locked "$1" "$2" "$3" || {
     echo runtime_error; return 13;
@@ -544,6 +578,7 @@ _jsonl_rename_team_locked() {
 }
 
 storage_rename_team() {
+  _JSONL_TEAM="$1"
   _jsonl_init_file || { echo runtime_error; return 13; }
   _jsonl_with_lock _jsonl_rename_team_locked "$1" "$2" || {
     echo runtime_error; return 13;

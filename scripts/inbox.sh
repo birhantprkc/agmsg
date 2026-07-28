@@ -19,7 +19,7 @@ agmsg_storage_load
 # Preserve the read-only "not initialized yet" behaviour: an inbox check must not
 # create the store. Ask the active driver whether one exists (driver-level, so it
 # works for jsonl's events.jsonl as well as sqlite's messages.db).
-if ! storage_store_exists; then
+if ! storage_store_exists "$TEAM"; then
   if [ "$QUIET" = true ]; then exit 0; fi
   echo "No messages (DB not initialized)"
   exit 0

@@ -129,12 +129,16 @@ touch "$MARKER"
 
 # Check for unread messages and mark as read. Ask the active driver whether a
 # store exists (driver-level, works for jsonl too) — don't create one on a poll.
+# The check is per team, inside the loop below: a store is selected per team
+# now, so "this team has no store yet" is a normal state, and answering it
+# once for the whole process would silently stop delivery for every OTHER
+# team the moment one of them was uninitialized.
 agmsg_storage_load
-if ! storage_store_exists; then exit 0; fi
 
 OUTPUT=""
 IFS=',' read -ra TEAM_LIST <<< "$TEAMS"
 for team in "${TEAM_LIST[@]}"; do
+  storage_store_exists "$team" || continue
   # Honor actas exclusivity locks. If (team, AGENT) is currently held by
   # another live session, that session is the owner of that role's inbox —
   # don't deliver here. Mirrors the per-pair filtering watch.sh does for

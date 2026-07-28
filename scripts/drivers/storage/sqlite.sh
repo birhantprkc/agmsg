@@ -19,7 +19,10 @@
 # --- helpers ---------------------------------------------------------------
 
 _sqlite_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-_sqlite_db() { agmsg_db_path; }
+# <team> is the storage selector (see agmsg_db_path). Passed explicitly rather
+# than held in a driver-wide variable: these run inside command substitutions,
+# where an assignment made by a caller would not be visible anyway.
+_sqlite_db() { agmsg_db_path "$1"; }
 _sqlite_lit() { printf '%s' "$1" | sed "s/'/''/g"; }
 
 # Run a record-returning query: strip CR but PRESERVE the sqlite exit status
@@ -28,7 +31,7 @@ _sqlite_lit() { printf '%s' "$1" | sed "s/'/''/g"; }
 # separate fd — it never pollutes the JSONL on stdout) so failures are
 # debuggable, per §2.1 framing (#203 (1) / co1 review).
 _sqlite_data() {
-  ( set -o pipefail; agmsg_sqlite "$(_sqlite_db)" "$1" | tr -d '\r' )
+  ( set -o pipefail; agmsg_sqlite "$(_sqlite_db "$1")" "$2" | tr -d '\r' )
 }
 
 # UUIDv7: 48-bit ms timestamp + version/variant + random. python3 preferred;
@@ -78,18 +81,22 @@ storage_check() {
 }
 
 storage_describe() {
+  # The selector is optional HERE and only here: describe reports driver
+  # metadata, and the capabilities caller has no team to name. The path line
+  # is the only team-dependent part, so it is reported only when a specific
+  # store was asked about. This is not a second way to reach the store.
   printf 'name=sqlite\n'
   printf 'backend=SQLite (WAL) event log + legacy messages table\n'
   printf 'capabilities=stage1-sync,stage1-resync,stage2-read-state\n'
-  printf 'db=%s\n' "$(_sqlite_db)"
+  [ -z "${1-}" ] || printf 'db=%s\n' "$(_sqlite_db "$1")"
 }
 
 # Does a store already exist? (does NOT create one — lets a read call-site answer
 # "no messages yet" without lazily initializing a store in a storeless project.)
-storage_store_exists() { [ -f "$(_sqlite_db)" ]; }
+storage_store_exists() { [ -f "$(_sqlite_db "$1")" ]; }
 
 storage_init() {
-  local db; db="$(_sqlite_db)"
+  local db; db="$(_sqlite_db "$1")"
   mkdir -p "$(dirname "$db")" 2>/dev/null || true
   agmsg_sqlite "$db" "
     PRAGMA journal_mode=WAL;
@@ -168,7 +175,7 @@ storage_init() {
 
 storage_send() {
   local team="$1" from="$2" to="$3" body="$4"
-  local id at db; id="$(_sqlite_uuid7)"; at="$(_sqlite_now)"; db="$(_sqlite_db)"
+  local id at db; id="$(_sqlite_uuid7)"; at="$(_sqlite_now)"; db="$(_sqlite_db "$team")"
   local insert="
     INSERT INTO events (type,id,team,from_agent,to_agent,body,at)
     VALUES ('message_sent','$(_sqlite_lit "$id")','$(_sqlite_lit "$team")',
@@ -184,7 +191,7 @@ storage_send() {
   # argv ceiling than macOS, so a valid large local message must travel on
   # sqlite3's stdin rather than as the final command-line SQL argument.
   if ! printf '%s\n' "$insert" | agmsg_sqlite "$db" >/dev/null 2>&1; then
-    storage_init >/dev/null
+    storage_init "$team" >/dev/null
     printf '%s\n' "$insert" | agmsg_sqlite "$db" >/dev/null 2>&1 || return 1
   fi
   printf '%s\n' "$id"
@@ -193,8 +200,8 @@ storage_send() {
 # storage_read_cursor_get <team> <agent> — opaque local read frontier.
 storage_read_cursor_get() {
   local team="$1" agent="$2"
-  storage_init >/dev/null || return 13
-  _sqlite_data "SELECT COALESCE((SELECT local_position FROM read_cursors
+  storage_init "$team" >/dev/null || return 13
+  _sqlite_data "$team" "SELECT COALESCE((SELECT local_position FROM read_cursors
     WHERE team='$(_sqlite_lit "$team")' AND agent='$(_sqlite_lit "$agent")'),0);"
 }
 
@@ -205,9 +212,9 @@ storage_read_cursor_get() {
 storage_read_cursor_consume() {
   local team="$1" agent="$2" target="$3"; shift 3
   case "$target" in ''|*[!0-9]*) echo runtime_error; return 13 ;; esac
-  storage_init >/dev/null || { echo runtime_error; return 13; }
+  storage_init "$team" >/dev/null || { echo runtime_error; return 13; }
   local db tl al at id sql=""
-  db="$(_sqlite_db)"; tl="$(_sqlite_lit "$team")"; al="$(_sqlite_lit "$agent")"
+  db="$(_sqlite_db "$team")"; tl="$(_sqlite_lit "$team")"; al="$(_sqlite_lit "$agent")"
   at="$(_sqlite_now)"
   for id in "$@"; do
     sql="$sql
@@ -242,9 +249,9 @@ storage_list_unread() {
   shift 2
   while [ $# -gt 0 ]; do case "$1" in --limit) limit="$2"; shift 2 ;; *) shift ;; esac; done
   case "$limit" in ''|*[!0-9]*) limit="" ;; esac
-  storage_init >/dev/null
+  storage_init "$team" >/dev/null
   local tl al; tl="$(_sqlite_lit "$team")"; al="$(_sqlite_lit "$agent")"
-  _sqlite_data "
+  _sqlite_data "$team" "
     SELECT j FROM (
       SELECT json_object('type','message_sent','id',e.id,'team',e.team,
                'from',e.from_agent,'to',e.to_agent,'body',e.body,'at',e.at) AS j,
@@ -288,12 +295,14 @@ _sqlite_highwater() {
 }
 
 storage_watch_tip() {
-  storage_init >/dev/null
-  _sqlite_data "SELECT $(_sqlite_highwater);"
+  local team; team="$(agmsg_pair_team "$@")" || return 13
+  storage_init "$team" >/dev/null
+  _sqlite_data "$team" "SELECT $(_sqlite_highwater);"
 }
 
 storage_watch_after() {
   local cursor="$1"; shift
+  local team; team="$(agmsg_pair_team "$@")" || return 13
   case "$cursor" in ''|*[!0-9]*) cursor=0 ;; esac
   local pairs; pairs="$(_sqlite_pair_in "$@")"
   # The message scan and the trailing-cursor (high-water) read MUST observe the
@@ -301,7 +310,7 @@ storage_watch_after() {
   # cursor past a message the scan never returned — a silent skip. A deferred read
   # transaction pins one WAL snapshot across both SELECTs, so the emitted cursor
   # never runs ahead of what the scan saw (§2.2 "never skip").
-  _sqlite_data "
+  _sqlite_data "$team" "
     BEGIN;
     SELECT json_object('type','message_sent','id',id,'team',team,'from',from_agent,
                        'to',to_agent,'body',body,'at',at)
@@ -333,7 +342,7 @@ storage_history() {
   if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then agent="$1"; shift; fi
   while [ $# -gt 0 ]; do case "$1" in --limit) limit="$2"; shift 2 ;; *) shift ;; esac; done
   case "$limit" in ''|*[!0-9]*) limit="" ;; esac
-  storage_init >/dev/null
+  storage_init "$team" >/dev/null
   local tl al afilter; tl="$(_sqlite_lit "$team")"; al="$(_sqlite_lit "$agent")"
   if [ -n "$agent" ]; then
     afilter="AND (to_agent='$al' OR from_agent='$al')"
@@ -343,7 +352,7 @@ storage_history() {
   # --limit returns the most RECENT N (inner DESC + LIMIT), re-sorted to
   # chronological order for output — the intuitive "recent history" semantics,
   # not the oldest N.
-  _sqlite_data "
+  _sqlite_data "$team" "
     SELECT j FROM (
       SELECT j, ts, src, ord FROM (
         SELECT json_object('type','message_sent','id',id,'team',team,'from',from_agent,
@@ -366,12 +375,12 @@ storage_history() {
 # --- contract: export / import / compact -----------------------------------
 
 storage_export() {
-  local file="$1"
-  storage_init >/dev/null
+  local team="$1" file="$2"
+  storage_init "$team" >/dev/null
   # Forward-compat (§2.3): only the v1 event types are projected. A WHERE filter
   # (not just a CASE) keeps unknown-type rows out entirely, so they never surface
   # as a NULL → blank line on stdout, matching list_unread/history/watch_after.
-  _sqlite_data "
+  _sqlite_data "$team" "
     SELECT CASE type
       WHEN 'message_sent' THEN json_object('type','message_sent','id',id,'team',team,
              'from',from_agent,'to',to_agent,'body',body,'at',at)
@@ -385,7 +394,7 @@ storage_export() {
 }
 
 storage_import() {
-  local file="$1" db; db="$(_sqlite_db)"
+  local team="$1" file="$2" db; db="$(_sqlite_db "$team")"
   [ -f "$file" ] || return 1
   storage_init >/dev/null
   local line t id team frm to body msg_id agent at
@@ -411,7 +420,7 @@ storage_import() {
 
 # Internal (§2.7): coalesce duplicate message_read markers, keeping the earliest. (control op)
 storage_compact() {
-  local db; db="$(_sqlite_db)"
+  local db; db="$(_sqlite_db "$1")"
   agmsg_sqlite "$db" "
     DELETE FROM events WHERE type='message_read' AND seq NOT IN (
       SELECT MIN(seq) FROM events WHERE type='message_read'

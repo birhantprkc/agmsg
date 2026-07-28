@@ -19,7 +19,7 @@ agmsg_storage_load
 
 # Ask the active driver whether a store exists (driver-level, works for jsonl) —
 # a history read must not create one in a storeless project.
-if ! storage_store_exists; then
+if ! storage_store_exists "$TEAM"; then
   echo "No messages (DB not initialized)"
   exit 0
 fi

@@ -24,7 +24,7 @@ source "$SCRIPT_DIR/lib/validate.sh"
 agmsg_validate_team_name "$TEAM" || exit 1
 
 agmsg_storage_load
-DB="$(agmsg_db_path)"
+DB="$(agmsg_db_path "$TEAM")"
 
 # Keep the full-schema bootstrap (registry + storage tables) for a first-ever
 # command; the message write itself goes through the storage facade below.

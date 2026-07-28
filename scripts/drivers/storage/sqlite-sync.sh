@@ -81,6 +81,7 @@ _sqlite_sync_sequence() {
   [ "$(_sqlite_sync_decimal_le "$1" 9223372036854775807)" = 1 ]
 }
 
+# <team> is the storage selector, threaded from the contract that called us.
 _sqlite_sync_schema() {
   command -v jq >/dev/null 2>&1 || {
     echo "agmsg: Stage-1 sync requires jq" >&2
@@ -88,7 +89,7 @@ _sqlite_sync_schema() {
   }
   storage_init >/dev/null || return 13
   local db generation
-  db="$(_sqlite_db)"
+  db="$(_sqlite_db "$1")"
   agmsg_sqlite "$db" "
     CREATE TABLE IF NOT EXISTS sync_store_metadata (
       singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -259,7 +260,7 @@ storage_sync_resync_status() {
   _sqlite_sync_valid_binding "$server" "$remote" "$protocol" || return 13
   _sqlite_sync_sequence "$floor" || return 13
   local db tl generation table_count
-  db="$(_sqlite_db)"; tl="$(_sqlite_lit "$team")"
+  db="$(_sqlite_db "$team")"; tl="$(_sqlite_lit "$team")"
   [ -f "$db" ] || return 13
   table_count=$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM sqlite_master
     WHERE type='table' AND name IN ('sync_store_metadata','sync_bindings','sync_resync_audits');" \
@@ -269,7 +270,7 @@ storage_sync_resync_status() {
     2>/dev/null | tr -d '\r') || return 13
   [ -n "$generation" ] || return 13
   local output
-  output=$(_sqlite_data "SELECT json_object(
+  output=$(_sqlite_data "$team" "SELECT json_object(
       'type','sync_resync_status','driver_generation',b.driver_generation,
       'transport_cursor',b.transport_cursor,'audit',CASE WHEN a.accepted_floor IS NULL
         THEN NULL ELSE json_object(
@@ -314,8 +315,8 @@ storage_sync_resync() {
   [ "$(_sqlite_sync_decimal_le "$floor" "$current")" = 1 ] || return 13
   gap_start=$((10#$expected + 1))
   _sqlite_sync_sequence "$gap_start" || return 13
-  _sqlite_sync_schema || return $?
-  generation=$(_sqlite_sync_generation); db="$(_sqlite_db)"; tl="$(_sqlite_lit "$team")"
+  _sqlite_sync_schema "$team" || return $?
+  generation=$(_sqlite_sync_generation "$team"); db="$(_sqlite_db "$team")"; tl="$(_sqlite_lit "$team")"
 
   agmsg_sqlite "$db" "BEGIN IMMEDIATE;
     CREATE TEMP TABLE resync_assert(ok INTEGER CHECK(ok=1));
@@ -338,7 +339,7 @@ storage_sync_resync() {
        AND transport_cursor='$expected';
     COMMIT;" >/dev/null 2>&1 || return 13
 
-  _sqlite_data "SELECT json_object(
+  _sqlite_data "$team" "SELECT json_object(
       'type','sync_resync_result','driver_generation',driver_generation,
       'expected_transport_cursor',expected_transport_cursor,
       'transport_cursor',accepted_floor,'accepted_floor',accepted_floor,
@@ -348,14 +349,15 @@ storage_sync_resync() {
       AND driver_generation='$(_sqlite_lit "$generation")' AND accepted_floor='$floor';"
 }
 
+# <team> is the storage selector, threaded from the contract that called us.
 _sqlite_sync_generation() {
-  agmsg_sqlite "$(_sqlite_db)" \
+  agmsg_sqlite "$(_sqlite_db "$1")" \
     "SELECT generation FROM sync_store_metadata WHERE singleton=1;" | tr -d '\r'
 }
 
 _sqlite_sync_ensure_binding() {
   local team="$1" server="$2" remote="$3" protocol="$4" generation="$5"
-  agmsg_sqlite "$(_sqlite_db)" "INSERT OR IGNORE INTO sync_bindings
+  agmsg_sqlite "$(_sqlite_db "$team")" "INSERT OR IGNORE INTO sync_bindings
     (local_team,server_instance_id,remote_team_id,protocol_version,driver_generation)
     VALUES('$(_sqlite_lit "$team")','$server','$remote',$protocol,'$generation');" \
     >/dev/null 2>&1
@@ -367,7 +369,7 @@ storage_sync_prepare_push() {
   _sqlite_sync_valid_binding "$server" "$remote" "$protocol" || return 13
   case "$limit" in ''|*[!0-9]*) return 13 ;; esac
   [ "$limit" -ge 1 ] && [ "$limit" -le 1000 ] || return 13
-  _sqlite_sync_schema || return $?
+  _sqlite_sync_schema "$team" || return $?
 
   local prepare generation db tl input_ok version cipher key_json key_id recipients max_blob allow_new
   prepare=$(cat)
@@ -394,9 +396,9 @@ storage_sync_prepare_push() {
   esac
   case "$max_blob" in ''|*[!0-9]*) return 13 ;; esac
 
-  generation=$(_sqlite_sync_generation) || return 13
+  generation=$(_sqlite_sync_generation "$team") || return 13
   _sqlite_sync_ensure_binding "$team" "$server" "$remote" "$protocol" "$generation" || return 13
-  db="$(_sqlite_db)"; tl="$(_sqlite_lit "$team")"
+  db="$(_sqlite_db "$team")"; tl="$(_sqlite_lit "$team")"
 
   local rows uuids
   local pos local_id wire idx status blob q cipher_lit chunk_sql="" chunk_count=0
@@ -407,7 +409,7 @@ storage_sync_prepare_push() {
   [ -f "$cipher_helper" ] || return 13
   # 'reserved' carries the LEFT JOIN's existing wire_id so the immutability
   # check below is a filter on rows already in hand, not a lookup per message.
-  rows=$(_sqlite_data "
+  rows=$(_sqlite_data "$team" "
     SELECT json_object('local_position',CAST(e.seq AS TEXT),'local_id',e.id,
                        'body',e.body,'at',e.at,'from_agent',e.from_agent,
                        'to_agent',e.to_agent,'reserved',m.wire_id)
@@ -538,7 +540,7 @@ storage_sync_prepare_push() {
     [ "$sealed" -eq "$pending" ] || return 13
   fi
 
-  _sqlite_data "SELECT json_object('type','sync_state','driver_generation',
+  _sqlite_data "$team" "SELECT json_object('type','sync_state','driver_generation',
       '$generation','transport_cursor',transport_cursor)
     FROM sync_bindings WHERE local_team='$tl' AND server_instance_id='$server'
       AND remote_team_id='$remote' AND protocol_version=$protocol
@@ -561,9 +563,9 @@ storage_sync_prepare_push() {
 storage_sync_reconcile_push() {
   local team="$1" server="$2" remote="$3" protocol="$4"
   _sqlite_sync_valid_binding "$server" "$remote" "$protocol" || return 13
-  _sqlite_sync_schema || return $?
+  _sqlite_sync_schema "$team" || return $?
   local generation db tl line values="" pos wire seq disposition count=0
-  generation=$(_sqlite_sync_generation); db="$(_sqlite_db)"; tl="$(_sqlite_lit "$team")"
+  generation=$(_sqlite_sync_generation "$team"); db="$(_sqlite_db "$team")"; tl="$(_sqlite_lit "$team")"
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     [ "$(printf '%s\n' "$line" | jq -r '.type // empty')" = sync_push_ack ] || return 13
@@ -621,7 +623,7 @@ storage_sync_reconcile_push() {
       AND b.driver_generation='$generation';
     COMMIT;" >/dev/null 2>&1 || return 12
 
-  _sqlite_data "SELECT json_object('type','sync_reconcile_result','push_cursor',
+  _sqlite_data "$team" "SELECT json_object('type','sync_reconcile_result','push_cursor',
     CAST(push_cursor AS TEXT)) FROM sync_bindings WHERE local_team='$tl'
     AND server_instance_id='$server' AND remote_team_id='$remote'
     AND protocol_version=$protocol AND driver_generation='$generation';"
@@ -632,11 +634,11 @@ storage_sync_reconcile_push() {
 storage_sync_apply_pull() {
   local team="$1" server="$2" remote="$3" protocol="$4"
   _sqlite_sync_valid_binding "$server" "$remote" "$protocol" || return 13
-  _sqlite_sync_schema || return $?
+  _sqlite_sync_schema "$team" || return $?
   local generation db tl sql_file line type final_cursor="" corrupt=0 outcome_ids=""
   local seq wire received v cipher key_id blob status policy local_rev reason
   local from to body at local_id q
-  generation=$(_sqlite_sync_generation); db="$(_sqlite_db)"; tl="$(_sqlite_lit "$team")"
+  generation=$(_sqlite_sync_generation "$team"); db="$(_sqlite_db "$team")"; tl="$(_sqlite_lit "$team")"
   _sqlite_sync_ensure_binding "$team" "$server" "$remote" "$protocol" "$generation" || return 13
   sql_file=$(mktemp "${TMPDIR:-/tmp}/agmsg-sync-sql.XXXXXX") || return 13
   _AGMSG_SYNC_SQL_FILE="$sql_file"
@@ -817,7 +819,7 @@ storage_sync_apply_pull() {
     AND status='corrupt_state') +
     (SELECT COUNT(*) FROM sync_conflicts WHERE server_instance_id='$server'
      AND remote_team_id='$remote' AND protocol_version=$protocol);" | tr -d '\r')
-  _sqlite_data "SELECT json_object('type','sync_apply_result','transport_cursor',
+  _sqlite_data "$team" "SELECT json_object('type','sync_apply_result','transport_cursor',
     transport_cursor,'corrupt_count',$corrupt) FROM sync_bindings
     WHERE local_team='$tl' AND server_instance_id='$server' AND remote_team_id='$remote'
       AND protocol_version=$protocol AND driver_generation='$generation';
@@ -846,7 +848,7 @@ storage_sync_reprocess() {
   _sqlite_sync_valid_binding "$server" "$remote" "$protocol" || return 13
   case "$limit" in ''|*[!0-9]*) return 13 ;; esac
   [ "$limit" -ge 1 ] && [ "$limit" -le 1000 ] || return 13
-  _sqlite_sync_schema || return $?
+  _sqlite_sync_schema "$team" || return $?
   local generation tl after_seq after_wire after_sql=""
   if [ -n "$after" ]; then
     case "$after" in *:*) ;; *) return 13 ;; esac
@@ -858,10 +860,10 @@ storage_sync_reprocess() {
     after_sql="AND (CAST(server_seq AS INTEGER)>$after_seq OR
       (CAST(server_seq AS INTEGER)=$after_seq AND wire_id>'$after_wire'))"
   fi
-  generation=$(_sqlite_sync_generation) || return 13
+  generation=$(_sqlite_sync_generation "$team") || return 13
   tl=$(_sqlite_lit "$team")
   _sqlite_sync_ensure_binding "$team" "$server" "$remote" "$protocol" "$generation" || return 13
-  _sqlite_data "SELECT json_object('type','sync_state','driver_generation',
+  _sqlite_data "$team" "SELECT json_object('type','sync_state','driver_generation',
       '$generation','transport_cursor',transport_cursor)
     FROM sync_bindings WHERE local_team='$tl' AND server_instance_id='$server'
       AND remote_team_id='$remote' AND protocol_version=$protocol
@@ -903,11 +905,11 @@ storage_sync_reprocess() {
 storage_sync_prepare_read_state() {
   local team="$1" server="$2" remote="$3" protocol="$4"
   _sqlite_sync_valid_binding "$server" "$remote" "$protocol" || return 13
-  _sqlite_sync_schema || return $?
+  _sqlite_sync_schema "$team" || return $?
   local generation db tl context floor current members local_agents count values="" local_values=""
   local member id name agent insert_members="" insert_local_agents=""
-  generation=$(_sqlite_sync_generation) || return 13
-  db="$(_sqlite_db)"; tl="$(_sqlite_lit "$team")"
+  generation=$(_sqlite_sync_generation "$team") || return 13
+  db="$(_sqlite_db "$team")"; tl="$(_sqlite_lit "$team")"
   _sqlite_sync_ensure_binding "$team" "$server" "$remote" "$protocol" "$generation" || return 13
   context=$(cat)
   [ "$(printf '%s\n' "$context" | jq -r '
@@ -1048,7 +1050,7 @@ EOF
        AND rm.name_mismatch=0;
     COMMIT;" >/dev/null || return 13
 
-  _sqlite_data "SELECT json_object('type','sync_read_frontier','member_id',f.member_id,
+  _sqlite_data "$team" "SELECT json_object('type','sync_read_frontier','member_id',f.member_id,
       'server_seq',f.server_seq) FROM sync_read_prepared f JOIN sync_read_members rm
       ON rm.local_team=f.local_team AND rm.server_instance_id=f.server_instance_id
      AND rm.remote_team_id=f.remote_team_id AND rm.protocol_version=f.protocol_version
@@ -1071,7 +1073,7 @@ EOF
        AND x.driver_generation='$generation' AND x.server_seq IS NOT NULL
        AND CAST(x.server_seq AS INTEGER)>f.server_seq
      ORDER BY rm.member_id,x.wire_id;"
-  _sqlite_data "SELECT json_object('type','sync_read_blocked','member_id',member_id,
+  _sqlite_data "$team" "SELECT json_object('type','sync_read_blocked','member_id',member_id,
       'reason',CASE WHEN name_mismatch=1 THEN 'member-name-mismatch' ELSE blocked_reason END)
       FROM sync_read_members WHERE local_team='$tl' AND server_instance_id='$server'
        AND remote_team_id='$remote' AND protocol_version=$protocol
@@ -1084,10 +1086,10 @@ EOF
 storage_sync_block_read_state() {
   local team="$1" server="$2" remote="$3" protocol="$4"
   _sqlite_sync_valid_binding "$server" "$remote" "$protocol" || return 13
-  _sqlite_sync_schema || return $?
+  _sqlite_sync_schema "$team" || return $?
   local generation db tl input member reason
-  generation=$(_sqlite_sync_generation) || return 13
-  db="$(_sqlite_db)"; tl="$(_sqlite_lit "$team")"; input=$(cat)
+  generation=$(_sqlite_sync_generation "$team") || return 13
+  db="$(_sqlite_db "$team")"; tl="$(_sqlite_lit "$team")"; input=$(cat)
   member=$(printf '%s\n' "$input" | jq -r 'select(.type=="sync_read_block")|.member_id // empty')
   reason=$(printf '%s\n' "$input" | jq -r 'select(.type=="sync_read_block")|.reason // empty')
   printf '%s\n' "$member" | grep -Eq \
@@ -1107,10 +1109,10 @@ storage_sync_block_read_state() {
 storage_sync_unblock_read_state() {
   local team="$1" server="$2" remote="$3" protocol="$4"
   _sqlite_sync_valid_binding "$server" "$remote" "$protocol" || return 13
-  _sqlite_sync_schema || return $?
+  _sqlite_sync_schema "$team" || return $?
   local generation db tl input member
-  generation=$(_sqlite_sync_generation) || return 13
-  db="$(_sqlite_db)"; tl="$(_sqlite_lit "$team")"; input=$(cat)
+  generation=$(_sqlite_sync_generation "$team") || return 13
+  db="$(_sqlite_db "$team")"; tl="$(_sqlite_lit "$team")"; input=$(cat)
   member=$(printf '%s\n' "$input" | jq -r 'select(.type=="sync_read_unblock")|.member_id // empty')
   printf '%s\n' "$member" | grep -Eq \
     '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' || return 13
@@ -1135,10 +1137,10 @@ storage_sync_unblock_read_state() {
 storage_sync_apply_read_state() {
   local team="$1" server="$2" remote="$3" protocol="$4"
   _sqlite_sync_valid_binding "$server" "$remote" "$protocol" || return 13
-  _sqlite_sync_schema || return $?
+  _sqlite_sync_schema "$team" || return $?
   local generation db tl sql_file line type floor="" current="" member seq wire
-  generation=$(_sqlite_sync_generation) || return 13
-  db="$(_sqlite_db)"; tl="$(_sqlite_lit "$team")"
+  generation=$(_sqlite_sync_generation "$team") || return 13
+  db="$(_sqlite_db "$team")"; tl="$(_sqlite_lit "$team")"
   sql_file=$(mktemp "${TMPDIR:-/tmp}/agmsg-read-sync-sql.XXXXXX") || return 13
   _AGMSG_READ_SYNC_SQL_FILE="$sql_file"
   trap 'case "${_AGMSG_READ_SYNC_SQL_FILE:-}" in "${TMPDIR:-/tmp}"/agmsg-read-sync-sql.*) rm -f "$_AGMSG_READ_SYNC_SQL_FILE" ;; esac' EXIT INT TERM HUP
@@ -1273,7 +1275,7 @@ storage_sync_apply_read_state() {
     rm -f "$sql_file"; trap - EXIT INT TERM HUP; return 13
   fi
   rm -f "$sql_file"; trap - EXIT INT TERM HUP; _AGMSG_READ_SYNC_SQL_FILE=""
-  _sqlite_data "SELECT json_object('type','sync_read_apply_result','min_available_seq',
+  _sqlite_data "$team" "SELECT json_object('type','sync_read_apply_result','min_available_seq',
       MAX(min_available_seq),'member_count',COUNT(*)) FROM sync_read_members
     WHERE local_team='$tl' AND server_instance_id='$server' AND remote_team_id='$remote'
       AND protocol_version=$protocol AND driver_generation='$generation' AND active=1;"

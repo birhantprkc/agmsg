@@ -91,7 +91,6 @@ PROJECT_PATH="$(agmsg_resolve_project "$PROJECT_PATH" "$AGENT_TYPE")"
 # monitor/actas/drop steps pass a bare session_id and we self-derive here.
 SESSION_ID="$(agmsg_normalize_instance_id "$SESSION_ID" "$AGENT_TYPE")"
 
-DB="$(agmsg_db_path)"
 RUN_DIR="$SKILL_DIR/run"
 PIDFILE="$RUN_DIR/watch.$SESSION_ID.pid"
 
@@ -244,6 +243,11 @@ fi
 # on stdout (the Monitor event stream) and exit, turning the silent failure into
 # a visible one. Done before the ready sentinel so we never signal "ready" for a
 # watcher that cannot read the store.
+# Resolved from this watcher's own subscription rather than a bare default:
+# the store is selected per team now. Every pair here shares a team (the
+# subscription is one project's roster); when stores actually split, this
+# becomes one check per distinct team in PAIRS.
+DB="$(agmsg_db_path "$(printf '%s\n' "$PAIRS" | head -1 | cut -f1)")" || exit 1
 if [ -f "$DB" ] && ! agmsg_sqlite "$DB" "SELECT 1;" >/dev/null 2>&1; then
   echo "ERROR: cannot open message DB $DB"
   exit 1
@@ -280,89 +284,91 @@ while true; do
   if agmsg_instance_is_composite "$SESSION_ID" && ! agmsg_instance_alive "$SESSION_ID"; then
     exit 0
   fi
-  if storage_store_exists; then
-    while IFS=$'\t' read -r pair_team pair_agent; do
-      [ -z "$pair_team" ] && continue
-      READ_CURSOR="$(storage_read_cursor_get "$pair_team" "$pair_agent" 2>/dev/null || true)"
-      [ -n "$READ_CURSOR" ] || READ_CURSOR=0
-      OUT="$(storage_watch_after "$READ_CURSOR" "$pair_team:$pair_agent" 2>/dev/null || true)"
-      if [ -n "$OUT" ]; then
-      _arr="[$(printf '%s' "$OUT" | paste -sd, -)]"
-      ROWS="$(agmsg_sqlite ':memory:' "
-        SELECT COALESCE(json_extract(value,'\$.type'),'') || char(31) ||
-               COALESCE(json_extract(value,'\$.id'),'') || char(31) ||
-               COALESCE(json_extract(value,'\$.at'),'') || char(31) ||
-               COALESCE(json_extract(value,'\$.team'),'') || char(31) ||
-               COALESCE(json_extract(value,'\$.from'),'') || char(31) ||
-               COALESCE(json_extract(value,'\$.to'),'') || char(31) ||
-               replace(replace(replace(COALESCE(json_extract(value,'\$.body'),''), char(13), ''), char(10), '\\n'), char(9), '\t') || char(31) ||
-               COALESCE(json_extract(value,'\$.cursor'),'')
-        FROM json_each('$(printf '%s' "$_arr" | sed "s/'/''/g")');
-      " 2>/dev/null || true)"
+  while IFS=$'\t' read -r pair_team pair_agent; do
+    [ -z "$pair_team" ] && continue
+    # Per team: with a store per team, "one team has no store yet" is a
+    # normal state, and a single check outside this loop would silence
+    # delivery for every OTHER team as well.
+    storage_store_exists "$pair_team" || continue
+    READ_CURSOR="$(storage_read_cursor_get "$pair_team" "$pair_agent" 2>/dev/null || true)"
+    [ -n "$READ_CURSOR" ] || READ_CURSOR=0
+    OUT="$(storage_watch_after "$READ_CURSOR" "$pair_team:$pair_agent" 2>/dev/null || true)"
+    if [ -n "$OUT" ]; then
+    _arr="[$(printf '%s' "$OUT" | paste -sd, -)]"
+    ROWS="$(agmsg_sqlite ':memory:' "
+      SELECT COALESCE(json_extract(value,'\$.type'),'') || char(31) ||
+             COALESCE(json_extract(value,'\$.id'),'') || char(31) ||
+             COALESCE(json_extract(value,'\$.at'),'') || char(31) ||
+             COALESCE(json_extract(value,'\$.team'),'') || char(31) ||
+             COALESCE(json_extract(value,'\$.from'),'') || char(31) ||
+             COALESCE(json_extract(value,'\$.to'),'') || char(31) ||
+             replace(replace(replace(COALESCE(json_extract(value,'\$.body'),''), char(13), ''), char(10), '\\n'), char(9), '\t') || char(31) ||
+             COALESCE(json_extract(value,'\$.cursor'),'')
+      FROM json_each('$(printf '%s' "$_arr" | sed "s/'/''/g")');
+    " 2>/dev/null || true)"
 
-      FINAL_CURSOR=""
-      DELIVERED_IDS=()
-      DESPAWN_TARGET=""
-      while IFS=$'\x1f' read -r kind id ts team from to body cursor; do
-        [ -z "$kind" ] && continue
-        if [ "$kind" = "cursor" ]; then
-          FINAL_CURSOR="$cursor"
-          continue
-        fi
-        [ "$kind" = "message_sent" ] || continue
-        [ -z "$id" ] && continue
-        # Control message: a leader's `despawn` sends `ctrl:despawn` to this
-        # role. Tear ourselves down rather than printing it — drop the role
-        # (releases the lock + registration) then close our own tmux pane,
-        # which also ends the agent CLI sharing it. Deterministic teardown, no
-        # dependence on the agent LLM noticing the message. See #109.
-        if [ "$body" = "ctrl:despawn" ]; then
-          DELIVERED_IDS+=("$id")
-          # Only an EXCLUSIVE watcher dedicated to exactly this role tears
-          # itself down. A broad-subscription watcher (e.g. a leader whose
-          # default watcher subscribes to every project role, including the
-          # despawn target) must NOT act on it — its $TMUX_PANE is the leader's
-          # own pane, so killing it would take down the leader's session. The
-          # spawned member's watcher runs in actas mode (ACTIVE_NAME=$to) in its
-          # own pane; that's the one meant to respond. A broad watcher `continue`s
-          # and consumes the control row without acting. An exclusive target
-          # consumes the complete scanned batch before teardown.
-          if [ -z "$ACTIVE_NAME" ] || [ "$to" != "$ACTIVE_NAME" ]; then
-            continue
-          fi
-          DESPAWN_TARGET="$to"
-          continue
-        fi
-        if ! printf '%s | %s | %s → %s | %s\n' "$ts" "$team" "$from" "$to" "$body"; then
-          cleanup
-          exit 0
-        fi
-        DELIVERED_IDS+=("$id")
-      done <<< "$ROWS"
-      if [ -n "$FINAL_CURSOR" ]; then
-        # Bash 3 with `set -u` treats an empty array expansion as unbound. A
-        # cursor-only page is valid, so advance it without optional IDs in that
-        # case (and preserve exact delivered IDs when there are any).
-        if [ "${#DELIVERED_IDS[@]}" -gt 0 ]; then
-          storage_read_cursor_consume "$pair_team" "$pair_agent" "$FINAL_CURSOR" \
-            "${DELIVERED_IDS[@]}" >/dev/null 2>&1 || true
-        else
-          storage_read_cursor_consume "$pair_team" "$pair_agent" "$FINAL_CURSOR" \
-            >/dev/null 2>&1 || true
-        fi
+    FINAL_CURSOR=""
+    DELIVERED_IDS=()
+    DESPAWN_TARGET=""
+    while IFS=$'\x1f' read -r kind id ts team from to body cursor; do
+      [ -z "$kind" ] && continue
+      if [ "$kind" = "cursor" ]; then
+        FINAL_CURSOR="$cursor"
+        continue
       fi
-      if [ -n "$DESPAWN_TARGET" ]; then
-        "$SCRIPT_DIR/reset.sh" "$PROJECT_PATH" "$AGENT_TYPE" "$DESPAWN_TARGET" "$SESSION_ID" >/dev/null 2>&1 || true
-        if [ -n "${TMUX_PANE:-}" ] && command -v tmux >/dev/null 2>&1; then
-          tmux kill-pane -t "$TMUX_PANE" 2>/dev/null || true
-        else
-          echo "agmsg watch: despawned '$DESPAWN_TARGET' (role dropped); close this window manually" >&2
+      [ "$kind" = "message_sent" ] || continue
+      [ -z "$id" ] && continue
+      # Control message: a leader's `despawn` sends `ctrl:despawn` to this
+      # role. Tear ourselves down rather than printing it — drop the role
+      # (releases the lock + registration) then close our own tmux pane,
+      # which also ends the agent CLI sharing it. Deterministic teardown, no
+      # dependence on the agent LLM noticing the message. See #109.
+      if [ "$body" = "ctrl:despawn" ]; then
+        DELIVERED_IDS+=("$id")
+        # Only an EXCLUSIVE watcher dedicated to exactly this role tears
+        # itself down. A broad-subscription watcher (e.g. a leader whose
+        # default watcher subscribes to every project role, including the
+        # despawn target) must NOT act on it — its $TMUX_PANE is the leader's
+        # own pane, so killing it would take down the leader's session. The
+        # spawned member's watcher runs in actas mode (ACTIVE_NAME=$to) in its
+        # own pane; that's the one meant to respond. A broad watcher `continue`s
+        # and consumes the control row without acting. An exclusive target
+        # consumes the complete scanned batch before teardown.
+        if [ -z "$ACTIVE_NAME" ] || [ "$to" != "$ACTIVE_NAME" ]; then
+          continue
         fi
+        DESPAWN_TARGET="$to"
+        continue
+      fi
+      if ! printf '%s | %s | %s → %s | %s\n' "$ts" "$team" "$from" "$to" "$body"; then
+        cleanup
         exit 0
       fi
+      DELIVERED_IDS+=("$id")
+    done <<< "$ROWS"
+    if [ -n "$FINAL_CURSOR" ]; then
+      # Bash 3 with `set -u` treats an empty array expansion as unbound. A
+      # cursor-only page is valid, so advance it without optional IDs in that
+      # case (and preserve exact delivered IDs when there are any).
+      if [ "${#DELIVERED_IDS[@]}" -gt 0 ]; then
+        storage_read_cursor_consume "$pair_team" "$pair_agent" "$FINAL_CURSOR" \
+          "${DELIVERED_IDS[@]}" >/dev/null 2>&1 || true
+      else
+        storage_read_cursor_consume "$pair_team" "$pair_agent" "$FINAL_CURSOR" \
+          >/dev/null 2>&1 || true
       fi
-    done <<< "$PAIRS"
-  fi
+    fi
+    if [ -n "$DESPAWN_TARGET" ]; then
+      "$SCRIPT_DIR/reset.sh" "$PROJECT_PATH" "$AGENT_TYPE" "$DESPAWN_TARGET" "$SESSION_ID" >/dev/null 2>&1 || true
+      if [ -n "${TMUX_PANE:-}" ] && command -v tmux >/dev/null 2>&1; then
+        tmux kill-pane -t "$TMUX_PANE" 2>/dev/null || true
+      else
+        echo "agmsg watch: despawned '$DESPAWN_TARGET' (role dropped); close this window manually" >&2
+      fi
+      exit 0
+    fi
+    fi
+  done <<< "$PAIRS"
 
   # Run sleep in the background and `wait` for it so signal traps fire
   # immediately. Bash defers traps while a foreground builtin like `sleep`

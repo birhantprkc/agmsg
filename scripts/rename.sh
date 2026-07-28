@@ -20,7 +20,7 @@ agmsg_validate_team_name "$TEAM" || exit 1
 agmsg_validate_agent_name "$OLD_NAME" || exit 1
 agmsg_validate_agent_name "$NEW_NAME" || exit 1
 TEAMS_DIR="$SCRIPT_DIR/../teams"
-DB="$(agmsg_db_path)"
+DB="$(agmsg_db_path "$TEAM")"
 OLD_NAME_SQL=$(agmsg_sqlesc "$OLD_NAME")
 NEW_NAME_SQL=$(agmsg_sqlesc "$NEW_NAME")
 TEAM_CONFIG="$TEAMS_DIR/$TEAM/config.json"

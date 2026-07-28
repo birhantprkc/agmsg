@@ -113,7 +113,7 @@ get_messages() {
   # numeric-filtered; it is bound as an escaped SQL string literal instead.
   case "$limit" in ''|*[!0-9]*) limit=30 ;; esac
 
-  local db; db="$(agmsg_db_path)"
+  local db; db="$(agmsg_db_path "$team")"
   if [ ! -f "$db" ]; then
     return 0 # no store yet — empty result, not an error
   fi
@@ -121,7 +121,7 @@ get_messages() {
   # pure-legacy store (init-db.sh ran, storage_send never called) may have
   # messages but no events table yet — the UNION below would fail to parse
   # without it. storage_init is idempotent (CREATE TABLE IF NOT EXISTS).
-  storage_init >/dev/null
+  storage_init "$team" >/dev/null
 
   local team_sql; team_sql="$(_agmsg_sqlesc "$team")"
   local where="team='$team_sql'"
