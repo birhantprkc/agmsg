@@ -198,19 +198,60 @@ fn bash_command() -> Result<std::process::Command, String> {
     Ok(cmd)
 }
 
-/// THE ONE PLACE the app decides where a message store lives.
+/// Where one team's store is, as agmsg reports it — never as the app guesses.
 ///
-/// Kept as a single function on purpose: the storage layout is under
-/// discussion (shared store by default, per-team for connected teams), and
-/// when that lands this is the only thing that moves. Do not join a store
-/// path anywhere else — the reason this file needed fixing at all is that a
-/// layout change had nothing to break.
+/// The app used to join `db/messages.db` itself, which is why a storage
+/// layout change broke it with nothing to notice: a hardcoded path cannot go
+/// stale loudly. Asking means the answer follows the layout.
+#[derive(Deserialize)]
+struct StoreInfo {
+    driver: String,
+    path: String,
+    /// A team that has never been written to has no store yet. Not an error —
+    /// it is an empty room.
+    exists: bool,
+}
+
+/// `api.sh` is the contract; reading the file directly is an optimisation
+/// that only applies when the driver is one this app can parse.
 ///
-/// Also note what it does NOT decide: which tables to read. That is
-/// [`MESSAGES_SINCE_SQL`], and it is a separate axis — pointing at the right
-/// file and reading the right tables broke independently, in that order.
-fn db_path() -> PathBuf {
-    agmsg_base().join("db/messages.db")
+/// Anything else — an unknown driver, a failed lookup — falls back to going
+/// through `api.sh`, which is slower and always right. It must never fall
+/// back to showing nothing: "I could not read it" rendered as an empty room
+/// is the same failure as the three this branch fixes, and the room looks
+/// identical in both cases.
+const DIRECTLY_READABLE_DRIVER: &str = "sqlite";
+
+fn store_info(team: &str) -> Result<StoreInfo, String> {
+    let raw = run_script("api.sh", &["get", "teams", team, "store"])?;
+    parse_jsonl::<StoreInfo>(&raw)
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no store info for team {team}"))
+}
+
+/// The store to read directly for `team`, or `None` when the app must go
+/// through `api.sh` instead.
+///
+/// Logs the reason on the way past. Distinguishing "slow but working" from
+/// "fast but wrong" after the fact needs the fallback to leave a mark.
+fn direct_store_path(team: &str) -> Option<PathBuf> {
+    match store_info(team) {
+        Ok(info) if !info.exists => None,
+        Ok(info) if info.driver == DIRECTLY_READABLE_DRIVER => Some(PathBuf::from(info.path)),
+        Ok(info) => {
+            eprintln!(
+                "agmsg: team {team} uses the '{}' driver, which this app cannot read \
+                 directly — falling back to api.sh",
+                info.driver
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("agmsg: could not resolve the store for team {team} ({e}) — falling back to api.sh");
+            None
+        }
+    }
 }
 
 /// New messages, from the event log and the legacy table together.
@@ -308,12 +349,35 @@ fn read_new_messages(
     Ok(out)
 }
 
-fn open_ro() -> Result<rusqlite::Connection, String> {
-    rusqlite::Connection::open_with_flags(
-        db_path(),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(|e| e.to_string())
+fn open_ro(path: &std::path::Path) -> Result<rusqlite::Connection, String> {
+    rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| e.to_string())
+}
+
+/// Every distinct store behind the teams this install knows about.
+///
+/// Deduplicated by path, which is what makes one function serve both
+/// layouts: under a shared store every team resolves to the same file and
+/// this yields one connection — today's behaviour exactly — while under
+/// per-team stores it yields one per team. The app does not branch on the
+/// layout because it does not need to know it.
+///
+/// Teams whose driver the app cannot read directly are absent here; their
+/// messages arrive through `api.sh` like everyone's history does.
+fn watchable_stores() -> Vec<PathBuf> {
+    let teams = match run_script("api.sh", &["get", "teams"]) {
+        Ok(raw) => parse_jsonl::<ApiTeam>(&raw),
+        Err(_) => return Vec::new(),
+    };
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for t in teams {
+        if let Some(p) = direct_store_path(&t.name) {
+            if !seen.contains(&p) {
+                seen.push(p);
+            }
+        }
+    }
+    seen
 }
 
 #[derive(Clone, Serialize)]
@@ -814,31 +878,53 @@ pub fn start_watcher(app: AppHandle) {
         // installs it (and creates the DB) after this thread has already
         // started. Retry instead of giving up once, so that session isn't
         // permanently missing live updates and stdin-inject delivery.
-        let conn = loop {
-            match open_ro() {
-                Ok(c) => break c,
-                Err(_) => thread::sleep(Duration::from_millis(800)),
-            }
-        };
-        // Start at the current end of both id spaces: the room loads its own
-        // history separately, so replaying it here would double every
-        // message already on screen.
-        let mut cursors = Cursors {
-            seq: conn
-                .query_row("SELECT COALESCE(MAX(seq),0) FROM events", [], |r| r.get(0))
-                .unwrap_or(0),
-            legacy_id: conn
-                .query_row("SELECT COALESCE(MAX(id),0) FROM messages", [], |r| r.get(0))
-                .unwrap_or(0),
-        };
+        // One open connection and cursor pair per store, keyed by path.
+        let mut open: Vec<(PathBuf, rusqlite::Connection, Cursors)> = Vec::new();
+        // Re-enumerating costs a subprocess per team, so it happens on a much
+        // slower beat than the poll. `join` creating a team is an ordinary
+        // action, though, so it cannot be startup-only: "I joined and the app
+        // never showed it, until I restarted" is a bug report nobody can
+        // diagnose.
+        let mut ticks_until_rescan = 0u32;
+
         loop {
+            if ticks_until_rescan == 0 {
+                ticks_until_rescan = 12; // ~10s at the poll interval below
+                for path in watchable_stores() {
+                    if open.iter().any(|(p, _, _)| p == &path) {
+                        continue;
+                    }
+                    if let Ok(conn) = open_ro(&path) {
+                        // Start at the current end of both id spaces: the room
+                        // loads its own history separately, so replaying it
+                        // here would double every message already on screen.
+                        let cursors = Cursors {
+                            seq: conn
+                                .query_row("SELECT COALESCE(MAX(seq),0) FROM events", [], |r| {
+                                    r.get(0)
+                                })
+                                .unwrap_or(0),
+                            legacy_id: conn
+                                .query_row("SELECT COALESCE(MAX(id),0) FROM messages", [], |r| {
+                                    r.get(0)
+                                })
+                                .unwrap_or(0),
+                        };
+                        open.push((path, conn, cursors));
+                    }
+                }
+            }
+            ticks_until_rescan -= 1;
+
             // A read failure is transient here (a WAL checkpoint, a store
             // being recreated), not a reason to end the thread — the previous
             // version returned on a prepare error and the session went
             // silently dead for the rest of its life.
-            if let Ok(new_rows) = read_new_messages(&conn, &mut cursors) {
-                for m in new_rows {
-                    let _ = app.emit("agmsg-message", m);
+            for (_, conn, cursors) in open.iter_mut() {
+                if let Ok(new_rows) = read_new_messages(conn, cursors) {
+                    for m in new_rows {
+                        let _ = app.emit("agmsg-message", m);
+                    }
                 }
             }
             thread::sleep(Duration::from_millis(800));
@@ -1149,16 +1235,16 @@ mod tests {
         }
     }
 
-    /// The one test that goes red if any of the three independent failures
-    /// comes back. Each of them was silent: the store opened, the query ran,
-    /// the parse "succeeded" by discarding rows, and the app showed nothing
-    /// while reporting no error at all.
+    /// Goes red if either read-rule failure comes back. Both were silent:
+    /// the query ran, the parse "succeeded" by discarding rows, and the app
+    /// showed nothing while reporting no error at all.
     ///
-    /// - **wrong path** — reading somewhere other than [`super::db_path`]
-    ///   finds no store, so nothing arrives.
     /// - **legacy table only** — the UUID-keyed row is missing.
     /// - **id treated as a number** — the UUID row is the one that
     ///   disappears, because it is the only id that is not numeric.
+    ///
+    /// The third failure — opening the wrong file — is a different axis and
+    /// is covered by `the_store_path_comes_from_agmsg_not_from_a_guess`.
     ///
     /// It exercises the watcher's own reader, not a copy of its SQL.
     #[test]
@@ -1172,7 +1258,8 @@ mod tests {
             &["2026-07-28T10:00:00Z"],
         );
 
-        let conn = super::open_ro().expect("the store db_path() resolves to must open");
+        let conn = super::open_ro(&dir.path().join("db/messages.db"))
+            .expect("the store must open");
         let mut cursors = super::Cursors::default();
         let got = super::read_new_messages(&conn, &mut cursors).expect("read");
 
@@ -1214,11 +1301,58 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let conn = super::open_ro().unwrap();
+        let conn = super::open_ro(&dir.path().join("db/messages.db")).unwrap();
         let mut cursors = super::Cursors::default();
         let got = super::read_new_messages(&conn, &mut cursors).expect("read");
 
         assert_eq!(got.len(), 1, "a pre-event-log store must not read as empty");
         assert_eq!(got[0].body, "older than the event log");
+    }
+
+    /// The third axis: the app must read where agmsg says the store is, not
+    /// where the app thinks it should be. Hardcoding the path is what let a
+    /// storage-layout change break the app with nothing to notice.
+    #[test]
+    #[serial]
+    fn the_store_path_comes_from_agmsg_not_from_a_guess() {
+        let _base = fake_base(&[(
+            "api.sh",
+            r#"echo '{"team":"alpha","driver":"sqlite","layout":"per-team","path":"/somewhere/else/alpha.db","exists":true}'"#,
+        )]);
+        assert_eq!(
+            super::direct_store_path("alpha"),
+            Some(std::path::PathBuf::from("/somewhere/else/alpha.db")),
+            "the reported path must be used verbatim — a layout the app has \
+             never heard of has to work without the app changing"
+        );
+    }
+
+    /// A driver this app cannot parse must send it back through `api.sh`,
+    /// which is slower and correct. Returning "no messages" instead would be
+    /// the same silent-empty failure as the bugs above.
+    #[test]
+    #[serial]
+    fn an_unreadable_driver_falls_back_rather_than_showing_an_empty_room() {
+        let _base = fake_base(&[(
+            "api.sh",
+            r#"echo '{"team":"alpha","driver":"jsonl","layout":"per-team","path":"/x/a.jsonl","exists":true}'"#,
+        )]);
+        assert_eq!(
+            super::direct_store_path("alpha"),
+            None,
+            "an unknown driver must not be opened as sqlite"
+        );
+    }
+
+    /// A team nobody has written to yet has no store. That is an empty room,
+    /// not a failure, and must not be reported as one.
+    #[test]
+    #[serial]
+    fn a_team_with_no_store_yet_is_not_an_error() {
+        let _base = fake_base(&[(
+            "api.sh",
+            r#"echo '{"team":"alpha","driver":"sqlite","layout":"shared","path":"/x/db.sqlite","exists":false}'"#,
+        )]);
+        assert_eq!(super::direct_store_path("alpha"), None);
     }
 }
