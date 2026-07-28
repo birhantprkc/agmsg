@@ -347,7 +347,7 @@ still does not inspect recipients or message bodies.
 
 ## References
 
-- [ADR 0003: storage-axis ABI](../../adr/ref/0003-storage-axis-driver-abi-and-scope.md)
+- [ADR 0003: storage-axis ABI](../../adr/0003-storage-axis-driver-abi-and-scope.md)
 - [Stage-1 remote synchronization](stage-1-remote-sync.md)
 - [ADR 0005: Remote synchronization contract](../../adr/ref/0005-remote-sync-contract.md)
 - [HTTP API v1](../../../server/spec/v1.md)

@@ -23,7 +23,7 @@ Stage-1 remote sync ABI
 ([specification](../../spec/ref/stage-1-remote-sync.md), draft PR
 #450, `storage_sync_prepare_push` / `storage_sync_reconcile_push` /
 `storage_sync_apply_pull`) and the rebased storage-axis driver contract
-([ADR 0003](../../adr/ref/0003-storage-axis-driver-abi-and-scope.md)).
+([ADR 0003](../../adr/0003-storage-axis-driver-abi-and-scope.md)).
 
 This was an **interface addition** (a new command surface, a new
 credential storage location, a new team-config field), reviewed and
@@ -896,7 +896,7 @@ What this section still owns, unchanged: `generate`, `show`, `import`,
 
 ## References
 
-- Builds on [ADR 0003](../../adr/ref/0003-storage-axis-driver-abi-and-scope.md) and
+- Builds on [ADR 0003](../../adr/0003-storage-axis-driver-abi-and-scope.md) and
   [Stage-1 synchronization specification](../../spec/ref/stage-1-remote-sync.md)
   (draft PR #450).
 - [`docs/spec/ref/age-v1-profile.md`](../../spec/ref/age-v1-profile.md) (approved
