@@ -578,7 +578,13 @@ _jsonl_rename_team_locked() {
 }
 
 storage_rename_team() {
-  _JSONL_TEAM="$1"
+  # Resolve paths through the NEW name: rename-team.sh moves the team's store
+  # directory before calling this, so the log and cursor files are already at
+  # the new location. Selecting on the old name would resolve to a directory
+  # that no longer exists, and _jsonl_init_file would helpfully recreate it —
+  # leaving an empty log beside the real one and losing the cursor.
+  # The old/new arguments below still drive the CONTENT rewrite.
+  _JSONL_TEAM="$2"
   _jsonl_init_file || { echo runtime_error; return 13; }
   _jsonl_with_lock _jsonl_rename_team_locked "$1" "$2" || {
     echo runtime_error; return 13;

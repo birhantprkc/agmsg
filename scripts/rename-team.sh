@@ -6,7 +6,8 @@ set -euo pipefail
 # Renames a team:
 #   1. moves teams/<old>/ to teams/<new>/
 #   2. updates "name" field in the moved config.json
-#   3. updates messages.db: UPDATE messages SET team=<new> WHERE team=<old>
+#   3. moves the team's store to <storage>/teams/<new>/
+#   4. updates the moved store: UPDATE messages SET team=<new> WHERE team=<old>
 
 OLD_TEAM="${1:?Usage: rename-team.sh <old_team> <new_team>}"
 NEW_TEAM="${2:?Missing new team name}"
@@ -27,9 +28,16 @@ source "$SCRIPT_DIR/lib/validate.sh"
 agmsg_validate_team_name "$OLD_TEAM" || exit 1
 agmsg_validate_team_name "$NEW_TEAM" || exit 1
 TEAMS_DIR="$SCRIPT_DIR/../teams"
-DB="$(agmsg_db_path "$OLD_TEAM")"
 OLD_DIR="$TEAMS_DIR/$OLD_TEAM"
 NEW_DIR="$TEAMS_DIR/$NEW_TEAM"
+# The store lives under the storage root, which AGMSG_STORAGE_PATH can move
+# independently of the config tree above — so it is resolved, never derived
+# from TEAMS_DIR. The whole directory moves, not just messages.db: the WAL
+# sidecars and the jsonl driver's events.jsonl are in it and belong to the
+# same team.
+OLD_STORE_DIR="$(dirname "$(agmsg_db_path "$OLD_TEAM")")"
+NEW_STORE_DIR="$(dirname "$(agmsg_db_path "$NEW_TEAM")")"
+DB="$(agmsg_db_path "$NEW_TEAM")"
 
 if [ ! -d "$OLD_DIR" ]; then
   echo "Team not found: $OLD_TEAM"
@@ -63,9 +71,26 @@ if [ -f "$NEW_DIR/config.json" ]; then
   exit 1
 fi
 
+# A store can outlive its config — leaving a team keeps its history — so the
+# target name being free as a team does not mean it is free as a store. Checked
+# before anything moves: refusing here costs nothing, while refusing after the
+# config move would leave the rename half-applied.
+if [ -e "$NEW_STORE_DIR" ]; then
+  echo "A store already exists for $NEW_TEAM at $NEW_STORE_DIR" >&2
+  echo "Remove or rename it before renaming this team; its history is not merged." >&2
+  exit 1
+fi
+
 # Move the config into the locked, reserved target dir. Move the file (not the
 # dir) because the target dir already exists — we created and locked it.
 mv "$OLD_DIR/config.json" "$NEW_DIR/config.json"
+
+# Move the store with it. A team that never sent anything has no store yet,
+# which is not an error — the next send creates one under the new name.
+if [ -d "$OLD_STORE_DIR" ]; then
+  mkdir -p "$(dirname "$NEW_STORE_DIR")"
+  mv "$OLD_STORE_DIR" "$NEW_STORE_DIR"
+fi
 
 # --- Update name in config.json ---
 # Read the config with readfile() (not `.param set`, whose dot-command tokenizer

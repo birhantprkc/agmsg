@@ -431,9 +431,12 @@ EOF
   storage_init oldteam >/dev/null
   storage_read_cursor_consume oldteam alice 0 >/dev/null
   _sqlite_sync_schema oldteam
-  local generation db store_dir
+  local generation db renamed_db store_dir
   generation=$(_sqlite_sync_generation)
-  db=$(agmsg_db_path demo)
+  # The store moves with the team, so the rows are written through the old
+  # team's path and read back through the new one.
+  db=$(agmsg_db_path oldteam)
+  renamed_db=$(agmsg_db_path newteam)
   store_dir=$(agmsg_storage_dir)
   agmsg_sqlite "$db" "INSERT INTO sync_bindings
     (local_team,server_instance_id,remote_team_id,protocol_version,driver_generation)
@@ -444,8 +447,9 @@ EOF
     > "$store_dir/remote-sync/oldteam.json"
   chmod 600 "$store_dir/remote-sync/oldteam.json"
   bash "$SCRIPTS/rename-team.sh" oldteam newteam
-  [ "$(agmsg_sqlite "$db" "SELECT team FROM read_cursors;" | tr -d '\r')" = newteam ]
-  [ "$(agmsg_sqlite "$db" "SELECT local_team FROM sync_bindings;" | tr -d '\r')" = newteam ]
+  [ ! -e "$db" ]
+  [ "$(agmsg_sqlite "$renamed_db" "SELECT team FROM read_cursors;" | tr -d '\r')" = newteam ]
+  [ "$(agmsg_sqlite "$renamed_db" "SELECT local_team FROM sync_bindings;" | tr -d '\r')" = newteam ]
   [ ! -e "$store_dir/remote-sync/oldteam.json" ]
   [ "$(jq -r '.local_team' "$store_dir/remote-sync/newteam.json")" = newteam ]
 }
@@ -531,7 +535,8 @@ EOF
   _sqlite_sync_schema myteam
   local generation db
   generation=$(_sqlite_sync_generation)
-  db=$(agmsg_db_path demo)
+  # An agent rename does not move the store, so one path serves both ends.
+  db=$(agmsg_db_path myteam)
   agmsg_sqlite "$db" "INSERT INTO sync_read_members
     (local_team,server_instance_id,remote_team_id,protocol_version,
      driver_generation,member_id,agent,remote_agent)
@@ -711,11 +716,16 @@ EOF
 @test "rename: escapes the agent name in the messages UPDATE without widening it" {
   # rename.sh rewrites the legacy messages table directly. Seed it with the
   # renamed agent's row plus an unrelated victim row that an unscoped/injection
-  # predicate would wrongly rewrite.
-  local db="$TEST_SKILL_DIR/db/messages.db"
+  # predicate would wrongly rewrite. The seed goes into team t's own store —
+  # the pre-split shared file is no longer what rename.sh reads.
+  bash "$SCRIPTS/join.sh" t alice claude-code /tmp/proj
+  export SKILL_DIR="$TEST_SKILL_DIR"
+  source "$SCRIPTS/lib/storage.sh"
+  agmsg_storage_load
+  storage_init t >/dev/null
+  local db; db="$(agmsg_db_path t)"
   sqlite3 "$db" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('t', 'alice', 'x', 'a-msg');"
   sqlite3 "$db" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('t', 'keepme', 'x', 'k-msg');"
-  bash "$SCRIPTS/join.sh" t alice claude-code /tmp/proj
 
   run bash "$SCRIPTS/rename.sh" t alice carol
   [ "$status" -eq 0 ]
