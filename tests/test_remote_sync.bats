@@ -478,3 +478,53 @@ _seed_legacy_history() {
   [ "$before" = "$after" ]
   [ "$after" -eq 0 ]
 }
+
+@test "sync contract: a legacy history acknowledged once is never offered again" {
+  _seed_legacy_history
+  local candidates acks result second
+  candidates=$(prepare_push)
+  # The server stores each blob under its wire id and answers with a sequence.
+  acks=$(printf '%s\n' "$candidates" | jq -c '
+    select(.type=="sync_push_candidate")
+    | {type:"sync_push_ack",local_position,id,
+       server_seq:((.local_position|tonumber)+1000000000|tostring),
+       disposition:"stored"}')
+  result=$(printf '%s\n' "$acks" | storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1)
+  [ "$(printf '%s\n' "$result" | jq -r '.push_cursor')" = "-999999997" ]
+
+  # Connecting again offers nothing: this is what "doing it twice leaves the
+  # server unchanged" means locally, and it holds because the reservation keyed
+  # on the projected position carries the same wire id both times.
+  second=$(prepare_push)
+  [ "$(printf '%s\n' "$second" | jq -s '[.[] | select(.type=="sync_push_candidate")] | length')" -eq 0 ]
+}
+
+# Feeds one hand-built ack through reconcile in THIS shell. Going through
+# `bash -c` would start a shell where the driver functions are undefined, and
+# the 127 that produces looks exactly like the rejection being asserted.
+_reconcile_one_ack() {
+  local pos="$1" seq="$2"
+  printf '{"type":"sync_push_ack","local_position":"%s","id":"%s","server_seq":"%s","disposition":"stored"}\n' \
+    "$pos" "00000000-0000-4000-8000-000000000000" "$seq" \
+    | storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1
+}
+
+@test "sync contract: an ack position stays a whitelist after allowing negatives" {
+  # local_position is interpolated straight into SQL, so widening it to accept
+  # projected (negative) positions must not widen it to anything else.
+  _seed_legacy_history
+  prepare_push >/dev/null
+  local bad
+  for bad in "-" "" "1;DROP TABLE events" "-1 OR 1=1" "--1" "1-1" "0x10" " 1" "+1" "1.0"; do
+    run _reconcile_one_ack "$bad" 1
+    # 13 specifically: a "command not found" 127 would also be non-zero and
+    # would pass a laxer check while testing nothing.
+    [ "$status" -eq 13 ]
+  done
+  # A server sequence is assigned by the server and is never negative, so it
+  # did not get the same widening.
+  run _reconcile_one_ack -999999999 -1
+  [ "$status" -eq 13 ]
+  # The events table is still there: nothing above reached a statement.
+  [ "$(agmsg_sqlite "$(agmsg_db_path demo)" "SELECT COUNT(*) FROM events;" | tr -d '\r')" -gt 0 ]
+}
