@@ -37,6 +37,35 @@ ISSUED_CREDENTIAL_IDS = set()
 REVOKED_CREDENTIAL_IDS = []
 
 
+PULL_SERVER_ID = "018f3f7e-2222-7000-8000-000000000001"
+PULL_TEAM_ID = "018f3f7e-2222-7000-8000-000000000002"
+PULL_MEMBERS = [
+    {"member_id": "018f3f7e-2222-7000-8000-000000000010",
+     "name": "alice", "registrations": []},
+    {"member_id": "018f3f7e-2222-7000-8000-000000000011",
+     "name": "bob", "registrations": []},
+]
+# cipher "none" carries the message as the base64 of its canonical JSON, which
+# is what the client decodes on import.
+def _blob(from_agent, to_agent, body, at):
+    import base64
+    payload = json.dumps({"from": from_agent, "to": to_agent, "body": body, "at": at},
+                         separators=(",", ":"), sort_keys=True)
+    return base64.b64encode(payload.encode()).decode()
+
+
+PULL_MESSAGES = [
+    {"id": "11111111-1111-4111-8111-111111111111", "server_seq": "1",
+     "server_received_at": "2026-01-01T00:00:00.000Z",
+     "envelope": {"v": 1, "cipher": "none", "key_id": None,
+                  "blob": _blob("alice", "bob", "history one", "2026-01-01T00:00:00Z")}},
+    {"id": "22222222-2222-4222-8222-222222222222", "server_seq": "2",
+     "server_received_at": "2026-01-02T00:00:00.000Z",
+     "envelope": {"v": 1, "cipher": "none", "key_id": None,
+                  "blob": _blob("bob", "alice", "history two", "2026-01-02T00:00:00Z")}},
+]
+
+
 class LoopbackHTTPServer(HTTPServer):
     """HTTPServer without a reverse-DNS lookup during fixture startup."""
 
@@ -69,6 +98,52 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/_test/revoked":
             self._send_json(200, {"revoked": REVOKED_CREDENTIAL_IDS})
+            return
+        # The pull side: a machine that has none of this asking for a team by
+        # id. No credential, matching /v1/connect -- reaching the server is the
+        # permission.
+        parts = self.path.split("?", 1)
+        route = parts[0]
+        query = parts[1] if len(parts) > 1 else ""
+        if route == "/v1/teams/%s" % PULL_TEAM_ID:
+            self._send_json(200, {
+                "protocol_version": 1,
+                "server_instance_id": PULL_SERVER_ID,
+                "team_id": PULL_TEAM_ID,
+                "team_name": "pulled-team",
+                "min_available_seq": "0",
+                "current_seq": str(len(PULL_MESSAGES)),
+                "policy_revision": "0",
+                "accepted_envelope_versions": [1],
+                "write_allowed_ciphers": ["none", "age-v1"],
+                "policy_history": [{
+                    "policy_revision": "0", "effective_from_seq": "1",
+                    "accepted_envelope_versions": [1],
+                    "write_allowed_ciphers": ["none", "age-v1"],
+                }],
+                "members_revision": 0,
+                "members": PULL_MEMBERS,
+            })
+            return
+        if route == "/v1/teams/%s/messages" % PULL_TEAM_ID:
+            after = 0
+            for pair in query.split("&"):
+                if pair.startswith("after="):
+                    try:
+                        after = int(pair[len("after="):])
+                    except ValueError:
+                        after = 0
+            page = [m for m in PULL_MESSAGES if int(m["server_seq"]) > after]
+            self._send_json(200, {
+                "protocol_version": 1,
+                "server_instance_id": PULL_SERVER_ID,
+                "team_id": PULL_TEAM_ID,
+                "team_name": "pulled-team",
+                "min_available_seq": "0",
+                "messages": page,
+                "next_after": page[-1]["server_seq"] if page else str(after),
+                "has_more": False,
+            })
             return
         self._send_json(404, {"error": "not found"})
 

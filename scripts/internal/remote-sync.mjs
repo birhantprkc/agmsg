@@ -5,7 +5,8 @@ import { spawn } from "node:child_process";
 import { appendFile, lstat, mkdir, open, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import process from "node:process";
-import { pathToFileURL } from "node:url";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { ageExecutableVersion, CipherStateError, openEnvelope,
   readNativeAgeIdentity } from "./sync-cipher.mjs";
 import { parseStrictJson, parseStrictJsonl } from "./strict-jsonl.mjs";
@@ -1759,7 +1760,13 @@ async function main() {
   });
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// realpath on both sides: on macOS a temp dir is /var/... symlinked to
+// /private/var/..., and import.meta.url resolves the link while argv[1] does
+// not. Compared as strings the guard silently fails to match, so the process
+// runs main() never, exits 0, and prints nothing -- a no-op that looks like a
+// success. Anything invoked through a symlinked path hits this.
+if (process.argv[1] &&
+    realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1])) {
   main().catch(async (error) => {
     await event("fatal", { message: error.message, code: error.code ?? null });
     process.stderr.write(`${error.message}\n`);
