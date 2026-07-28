@@ -1,9 +1,0 @@
-{"type":"sync_generation","generation":"550e8400-e29b-41d4-a716-446655440001"}
-{"type":"message_sent","id":"019fa7d3-12d6-707f-82c8-1f8a8d2ad551","team":"demo","from":"alice","to":"bob","body":"different-payload","at":""}
-{"type":"message_sent","id":"019fa7d3-14bb-7bdc-99da-e6b8e22a5cbc","team":"demo","from":"alice","to":"bob","body":"second","at":""}
-{"type":"sync_generation","generation":"22f0ecb2-93f6-45c1-aeff-102485df503a","created_at":"2026-07-28T08:24:18.284Z"}
-{"type":"sync_generation","generation":"5766989c-72e5-422a-aeb9-6b202efc6fca","created_at":"2026-07-28T08:24:21.957Z"}
-{"type":"sync_generation","generation":"5d474d34-2b6c-4173-9401-05facdfc60f2","created_at":"2026-07-28T08:24:22.737Z"}
-{"type":"sync_generation","generation":"2333384e-85e4-4486-b4c2-cadcdab53fd3","created_at":"2026-07-28T08:27:31.978Z"}
-{"type":"sync_generation","generation":"a8efb9d8-17f8-4c3f-a5e4-c26d2eb064b3","created_at":"2026-07-28T08:27:36.876Z"}
-{"type":"sync_generation","generation":"127c5ff3-ac8d-4c45-9879-972f2b2c4cb8","created_at":"2026-07-28T08:27:40.676Z"}
