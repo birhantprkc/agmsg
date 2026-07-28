@@ -298,7 +298,7 @@ EOF
   printf '%s\n' "$page" | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
   [ "$(storage_history demo | jq -s '[.[]|select(.body=="incoming")]|length')" -eq 1 ]
   [ "$(prepare_push | jq -s '[.[]|select(.type=="sync_push_candidate")]|length')" -eq 0 ]
-  storage_compact >/dev/null
+  storage_compact demo >/dev/null
   [ "$(storage_history demo | jq -s '[.[]|select(.body=="incoming")]|length')" -eq 1 ]
   log="$(dirname "$(agmsg_db_path demo)")/events.jsonl"
   jq -e -s '[.[]|select(.type=="sync_pull_commit")][0]
@@ -416,7 +416,7 @@ EOF
   local before candidate old_generation after new_candidate new_generation ack result
   before=$(prepare_push); candidate=$(candidate_of "$before")
   old_generation=$(printf '%s\n' "$before" | jq -r 'select(.type=="sync_state")|.driver_generation')
-  storage_compact >/dev/null
+  storage_compact demo >/dev/null
   after=$(prepare_push); new_candidate=$(candidate_of "$after")
   new_generation=$(printf '%s\n' "$after" | jq -r 'select(.type=="sync_state")|.driver_generation')
   [ "$old_generation" != "$new_generation" ]
@@ -438,7 +438,7 @@ EOF
     {type:"sync_push_ack",local_position,id,server_seq:"1",disposition:"stored"}')
   printf '%s\n' "$ack" |
     storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
-  storage_compact >/dev/null
+  storage_compact demo >/dev/null
   storage_send demo alice bob after-compact >/dev/null
   second=$(prepare_push); later=$(candidate_of "$second")
   [ "$(printf '%s\n' "$later" | jq -r .local_id)" != "$(printf '%s\n' "$candidate" | jq -r .local_id)" ]
@@ -457,7 +457,7 @@ EOF
   log="$(dirname "$(agmsg_db_path demo)")/events.jsonl"
   before=$(cksum "$log")
   export AGMSG_SYNC_TEST_ABORT_AFTER_ROTATE_APPEND=1
-  run storage_compact
+  run storage_compact demo
   [ "$status" -eq 13 ]
   unset AGMSG_SYNC_TEST_ABORT_AFTER_ROTATE_APPEND
   after=$(cksum "$log")

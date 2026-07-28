@@ -305,13 +305,19 @@ SH
 }
 
 @test "storage: no shipped script resolves a store without a selector" {
-  # The point of requiring the selector is that at split time there is no
-  # half-converted caller left to find. A bare agmsg_db_path in production is
-  # exactly that, so it is swept for rather than trusted.
+  # The point of requiring the selector is that no half-converted caller is left
+  # to find. A bare call in production is exactly that, so it is swept for
+  # rather than trusted.
+  #
+  # storage_init is here because watching only agmsg_db_path was not enough:
+  # sqlite-sync.sh called storage_init with no team, which reached the resolver
+  # one frame down. It failed to stderr while the command still succeeded, so
+  # nothing went red until a test captured stderr and fed it to jq.
   local offenders
-  # Bare only: `agmsg_db_path)` closing a substitution, or ending a line. A call
-  # WITH a selector is the thing we want, so it must not match.
-  offenders="$(cd "$BATS_TEST_DIRNAME/.." && grep -rnE 'agmsg_db_path *(\)|$)' \
-    scripts bin 2>/dev/null | grep -v ':[0-9]*: *#' || true)"
+  # Bare only: the name closing a substitution, ending a line, or followed by a
+  # redirect or pipe. A call WITH a selector is the thing we want, so it must
+  # not match.
+  offenders="$(cd "$BATS_TEST_DIRNAME/.." && grep -rnE '(agmsg_db_path|storage_init) *(\)|\||>|$)' \
+    scripts bin 2>/dev/null | grep -v ':[0-9]*: *#' | grep -v 'storage_init()' || true)"
   [ -z "$offenders" ] || { echo "$offenders"; false; }
 }

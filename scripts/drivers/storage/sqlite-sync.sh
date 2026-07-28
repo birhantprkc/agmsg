@@ -87,7 +87,7 @@ _sqlite_sync_schema() {
     echo "agmsg: Stage-1 sync requires jq" >&2
     return 10
   }
-  storage_init >/dev/null || return 13
+  storage_init "$1" >/dev/null || return 13
   local db generation
   db="$(_sqlite_db "$1")"
   agmsg_sqlite "$db" "

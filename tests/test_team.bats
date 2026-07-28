@@ -432,7 +432,7 @@ EOF
   storage_read_cursor_consume oldteam alice 0 >/dev/null
   _sqlite_sync_schema oldteam
   local generation db renamed_db store_dir
-  generation=$(_sqlite_sync_generation)
+  generation=$(_sqlite_sync_generation oldteam)
   # The store moves with the team, so the rows are written through the old
   # team's path and read back through the new one.
   db=$(agmsg_db_path oldteam)
@@ -534,7 +534,7 @@ EOF
   storage_read_cursor_consume myteam claude 0 >/dev/null
   _sqlite_sync_schema myteam
   local generation db
-  generation=$(_sqlite_sync_generation)
+  generation=$(_sqlite_sync_generation myteam)
   # An agent rename does not move the store, so one path serves both ends.
   db=$(agmsg_db_path myteam)
   agmsg_sqlite "$db" "INSERT INTO sync_read_members
