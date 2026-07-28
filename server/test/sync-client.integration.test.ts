@@ -118,6 +118,13 @@ describeDatabase("Stage-1 polling sync client", () => {
     await rm(root, { recursive: true });
   });
 
+  // Stores are per team. A store root no longer holds one messages.db for
+  // everybody — that file still exists there and is now the runtime/lock store,
+  // so reading it finds a real database with none of these tables in it.
+  function teamStore(store: string, team = localTeam) {
+    return join(store, "teams", team, "messages.db");
+  }
+
   function environment(store: string) {
     const connectionRoot = store === storeA ? connectionA
       : store === storeB ? connectionB
@@ -244,7 +251,7 @@ storage_list_unread "$2" "$3"`;
     expect(policyTransition.stdout).toContain('"event":"push.blocked"');
     expect(policyTransition.stdout).toContain('"event":"pull.quarantined"');
     expect(policyTransition.stdout).toContain('"status":"unsupported_cipher"');
-    const quarantined = await execFileAsync("sqlite3", [join(storeA, "messages.db"),
+    const quarantined = await execFileAsync("sqlite3", [teamStore(storeA),
       "SELECT status || ':' || server_seq FROM sync_quarantine WHERE wire_id='550e8400-e29b-41d4-a716-446655440099';"]);
     expect(quarantined.stdout.trim()).toBe("unsupported_cipher:3");
     expect((await history(storeA)).map((message) => message.body)).toEqual([
@@ -261,7 +268,7 @@ storage_list_unread "$2" "$3"`;
     expect(recovered.stdout).toContain('"event":"resync.complete"');
     expect(recovered.stdout).toContain('"disposition":"accepted"');
     expect(await history(storeB)).toEqual(beforeResync);
-    const resyncState = await execFileAsync("sqlite3", [join(storeB, "messages.db"),
+    const resyncState = await execFileAsync("sqlite3", [teamStore(storeB),
       `SELECT transport_cursor || ':' ||
          (SELECT count(*) FROM sync_resync_audits) FROM sync_bindings;`]);
     expect(resyncState.stdout.trim()).toBe("3:1");
