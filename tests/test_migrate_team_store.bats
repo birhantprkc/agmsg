@@ -96,6 +96,23 @@ shared_rows() {
   [ "$(shared_rows alpha)" -eq 1 ]
 }
 
+@test "migrate: a moved team can still be renamed, and its store follows" {
+  # Renaming a shared-layout team rewrites a column; renaming a moved one has to
+  # move a directory as well. Only the second path exists after a migration, so
+  # it is covered here rather than beside the shared-layout rename tests.
+  bash "$SCRIPTS/send.sh" alpha ann bob "carried across" >/dev/null
+  migrate alpha
+  [ -e "$TEST_SKILL_DIR/db/teams/alpha/messages.db" ]
+
+  run bash "$SCRIPTS/rename-team.sh" alpha gamma
+  [ "$status" -eq 0 ]
+
+  [ ! -e "$TEST_SKILL_DIR/db/teams/alpha/messages.db" ]
+  [ -e "$TEST_SKILL_DIR/db/teams/gamma/messages.db" ]
+  run bash "$SCRIPTS/history.sh" gamma bob
+  [[ "$output" =~ "carried across" ]]
+}
+
 @test "migrate: a team that does not exist is refused" {
   run migrate nosuchteam
   [ "$status" -ne 0 ]
