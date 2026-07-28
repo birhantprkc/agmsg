@@ -429,3 +429,52 @@ prepare_push() {
     storage_sync_prepare_read_state demo "$SERVER_ID" "$TEAM_ID" 1)
   [ "$(printf '%s\n' "$prepared" | jq -s '[.[]|select(.type=="sync_read_frontier")]|length')" -eq 1 ]
 }
+
+# A store that predates the event log keeps its history in the legacy `messages`
+# table; nothing writes that table any more, and the phase-3 adoption marked
+# every row delivered. Connecting such a team has to upload that history — the
+# failure mode is silent (zero candidates, no error), so it is pinned here.
+_seed_legacy_history() {
+  local db; db=$(agmsg_db_path demo)
+  agmsg_sqlite "$db" "
+    DELETE FROM storage_metadata WHERE key='read_cursor_v1';
+    INSERT INTO messages(team,from_agent,to_agent,body,created_at) VALUES
+      ('demo','alice','bob','legacy one','2026-01-01T00:00:00Z'),
+      ('demo','bob','alice','legacy two','2026-01-02T00:00:00Z'),
+      ('demo','alice','bob','legacy three','2026-01-03T00:00:00Z');
+  " >/dev/null
+  # The new build initialising an old store: this is what marks them delivered.
+  storage_init demo >/dev/null
+}
+
+@test "sync contract: a legacy-only team pushes its whole history, in order" {
+  _seed_legacy_history
+  local out positions
+  out=$(prepare_push)
+  [ "$(printf '%s\n' "$out" | jq -s '[.[] | select(.type=="sync_push_candidate")] | length')" -eq 3 ]
+  positions=$(printf '%s\n' "$out" | jq -rs '[.[] | select(.type=="sync_push_candidate") | .local_id] | join(",")')
+  [ "$positions" = "1,2,3" ]
+}
+
+@test "sync contract: pushing a legacy-only team twice is byte-identical" {
+  _seed_legacy_history
+  local first second
+  first=$(prepare_push)
+  second=$(prepare_push)
+  # Non-vacuity first: two empty pages are byte-identical too, and that would
+  # pass this test while proving nothing about wire id stability.
+  [ "$(printf '%s\n' "$first" | jq -s '[.[] | select(.type=="sync_push_candidate")] | length')" -eq 3 ]
+  [ "$first" = "$second" ]
+}
+
+@test "sync contract: projecting legacy history does not resurface it as unread" {
+  _seed_legacy_history
+  local before after
+  before=$(storage_list_unread demo bob | wc -l)
+  # Non-vacuity: the projection must actually have happened, or "the inbox did
+  # not change" is trivially true and this guards nothing.
+  [ "$(prepare_push | jq -s '[.[] | select(.type=="sync_push_candidate")] | length')" -eq 3 ]
+  after=$(storage_list_unread demo bob | wc -l)
+  [ "$before" = "$after" ]
+  [ "$after" -eq 0 ]
+}
