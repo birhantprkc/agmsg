@@ -121,7 +121,7 @@ describeDatabase("remote storage HTTP API v1", () => {
     });
   });
 
-  it("requires matching protocol, credentials, and immutable team ID", async () => {
+  it("requires a matching protocol and a valid team ID, with no data-plane credential", async () => {
     const noVersion = await app.inject({
       method: "GET",
       url: "/v1/members",
@@ -130,6 +130,10 @@ describeDatabase("remote storage HTTP API v1", () => {
     expect(noVersion.statusCode).toBe(426);
     expect(noVersion.json().error.code).toBe("unsupported-protocol-version");
 
+    // The data plane no longer authenticates: a valid protocol + team id, with
+    // no Authorization, now succeeds. Reaching the server is the permission
+    // (see scopedTeamId / docs/design/remote-sync.md). Credentials remain only
+    // on the pairing/revoke routes.
     const noAuth = await app.inject({
       method: "GET",
       url: "/v1/members",
@@ -138,7 +142,7 @@ describeDatabase("remote storage HTTP API v1", () => {
         "agmsg-team-id": teamId,
       },
     });
-    expect(noAuth.statusCode).toBe(401);
+    expect(noAuth.statusCode).toBe(200);
   });
 
   it("stores a batch atomically and returns complete input-order acknowledgements", async () => {
@@ -786,6 +790,9 @@ describeDatabase("remote storage HTTP API v1", () => {
     const firstToken = firstIssue.stdout.trim().split(" ").at(-1) ?? "";
     expect(firstIssue.stderr).not.toContain(firstToken);
 
+    // The data plane no longer authenticates, so a stray/legacy Bearer is simply
+    // ignored rather than rejected: the request is scoped by the team-id header
+    // and succeeds. (The pairing/revoke routes below still take a credential.)
     const legacyGlobalToken = await app.inject({
       method: "GET",
       url: "/v1/members",
@@ -795,7 +802,7 @@ describeDatabase("remote storage HTTP API v1", () => {
         "agmsg-team-id": onboardingTeam,
       },
     });
-    expect(legacyGlobalToken.statusCode).toBe(401);
+    expect(legacyGlobalToken.statusCode).toBe(200);
 
     const exchange = async (pairingToken: string) =>
       app.inject({
@@ -867,7 +874,12 @@ describeDatabase("remote storage HTTP API v1", () => {
     });
     expect(canonicalCapabilities.statusCode).toBe(200);
     expect(first.capabilities).toEqual(canonicalCapabilities.json());
-    const wrongTeam = await app.inject({
+    // A credential can no longer scope the data plane: it is ignored, and the
+    // team is taken from the header. A caller naming another team simply reads
+    // that team — anyone who can reach the server and knows a team_id can read
+    // it (docs/design/remote-sync.md, "deliberately out of scope"). This is no
+    // longer a cross-team rejection.
+    const otherTeamByHeader = await app.inject({
       method: "GET",
       url: "/v1/members",
       headers: {
@@ -875,7 +887,7 @@ describeDatabase("remote storage HTTP API v1", () => {
         "agmsg-team-id": teamId,
       },
     });
-    expect(wrongTeam.statusCode).toBe(401);
+    expect(otherTeamByHeader.statusCode).toBe(200);
 
     const secondIssue = await runAdmin(
       "token", "issue", "--team", onboardingTeam,
@@ -937,10 +949,13 @@ describeDatabase("remote storage HTTP API v1", () => {
     });
     expect((await revokeSelf()).statusCode).toBe(200);
     expect((await revokeSelf()).statusCode).toBe(200);
+    // Revocation still works on its own route (above), but it no longer gates
+    // the data plane: that plane does not authenticate, so a revoked — or any —
+    // credential is ignored and the request is scoped by the team-id header.
     const revokedAuth = await app.inject({
       method: "GET", url: "/v1/members", headers: credentialHeaders(first.credential),
     });
-    expect(revokedAuth.statusCode).toBe(401);
+    expect(revokedAuth.statusCode).toBe(200);
     expect((await app.inject({
       method: "GET", url: "/v1/members", headers: credentialHeaders(second.credential),
     })).statusCode).toBe(200);

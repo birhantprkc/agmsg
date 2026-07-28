@@ -70,10 +70,12 @@ describe("data-plane plugin embedding contract", () => {
       payload: JSON.stringify({ pad: "y".repeat(8 * 1024) }), // ~8 KiB, valid JSON, > host 1 KiB
     });
     // The route's own 2 MiB limit governs, so an 8 KiB body is NOT rejected by
-    // the host's 1 KiB default: it reaches the handler and fails auth (401),
-    // never a 413. The property under test is only "not prematurely rejected".
+    // the host's 1 KiB default: it reaches the handler and is rejected there for
+    // its shape (400 invalid-request), never a 413. The data plane no longer
+    // authenticates, so the body reaches schema validation rather than a 401.
+    // The property under test is only "not prematurely rejected".
     expect(res.statusCode).not.toBe(413);
-    expect(res.statusCode).toBe(401);
+    expect(res.statusCode).toBe(400);
   });
 
   // B2: standalone createApp still answers unknown routes exactly as before —
