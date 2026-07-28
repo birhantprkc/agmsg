@@ -1268,7 +1268,7 @@ skip_if_no_special_fs() {
   local cmd
   cmd=$(sqlite_mem "SELECT json_extract(readfile('$hfq'), '\$.hooks.Stop[0].hooks[0].command');")
   [[ "$cmd" == *"check-inbox.sh"* ]]
-  [[ "$cmd" == *"o'brien \"x\""* ]]
+  [[ "$cmd" == *"o'\\''brien \"x\""* ]]
 }
 
 @test "delivery set turn: project path with quotes yields valid JSON + commandWindows (codex) (#134)" {
@@ -1614,7 +1614,7 @@ EOF
 @test "delivery set monitor (codex): installs SessionStart and prints Codex shell function" {
   run bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Codex monitor beta is enabled"* ]]
+  [[ "$output" == *"Codex monitor is enabled"* ]]
   [[ "$output" == *"codex() {"* ]]
   [[ "$output" == *"codex-shim.sh"* ]]
   [[ "$output" == *"launch with codex"* ]]

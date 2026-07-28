@@ -25,6 +25,8 @@ describeDatabase("Stage-1 polling sync client", () => {
   const memberA = "018f3f7e-0000-7000-8000-000000000110";
   const memberB = "018f3f7e-0000-7000-8000-000000000120";
   const localTeam = "dogfood-team";
+  const crossTeamId = "018f3f7e-0000-7000-8000-000000000102";
+  const crossTeam = "cross-driver-team";
   let admin: Pool;
   let pool: Pool;
   let app: ReturnType<typeof createApp>;
@@ -32,8 +34,12 @@ describeDatabase("Stage-1 polling sync client", () => {
   let root: string;
   let storeA: string;
   let storeB: string;
+  let crossStoreSqlite: string;
+  let crossStoreJsonl: string;
   let connectionA: string;
   let connectionB: string;
+  let crossConnectionSqlite: string;
+  let crossConnectionJsonl: string;
   let rosterFile: string;
 
   beforeAll(async () => {
@@ -54,6 +60,19 @@ describeDatabase("Stage-1 polling sync client", () => {
        ($1,$2,'machine-a'),($1,$3,'machine-b')`,
       [teamId, memberA, memberB],
     );
+    await pool.query("INSERT INTO teams(team_id,team_name) VALUES($1,$2)", [crossTeamId, crossTeam]);
+    await pool.query(
+      `INSERT INTO team_policy_history
+         (team_id,policy_revision,effective_from_seq,
+          accepted_envelope_versions,write_allowed_ciphers)
+       VALUES($1,0,1,ARRAY[1],ARRAY['none','age-v1']::TEXT[])`,
+      [crossTeamId],
+    );
+    await pool.query(
+      `INSERT INTO members(team_id,member_id,name) VALUES
+       ($1,$2,'machine-a'),($1,$3,'machine-b')`,
+      [crossTeamId, memberA, memberB],
+    );
     const config: Config = {
       databaseUrl: databaseUrl ?? "",
       host: "127.0.0.1", port: 8787, logLevel: "silent",
@@ -64,12 +83,21 @@ describeDatabase("Stage-1 polling sync client", () => {
     root = await mkdtemp(join(tmpdir(), "agmsg-stage1-sync-"));
     storeA = join(root, "machine-a");
     storeB = join(root, "machine-b");
+    crossStoreSqlite = join(root, "cross-sqlite");
+    crossStoreJsonl = join(root, "cross-jsonl");
     connectionA = join(root, "connection-a");
     connectionB = join(root, "connection-b");
-    for (const connectionRoot of [connectionA, connectionB]) {
-      const issued = await issuePairingToken(pool, teamId);
+    crossConnectionSqlite = join(root, "connection-cross-sqlite");
+    crossConnectionJsonl = join(root, "connection-cross-jsonl");
+    const bindings: Array<[string, string, string]> = [
+      [connectionA, teamId, localTeam], [connectionB, teamId, localTeam],
+      [crossConnectionSqlite, crossTeamId, crossTeam],
+      [crossConnectionJsonl, crossTeamId, crossTeam],
+    ];
+    for (const [connectionRoot, boundTeamId, boundTeam] of bindings) {
+      const issued = await issuePairingToken(pool, boundTeamId);
       await execFileAsync("bash", [join(repositoryRoot, "scripts/remote.sh"), "connect",
-        "--endpoint", serverUrl, issued.token, localTeam], {
+        "--endpoint", serverUrl, issued.token, boundTeam], {
         cwd: repositoryRoot,
         env: { ...process.env, AGMSG_SYNC_CONNECTION_DIR: connectionRoot },
       });
@@ -91,11 +119,13 @@ describeDatabase("Stage-1 polling sync client", () => {
   });
 
   function environment(store: string) {
-    const connectionRoot = store === storeA ? connectionA : connectionB;
+    const connectionRoot = store === storeA ? connectionA
+      : store === storeB ? connectionB
+        : store === crossStoreSqlite ? crossConnectionSqlite : crossConnectionJsonl;
     return {
       ...process.env,
       AGMSG_STORAGE_PATH: store,
-      AGMSG_STORAGE_DRIVER: "sqlite",
+      AGMSG_STORAGE_DRIVER: store === crossStoreJsonl ? "jsonl" : "sqlite",
       AGMSG_SYNC_CONNECTION_DIR: connectionRoot,
       AGMSG_SYNC_LOCAL_ROSTER_FILE: rosterFile,
       AGMSG_NODE: process.execPath,
@@ -111,22 +141,22 @@ describeDatabase("Stage-1 polling sync client", () => {
     });
   }
 
-  async function localSend(store: string, from: string, to: string, body: string) {
+  async function localSend(store: string, from: string, to: string, body: string, team = localTeam) {
     const script = `. "$1/scripts/lib/storage.sh"
 agmsg_storage_load
 storage_init >/dev/null
 storage_send "$2" "$3" "$4" "$5"`;
-    return execFileAsync("bash", ["-c", script, "stage1-test", repositoryRoot, localTeam, from, to, body], {
+    return execFileAsync("bash", ["-c", script, "stage1-test", repositoryRoot, team, from, to, body], {
       cwd: repositoryRoot,
       env: environment(store),
     });
   }
 
-  async function history(store: string) {
+  async function history(store: string, team = localTeam) {
     const script = `. "$1/scripts/lib/storage.sh"
 agmsg_storage_load
 storage_history "$2"`;
-    const result = await execFileAsync("bash", ["-c", script, "stage1-test", repositoryRoot, localTeam], {
+    const result = await execFileAsync("bash", ["-c", script, "stage1-test", repositoryRoot, team], {
       cwd: repositoryRoot,
       env: environment(store),
     });
@@ -246,5 +276,22 @@ storage_list_unread "$2" "$3"`;
     await expect(sync(storeB, "once", "--team", localTeam)).rejects.toMatchObject({
       stderr: expect.stringContaining("invalid or disconnected"),
     });
+  }, 20_000);
+
+  it("synchronizes a SQLite and JSONL peer in both directions without duplicates", async () => {
+    const fromSqlite = "heterogeneous message from SQLite";
+    const fromJsonl = "heterogeneous reply from JSONL";
+
+    await localSend(crossStoreSqlite, "machine-a", "machine-b", fromSqlite, crossTeam);
+    await sync(crossStoreSqlite, "once", "--team", crossTeam);
+    await sync(crossStoreJsonl, "once", "--team", crossTeam);
+    expect((await history(crossStoreJsonl, crossTeam)).filter((message) => message.body === fromSqlite)).toHaveLength(1);
+
+    await localSend(crossStoreJsonl, "machine-b", "machine-a", fromJsonl, crossTeam);
+    await sync(crossStoreJsonl, "once", "--team", crossTeam);
+    await sync(crossStoreSqlite, "once", "--team", crossTeam);
+    const expectedBodies = [fromSqlite, fromJsonl];
+    expect((await history(crossStoreSqlite, crossTeam)).map((message) => message.body)).toEqual(expectedBodies);
+    expect((await history(crossStoreJsonl, crossTeam)).map((message) => message.body)).toEqual(expectedBodies);
   }, 20_000);
 });
