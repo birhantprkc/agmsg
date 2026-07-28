@@ -128,7 +128,7 @@ fail-closed overflow are architecture requirements.
 
 ## Normative specifications
 
-- [Stage-2 read-state synchronization](../../spec/draft/read-state-synchronization.md)
+- [Stage-2 read-state synchronization](../../spec/ref/read-state-synchronization.md)
 - [HTTP API v1](../../../server/spec/v1.md)
 - [Storage driver interface](../../spec/driver-interface.md)
 - [ADR 0005: Remote synchronization contract](0005-remote-sync-contract.md)
