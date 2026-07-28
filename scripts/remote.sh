@@ -40,6 +40,12 @@ source "$SCRIPT_DIR/lib/validate.sh"
 source "$SCRIPT_DIR/lib/require-python3.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/node.sh"
+# For _agmsg_pid_alive — the one piece of watch.sh's daemon plumbing that is
+# already a shared, reusable helper. The rest of the sync engine's lifecycle
+# (below) is written here rather than shared, because watch.sh's is inline and
+# keyed on watcher-only concepts (session/actas) this engine does not have.
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/instance-id.sh"
 
 TEAMS_DIR="$CONNECTION_ROOT/teams"
 CRED_ROOT="$CONNECTION_ROOT/run/remote-credentials"
@@ -846,6 +852,43 @@ cmd_pull() {
   echo "Pulled '$pulled_name' into local team '$team' ($imported message(s))."
 }
 
+# The remote-sync engine runs as a background daemon: one per connected team,
+# polling to push new local messages and pull remote ones. Its lifecycle mirrors
+# watch.sh's FORM without sharing its code (see the instance-id.sh source note):
+# one pidfile per unit under the connection's run dir, SIGTERM to stop, and
+# _agmsg_pid_alive to tell a live engine from a stale pidfile. This leaves the
+# pidfile lifecycle in two places (here and watch.sh); factoring it into a shared
+# lib is intentionally deferred, not overlooked.
+_remote_sync_engine_pidfile() { printf '%s' "$CONNECTION_ROOT/run/remote-sync.$1.pid"; }
+
+_remote_sync_engine_start() {
+  local team="$1" pidfile logfile old_pid
+  pidfile="$(_remote_sync_engine_pidfile "$team")"
+  logfile="$CONNECTION_ROOT/run/remote-sync.$team.log"
+  mkdir -p "$CONNECTION_ROOT/run" 2>/dev/null || true
+  # Stop a previous engine for this team before claiming the slot; a stale
+  # pidfile (its process already gone) is simply overwritten. _agmsg_pid_alive
+  # guards against a recycled pid pointing at an unrelated process.
+  if [ -f "$pidfile" ]; then
+    old_pid="$(cat "$pidfile" 2>/dev/null || true)"
+    [ -n "$old_pid" ] && _agmsg_pid_alive "$old_pid" && kill "$old_pid" 2>/dev/null || true
+  fi
+  # nohup so the engine outlives this connect; remote-sync.sh execs node, so $!
+  # stays the engine's own pid and is exactly what _remote_sync_engine_stop signals.
+  nohup bash "$SCRIPT_DIR/remote-sync.sh" run --team "$team" >> "$logfile" 2>&1 &
+  echo $! > "$pidfile"
+  disown 2>/dev/null || true
+}
+
+_remote_sync_engine_stop() {
+  local team="$1" pidfile pid
+  pidfile="$(_remote_sync_engine_pidfile "$team")"
+  [ -f "$pidfile" ] || return 0
+  pid="$(cat "$pidfile" 2>/dev/null || true)"
+  [ -n "$pid" ] && _agmsg_pid_alive "$pid" && kill "$pid" 2>/dev/null || true
+  rm -f "$pidfile"
+}
+
 cmd_connect() {
   # Register a team you already own with a remote, then move it to its own
   # store and start syncing. No token, no credential: reaching the server is
@@ -884,7 +927,10 @@ cmd_connect() {
   body_file="$(mktemp "${TMPDIR:-/tmp}/agmsg-connect-body.XXXXXX")"
   resp_file="$(mktemp "${TMPDIR:-/tmp}/agmsg-connect-resp.XXXXXX")"
   header_file="$(mktemp "${TMPDIR:-/tmp}/agmsg-connect-hdr.XXXXXX")"
-  trap 'rm -f "$body_file" "$resp_file" "$header_file"' EXIT INT TERM
+  # Guard each name with ${var:-}: this trap also fires on the script's own EXIT,
+  # by which point these function-locals are out of scope and a bare reference
+  # would abort under `set -u`.
+  trap 'rm -f "${body_file:-}" "${resp_file:-}" "${header_file:-}"' EXIT INT TERM
 
   agmsg_sqlite_mem "SELECT json_object(
       'team_id', json_extract('$cfg_escaped', '\$.team_id'),
@@ -955,14 +1001,12 @@ cmd_connect() {
     exit 1
   }
 
-  # Push what we have and pull anything already there, then leave the polling
-  # engine running so new messages flow as they are written.
-  bash "$SCRIPT_DIR/remote-sync.sh" once --team "$team" || {
-    echo "agmsg: connected and migrated, but the initial sync failed — retry with 'remote-sync.sh once --team $team'." >&2
-    exit 1
-  }
+  # Start the polling engine in the background: it pushes what we have, pulls
+  # anything already there, and keeps running so new messages flow both ways as
+  # they are written. Stop it with 'remote.sh disconnect <team>'.
+  _remote_sync_engine_start "$team"
 
-  echo "Connected: team '$team'${remote_team_name:+ (org '$remote_team_name')}."
+  echo "Connected: team '$team'${remote_team_name:+ (org '$remote_team_name')}. Sync engine running."
 }
 
 # --- status --------------------------------------------------------------
@@ -1119,6 +1163,10 @@ cmd_disconnect() {
     echo "agmsg: team '$team' is not connected" >&2
     exit 1
   fi
+
+  # Stop the background sync engine first: leaving it polling a team we are
+  # tearing the binding off of would just error every cycle.
+  _remote_sync_engine_stop "$team"
 
   local cred_file endpoint server_instance_id remote_team_id credential_id credential
   cred_file="$(_remote_cred_file "$team")"
