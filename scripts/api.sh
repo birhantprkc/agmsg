@@ -67,6 +67,35 @@ get_teams() {
   agmsg_sqlite_mem "SELECT json_object('name', n) FROM ($query) ORDER BY n;"
 }
 
+# Where a team's messages physically live, and in what form.
+#
+# Reading the store directly is faster than going through this script, and
+# several programs outside agmsg do exactly that. This resource exists so they
+# stop HARDCODING the path: ask, then read what you were told. A team that moves
+# to its own store (connecting does that) then costs those readers nothing,
+# where a hardcoded path leaves them opening a file that still exists and has
+# none of their data in it — the failure that prompted this.
+#
+# `driver` is not decoration. A jsonl store is an append-only log, not a
+# database; a consumer that opens it with a SQLite client gets nonsense. Check
+# it before reading, and treat an unfamiliar value as "do not read this".
+get_store() {
+  local team="$1" path driver layout exists
+  path="$(agmsg_db_path "$team")" || return 1
+  driver="$(agmsg_storage_driver)"
+  layout="$(agmsg_driver_for_team layout "$team" shared)"
+  # json(...) so the field is a JSON boolean; a bare 1/0 reads as a number and a
+  # consumer testing `=== true` would silently take the wrong branch.
+  if [ -e "$path" ]; then exists="json('true')"; else exists="json('false')"; fi
+  agmsg_sqlite_mem "SELECT json_object(
+    'team', '$(agmsg_sqlesc "$team")',
+    'driver', '$(agmsg_sqlesc "$driver")',
+    'layout', '$(agmsg_sqlesc "$layout")',
+    'path', '$(agmsg_sqlesc "$path")',
+    'exists', $exists
+  );"
+}
+
 get_members() {
   local team="$1"
   local config="$SCRIPT_DIR/../teams/$team/config.json"
@@ -177,7 +206,7 @@ get_messages() {
 }
 
 route_get() {
-  local resource="${1:?Usage: api.sh get teams [<team> members|messages ...]}"
+  local resource="${1:?Usage: api.sh get teams [<team> store|members|messages ...]}"
   shift
   case "$resource" in
     teams)
@@ -194,6 +223,7 @@ route_get() {
       case "$sub" in
         members) get_members "$team" ;;
         messages) get_messages "$team" "$@" ;;
+        store) get_store "$team" ;;
         *) echo "Unknown resource: teams $team $sub" >&2; exit 1 ;;
       esac
       ;;
