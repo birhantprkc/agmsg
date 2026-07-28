@@ -2,6 +2,10 @@
 
 load test_helper
 
+# Some cases deliberately remove python3 from PATH to verify the control-plane
+# gate. Keep the fixture interpreter independent from that system under test.
+MOCK_PYTHON3="$(command -v python3)"
+
 setup() {
   setup_test_env
   bash "$SCRIPTS/join.sh" testteam alice claude-code /tmp/project-a
@@ -11,7 +15,7 @@ setup() {
   MOCK_REVOKE_BAD_HEADER="${MOCK_REVOKE_BAD_HEADER:-}" \
   MOCK_REVOKE_BAD_BODY="${MOCK_REVOKE_BAD_BODY:-}" \
   MOCK_REVOKE_LARGE_BODY="${MOCK_REVOKE_LARGE_BODY:-}" \
-    python3 "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
+    "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
     > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" &
   MOCK_SERVER_PID=$!
   wait_for_file_contains "$TEST_SKILL_DIR/server.port" '^[0-9][0-9]*$'
@@ -32,7 +36,7 @@ restart_mock_server() {
   MOCK_REVOKE_BAD_HEADER="${MOCK_REVOKE_BAD_HEADER:-}" \
   MOCK_REVOKE_BAD_BODY="${MOCK_REVOKE_BAD_BODY:-}" \
   MOCK_REVOKE_LARGE_BODY="${MOCK_REVOKE_LARGE_BODY:-}" \
-    python3 "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
+    "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
       > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" &
   MOCK_SERVER_PID=$!
   wait_for_file_contains "$TEST_SKILL_DIR/server.port" '^[0-9][0-9]*$'
@@ -596,7 +600,7 @@ json.dump({
 @test "disconnect: server unreachable for revoke still clears local state, with a warning" {
   MOCK_REVOKE_FAIL=1
   kill "$MOCK_SERVER_PID" 2>/dev/null
-  MOCK_REVOKE_FAIL=1 python3 "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
+  MOCK_REVOKE_FAIL=1 "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
     > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" &
   MOCK_SERVER_PID=$!
   wait_for_file_contains "$TEST_SKILL_DIR/server.port" '^[0-9][0-9]*$'

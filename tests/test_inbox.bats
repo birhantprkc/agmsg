@@ -80,7 +80,8 @@ await_barrier_reached() {
 
 @test "check-inbox: a message arriving between display and mark is NOT marked read unseen" {
   bash "$SCRIPTS/send.sh" testteam bob alice "early"
-  AGMSG_TEST_MARK_BARRIER="$BARRIER" bash "$SCRIPTS/check-inbox.sh" claude-code /tmp/project-a > "$TEST_SKILL_DIR/check-run.out" 2>/dev/null 3>&- &
+  AGMSG_TEST_MARK_BARRIER="$BARRIER" bash "$SCRIPTS/check-inbox.sh" claude-code /tmp/project-a \
+    </dev/null > "$TEST_SKILL_DIR/check-run.out" 2>/dev/null 3>&- &
   bg_pid=$!
   await_barrier_reached
   bash "$SCRIPTS/send.sh" testteam bob alice "late"

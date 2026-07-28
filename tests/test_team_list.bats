@@ -2,6 +2,8 @@
 
 load test_helper
 
+MOCK_PYTHON3="$(command -v python3)"
+
 setup() {
   setup_test_env
 }
@@ -48,7 +50,7 @@ json_field() {
 @test "team list --json: an actively connected team has binding_state=active and a real remote_team_id" {
   bash "$SCRIPTS/join.sh" myteam alice claude-code /tmp/project-a
 
-  MOCK_REVOKE_FAIL="${MOCK_REVOKE_FAIL:-}" python3 "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
+  MOCK_REVOKE_FAIL="${MOCK_REVOKE_FAIL:-}" "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
     > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" &
   local mock_pid=$!
   wait_for_file_contains "$TEST_SKILL_DIR/server.port" '^[0-9][0-9]*$'
@@ -71,7 +73,7 @@ json_field() {
 
 @test "team list --json: a disconnected team has binding_state=disconnected, remote_team_id retained" {
   bash "$SCRIPTS/join.sh" myteam alice claude-code /tmp/project-a
-  python3 "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
+  "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
     > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" &
   local mock_pid=$!
   wait_for_file_contains "$TEST_SKILL_DIR/server.port" '^[0-9][0-9]*$'
