@@ -15,6 +15,24 @@
 # full order is env > config > default. Keep that logic here so call sites
 # stay unchanged.
 
+# agmsg_db_path turns the team selector into a path segment, so it cannot do its
+# job without the shared name validator. Sourced here rather than left to each
+# caller: watch.sh already reached the store without validate.sh in scope, and a
+# caller that forgets it would build an unchecked path rather than fail.
+# validate.sh guards against double-sourcing, so a caller that sources it too is
+# unaffected. If neither locator resolves, the validator is simply absent and
+# agmsg_db_path fails on the call — never silently unvalidated.
+if ! declare -F agmsg_validate_team_name >/dev/null 2>&1; then
+  if [ -n "${BASH_SOURCE[0]:-}" ]; then
+    # shellcheck disable=SC1091
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/validate.sh"
+  elif [ -n "${SKILL_DIR:-}" ]; then
+    # BASH_SOURCE empty — see agmsg_storage_dir for when that happens.
+    # shellcheck disable=SC1091
+    source "$SKILL_DIR/scripts/lib/validate.sh"
+  fi
+fi
+
 # Echo the directory that holds (or will hold) the message store.
 agmsg_storage_dir() {
   if [ -n "${AGMSG_STORAGE_PATH:-}" ]; then
@@ -38,40 +56,43 @@ agmsg_storage_dir() {
   printf '%s\n' "$skill_dir/db"
 }
 
-# Echo the full path to the message store, in a form the sqlite3 binary can open.
+# Echo the full path to a team's message store, in a form sqlite3 can open.
 #
-# Takes a team SELECTOR, and every message-store caller must pass one. The
-# selector is an input to resolution — it is NOT the storage identity, and it is
-# NOT where the path comes from: today every selector resolves to the same file,
-# and that is deliberate. When message stores are actually split per team, only
-# this function changes; if a permanent per-team key is ever introduced, it is
-# resolved from the selector HERE, so a display name never becomes a path.
+# Each team owns a store: <storage>/teams/<team>/messages.db. The selector is
+# the team's own directory name, matching teams/<name>/config.json, which is
+# already the local record of a team and already what rename-team.sh moves.
+# Using the same key here adds no coupling that the tree did not already have.
 #
 # The argument is required rather than optional on purpose. An optional one
-# leaves two ways to reach the store, and a preparation that is only half
-# applied is worse than none: at split time it would be impossible to tell which
-# callers had been converted.
+# leaves two ways to reach the store, and a caller that forgot the selector
+# would silently read a different team's messages instead of failing.
+#
+# The selector reaches the filesystem as a path segment, so it is validated
+# here rather than trusted: a name containing '/' or equal to '..' would resolve
+# outside the storage tree. Every caller already validates at its own entry
+# point; this is the resolver refusing to build a path it cannot vouch for.
 agmsg_db_path() {
   local team="${1-}"
   if [ -z "$team" ]; then
     echo "Error: agmsg_db_path requires a team selector" >&2
     return 1
   fi
-  _agmsg_db_file
+  agmsg_validate_team_name "$team" || return 1
+  _agmsg_db_file "teams/$team/messages.db"
 }
 
 # The store that is NOT team-scoped, and the only resolver allowed to take no
-# selector. Two things live in the same file today that are not message data:
-# the runtime `locks` table (its resources are project-scoped — there is no team
-# to pass), and the install-time bootstrap of the legacy `messages` table.
+# selector. Two things live here that are not message data: the runtime `locks`
+# table (its resources are project-scoped — there is no team to pass), and the
+# pre-split store that migration reads from.
 #
-# Separating the two resolvers is what keeps `agmsg_db_path` single-meaning. It
-# is a seam, not a parallel accessor family: when message stores split per team,
-# runtime state does not follow them, and this resolution does not change.
-# Splitting the physical file is a separate change.
+# Runtime state deliberately did not follow the messages when they split: a lock
+# on a project is not a fact about any one team, and per-team lock files would
+# let two teams in the same project take the same lock.
 _agmsg_runtime_db_path() { _agmsg_db_file; }
 
-# Shared by both resolvers while they still name the same file.
+# Join a store-relative path onto the storage directory. Defaults to the
+# pre-split shared file, which is what the runtime store still is.
 #
 # On Windows, sqlite3.exe is a native binary that cannot open a Git Bash path
 # like /c/Users/.../db/messages.db: open() fails, so inbox/send/watch all fail
@@ -82,7 +103,7 @@ _agmsg_runtime_db_path() { _agmsg_db_file; }
 # No-op off Windows (cygpath absent). Mirrors agmsg_sql_readfile_path's pattern.
 _agmsg_db_file() {
   local db
-  db="$(agmsg_storage_dir)/messages.db"
+  db="$(agmsg_storage_dir)/${1:-messages.db}"
   if command -v cygpath >/dev/null 2>&1; then
     db=$(cygpath -m "$db" 2>/dev/null || printf '%s' "$db")
   fi
