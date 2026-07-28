@@ -410,6 +410,13 @@ if [ ! -f "$SKILL_DIR/db/messages.db" ]; then
   bash "$SKILL_DIR/scripts/internal/init-db.sh"
 fi
 
+# Move existing history into per-team stores. Unconditional rather than guarded
+# on the store's existence: an install that upgrades a pre-split store is
+# exactly the case that needs it, and the script is a no-op once every team has
+# one. It runs here, before anything reads through the new resolver, so an
+# upgraded install never shows an empty inbox for a team whose history exists.
+bash "$SKILL_DIR/scripts/internal/migrate-per-team.sh"
+
 # Initialize config
 if [ ! -f "$SKILL_DIR/db/config.yaml" ]; then
   bash "$SKILL_DIR/scripts/config.sh" show >/dev/null
