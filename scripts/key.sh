@@ -8,7 +8,7 @@ set -euo pipefail
 #   key.sh rotate [<team>]   -- NOT READY, see cmd_rotate
 #
 # Team-scoped end-to-end encryption key management (age-v1 profile,
-# docs/spec/draft/age-v1-profile.md). Scope: initial single-writer onboarding
+# docs/spec/ref/age-v1-profile.md). Scope: initial single-writer onboarding
 # (generate the very first key, or import one obtained out-of-band) — NOT
 # key rotation (see cmd_rotate) and NOT the multi-writer cutover protocol.
 # This script does not implement age-v1's anti-rollback epoch-snapshot

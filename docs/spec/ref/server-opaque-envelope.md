@@ -4,7 +4,7 @@
 **Last updated:** 2026-07-25
 
 The irreversible architectural decision behind this schema is recorded in
-[ADR 0005: Remote synchronization contract](../../adr/draft/0005-remote-sync-contract.md).
+[ADR 0005: Remote synchronization contract](../../adr/ref/0005-remote-sync-contract.md).
 
 ## Context
 
