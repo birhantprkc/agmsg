@@ -429,3 +429,102 @@ prepare_push() {
     storage_sync_prepare_read_state demo "$SERVER_ID" "$TEAM_ID" 1)
   [ "$(printf '%s\n' "$prepared" | jq -s '[.[]|select(.type=="sync_read_frontier")]|length')" -eq 1 ]
 }
+
+# A store that predates the event log keeps its history in the legacy `messages`
+# table; nothing writes that table any more, and the phase-3 adoption marked
+# every row delivered. Connecting such a team has to upload that history — the
+# failure mode is silent (zero candidates, no error), so it is pinned here.
+_seed_legacy_history() {
+  local db; db=$(agmsg_db_path demo)
+  agmsg_sqlite "$db" "
+    DELETE FROM storage_metadata WHERE key='read_cursor_v1';
+    INSERT INTO messages(team,from_agent,to_agent,body,created_at) VALUES
+      ('demo','alice','bob','legacy one','2026-01-01T00:00:00Z'),
+      ('demo','bob','alice','legacy two','2026-01-02T00:00:00Z'),
+      ('demo','alice','bob','legacy three','2026-01-03T00:00:00Z');
+  " >/dev/null
+  # The new build initialising an old store: this is what marks them delivered.
+  storage_init demo >/dev/null
+}
+
+@test "sync contract: a legacy-only team pushes its whole history, in order" {
+  _seed_legacy_history
+  local out positions
+  out=$(prepare_push)
+  [ "$(printf '%s\n' "$out" | jq -s '[.[] | select(.type=="sync_push_candidate")] | length')" -eq 3 ]
+  positions=$(printf '%s\n' "$out" | jq -rs '[.[] | select(.type=="sync_push_candidate") | .local_id] | join(",")')
+  [ "$positions" = "1,2,3" ]
+}
+
+@test "sync contract: pushing a legacy-only team twice is byte-identical" {
+  _seed_legacy_history
+  local first second
+  first=$(prepare_push)
+  second=$(prepare_push)
+  # Non-vacuity first: two empty pages are byte-identical too, and that would
+  # pass this test while proving nothing about wire id stability.
+  [ "$(printf '%s\n' "$first" | jq -s '[.[] | select(.type=="sync_push_candidate")] | length')" -eq 3 ]
+  [ "$first" = "$second" ]
+}
+
+@test "sync contract: projecting legacy history does not resurface it as unread" {
+  _seed_legacy_history
+  local before after
+  before=$(storage_list_unread demo bob | wc -l)
+  # Non-vacuity: the projection must actually have happened, or "the inbox did
+  # not change" is trivially true and this guards nothing.
+  [ "$(prepare_push | jq -s '[.[] | select(.type=="sync_push_candidate")] | length')" -eq 3 ]
+  after=$(storage_list_unread demo bob | wc -l)
+  [ "$before" = "$after" ]
+  [ "$after" -eq 0 ]
+}
+
+@test "sync contract: a legacy history acknowledged once is never offered again" {
+  _seed_legacy_history
+  local candidates acks result second
+  candidates=$(prepare_push)
+  # The server stores each blob under its wire id and answers with a sequence.
+  acks=$(printf '%s\n' "$candidates" | jq -c '
+    select(.type=="sync_push_candidate")
+    | {type:"sync_push_ack",local_position,id,
+       server_seq:((.local_position|tonumber)+1000000000|tostring),
+       disposition:"stored"}')
+  result=$(printf '%s\n' "$acks" | storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1)
+  [ "$(printf '%s\n' "$result" | jq -r '.push_cursor')" = "-999999997" ]
+
+  # Connecting again offers nothing: this is what "doing it twice leaves the
+  # server unchanged" means locally, and it holds because the reservation keyed
+  # on the projected position carries the same wire id both times.
+  second=$(prepare_push)
+  [ "$(printf '%s\n' "$second" | jq -s '[.[] | select(.type=="sync_push_candidate")] | length')" -eq 0 ]
+}
+
+# Feeds one hand-built ack through reconcile in THIS shell. Going through
+# `bash -c` would start a shell where the driver functions are undefined, and
+# the 127 that produces looks exactly like the rejection being asserted.
+_reconcile_one_ack() {
+  local pos="$1" seq="$2"
+  printf '{"type":"sync_push_ack","local_position":"%s","id":"%s","server_seq":"%s","disposition":"stored"}\n' \
+    "$pos" "00000000-0000-4000-8000-000000000000" "$seq" \
+    | storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1
+}
+
+@test "sync contract: an ack position stays a whitelist after allowing negatives" {
+  # local_position is interpolated straight into SQL, so widening it to accept
+  # projected (negative) positions must not widen it to anything else.
+  _seed_legacy_history
+  prepare_push >/dev/null
+  local bad
+  for bad in "-" "" "1;DROP TABLE events" "-1 OR 1=1" "--1" "1-1" "0x10" " 1" "+1" "1.0"; do
+    run _reconcile_one_ack "$bad" 1
+    # 13 specifically: a "command not found" 127 would also be non-zero and
+    # would pass a laxer check while testing nothing.
+    [ "$status" -eq 13 ]
+  done
+  # A server sequence is assigned by the server and is never negative, so it
+  # did not get the same widening.
+  run _reconcile_one_ack -999999999 -1
+  [ "$status" -eq 13 ]
+  # The events table is still there: nothing above reached a statement.
+  [ "$(agmsg_sqlite "$(agmsg_db_path demo)" "SELECT COUNT(*) FROM events;" | tr -d '\r')" -gt 0 ]
+}

@@ -355,6 +355,84 @@ _sqlite_sync_generation() {
     "SELECT generation FROM sync_store_metadata WHERE singleton=1;" | tr -d '\r'
 }
 
+# Legacy rows live in `messages`, which predates the event log and which nothing
+# writes any more. The push candidate query reads `events` only, so a team whose
+# history is entirely legacy would connect and upload nothing -- silently, since
+# an empty page is a normal answer. This projects those rows into the event log
+# once, per team, at the moment that team first prepares a push.
+#
+# The synthesized seq is `id - _AGMSG_LEGACY_SEQ_OFFSET`, which is negative and
+# therefore below every existing position. That single choice satisfies all
+# three things the position has to be at once:
+#
+#   collision-free  existing seq values are the positive AUTOINCREMENT space
+#   stable          it is a pure function of the legacy row id, so a re-run
+#                   reproduces it and the wire id reserved against it in
+#                   sync_messages stays valid
+#   ordered         legacy ids ascend, so the projected history sorts ahead of
+#                   every event that already exists -- chronologically correct
+#
+# It also leaves read state alone. `read_cursors.local_position` holds positive
+# values and the unread query asks for `seq > cursor`, so projected rows are
+# below every cursor and stay delivered, which is what the phase-3 adoption
+# already decided about them.
+#
+# Explicit negative rowids do not disturb AUTOINCREMENT: sqlite_sequence keeps
+# the high-water it had, so the delivery tip (which reads it) is unaffected.
+_AGMSG_LEGACY_SEQ_OFFSET=1000000000
+
+_sqlite_sync_project_legacy() {
+  local team="$1" db tl done_marker max_id
+  db="$(_sqlite_db "$team")"; tl="$(_sqlite_lit "$team")"
+
+  done_marker=$(agmsg_sqlite "$db" "SELECT value FROM storage_metadata
+    WHERE key='legacy_push_projected_v1';" 2>/dev/null | tr -d '\r')
+  [ -z "$done_marker" ] || return 0
+
+  # A legacy id at or above the offset would project to a NON-negative seq and
+  # collide with the live space. Refuse rather than corrupt: this is a constant
+  # chosen to sit far above any real store, and "far above" is an assumption
+  # worth failing on rather than assuming quietly.
+  max_id=$(agmsg_sqlite "$db" "SELECT COALESCE(MAX(id),0) FROM messages
+    WHERE team='$tl';" 2>/dev/null | tr -d '\r')
+  case "$max_id" in ''|*[!0-9]*) max_id=0 ;; esac
+  if [ "$max_id" -ge "$_AGMSG_LEGACY_SEQ_OFFSET" ]; then
+    echo "agmsg: legacy message id $max_id exceeds the projection offset" >&2
+    return 13
+  fi
+
+  agmsg_sqlite "$db" "
+    INSERT INTO events(seq,type,id,team,from_agent,to_agent,body,at)
+      SELECT m.id - $_AGMSG_LEGACY_SEQ_OFFSET,'message_sent',CAST(m.id AS TEXT),
+             m.team,m.from_agent,m.to_agent,m.body,m.created_at
+        FROM messages m
+       WHERE m.team='$tl'
+         AND NOT EXISTS(SELECT 1 FROM events e
+                         WHERE e.seq=m.id - $_AGMSG_LEGACY_SEQ_OFFSET);
+    INSERT OR REPLACE INTO storage_metadata(key,value)
+      VALUES('legacy_push_projected_v1','1');" >/dev/null 2>&1 || return 13
+}
+
+# Bindings default their push cursor to 0, which is above the projected space,
+# so a team with legacy history would prepare zero candidates. Lower the cursor
+# to just under the oldest projected position -- for a team with no legacy rows
+# the subquery is NULL and this leaves the cursor exactly where it was.
+#
+# Lowering an already-advanced cursor is safe: both the candidate query and the
+# emission filter on `server_seq IS NULL`, so rows the server already
+# acknowledged are skipped rather than resent. The cost is a wider scan.
+_sqlite_sync_rewind_to_legacy() {
+  local team="$1" db tl
+  db="$(_sqlite_db "$team")"; tl="$(_sqlite_lit "$team")"
+  agmsg_sqlite "$db" "
+    UPDATE sync_bindings
+       SET push_cursor = MIN(push_cursor,
+             COALESCE((SELECT MIN(seq)-1 FROM events
+                        WHERE type='message_sent' AND team='$tl' AND seq<0),
+                      push_cursor))
+     WHERE local_team='$tl';" >/dev/null 2>&1 || return 13
+}
+
 _sqlite_sync_ensure_binding() {
   local team="$1" server="$2" remote="$3" protocol="$4" generation="$5"
   agmsg_sqlite "$(_sqlite_db "$team")" "INSERT OR IGNORE INTO sync_bindings
@@ -397,7 +475,9 @@ storage_sync_prepare_push() {
   case "$max_blob" in ''|*[!0-9]*) return 13 ;; esac
 
   generation=$(_sqlite_sync_generation "$team") || return 13
+  _sqlite_sync_project_legacy "$team" || return 13
   _sqlite_sync_ensure_binding "$team" "$server" "$remote" "$protocol" "$generation" || return 13
+  _sqlite_sync_rewind_to_legacy "$team" || return 13
   db="$(_sqlite_db "$team")"; tl="$(_sqlite_lit "$team")"
 
   local rows uuids
@@ -573,7 +653,19 @@ storage_sync_reconcile_push() {
     wire=$(printf '%s\n' "$line" | jq -r '.id // empty')
     seq=$(printf '%s\n' "$line" | jq -r '.server_seq // empty')
     disposition=$(printf '%s\n' "$line" | jq -r '.disposition // empty')
-    case "$pos:$seq" in *[!0-9:]*) return 13 ;; esac
+    # $pos and $seq are interpolated into SQL below, so these stay whitelists.
+    # A local position may be negative (projected legacy history sits under the
+    # live space); a server sequence is assigned by the server and never is.
+    case "$pos" in
+      '' | '-') return 13 ;;
+      -*) case "${pos#-}" in
+            '' | *[!0-9]*) return 13 ;;
+          esac ;;
+      *[!0-9]*) return 13 ;;
+    esac
+    case "$seq" in
+      '' | *[!0-9]*) return 13 ;;
+    esac
     case "$disposition" in stored|duplicate) ;; *) return 13 ;; esac
     printf '%s' "$wire" | grep -Eq '^[0-9a-f-]{36}$' || return 13
     values="${values}${values:+,}($pos,'$wire','$seq')"; count=$((count + 1))
