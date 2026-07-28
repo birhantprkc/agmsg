@@ -70,10 +70,19 @@ row when a name changes. That works while there is one copy. Remotely it would
 mean **replaying history rewrites to every machine** — the past becomes mutable
 and append-only stops holding. Hence ids.
 
-**Migration happens per team, when that team connects.** Teams that never
-connect keep working by name and are not touched. On our own store this would
-be one team of 5,946 messages out of 6,121 across ten teams, and 66 distinct
-agent names to resolve.
+**A team is either wholly id-bearing or wholly name-based; never partly both.**
+A team created from now on gets its ids at creation, and a member joining such
+a team gets one too. A team that predates ids keeps none — not even for a member
+who joins it today — until it connects, at which point the team and every member
+it currently has are minted together. Half a roster with ids is the one state
+worth ruling out, because every reader would then need to handle both.
+
+**Rewriting stored history happens per team, when that team connects.** Teams
+that never connect keep working by name and their rows are not rewritten. On our
+own store this would be one team of 5,946 messages out of 6,121 across ten teams,
+and 66 distinct agent names to resolve. This is about message rows, not about the
+ids above: minting an id costs nothing and touches one small file, while
+rewriting history is the expensive, irreversible part that waits for a reason.
 
 ## One local team, one remote team
 
