@@ -4,6 +4,9 @@ load test_helper
 
 setup() {
   setup_test_env
+  # This is a fixture dependency, not the python3 availability under test.
+  # Resolve it in the per-test process before a case changes PATH.
+  MOCK_PYTHON3="$(command -v python3)"
 }
 
 teardown() {
@@ -48,13 +51,10 @@ json_field() {
 @test "team list --json: an actively connected team has binding_state=active and a real remote_team_id" {
   bash "$SCRIPTS/join.sh" myteam alice claude-code /tmp/project-a
 
-  MOCK_REVOKE_FAIL="${MOCK_REVOKE_FAIL:-}" python3 "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
-    > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" &
+  MOCK_REVOKE_FAIL="${MOCK_REVOKE_FAIL:-}" "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
+    </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
   local mock_pid=$!
-  for _ in $(seq 1 50); do
-    [ -s "$TEST_SKILL_DIR/server.port" ] && break
-    sleep 0.05
-  done
+  wait_for_file_contains "$TEST_SKILL_DIR/server.port" '^[0-9][0-9]*$'
   local mock_port; mock_port="$(cat "$TEST_SKILL_DIR/server.port")"
   local endpoint="http://127.0.0.1:$mock_port"
   bash "$SCRIPTS/remote.sh" connect --endpoint "$endpoint" good-token myteam
@@ -74,13 +74,10 @@ json_field() {
 
 @test "team list --json: a disconnected team has binding_state=disconnected, remote_team_id retained" {
   bash "$SCRIPTS/join.sh" myteam alice claude-code /tmp/project-a
-  python3 "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
-    > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" &
+  "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
+    </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
   local mock_pid=$!
-  for _ in $(seq 1 50); do
-    [ -s "$TEST_SKILL_DIR/server.port" ] && break
-    sleep 0.05
-  done
+  wait_for_file_contains "$TEST_SKILL_DIR/server.port" '^[0-9][0-9]*$'
   local mock_port; mock_port="$(cat "$TEST_SKILL_DIR/server.port")"
   local endpoint="http://127.0.0.1:$mock_port"
   bash "$SCRIPTS/remote.sh" connect --endpoint "$endpoint" good-token myteam

@@ -194,10 +194,13 @@ agmsg_project_path_variants "$project_path" > "$variants_file"
 format="human"
 [ "$json" -eq 1 ] && format="json"
 
-truncated_flag=()
-[ "$truncated" -eq 1 ] && truncated_flag=(--truncated)
-
-python3 "$SCRIPT_DIR/internal/team-list.py" \
-  --entries "$work_file" --variants "$variants_file" \
-  --scope "$scope" --max-config-bytes "$MAX_CONFIG_BYTES" --format "$format" \
-  "${truncated_flag[@]}"
+if [ "$truncated" -eq 1 ]; then
+  python3 "$SCRIPT_DIR/internal/team-list.py" \
+    --entries "$work_file" --variants "$variants_file" \
+    --scope "$scope" --max-config-bytes "$MAX_CONFIG_BYTES" --format "$format" \
+    --truncated
+else
+  python3 "$SCRIPT_DIR/internal/team-list.py" \
+    --entries "$work_file" --variants "$variants_file" \
+    --scope "$scope" --max-config-bytes "$MAX_CONFIG_BYTES" --format "$format"
+fi

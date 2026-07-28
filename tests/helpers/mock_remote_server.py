@@ -27,6 +27,7 @@ import json
 import os
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import TCPServer
 
 REVOKE_FAIL = os.environ.get("MOCK_REVOKE_FAIL") == "1"
 REVOKE_BAD_HEADER = os.environ.get("MOCK_REVOKE_BAD_HEADER") == "1"
@@ -34,6 +35,16 @@ REVOKE_BAD_BODY = os.environ.get("MOCK_REVOKE_BAD_BODY") == "1"
 REVOKE_LARGE_BODY = os.environ.get("MOCK_REVOKE_LARGE_BODY") == "1"
 ISSUED_CREDENTIAL_IDS = set()
 REVOKED_CREDENTIAL_IDS = []
+
+
+class LoopbackHTTPServer(HTTPServer):
+    """HTTPServer without a reverse-DNS lookup during fixture startup."""
+
+    def server_bind(self):
+        TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -239,7 +250,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 0
-    server = HTTPServer(("127.0.0.1", port), Handler)
+    server = LoopbackHTTPServer(("127.0.0.1", port), Handler)
     print(server.server_port, flush=True)
     server.serve_forever()
 

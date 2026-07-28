@@ -121,7 +121,6 @@ _wait_for_file_contains() {
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code \
     >"$TEST_SKILL_DIR/out1.log" 2>/dev/null 3>&- 4>&- &
   local w1=$!
-  sleep 1.5
   bash "$SCRIPTS/send.sh" team bob alice "M1-before-stop" >/dev/null
   _wait_for_file_contains "$TEST_SKILL_DIR/out1.log" "M1-before-stop"
   local i cursor
@@ -138,7 +137,7 @@ _wait_for_file_contains() {
   bash "$SCRIPTS/send.sh" team bob alice "M2-in-gap" >/dev/null
 
   # Any later watcher resumes from the store frontier (session id is irrelevant).
-  run_watcher_for "$sid" "$TEST_SKILL_DIR/out2.log" 2
+  run_watcher_until "$sid" "$TEST_SKILL_DIR/out2.log" "M2-in-gap"
 
   # In-gap message is delivered on restart...
   grep -q "M2-in-gap" "$TEST_SKILL_DIR/out2.log"
