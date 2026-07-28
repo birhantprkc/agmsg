@@ -52,7 +52,7 @@ json_field() {
   bash "$SCRIPTS/join.sh" myteam alice claude-code /tmp/project-a
 
   MOCK_REVOKE_FAIL="${MOCK_REVOKE_FAIL:-}" "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
-    > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" &
+    </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
   local mock_pid=$!
   wait_for_file_contains "$TEST_SKILL_DIR/server.port" '^[0-9][0-9]*$'
   local mock_port; mock_port="$(cat "$TEST_SKILL_DIR/server.port")"
@@ -75,7 +75,7 @@ json_field() {
 @test "team list --json: a disconnected team has binding_state=disconnected, remote_team_id retained" {
   bash "$SCRIPTS/join.sh" myteam alice claude-code /tmp/project-a
   "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
-    > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" &
+    </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
   local mock_pid=$!
   wait_for_file_contains "$TEST_SKILL_DIR/server.port" '^[0-9][0-9]*$'
   local mock_port; mock_port="$(cat "$TEST_SKILL_DIR/server.port")"
