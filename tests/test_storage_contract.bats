@@ -13,7 +13,7 @@ setup() {
   # shellcheck disable=SC1091
   source "$SCRIPTS/lib/storage.sh"
   agmsg_storage_load
-  storage_init
+  storage_init agsuite
 }
 
 teardown() { teardown_test_env; }
@@ -29,7 +29,7 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
 
 @test "contract: storage_store_exists is true once the store is initialized" {
   # setup() ran storage_init, so the active driver's store is present.
-  run storage_store_exists
+  run storage_store_exists agsuite
   [ "$status" -eq 0 ]
 }
 
@@ -118,15 +118,15 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
   storage_send agsuite alice bob "before-cursor-migration" >/dev/null
 
   if [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = jsonl ]; then
-    local store_dir; store_dir="$(dirname "$(agmsg_db_path)")"
+    local store_dir; store_dir="$(dirname "$(agmsg_db_path agsuite)")"
     rm -f "$store_dir/.read-cursor-v1" "$store_dir/read-cursors.tsv"
   else
-    agmsg_sqlite "$(agmsg_db_path)" "
+    agmsg_sqlite "$(agmsg_db_path agsuite)" "
       DELETE FROM storage_metadata WHERE key='read_cursor_v1';
       DELETE FROM read_cursors;" >/dev/null
   fi
 
-  storage_init >/dev/null
+  storage_init agsuite >/dev/null
   run storage_list_unread agsuite bob
   [[ "$output" != *before-cursor-migration* ]]
 
@@ -218,11 +218,11 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
   local id; id=$(storage_send agsuite alice bob "keep")
   storage_mark_read_batch agsuite bob "$id"
   local f="$TEST_SKILL_DIR/export.jsonl"
-  storage_export "$f"
+  storage_export agsuite "$f"
   [ -s "$f" ]
   rm -f "$TEST_SKILL_DIR"/db/messages.db*
-  storage_init
-  storage_import "$f"
+  storage_init agsuite
+  storage_import agsuite "$f"
   run storage_history agsuite bob
   [[ "$output" == *keep* ]]
 }
@@ -265,9 +265,9 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
   # A backend error must surface as a non-zero exit, never a silent empty result.
   # Corruption is store-specific, so break whichever store the active driver reads.
   if [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = jsonl ]; then
-    printf 'not json at all {{{\n' > "$(dirname "$(agmsg_db_path)")/events.jsonl"
+    printf 'not json at all {{{\n' > "$(dirname "$(agmsg_db_path agsuite)")/events.jsonl"
   else
-    local db; db="$(agmsg_db_path)"
+    local db; db="$(agmsg_db_path agsuite)"
     rm -f "$db"-wal "$db"-shm
     printf 'not a sqlite database' > "$db"
   fi
@@ -281,23 +281,23 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
   [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = jsonl ] || skip "jsonl-specific (mkdir write lock)"
   local id; id=$(storage_send agsuite alice bob "x")
   # Hold the write lock so the mark can't acquire it; cap retries so it fails fast.
-  mkdir "$(dirname "$(agmsg_db_path)")/events.jsonl.lock"
+  mkdir "$(dirname "$(agmsg_db_path agsuite)")/events.jsonl.lock"
   AGMSG_JSONL_LOCK_TRIES=2 run storage_mark_read_batch agsuite bob "$id"
-  rmdir "$(dirname "$(agmsg_db_path)")/events.jsonl.lock" 2>/dev/null || true
+  rmdir "$(dirname "$(agmsg_db_path agsuite)")/events.jsonl.lock" 2>/dev/null || true
   [ "$status" -ne 0 ]                  # control op surfaces the failure
   [[ "$output" != *ok* ]]             # never a false "ok"
 }
 
 @test "contract(jsonl): compact keys reads by tuple, not a space-join (no collision)" {
   [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = jsonl ] || skip "jsonl-specific (compaction key)"
-  storage_init
-  local log; log="$(dirname "$(agmsg_db_path)")/events.jsonl"
+  storage_init agsuite
+  local log; log="$(dirname "$(agmsg_db_path agsuite)")/events.jsonl"
   # Two DISTINCT (team, agent, msg_id) tuples that a space-joined key would merge:
   #   ("a b","c","1")  and  ("a","b c","1")  both flatten to "a b c 1".
   printf '%s\n%s\n' \
     '{"type":"message_read","id":"r1","msg_id":"1","team":"a b","agent":"c","at":"x"}' \
     '{"type":"message_read","id":"r2","msg_id":"1","team":"a","agent":"b c","at":"y"}' >> "$log"
-  storage_compact
+  storage_compact agsuite
   run grep -c '"type":"message_read"' "$log"   # both are distinct read-state; keep both
   [ "$output" -eq 2 ]
 }
@@ -305,7 +305,7 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
 @test "contract(jsonl): mark_read_batch fails non-zero on a corrupt log" {
   [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = jsonl ] || skip "jsonl-specific (corrupt JSONL)"
   storage_send agsuite alice bob "x" >/dev/null
-  printf 'not json {{{\n' > "$(dirname "$(agmsg_db_path)")/events.jsonl"
+  printf 'not json {{{\n' > "$(dirname "$(agmsg_db_path agsuite)")/events.jsonl"
   run storage_mark_read_batch agsuite bob someid
   [ "$status" -ne 0 ]                  # the existing-reads scan failure aborts the mark
   [[ "$output" != *ok* ]]
@@ -327,7 +327,7 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
   local unread_before history_before
   unread_before=$(storage_list_unread agsuite bob)
   history_before=$(storage_history agsuite bob)
-  storage_compact
+  storage_compact agsuite
   [ "$(storage_list_unread agsuite bob)" = "$unread_before" ]
   [ "$(storage_history agsuite bob)" = "$history_before" ]
 }
@@ -336,10 +336,10 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
   local id; id=$(storage_send agsuite alice bob "i1")
   storage_mark_read_batch agsuite bob "$id"
   storage_mark_read_batch agsuite bob "$id"
-  storage_compact
-  local after_one; after_one=$(storage_export "$TEST_SKILL_DIR/c1.jsonl"; cat "$TEST_SKILL_DIR/c1.jsonl")
-  storage_compact
-  storage_export "$TEST_SKILL_DIR/c2.jsonl"
+  storage_compact agsuite
+  local after_one; after_one=$(storage_export agsuite "$TEST_SKILL_DIR/c1.jsonl"; cat "$TEST_SKILL_DIR/c1.jsonl")
+  storage_compact agsuite
+  storage_export agsuite "$TEST_SKILL_DIR/c2.jsonl"
   [ "$(cat "$TEST_SKILL_DIR/c2.jsonl")" = "$after_one" ]
 }
 
@@ -353,7 +353,7 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
   storage_mark_read_batch agsuite carol "$x"
   storage_mark_read_batch agsuite carol "$x"
   storage_mark_read_batch agsuite carol "$x"
-  storage_compact
+  storage_compact agsuite
   run storage_watch_after "$tip" agsuite:bob
   [ "$status" -eq 0 ]
   [[ "$output" == *"c1"* ]]
@@ -366,7 +366,7 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
   storage_mark_read_batch agsuite bob "$id"
   storage_mark_read_batch agsuite bob "$id"   # redundant tail markers
   local tip_before; tip_before=$(storage_watch_tip agsuite:bob)
-  storage_compact
+  storage_compact agsuite
   local tip_after; tip_after=$(storage_watch_tip agsuite:bob)
   [ "$tip_after" -ge "$tip_before" ]
 }
@@ -380,7 +380,7 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
   # tail-duplicate rows whose deletion would regress a naive MAX(seq) tip. Here we
   # inject those duplicates directly (the highest seqs in the log), then compact —
   # the case that distinguishes the AUTOINCREMENT high-water from MAX(seq).
-  local db; db="$(agmsg_db_path)"
+  local db; db="$(agmsg_db_path agsuite)"
   storage_send agsuite alice bob "s1"
   # cursor taken before a later send — must still deliver that later message.
   local cur0; cur0=$(storage_watch_tip agsuite:bob)
@@ -398,7 +398,7 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
   tip_before=$(storage_watch_tip agsuite:bob)
   [ "$reads_before" -eq 3 ]
 
-  storage_compact
+  storage_compact agsuite
 
   local reads_after total_after tip_after
   reads_after=$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM events WHERE type='message_read';" | tr -d '\r')
@@ -416,14 +416,14 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
 
 @test "contract(sqlite): forward-compat — export/list/history ignore an unknown event type" {
   [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = sqlite ] || skip "sqlite-specific (direct events-table injection)"
-  local db; db="$(agmsg_db_path)"
+  local db; db="$(agmsg_db_path agsuite)"
   storage_send agsuite alice bob "known"
   # a v2-style event a v1 reader has never seen — must be skipped, not leaked.
   agmsg_sqlite "$db" "INSERT INTO events (type,id,team,from_agent,to_agent,body,at)
     VALUES ('message_reaction','x1','agsuite','bob','alice','👍','2026-02-02T00:00:00Z');"
   # export stays clean JSONL: no blank line, no unknown type, every line valid JSON.
   local f="$TEST_SKILL_DIR/fc.jsonl"
-  storage_export "$f"
+  storage_export agsuite "$f"
   [ "$(grep -c '^$' "$f")" -eq 0 ]          # no blank line leaked by the unknown type
   ! grep -q 'message_reaction' "$f"
   while IFS= read -r line; do
@@ -446,7 +446,7 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
 
 @test "contract(sqlite): legacy messages rows surface in unread and history" {
   [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = sqlite ] || skip "sqlite-specific (legacy messages table)"
-  local db; db="$(agmsg_db_path)"
+  local db; db="$(agmsg_db_path agsuite)"
   agmsg_sqlite "$db" "INSERT INTO messages (team,from_agent,to_agent,body,read_at)
     VALUES ('agsuite','alice','bob','legacy-unread',NULL),
            ('agsuite','alice','bob','legacy-read','2026-01-01T00:00:00Z');"
@@ -460,7 +460,7 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
 
 @test "contract(sqlite): marking a legacy id read hides it without mutating the row" {
   [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = sqlite ] || skip "sqlite-specific (legacy messages table)"
-  local db; db="$(agmsg_db_path)"
+  local db; db="$(agmsg_db_path agsuite)"
   agmsg_sqlite "$db" "INSERT INTO messages (team,from_agent,to_agent,body)
     VALUES ('agsuite','alice','bob','legacy-x');"
   local lid; lid=$(agmsg_sqlite "$db" "SELECT id FROM messages WHERE body='legacy-x';" | tr -d '\r')

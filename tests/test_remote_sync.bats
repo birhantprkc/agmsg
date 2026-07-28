@@ -10,7 +10,7 @@ setup() {
   # shellcheck disable=SC1091
   source "$SCRIPTS/lib/storage.sh"
   agmsg_storage_load
-  storage_init >/dev/null
+  storage_init demo >/dev/null
   SERVER_ID=018f3f7e-0000-7000-8000-000000000000
   TEAM_ID=018f3f7e-0000-7000-8000-000000000001
   PREPARE='{"type":"sync_prepare","envelope_v":1,"cipher":"none","key_id":null,"max_blob_bytes":1048576,"allow_new":true}'

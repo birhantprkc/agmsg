@@ -428,12 +428,12 @@ EOF
   export SKILL_DIR="$TEST_SKILL_DIR" AGMSG_STORAGE_DRIVER=sqlite
   source "$SCRIPTS/lib/storage.sh"
   agmsg_storage_load
-  storage_init >/dev/null
+  storage_init oldteam >/dev/null
   storage_read_cursor_consume oldteam alice 0 >/dev/null
-  _sqlite_sync_schema
+  _sqlite_sync_schema oldteam
   local generation db store_dir
   generation=$(_sqlite_sync_generation)
-  db=$(agmsg_db_path)
+  db=$(agmsg_db_path demo)
   store_dir=$(agmsg_storage_dir)
   agmsg_sqlite "$db" "INSERT INTO sync_bindings
     (local_team,server_instance_id,remote_team_id,protocol_version,driver_generation)
@@ -526,12 +526,12 @@ EOF
   export SKILL_DIR="$TEST_SKILL_DIR" AGMSG_STORAGE_DRIVER=sqlite
   source "$SCRIPTS/lib/storage.sh"
   agmsg_storage_load
-  storage_init >/dev/null
+  storage_init myteam >/dev/null
   storage_read_cursor_consume myteam claude 0 >/dev/null
-  _sqlite_sync_schema
+  _sqlite_sync_schema myteam
   local generation db
   generation=$(_sqlite_sync_generation)
-  db=$(agmsg_db_path)
+  db=$(agmsg_db_path demo)
   agmsg_sqlite "$db" "INSERT INTO sync_read_members
     (local_team,server_instance_id,remote_team_id,protocol_version,
      driver_generation,member_id,agent,remote_agent)

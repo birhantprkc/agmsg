@@ -15,19 +15,19 @@ teardown() {
 @test "storage: default path resolves under the skill dir" {
   source "$SCRIPTS/lib/storage.sh"
   unset AGMSG_STORAGE_PATH
-  [ "$(agmsg_db_path)" = "$TEST_SKILL_DIR/db/messages.db" ]
+  [ "$(agmsg_db_path demo)" = "$TEST_SKILL_DIR/db/messages.db" ]
 }
 
 @test "storage: AGMSG_STORAGE_PATH overrides the storage dir" {
   source "$SCRIPTS/lib/storage.sh"
   export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/store"
-  [ "$(agmsg_db_path)" = "$BATS_TEST_TMPDIR/store/messages.db" ]
+  [ "$(agmsg_db_path demo)" = "$BATS_TEST_TMPDIR/store/messages.db" ]
 }
 
 @test "storage: trailing slash on the override is normalized" {
   source "$SCRIPTS/lib/storage.sh"
   export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/store/"
-  [ "$(agmsg_db_path)" = "$BATS_TEST_TMPDIR/store/messages.db" ]
+  [ "$(agmsg_db_path demo)" = "$BATS_TEST_TMPDIR/store/messages.db" ]
 }
 
 # --- agmsg_db_path() Windows path conversion (#197) ---
@@ -46,7 +46,7 @@ printf '%s\n' "$1" | sed -E 's#^/c/#C:/#'
 SH
   chmod +x "$bindir/cygpath"
   run env PATH="$bindir:$PATH" AGMSG_STORAGE_PATH="/c/Users/test/db" \
-    bash -c 'source "'"$SCRIPTS"'/lib/storage.sh"; agmsg_db_path'
+    bash -c 'source "'"$SCRIPTS"'/lib/storage.sh"; agmsg_db_path demo'
   [ "$status" -eq 0 ]
   [ "$output" = "C:/Users/test/db/messages.db" ]
 }
@@ -55,7 +55,7 @@ SH
   source "$SCRIPTS/lib/storage.sh"
   export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/store"
   # cygpath is absent on the test host, so the path is returned unchanged.
-  [ "$(agmsg_db_path)" = "$BATS_TEST_TMPDIR/store/messages.db" ]
+  [ "$(agmsg_db_path demo)" = "$BATS_TEST_TMPDIR/store/messages.db" ]
 }
 
 # --- init-db.sh honoring the override ---
@@ -161,7 +161,7 @@ SH
 
   [ "$(agmsg_runtime_lock_acquire codex-dispatcher:test 111)" = 111 ]
   bash "$SCRIPTS/send.sh" team alice bob "after lock init" --force
-  [ "$(agmsg_sqlite "$(agmsg_db_path)" "SELECT COUNT(*) FROM events WHERE type='message_sent' AND body = 'after lock init';")" = 1 ]
+  [ "$(agmsg_sqlite "$(agmsg_db_path demo)" "SELECT COUNT(*) FROM events WHERE type='message_sent' AND body = 'after lock init';")" = 1 ]
 }
 
 @test "send: concurrent fan-out to N recipients all land (no SQLITE_BUSY)" {
@@ -231,4 +231,51 @@ SH
   done
 
   [ "$(wc -l < "$count" | tr -d ' ')" -eq 5 ]
+}
+
+# --- team selector (preparation for splitting the store per team) ------------
+#
+# These three fix what this change IS, and — just as importantly — what it is
+# NOT. Nothing is split here: every selector still resolves to the same file.
+# Without pinning that, a later split would change behaviour with no way to tell
+# which differences were intended and which were accidents.
+
+@test "storage: the selector does not choose a path yet (nothing is split)" {
+  export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/db"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/storage.sh"
+  local a b
+  a="$(agmsg_db_path alpha)"
+  b="$(agmsg_db_path bravo)"
+  [ -n "$a" ]
+  [ "$a" = "$b" ]
+  # And the same store the non-team resolver names, while they are one file.
+  [ "$a" = "$(_agmsg_runtime_db_path)" ]
+}
+
+@test "storage: resolving a store without a selector is an error, not a default" {
+  export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/db"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/storage.sh"
+  run agmsg_db_path
+  [ "$status" -ne 0 ]
+  run agmsg_db_path ""
+  [ "$status" -ne 0 ]
+  # The runtime resolver is the one place a missing selector is correct: its
+  # callers hold project-scoped state and have no team to name.
+  run _agmsg_runtime_db_path
+  [ "$status" -eq 0 ]
+  [ -n "$output" ]
+}
+
+@test "storage: no shipped script resolves a store without a selector" {
+  # The point of requiring the selector is that at split time there is no
+  # half-converted caller left to find. A bare agmsg_db_path in production is
+  # exactly that, so it is swept for rather than trusted.
+  local offenders
+  # Bare only: `agmsg_db_path)` closing a substitution, or ending a line. A call
+  # WITH a selector is the thing we want, so it must not match.
+  offenders="$(cd "$BATS_TEST_DIRNAME/.." && grep -rnE 'agmsg_db_path *(\)|$)' \
+    scripts bin 2>/dev/null | grep -v ':[0-9]*: *#' || true)"
+  [ -z "$offenders" ] || { echo "$offenders"; false; }
 }

@@ -39,7 +39,7 @@ bulk_store() {
   # shellcheck disable=SC1091
   source "$SCRIPTS/lib/storage.sh"
   agmsg_storage_load
-  storage_init >/dev/null
+  storage_init demo >/dev/null
   while [ "$i" -lt "$count" ]; do
     storage_send demo alice bob "backfill message $i" >/dev/null
     i=$((i + 1))
@@ -80,7 +80,7 @@ bulk_store() {
   # shellcheck disable=SC1091
   source "$SCRIPTS/lib/storage.sh"
   agmsg_storage_load
-  storage_init >/dev/null
+  storage_init demo >/dev/null
   # The page is streamed through paste and two jq passes on its way to the
   # helper, so a body has to survive a tab-delimited join, a JSON round trip and
   # a shell here-document unchanged. Every character below has broken one of
@@ -196,7 +196,7 @@ RUN
   # shellcheck disable=SC1091
   source "$SCRIPTS/lib/storage.sh"
   agmsg_storage_load
-  storage_init >/dev/null
+  storage_init demo >/dev/null
   storage_send demo alice bob "encrypted at the durability boundary" >/dev/null
   local recipient prepare first second
   recipient=$(jq -r '.recipient_sets.team_a.recipient' \
@@ -225,7 +225,7 @@ RUN
   # shellcheck disable=SC1091
   source "$SCRIPTS/lib/storage.sh"
   agmsg_storage_load
-  storage_init >/dev/null
+  storage_init demo >/dev/null
   storage_send demo alice bob "one published ciphertext" >/dev/null
   local recipient prepare first_file second_file first_pid second_pid
   recipient=$(jq -r '.recipient_sets.team_a.recipient' \

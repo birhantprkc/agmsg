@@ -394,9 +394,12 @@ storage_export() {
 }
 
 storage_import() {
-  local team="$1" file="$2" db; db="$(_sqlite_db "$team")"
+  # `selector`, not `team`: the loop below reuses `team` for the team named by
+  # each imported RECORD, which is a different thing from the store being
+  # written to. Sharing one name here would read as if they had to match.
+  local selector="$1" file="$2" db; db="$(_sqlite_db "$selector")"
   [ -f "$file" ] || return 1
-  storage_init >/dev/null
+  storage_init "$selector" >/dev/null
   local line t id team frm to body msg_id agent at
   j() { sqlite3 :memory: "SELECT COALESCE(json_extract('$(_sqlite_lit "$line")','\$.$1'),'')" 2>/dev/null | tr -d '\r'; }
   while IFS= read -r line; do
