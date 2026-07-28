@@ -317,7 +317,13 @@ SH
   # Bare only: the name closing a substitution, ending a line, or followed by a
   # redirect or pipe. A call WITH a selector is the thing we want, so it must
   # not match.
+  # server/ is swept too, because its integration tests drive the client through
+  # embedded bash. One selector-less storage_init lived there through two rounds
+  # of this sweep: it is not a shell file, so watching scripts/ alone never saw
+  # it, and it only failed once a store per team made the empty selector reach
+  # the resolver. tests/ is deliberately excluded — a bare call there is how the
+  # requirement itself is asserted.
   offenders="$(cd "$BATS_TEST_DIRNAME/.." && grep -rnE '(agmsg_db_path|storage_init) *(\)|\||>|$)' \
-    scripts bin 2>/dev/null | grep -v ':[0-9]*: *#' | grep -v 'storage_init()' || true)"
+    scripts bin server 2>/dev/null | grep -v ':[0-9]*: *#' | grep -v 'storage_init()' || true)"
   [ -z "$offenders" ] || { echo "$offenders"; false; }
 }

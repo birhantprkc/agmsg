@@ -142,9 +142,11 @@ describeDatabase("Stage-1 polling sync client", () => {
   }
 
   async function localSend(store: string, from: string, to: string, body: string, team = localTeam) {
+    // storage_init takes the team: stores are per team, so initializing without
+    // one reaches the resolver with an empty selector and fails under set -u.
     const script = `. "$1/scripts/lib/storage.sh"
 agmsg_storage_load
-storage_init >/dev/null
+storage_init "$2" >/dev/null
 storage_send "$2" "$3" "$4" "$5"`;
     return execFileAsync("bash", ["-c", script, "stage1-test", repositoryRoot, team, from, to, body], {
       cwd: repositoryRoot,
