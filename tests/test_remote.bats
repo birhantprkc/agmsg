@@ -14,10 +14,7 @@ setup() {
     python3 "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
     > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" &
   MOCK_SERVER_PID=$!
-  for _ in $(seq 1 50); do
-    [ -s "$TEST_SKILL_DIR/server.port" ] && break
-    sleep 0.05
-  done
+  wait_for_file_contains "$TEST_SKILL_DIR/server.port" '^[0-9][0-9]*$'
   MOCK_PORT="$(cat "$TEST_SKILL_DIR/server.port")"
   ENDPOINT="http://127.0.0.1:$MOCK_PORT"
 }
@@ -38,10 +35,7 @@ restart_mock_server() {
     python3 "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
       > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" &
   MOCK_SERVER_PID=$!
-  for _ in $(seq 1 50); do
-    [ -s "$TEST_SKILL_DIR/server.port" ] && break
-    sleep 0.05
-  done
+  wait_for_file_contains "$TEST_SKILL_DIR/server.port" '^[0-9][0-9]*$'
   MOCK_PORT="$(cat "$TEST_SKILL_DIR/server.port")"
   ENDPOINT="http://127.0.0.1:$MOCK_PORT"
 }
@@ -605,10 +599,7 @@ json.dump({
   MOCK_REVOKE_FAIL=1 python3 "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
     > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" &
   MOCK_SERVER_PID=$!
-  for _ in $(seq 1 50); do
-    [ -s "$TEST_SKILL_DIR/server.port" ] && break
-    sleep 0.05
-  done
+  wait_for_file_contains "$TEST_SKILL_DIR/server.port" '^[0-9][0-9]*$'
   MOCK_PORT="$(cat "$TEST_SKILL_DIR/server.port")"
   ENDPOINT="http://127.0.0.1:$MOCK_PORT"
 

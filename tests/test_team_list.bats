@@ -51,10 +51,7 @@ json_field() {
   MOCK_REVOKE_FAIL="${MOCK_REVOKE_FAIL:-}" python3 "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
     > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" &
   local mock_pid=$!
-  for _ in $(seq 1 50); do
-    [ -s "$TEST_SKILL_DIR/server.port" ] && break
-    sleep 0.05
-  done
+  wait_for_file_contains "$TEST_SKILL_DIR/server.port" '^[0-9][0-9]*$'
   local mock_port; mock_port="$(cat "$TEST_SKILL_DIR/server.port")"
   local endpoint="http://127.0.0.1:$mock_port"
   bash "$SCRIPTS/remote.sh" connect --endpoint "$endpoint" good-token myteam
@@ -77,10 +74,7 @@ json_field() {
   python3 "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
     > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" &
   local mock_pid=$!
-  for _ in $(seq 1 50); do
-    [ -s "$TEST_SKILL_DIR/server.port" ] && break
-    sleep 0.05
-  done
+  wait_for_file_contains "$TEST_SKILL_DIR/server.port" '^[0-9][0-9]*$'
   local mock_port; mock_port="$(cat "$TEST_SKILL_DIR/server.port")"
   local endpoint="http://127.0.0.1:$mock_port"
   bash "$SCRIPTS/remote.sh" connect --endpoint "$endpoint" good-token myteam
