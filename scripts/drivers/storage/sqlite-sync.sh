@@ -772,7 +772,7 @@ storage_sync_apply_pull() {
       body=$(printf '%s\n' "$line" | jq -r '.projection.body // empty')
       at=$(printf '%s\n' "$line" | jq -r '.projection.created_at // empty')
       [ -n "$from" ] && [ -n "$to" ] && [ -n "$body" ] && [ -n "$at" ] || { rm -f "$sql_file"; return 13; }
-      local_id=$(_sqlite_uuid7) || { rm -f "$sql_file"; return 13; }
+      local_id=$(compat_uuid7) || { rm -f "$sql_file"; return 13; }
       printf "%s\n" "
         INSERT INTO events(type,id,team,from_agent,to_agent,body,at)
         SELECT 'message_sent','$local_id','$tl','$(_sqlite_lit "$from")',

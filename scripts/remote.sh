@@ -69,15 +69,16 @@ _remote_read_config_field() {
 # initial-config shape exactly (no agents registered yet — connect only
 # establishes the sync binding, not an agent identity in the team).
 _remote_ensure_team() {
-  local team="$1" cfg
+  local team="$1" cfg initial
   cfg="$(_remote_team_config "$team")"
+  mkdir -p "$TEAMS_DIR/$team"
+  agmsg_lock_acquire "$TEAMS_DIR/$team" || return 1
   if [ ! -f "$cfg" ]; then
-    mkdir -p "$TEAMS_DIR/$team"
-    local initial
-    initial=$(printf '{\n  "name": "%s",\n  "agents": {},\n  "created_at": "%s"\n}' \
-      "$team" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+    initial=$(printf '{\n  "name": "%s",\n  "team_id": "%s",\n  "agents": {},\n  "created_at": "%s"\n}' \
+      "$team" "$(compat_uuid7)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
     agmsg_write_atomic "$cfg" "$initial"
   fi
+  agmsg_lock_release
 }
 
 # Reject a non-HTTPS endpoint (token/credential would cross the wire in

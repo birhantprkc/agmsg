@@ -132,6 +132,19 @@ compat_uuidgen() {
   fi | tr -d '\r'
 }
 
+# Generate a UUIDv7: 48-bit millisecond timestamp, version 7, RFC 4122
+# variant, and random tail bytes. Keep this in the core dependency tier:
+# /dev/urandom supplies the random bytes without invoking Python or another
+# optional runtime. No counter or other persistent state.
+compat_uuid7() {
+  local ms hex rnd
+  ms=$(( $(date -u +%s) * 1000 ))
+  hex=$(printf '%012x' "$ms")
+  rnd=$(head -c 10 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  printf '%s-%s-7%s-8%s-%s\n' \
+    "${hex:0:8}" "${hex:8:4}" "${rnd:0:3}" "${rnd:3:3}" "${rnd:6:12}"
+}
+
 # Get file modification time as epoch seconds.
 # Replaces: stat -f %m (macOS) / stat -c %Y (Linux/MSYS2)
 compat_file_mtime() {
