@@ -216,11 +216,14 @@ fn db_path() -> PathBuf {
 /// New messages, from the event log and the legacy table together.
 ///
 /// The read rule mirrors `storage_history()` in
-/// `scripts/drivers/storage/sqlite.sh`, deliberately, and
-/// `messages_match_the_shell_facade` asserts the two agree rather than
-/// leaving "deliberately" as a claim. `src` breaks ties between a legacy row
-/// and an event-log row carrying the same timestamp, so the two spaces
+/// `scripts/drivers/storage/sqlite.sh`. `src` breaks ties between a legacy
+/// row and an event-log row carrying the same timestamp, so the two spaces
 /// interleave in one stable order — legacy first, matching the facade.
+///
+/// NOT enforced: nothing checks that this stays in step with the shell. The
+/// tests below assert what this returns, not that the facade agrees, so a
+/// change to `storage_history()` will not turn anything red here. Keeping
+/// the two aligned is currently a matter of someone remembering.
 ///
 /// Two cursors because there are two id spaces: `events.seq` and the legacy
 /// `messages.id` autoincrement. They are unrelated counters, both starting
