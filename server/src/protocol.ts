@@ -170,6 +170,36 @@ export const agentNameSchema = z.string().refine((value) => {
   );
 });
 
+// POST /v1/connect registers a team the client already owns. The team_id and
+// every member_id are minted on the owning machine; the server records what it
+// is sent, it never originates a team. A member is just an identity here —
+// id + name — because with no server-side authentication there are no
+// per-device credentials to attach.
+const connectMemberSchema = z
+  .object({
+    member_id: uuidV7Schema,
+    name: agentNameSchema,
+  })
+  .strict();
+
+export const connectSchema = z
+  .object({
+    team_id: uuidV7Schema,
+    team_name: teamNameSchema,
+    members: z.array(connectMemberSchema).max(1000),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (new Set(value.members.map((member) => member.member_id)).size !== value.members.length) {
+      context.addIssue({ code: "custom", path: ["members"], message: "member IDs must be distinct" });
+    }
+    if (new Set(value.members.map((member) => member.name)).size !== value.members.length) {
+      context.addIssue({ code: "custom", path: ["members"], message: "member names must be distinct" });
+    }
+  });
+
+export type ConnectInput = z.infer<typeof connectSchema>;
+
 function u32(value: number): Buffer {
   const buffer = Buffer.allocUnsafe(4);
   buffer.writeUInt32BE(value);

@@ -2,6 +2,7 @@ import type { Pool, PoolClient } from "pg";
 import { ProtocolError } from "./errors.js";
 import {
   MAX_SEQUENCE,
+  type ConnectInput,
   envelopeDigest,
   type Envelope,
   type MessageInput,
@@ -738,6 +739,71 @@ export async function getCapabilities(
     (client) => capabilitySnapshot(client, teamId),
     { readOnly: true, repeatableRead: true },
   );
+}
+
+// Registers a team the client already owns: the team row and its opening
+// policy, plus the roster. The team_id is the client's — the server records it,
+// it never mints one. Returns the capability snapshot the client reads back to
+// confirm what the server now holds.
+export async function connectTeam(
+  pool: Pool,
+  input: ConnectInput,
+): Promise<Record<string, unknown>> {
+  return inTransaction(pool, async (client) => {
+    const serverId = await serverInstanceId(client);
+    // The team and its opening policy row — the two writes createTeam makes.
+    // team_policy_history is required: capabilitySnapshot (and so
+    // GET /v1/capabilities) reads it, and a team without it is out of bounds.
+    //
+    // ON CONFLICT makes the primary key the sole arbiter of "already
+    // registered", so the refusal holds under concurrency, not just serially: a
+    // second connect for the same team_id inserts nothing, and a concurrent one
+    // blocks on the first transaction's commit before it resolves to the same.
+    // A read-then-insert would instead let two connects both miss the row and
+    // the losing INSERT raise a raw primary-key violation (500) — the retry a
+    // timed-out client sends races its own first attempt exactly this way.
+    const inserted = await client.query(
+      `INSERT INTO teams
+         (team_id, team_name, members_revision,
+          accepted_envelope_versions, write_allowed_ciphers)
+       VALUES ($1, $2, 0, ARRAY[1], ARRAY['none', 'age-v1']::TEXT[])
+       ON CONFLICT (team_id) DO NOTHING`,
+      [input.team_id, input.team_name],
+    );
+    // Refused as a uniqueness conflict, the same reason git refuses a
+    // non-fast-forward push — not an authorization decision.
+    if (inserted.rowCount === 0) {
+      throw new ProtocolError(
+        409,
+        "team-already-exists",
+        "a team with this id is already registered",
+        { team_id: input.team_id },
+        { serverInstanceId: serverId, teamId: input.team_id },
+      );
+    }
+    await client.query(
+      `INSERT INTO team_policy_history
+         (team_id, policy_revision, effective_from_seq,
+          accepted_envelope_versions, write_allowed_ciphers)
+       VALUES ($1, 0, 1, ARRAY[1], ARRAY['none', 'age-v1']::TEXT[])`,
+      [input.team_id],
+    );
+    // The roster the client owns. member_identity_history is append-only and
+    // retires a (team, name) for the life of the team; members is the live set.
+    // The schema has already rejected duplicate ids or names within the batch.
+    for (const member of input.members) {
+      await client.query(
+        `INSERT INTO member_identity_history (team_id, member_id, name)
+         VALUES ($1, $2, $3)`,
+        [input.team_id, member.member_id, member.name],
+      );
+      await client.query(
+        `INSERT INTO members (team_id, member_id, name) VALUES ($1, $2, $3)`,
+        [input.team_id, member.member_id, member.name],
+      );
+    }
+    return capabilitySnapshot(client, input.team_id);
+  });
 }
 
 export async function getMembers(

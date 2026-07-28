@@ -17,6 +17,7 @@ import {
 import { errorBody, ProtocolError } from "./errors.js";
 import {
   MAX_REQUEST_BYTES,
+  connectSchema,
   messagesQuerySchema,
   parseSequence,
   postMessagesSchema,
@@ -24,6 +25,7 @@ import {
   uuidV7Schema,
 } from "./protocol.js";
 import {
+  connectTeam,
   getCapabilities,
   getMembers,
   getMessages,
@@ -254,6 +256,17 @@ async function dataPlaneRoutes(
     const body = pairingExchangeSchema.parse(request.body);
     reply.header("Cache-Control", "no-store");
     return exchangePairingToken(pool, body.token);
+  });
+
+  // Registers a team the client owns. No credential: reaching the server is the
+  // permission, the way reaching the filesystem is locally. The client mints
+  // the team_id, so this route never scopes to an existing one.
+  app.post("/v1/connect", { bodyLimit: MAX_REQUEST_BYTES }, async (request, reply) => {
+    requireProtocol(request);
+    emptyQuerySchema.parse(request.query);
+    const body = connectSchema.parse(request.body);
+    reply.header("Cache-Control", "no-store");
+    return connectTeam(pool, body);
   });
 
   app.post("/v1/credentials/:credentialId/revoke", { bodyLimit: MAX_REQUEST_BYTES }, async (request, reply) => {
