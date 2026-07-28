@@ -73,7 +73,7 @@ The storage axis is **messages only**: the durable message log and its read /
 replay state. The team registry (`teams/<team>/config.json`) and run-state
 (pidfiles, actas locks, ready sentinels) are
 **not** part of this contract — they stay file-based and form a separate axis
-(see [ADR 0003](../adr/ref/0003-storage-axis-driver-abi-and-scope.md)). A storage driver
+(see [ADR 0003](../adr/0003-storage-axis-driver-abi-and-scope.md)). A storage driver
 must implement the *entire* contract below: "this driver does only messages,
 that one also does teams" is disallowed, because a partial implementation breaks
 the swap-ability the axis exists for.
@@ -239,7 +239,7 @@ messages) and `api.sh`'s `get teams <team> messages` (which needs
 `--before-id` pagination the contract does not expose) currently read/write
 the sqlite driver's `messages`/`events` tables directly rather than through a
 `storage_*` function, so they only work correctly when sqlite is the active
-driver. See [ADR 0003](../adr/ref/0003-storage-axis-driver-abi-and-scope.md)'s
+driver. See [ADR 0003](../adr/0003-storage-axis-driver-abi-and-scope.md)'s
 consequences for the tracked follow-up (a rename-across-history op, and a
 paginated history op).
 

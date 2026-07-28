@@ -235,7 +235,7 @@ transport cursor automatically.
 ## References
 
 - [HTTP API v1](../../../server/spec/v1.md)
-- [ADR 0003: storage-axis ABI and scope](../../adr/ref/0003-storage-axis-driver-abi-and-scope.md)
+- [ADR 0003: storage-axis ABI and scope](../../adr/0003-storage-axis-driver-abi-and-scope.md)
 - [Retention-gap resynchronization](retention-gap-resynchronization.md)
 - [ADR 0005: Remote synchronization contract](../../adr/ref/0005-remote-sync-contract.md)
 - Issue #441 (local-first cross-machine replication proposal)
