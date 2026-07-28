@@ -433,10 +433,11 @@ EOF
   _sqlite_sync_schema oldteam
   local generation db renamed_db store_dir
   generation=$(_sqlite_sync_generation oldteam)
-  # The store moves with the team, so the rows are written through the old
-  # team's path and read back through the new one.
+  # This team is on the default shared layout, so both names resolve to the same
+  # file and the rename rewrites columns rather than moving anything. A team that
+  # owns its store is covered separately, in the layout tests.
   db=$(agmsg_db_path oldteam)
-  renamed_db=$(agmsg_db_path newteam)
+  renamed_db="$db"
   store_dir=$(agmsg_storage_dir)
   agmsg_sqlite "$db" "INSERT INTO sync_bindings
     (local_team,server_instance_id,remote_team_id,protocol_version,driver_generation)
@@ -447,7 +448,6 @@ EOF
     > "$store_dir/remote-sync/oldteam.json"
   chmod 600 "$store_dir/remote-sync/oldteam.json"
   bash "$SCRIPTS/rename-team.sh" oldteam newteam
-  [ ! -e "$db" ]
   [ "$(agmsg_sqlite "$renamed_db" "SELECT team FROM read_cursors;" | tr -d '\r')" = newteam ]
   [ "$(agmsg_sqlite "$renamed_db" "SELECT local_team FROM sync_bindings;" | tr -d '\r')" = newteam ]
   [ ! -e "$store_dir/remote-sync/oldteam.json" ]

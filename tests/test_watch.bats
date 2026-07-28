@@ -433,7 +433,7 @@ _wait_pidfile() {
   # brings it into existence first; a team that has never been written to has
   # no store at all, which is a different (and legitimate) state.
   bash "$SCRIPTS/send.sh" team bob alice "seed the store" >/dev/null
-  local DB="$TEST_SKILL_DIR/db/teams/team/messages.db"
+  local DB="$TEST_SKILL_DIR/db/messages.db"
   [ -f "$DB" ]
   chmod 000 "$DB"
   local out="$BATS_TEST_TMPDIR/hc.out"

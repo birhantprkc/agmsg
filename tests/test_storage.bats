@@ -15,19 +15,19 @@ teardown() {
 @test "storage: default path resolves under the skill dir" {
   source "$SCRIPTS/lib/storage.sh"
   unset AGMSG_STORAGE_PATH
-  [ "$(agmsg_db_path demo)" = "$TEST_SKILL_DIR/db/teams/demo/messages.db" ]
+  [ "$(agmsg_db_path demo)" = "$TEST_SKILL_DIR/db/messages.db" ]
 }
 
 @test "storage: AGMSG_STORAGE_PATH overrides the storage dir" {
   source "$SCRIPTS/lib/storage.sh"
   export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/store"
-  [ "$(agmsg_db_path demo)" = "$BATS_TEST_TMPDIR/store/teams/demo/messages.db" ]
+  [ "$(agmsg_db_path demo)" = "$BATS_TEST_TMPDIR/store/messages.db" ]
 }
 
 @test "storage: trailing slash on the override is normalized" {
   source "$SCRIPTS/lib/storage.sh"
   export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/store/"
-  [ "$(agmsg_db_path demo)" = "$BATS_TEST_TMPDIR/store/teams/demo/messages.db" ]
+  [ "$(agmsg_db_path demo)" = "$BATS_TEST_TMPDIR/store/messages.db" ]
 }
 
 # --- agmsg_db_path() Windows path conversion (#197) ---
@@ -48,14 +48,14 @@ SH
   run env PATH="$bindir:$PATH" AGMSG_STORAGE_PATH="/c/Users/test/db" \
     bash -c 'source "'"$SCRIPTS"'/lib/storage.sh"; agmsg_db_path demo'
   [ "$status" -eq 0 ]
-  [ "$output" = "C:/Users/test/db/teams/demo/messages.db" ]
+  [ "$output" = "C:/Users/test/db/messages.db" ]
 }
 
 @test "storage: agmsg_db_path is a no-op without cygpath (off Windows)" {
   source "$SCRIPTS/lib/storage.sh"
   export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/store"
   # cygpath is absent on the test host, so the path is returned unchanged.
-  [ "$(agmsg_db_path demo)" = "$BATS_TEST_TMPDIR/store/teams/demo/messages.db" ]
+  [ "$(agmsg_db_path demo)" = "$BATS_TEST_TMPDIR/store/messages.db" ]
 }
 
 # --- init-db.sh honoring the override ---
@@ -173,7 +173,7 @@ SH
   done
   wait
   local n
-  n=$(sqlite3 "$TEST_SKILL_DIR/db/teams/team/messages.db" \
+  n=$(sqlite3 "$TEST_SKILL_DIR/db/messages.db" \
     "SELECT COUNT(*) FROM events WHERE type='message_sent' AND from_agent='leader';")
   [ "$n" -eq 10 ]
 }
@@ -189,7 +189,7 @@ SH
   done
   wait
   local n
-  n=$(sqlite3 "$AGMSG_STORAGE_PATH/teams/team/messages.db" "SELECT COUNT(*) FROM events WHERE type='message_sent';")
+  n=$(sqlite3 "$AGMSG_STORAGE_PATH/messages.db" "SELECT COUNT(*) FROM events WHERE type='message_sent';")
   [ "$n" -eq 10 ]
 }
 
@@ -233,30 +233,60 @@ SH
   [ "$(wc -l < "$count" | tr -d ' ')" -eq 5 ]
 }
 
-# --- per-team stores ---------------------------------------------------------
+# --- storage layout axis -----------------------------------------------------
 #
-# The selector decides the file. Path equality is the cheap check; the one that
-# matters is the last test here, which reads through the driver and shows that
-# one team's messages are not reachable from another's store.
+# Which store a team uses is a per-team driver choice. `shared` is the default
+# and is what programs outside agmsg read; `per-team` is what a team moves to
+# when connecting requires it. The tests that matter here are the default (every
+# team in one file, unchanged from before the axis existed) and the isolation a
+# moved team gets.
 
-@test "storage: the selector chooses the path" {
-  export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/db"
+# Put <team> on the per-team layout the way migrate-team-store.sh does, without
+# copying anything: these tests are about resolution, not migration.
+_use_per_team() {
+  mkdir -p "$TEST_SKILL_DIR/teams/$1"
+  printf '{"name":"%s","drivers":{"layout":"per-team"}}\n' "$1" \
+    > "$TEST_SKILL_DIR/teams/$1/config.json"
+}
+
+@test "storage: every team shares one store by default" {
+  export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/db" SKILL_DIR="$TEST_SKILL_DIR"
   # shellcheck disable=SC1091
   source "$SCRIPTS/lib/storage.sh"
-  local a b
-  a="$(agmsg_db_path alpha)"
-  b="$(agmsg_db_path bravo)"
-  [ "$a" = "$BATS_TEST_TMPDIR/db/teams/alpha/messages.db" ]
-  [ "$b" = "$BATS_TEST_TMPDIR/db/teams/bravo/messages.db" ]
-  [ "$a" != "$b" ]
-  # Runtime state did not follow the messages: a lock on a project is not a
-  # fact about any one team.
-  [ "$(_agmsg_runtime_db_path)" = "$BATS_TEST_TMPDIR/db/messages.db" ]
-  [ "$a" != "$(_agmsg_runtime_db_path)" ]
+  # The layout external readers depend on. A team must not leave it by merely
+  # existing — only by something that requires the move.
+  [ "$(agmsg_db_path alpha)" = "$BATS_TEST_TMPDIR/db/messages.db" ]
+  [ "$(agmsg_db_path bravo)" = "$BATS_TEST_TMPDIR/db/messages.db" ]
+  [ "$(agmsg_db_path alpha)" = "$(_agmsg_runtime_db_path)" ]
+}
+
+@test "storage: a team on the per-team layout moves, and only that team" {
+  export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/db" SKILL_DIR="$TEST_SKILL_DIR"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/storage.sh"
+  _use_per_team alpha
+  [ "$(agmsg_db_path alpha)" = "$BATS_TEST_TMPDIR/db/teams/alpha/messages.db" ]
+  # Its neighbour is untouched — that is the whole point of choosing per team.
+  [ "$(agmsg_db_path bravo)" = "$BATS_TEST_TMPDIR/db/messages.db" ]
+  # And resolution does not stick: the memoized driver must not leak across teams.
+  [ "$(agmsg_db_path alpha)" = "$BATS_TEST_TMPDIR/db/teams/alpha/messages.db" ]
+}
+
+@test "storage: an unknown layout is an error, not a fallback" {
+  export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/db" SKILL_DIR="$TEST_SKILL_DIR"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/storage.sh"
+  mkdir -p "$TEST_SKILL_DIR/teams/gamma"
+  printf '{"name":"gamma","drivers":{"layout":"nope"}}\n' \
+    > "$TEST_SKILL_DIR/teams/gamma/config.json"
+  run agmsg_db_path gamma
+  [ "$status" -ne 0 ]
+  # Falling back to shared would read a real file holding other teams' rows.
+  [[ ! "$output" =~ "messages.db" ]]
 }
 
 @test "storage: a selector that would escape the storage tree is refused" {
-  export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/db"
+  export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/db" SKILL_DIR="$TEST_SKILL_DIR"
   # shellcheck disable=SC1091
   source "$SCRIPTS/lib/storage.sh"
   local bad
@@ -269,11 +299,12 @@ SH
   done
 }
 
-@test "storage: one team cannot read another team's messages" {
+@test "storage: a moved team's messages are not in the shared store" {
   export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/db" SKILL_DIR="$TEST_SKILL_DIR"
   # shellcheck disable=SC1091
   source "$SCRIPTS/lib/storage.sh"
   agmsg_storage_load
+  _use_per_team alpha
   storage_init alpha >/dev/null
   storage_init bravo >/dev/null
   storage_send alpha ann bob "alpha-only" >/dev/null
@@ -284,7 +315,7 @@ SH
   [[ "$(storage_list_unread bravo bob)" =~ "bravo-only" ]]
   [[ ! "$(storage_list_unread bravo bob)" =~ "alpha-only" ]]
 
-  # Not just filtered on the way out — the other team's body is not in the file.
+  # Not just filtered on the way out — the bytes are in different files.
   ! grep -q "bravo-only" "$(agmsg_db_path alpha)"
   ! grep -q "alpha-only" "$(agmsg_db_path bravo)"
 }
