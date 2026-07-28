@@ -28,6 +28,7 @@ import {
   connectTeam,
   getCapabilities,
   getMembers,
+  getTeamSnapshot,
   getMessages,
   health,
   postMessages,
@@ -280,7 +281,7 @@ async function dataPlaneRoutes(
     emptyQuerySchema.parse(request.query);
     const params = teamParamsSchema.parse(request.params);
     reply.header("Cache-Control", "no-store");
-    return getMembers(pool, params.teamId);
+    return getTeamSnapshot(pool, params.teamId);
   });
 
   // History is paged rather than returned whole: a team that has been running
