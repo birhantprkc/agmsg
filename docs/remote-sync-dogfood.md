@@ -124,7 +124,7 @@ pulled envelopes. The current dogfood command accepts only an initial revision-0
 snapshot. Joining an established rotated binding or rotating an active binding
 requires complete chain verification, quiesce, drain, a server authorization
 fence, and the fresh-boundary procedure in the
-[`age-v1` profile](spec/age-v1-profile.md#multi-writer-cutover-protocol), which
+[`age-v1` profile](spec/draft/age-v1-profile.md#multi-writer-cutover-protocol), which
 is not yet automated by this client.
 
 For `age-v1`, lifecycle logs omit imported plaintext fields by default. Set

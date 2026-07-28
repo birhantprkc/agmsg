@@ -7,7 +7,7 @@
 This is an editable onboarding and protocol design, not an architecture
 decision record. Persistent member, roster, installation, and local/remote
 identity semantics are recorded in
-[ADR 0007: Stable member and roster identity](../adr/0007-stable-member-and-roster-identity.md).
+[ADR 0007: Stable member and roster identity](../../adr/draft/0007-stable-member-and-roster-identity.md).
 
 ## Context
 
@@ -241,7 +241,7 @@ A rename retains `member_id` and enqueues a complete roster mutation. Local and
 remote names may differ while that mutation is pending; Stage-2 read-state
 publication for that member remains fail-closed until the authenticated roster
 and local catalog agree, as required by the
-[composite read-state frontier](../adr/0006-composite-read-state-frontier.md).
+[composite read-state frontier](../../adr/draft/0006-composite-read-state-frontier.md).
 
 ## Connect mode selection
 
@@ -1355,11 +1355,11 @@ post-cutoff wire ID, response-loss retry, and envelope-digest mismatch.
 
 ## References
 
-- [ADR 0005: Remote synchronization contract](../adr/0005-remote-sync-contract.md)
-- [ADR 0006: Composite read-state frontier](../adr/0006-composite-read-state-frontier.md)
-- [ADR 0007: Stable member and roster identity](../adr/0007-stable-member-and-roster-identity.md)
+- [ADR 0005: Remote synchronization contract](../../adr/draft/0005-remote-sync-contract.md)
+- [ADR 0006: Composite read-state frontier](../../adr/draft/0006-composite-read-state-frontier.md)
+- [ADR 0007: Stable member and roster identity](../../adr/draft/0007-stable-member-and-roster-identity.md)
 - [Remote connect onboarding design](remote-connect-onboarding.md)
-- [Stage-1 remote synchronization](../spec/stage-1-remote-sync.md)
-- [Cipher-independent opaque-envelope server schema](../spec/server-opaque-envelope.md)
-- [Stage-2 read-state synchronization](../spec/read-state-synchronization.md)
-- [HTTP API v1](../../server/spec/v1.md)
+- [Stage-1 remote synchronization](../../spec/draft/stage-1-remote-sync.md)
+- [Cipher-independent opaque-envelope server schema](../../spec/draft/server-opaque-envelope.md)
+- [Stage-2 read-state synchronization](../../spec/draft/read-state-synchronization.md)
+- [HTTP API v1](../../../server/spec/v1.md)

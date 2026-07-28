@@ -73,7 +73,7 @@ The storage axis is **messages only**: the durable message log and its read /
 replay state. The team registry (`teams/<team>/config.json`) and run-state
 (pidfiles, actas locks, ready sentinels) are
 **not** part of this contract — they stay file-based and form a separate axis
-(see [ADR 0003](../adr/0003-storage-axis-driver-abi-and-scope.md)). A storage driver
+(see [ADR 0003](../adr/draft/0003-storage-axis-driver-abi-and-scope.md)). A storage driver
 must implement the *entire* contract below: "this driver does only messages,
 that one also does teams" is disallowed, because a partial implementation breaks
 the swap-ability the axis exists for.
@@ -239,7 +239,7 @@ messages) and `api.sh`'s `get teams <team> messages` (which needs
 `--before-id` pagination the contract does not expose) currently read/write
 the sqlite driver's `messages`/`events` tables directly rather than through a
 `storage_*` function, so they only work correctly when sqlite is the active
-driver. See [ADR 0003](../adr/0003-storage-axis-driver-abi-and-scope.md)'s
+driver. See [ADR 0003](../adr/draft/0003-storage-axis-driver-abi-and-scope.md)'s
 consequences for the tracked follow-up (a rename-across-history op, and a
 paginated history op).
 
@@ -337,11 +337,11 @@ reevaluation without rewinding transport. It uses the Stage-1 specification's st
 so one explicit engine invocation reaches every candidate without an early
 permanent failure starving later records. The complete framing, record schemas,
 crash boundaries, and future reserved operation names are defined by
-[Stage-1 synchronization specification](stage-1-remote-sync.md).
+[Stage-1 synchronization specification](draft/stage-1-remote-sync.md).
 
 A driver may additionally advertise `stage1-resync` and implement the explicit
 operator recovery contract from the
-[retention-gap resynchronization specification](retention-gap-resynchronization.md):
+[retention-gap resynchronization specification](draft/retention-gap-resynchronization.md):
 
 ```text
 storage_sync_resync_status <local-team> <server-instance-id> <remote-team-id> <protocol-version> <accepted-floor>
@@ -358,7 +358,7 @@ audit, and result objects, including canonical sequence arithmetic and
 duplicate/unknown-field rejection.
 
 The independent Stage-2 extension from the
-[read-state synchronization specification](read-state-synchronization.md) is advertised as
+[read-state synchronization specification](draft/read-state-synchronization.md) is advertised as
 `capabilities=stage1-sync,stage2-read-state` and adds:
 
 ```text

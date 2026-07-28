@@ -6,7 +6,7 @@
 
 This document pins the first encrypted envelope profile for the agmsg remote
 sync protocol. It extends the opaque envelope in
-[`server/spec/v1.md`](../../server/spec/v1.md) without changing the HTTP message
+[`server/spec/v1.md`](../../../server/spec/v1.md) without changing the HTTP message
 schema or the Stage-1 storage-driver durability boundary.
 
 `age-v1` is a standard binary [age v1 file][age-format], encrypted to native

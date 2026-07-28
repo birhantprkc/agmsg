@@ -5,7 +5,7 @@ import) and §0-§7's connect/status/disconnect/doctor are approved and
 implemented (this PR). `key rotate` remains NOT READY — see §8 — and is
 explicitly out of this PR's scope pending its own follow-up design/review
 pass. `key request`/`approve` (device-pairing key delivery) has moved to
-`docs/design/device-pairing.md`, where its open findings are addressed; it
+`docs/design/draft/device-pairing.md`, where its open findings are addressed; it
 is designed but not yet implemented, and is not in this PR either.
 **Date:** 2026-07-21 (implementation landed 2026-07-23)
 **Owner:** @fujibee
@@ -20,10 +20,10 @@ The landing page commits to: *"Connect a team. One token links a team to your
 cloud org. That is the whole setup."* This design turns that promise into an
 actual CLI (and companion cloud-console) design, sitting on top of the
 Stage-1 remote sync ABI
-([specification](../spec/stage-1-remote-sync.md), draft PR
+([specification](../../spec/draft/stage-1-remote-sync.md), draft PR
 #450, `storage_sync_prepare_push` / `storage_sync_reconcile_push` /
 `storage_sync_apply_pull`) and the rebased storage-axis driver contract
-([ADR 0003](../adr/0003-storage-axis-driver-abi-and-scope.md)).
+([ADR 0003](../../adr/draft/0003-storage-axis-driver-abi-and-scope.md)).
 
 This was an **interface addition** (a new command surface, a new
 credential storage location, a new team-config field), reviewed and
@@ -158,7 +158,7 @@ where it does**, not as OSS-implemented scope:
   and key generation follow automatically. A second device joining the
   same team goes through the same login, then `key request`, and the
   human manually carries the resulting confirmation code to the first
-  device to `approve` it (`docs/design/device-pairing.md`, designed but
+  device to `approve` it (`docs/design/draft/device-pairing.md`, designed but
   not yet implemented).
 - **Path B (new users, console-first):** console-driven, building on §7's
   existing copy-paste block — the block leads with instruction text meant
@@ -452,7 +452,7 @@ IDs.
 ### 6. E2EE insertion point (reserved, not built)
 
 **Update: cloud onboarding now defaults new teams to E2EE (`age-v1`, approved
-profile — see `docs/spec/age-v1-profile.md`), so this is no longer a future
+profile — see `docs/spec/draft/age-v1-profile.md`), so this is no longer a future
 placeholder — it is concretized below and in §8.** The `age-v1` profile
 itself (envelope framing, recipient-set epochs, the multi-writer cutover
 protocol) is already pinned; this design only covers the **onboarding-time**
@@ -547,7 +547,7 @@ exactly one active writer. The `age-v1` **multi-writer** cutover protocol
 (rotating an already-established recipient set while more than one device
 is actively writing, adding/removing a device from a team that already has
 other active writers) is a separate, harder operational flow with its own
-quiesce/fence/commit barrier (`docs/spec/age-v1-profile.md`, "Multi-writer
+quiesce/fence/commit barrier (`docs/spec/draft/age-v1-profile.md`, "Multi-writer
 cutover protocol") and needs its own design pass — not folded into any verb
 below.
 
@@ -787,7 +787,7 @@ the key exist.
   the one guarantee every other bullet above assumes.
 
 **`key request` / `key approve` — device-pairing key delivery. Moved to
-its own document: `docs/design/device-pairing.md`.**
+its own document: `docs/design/draft/device-pairing.md`.**
 
 That design closes the four findings this section left open (the
 confirmation code's grinding resistance, the request/delivery state
@@ -896,10 +896,10 @@ What this section still owns, unchanged: `generate`, `show`, `import`,
 
 ## References
 
-- Builds on [ADR 0003](../adr/0003-storage-axis-driver-abi-and-scope.md) and
-  [Stage-1 synchronization specification](../spec/stage-1-remote-sync.md)
+- Builds on [ADR 0003](../../adr/draft/0003-storage-axis-driver-abi-and-scope.md) and
+  [Stage-1 synchronization specification](../../spec/draft/stage-1-remote-sync.md)
   (draft PR #450).
-- [`docs/spec/age-v1-profile.md`](../spec/age-v1-profile.md) (approved
+- [`docs/spec/draft/age-v1-profile.md`](../../spec/draft/age-v1-profile.md) (approved
   cipher profile, commit `eea3307`) — the key format, epoch model, and
   multi-writer cutover protocol §8 is scoped against.
 - Internal adversarial design review, rounds 1 (sync gates A-G) and 2 (E2EE

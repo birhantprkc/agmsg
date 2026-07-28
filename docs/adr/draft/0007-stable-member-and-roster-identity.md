@@ -171,9 +171,9 @@ reconciliation protocol; matching display names are insufficient.
 
 ## Normative design and specifications
 
-- [Local-first onboarding and convergent roster design](../design/local-first-onboarding.md)
-- [Remote connect onboarding design](../design/remote-connect-onboarding.md)
-- [HTTP API v1](../../server/spec/v1.md)
-- [Stage-2 read-state synchronization](../spec/read-state-synchronization.md)
+- [Local-first onboarding and convergent roster design](../../design/draft/local-first-onboarding.md)
+- [Remote connect onboarding design](../../design/draft/remote-connect-onboarding.md)
+- [HTTP API v1](../../../server/spec/v1.md)
+- [Stage-2 read-state synchronization](../../spec/draft/read-state-synchronization.md)
 - [ADR 0005: Remote synchronization contract](0005-remote-sync-contract.md)
 - [ADR 0006: Composite read-state frontier](0006-composite-read-state-frontier.md)

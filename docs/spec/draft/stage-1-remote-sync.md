@@ -4,7 +4,7 @@
 **Last updated:** 2026-07-25
 
 The irreversible architectural decisions behind this contract are recorded in
-[ADR 0005: Remote synchronization contract](../adr/0005-remote-sync-contract.md).
+[ADR 0005: Remote synchronization contract](../../adr/draft/0005-remote-sync-contract.md).
 
 ## Context
 
@@ -90,7 +90,7 @@ It contains the engine's validated envelope selection and capability limits,
 but no credentials. The ABI is cipher-neutral: the driver creates the canonical
 envelope selected by the binding configuration. `none` is the default profile.
 The optional `age-v1` profile defined in
-[`../spec/age-v1-profile.md`](../spec/age-v1-profile.md) performs its
+[`../spec/draft/age-v1-profile.md`](../../spec/draft/age-v1-profile.md) performs its
 encrypt-once operation at this same boundary. Prepare receives only the public
 recipient manifest; age identity files remain in the HTTP engine's open path
 and never cross the storage-driver boundary.
@@ -234,8 +234,8 @@ transport cursor automatically.
 
 ## References
 
-- [HTTP API v1](../../server/spec/v1.md)
-- [ADR 0003: storage-axis ABI and scope](../adr/0003-storage-axis-driver-abi-and-scope.md)
+- [HTTP API v1](../../../server/spec/v1.md)
+- [ADR 0003: storage-axis ABI and scope](../../adr/draft/0003-storage-axis-driver-abi-and-scope.md)
 - [Retention-gap resynchronization](retention-gap-resynchronization.md)
-- [ADR 0005: Remote synchronization contract](../adr/0005-remote-sync-contract.md)
+- [ADR 0005: Remote synchronization contract](../../adr/draft/0005-remote-sync-contract.md)
 - Issue #441 (local-first cross-machine replication proposal)

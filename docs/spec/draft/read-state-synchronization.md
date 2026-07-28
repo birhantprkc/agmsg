@@ -4,7 +4,7 @@
 **Last updated:** 2026-07-25
 
 The irreversible read-state semantics behind this contract are recorded in
-[ADR 0006: Composite read-state frontier](../adr/0006-composite-read-state-frontier.md).
+[ADR 0006: Composite read-state frontier](../../adr/draft/0006-composite-read-state-frontier.md).
 
 ## Context
 
@@ -347,7 +347,7 @@ still does not inspect recipients or message bodies.
 
 ## References
 
-- [ADR 0003: storage-axis ABI](../adr/0003-storage-axis-driver-abi-and-scope.md)
+- [ADR 0003: storage-axis ABI](../../adr/draft/0003-storage-axis-driver-abi-and-scope.md)
 - [Stage-1 remote synchronization](stage-1-remote-sync.md)
-- [ADR 0005: Remote synchronization contract](../adr/0005-remote-sync-contract.md)
-- [HTTP API v1](../../server/spec/v1.md)
+- [ADR 0005: Remote synchronization contract](../../adr/draft/0005-remote-sync-contract.md)
+- [HTTP API v1](../../../server/spec/v1.md)
