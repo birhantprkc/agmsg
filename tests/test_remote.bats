@@ -2,12 +2,12 @@
 
 load test_helper
 
-# Some cases deliberately remove python3 from PATH to verify the control-plane
-# gate. Keep the fixture interpreter independent from that system under test.
-MOCK_PYTHON3="$(command -v python3)"
-
 setup() {
   setup_test_env
+  # Some cases deliberately remove python3 from PATH to verify the control-plane
+  # gate. Resolve the fixture interpreter in each test process before that
+  # system under test changes its environment.
+  MOCK_PYTHON3="$(command -v python3)"
   bash "$SCRIPTS/join.sh" testteam alice claude-code /tmp/project-a
 
   # Start the mock pairing-exchange/revoke server on an OS-assigned port.

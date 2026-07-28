@@ -58,7 +58,8 @@ await_barrier_reached() {
   # Pause the run between display and mark, land a message inside the window,
   # then release. With the old blanket "WHERE read_at IS NULL" mark, the late
   # message was silently marked read without ever having been displayed.
-  AGMSG_TEST_MARK_BARRIER="$BARRIER" bash "$SCRIPTS/inbox.sh" testteam alice > "$TEST_SKILL_DIR/first-run.out" 3>&- &
+  AGMSG_TEST_MARK_BARRIER="$BARRIER" bash "$SCRIPTS/inbox.sh" testteam alice \
+    </dev/null > "$TEST_SKILL_DIR/first-run.out" 3>&- &
   bg_pid=$!
   await_barrier_reached
   bash "$SCRIPTS/send.sh" testteam bob alice "late"

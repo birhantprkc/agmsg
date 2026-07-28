@@ -2,10 +2,11 @@
 
 load test_helper
 
-MOCK_PYTHON3="$(command -v python3)"
-
 setup() {
   setup_test_env
+  # This is a fixture dependency, not the python3 availability under test.
+  # Resolve it in the per-test process before a case changes PATH.
+  MOCK_PYTHON3="$(command -v python3)"
 }
 
 teardown() {
