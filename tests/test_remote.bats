@@ -1079,3 +1079,14 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID"
   [ "$status" -ne 0 ]
 }
+
+@test "remote pull: the cloned team can be read with the ordinary commands" {
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" cloned
+  [ "$status" -eq 0 ]
+  # The point of the whole step: the history is here, not just the team.
+  [[ "$output" == *"2 message(s)"* ]]
+  run bash "$SCRIPTS/history.sh" cloned alice
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"history one"* ]]
+  [[ "$output" == *"history two"* ]]
+}

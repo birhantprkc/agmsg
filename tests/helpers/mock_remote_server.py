@@ -49,20 +49,21 @@ PULL_MEMBERS = [
 # is what the client decodes on import.
 def _blob(from_agent, to_agent, body, at):
     import base64
-    payload = json.dumps({"from": from_agent, "to": to_agent, "body": body, "at": at},
+    payload = json.dumps({"body": body, "created_at": at,
+                          "from_agent": from_agent, "to_agent": to_agent},
                          separators=(",", ":"), sort_keys=True)
     return base64.b64encode(payload.encode()).decode()
 
 
 PULL_MESSAGES = [
     {"id": "11111111-1111-4111-8111-111111111111", "server_seq": "1",
-     "server_received_at": "2026-01-01T00:00:00.000Z",
+     "server_received_at": "2026-01-01T00:00:00.000000Z",
      "envelope": {"v": 1, "cipher": "none", "key_id": None,
-                  "blob": _blob("alice", "bob", "history one", "2026-01-01T00:00:00Z")}},
+                  "blob": _blob("alice", "bob", "history one", "2026-01-01T00:00:00.000000Z")}},
     {"id": "22222222-2222-4222-8222-222222222222", "server_seq": "2",
-     "server_received_at": "2026-01-02T00:00:00.000Z",
+     "server_received_at": "2026-01-02T00:00:00.000000Z",
      "envelope": {"v": 1, "cipher": "none", "key_id": None,
-                  "blob": _blob("bob", "alice", "history two", "2026-01-02T00:00:00Z")}},
+                  "blob": _blob("bob", "alice", "history two", "2026-01-02T00:00:00.000000Z")}},
 ]
 
 
