@@ -43,7 +43,7 @@ prepare_push() {
   run prepare_push
   [ "$status" -eq 75 ]
   local db
-  db=$(agmsg_db_path)
+  db=$(agmsg_db_path demo)
   [ "$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM sync_messages;" | tr -d '\r')" -eq 0 ]
 
   unset AGMSG_SYNC_TEST_ABORT_AFTER_SEAL
@@ -129,7 +129,7 @@ prepare_push() {
   result=$(printf '%s\n' "$second_page" | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1)
   [ "$(printf '%s\n' "$result" | jq -s '.[0].corrupt_count')" -ge 1 ]
   [ "$(printf '%s\n' "$result" | jq -s '[.[]|select(.id=="550e8400-e29b-41d4-a716-446655440011" and .status=="corrupt_state")]|length')" -eq 1 ]
-  db=$(agmsg_db_path)
+  db=$(agmsg_db_path demo)
   [ "$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM sync_conflicts;" | tr -d '\r')" -eq 1 ]
 }
 
@@ -156,7 +156,7 @@ prepare_push() {
   [ "$(printf '%s\n' "$result" | jq -sr '.[0].corrupt_count')" -ge 1 ]
   [ "$(printf '%s\n' "$result" | jq -sr '[.[]|select(.id=="550e8400-e29b-41d4-a716-446655440012")][0].status')" = corrupt_state ]
   [ "$(storage_history demo | jq -s 'length')" -eq 1 ]
-  db=$(agmsg_db_path)
+  db=$(agmsg_db_path demo)
   [ "$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM sync_messages WHERE server_seq='1';" | tr -d '\r')" -eq 1 ]
   [ "$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM sync_conflicts;" | tr -d '\r')" -eq 1 ]
 }
@@ -178,7 +178,7 @@ prepare_push() {
   page=$(printf '%s\n%s\n' "$blocked" '{"type":"sync_pull_cursor","next_after":"1"}')
   result=$(printf '%s\n' "$page" | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1)
   [ "$(printf '%s\n' "$result" | jq -sr --arg wire "$wire" '[.[]|select(.id==$wire)][0].status')" = policy_violation ]
-  db=$(agmsg_db_path)
+  db=$(agmsg_db_path demo)
   [ "$(agmsg_sqlite "$db" "SELECT status FROM sync_quarantine WHERE wire_id='$wire';" | tr -d '\r')" = policy_violation ]
   [ "$(storage_history demo | jq -s 'length')" -eq 1 ]
 }
@@ -209,7 +209,7 @@ prepare_push() {
   [ "$(printf '%s\n' "$result" | jq -sr '.[0].transport_cursor')" = 1 ]
   [ "$(printf '%s\n' "$result" | jq -sr '[.[]|select(.status=="imported")]|length')" -eq 1 ]
   [ "$(storage_history demo | jq -s '[.[]|select(.body=="opened later")]|length')" -eq 1 ]
-  db=$(agmsg_db_path)
+  db=$(agmsg_db_path demo)
   [ "$(agmsg_sqlite "$db" "SELECT status FROM sync_quarantine WHERE wire_id='550e8400-e29b-41d4-a716-446655440020';" | tr -d '\r')" = imported ]
 }
 
@@ -261,7 +261,7 @@ prepare_push() {
     .transport_cursor=="5" and .audit=={
       expected_transport_cursor:"0",accepted_floor:"5",gap_start:"1",gap_end:"5",
       reason:"retention-gap-accepted"}' >/dev/null
-  db=$(agmsg_db_path)
+  db=$(agmsg_db_path demo)
   [ "$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM sync_resync_audits;" | tr -d '\r')" -eq 1 ]
   [ "$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM events WHERE body='local survives retention';" | tr -d '\r')" -eq 1 ]
   [ "$(agmsg_sqlite "$db" "SELECT wire_id FROM sync_messages WHERE direction='push';" | tr -d '\r')" = "$wire" ]
@@ -274,9 +274,9 @@ prepare_push() {
 @test "sync contract: resync status is read-only and absent bindings fail closed" {
   local before after other
   prepare_push >/dev/null
-  before=$(agmsg_sqlite "$(agmsg_db_path)" "SELECT total_changes();" | tr -d '\r')
+  before=$(agmsg_sqlite "$(agmsg_db_path demo)" "SELECT total_changes();" | tr -d '\r')
   storage_sync_resync_status demo "$SERVER_ID" "$TEAM_ID" 1 10 >/dev/null
-  after=$(agmsg_sqlite "$(agmsg_db_path)" "SELECT total_changes();" | tr -d '\r')
+  after=$(agmsg_sqlite "$(agmsg_db_path demo)" "SELECT total_changes();" | tr -d '\r')
   [ "$before" = "$after" ]
   other=018f3f7e-0000-7000-8000-000000000002
   run storage_sync_resync_status demo "$SERVER_ID" "$other" 1 10
@@ -293,7 +293,7 @@ prepare_push() {
   multiple=$'{"type":"sync_resync","expected_transport_cursor":"0","min_available_seq":"5","current_seq":"7","reason":"retention-gap-accepted"}\n\n{"type":"sync_resync","expected_transport_cursor":"0","min_available_seq":"6","current_seq":"7","reason":"retention-gap-accepted"}'
   run storage_sync_resync demo "$SERVER_ID" "$TEAM_ID" 1 <<< "$multiple"
   [ "$status" -ne 0 ]
-  db=$(agmsg_db_path)
+  db=$(agmsg_db_path demo)
   [ "$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM sync_resync_audits;" | tr -d '\r')" -eq 0 ]
   [ "$(agmsg_sqlite "$db" "SELECT transport_cursor FROM sync_bindings;" | tr -d '\r')" = 0 ]
 }
@@ -349,7 +349,7 @@ prepare_push() {
     storage_sync_apply_read_state demo "$SERVER_ID" "$TEAM_ID" 1)
   [ "$(printf '%s\n' "$applied" | jq -r '.member_count')" = 1 ]
   [ "$(storage_list_unread demo bob | jq -s 'length')" -eq 0 ]
-  db=$(agmsg_db_path)
+  db=$(agmsg_db_path demo)
   [ "$(agmsg_sqlite "$db" "SELECT transport_cursor FROM sync_bindings;" | tr -d '\r')" = 2 ]
 }
 
@@ -375,7 +375,7 @@ prepare_push() {
     member-name-mismatch ]
   [ "$(printf '%s\n' "$prepared" | jq -s '[.[]|select(.type=="sync_read_frontier")]|length')" -eq 0 ]
 
-  db=$(agmsg_db_path)
+  db=$(agmsg_db_path demo)
   agmsg_sqlite "$db" "UPDATE events SET to_agent='robert' WHERE team='demo' AND to_agent='bob';" >/dev/null
   agmsg_sqlite "$db" "UPDATE sync_read_members SET agent='robert',
     name_mismatch=CASE WHEN remote_agent='robert' THEN 0 ELSE 1 END
@@ -415,7 +415,7 @@ prepare_push() {
     {type:"sync_read_block",member_id:$member,reason:"read-state-limit-exceeded"}' |
     storage_sync_block_read_state demo "$SERVER_ID" "$TEAM_ID" 1)
   [ "$(printf '%s\n' "$result" | jq -r '.reason')" = read-state-limit-exceeded ]
-  db=$(agmsg_db_path)
+  db=$(agmsg_db_path demo)
   [ "$(agmsg_sqlite "$db" "SELECT blocked_reason FROM sync_read_members WHERE member_id='$member';" | tr -d '\r')" = \
     read-state-limit-exceeded ]
   prepared=$(printf '%s\n' "$context" |

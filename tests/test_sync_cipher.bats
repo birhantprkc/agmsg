@@ -146,7 +146,7 @@ agmsg_storage_load
 printf '%s\n' '$prepare' | storage_sync_prepare_push demo \
   $server_instance $remote_team 1 500 >/dev/null
 RUN
-  db=$(agmsg_db_path)
+  db=$(agmsg_db_path demo)
 
   AGMSG_AGE_BIN="$BATS_TEST_TMPDIR/slow-age" \
     bash "$BATS_TEST_TMPDIR/run-prepare.sh" 3>&- 4>&- &
@@ -246,5 +246,5 @@ RUN
   wait "$first_pid"
   wait "$second_pid"
   [ "$(cat "$first_file")" = "$(cat "$second_file")" ]
-  [ "$(agmsg_sqlite "$(agmsg_db_path)" "SELECT COUNT(*) FROM sync_messages;" | tr -d '\r')" -eq 1 ]
+  [ "$(agmsg_sqlite "$(agmsg_db_path demo)" "SELECT COUNT(*) FROM sync_messages;" | tr -d '\r')" -eq 1 ]
 }

@@ -65,7 +65,7 @@ candidate_of() { printf '%s\n' "$1" | jq -c 'select(.type=="sync_push_candidate"
   run prepare_push
   [ "$status" -eq 75 ]
   unset AGMSG_SYNC_TEST_ABORT_AFTER_SEAL
-  log="$(dirname "$(agmsg_db_path)")/events.jsonl"
+  log="$(dirname "$(agmsg_db_path demo)")/events.jsonl"
   [ "$(jq -s '[.[]|select(.type=="sync_prepare_commit")|.reservations[]|
     select(.local_id as $id | $id != null)]|length' "$log")" -eq 1 ]
   run prepare_push
@@ -76,7 +76,7 @@ candidate_of() { printf '%s\n' "$1" | jq -c 'select(.type=="sync_push_candidate"
 @test "jsonl append rollback removes a partial transition before releasing the lock" {
   storage_send demo alice bob partial-append >/dev/null
   local log before after
-  log="$(dirname "$(agmsg_db_path)")/events.jsonl"
+  log="$(dirname "$(agmsg_db_path demo)")/events.jsonl"
   before=$(cksum "$log")
   export AGMSG_SYNC_TEST_PARTIAL_APPEND_BYTES=17
   run prepare_push
@@ -91,7 +91,7 @@ candidate_of() { printf '%s\n' "$1" | jq -c 'select(.type=="sync_push_candidate"
 
 @test "jsonl sync rejects duplicate-key input and journal records before mutation" {
   storage_send demo alice bob strict >/dev/null
-  local log input; log="$(dirname "$(agmsg_db_path)")/events.jsonl"
+  local log input; log="$(dirname "$(agmsg_db_path demo)")/events.jsonl"
   input="$BATS_TEST_TMPDIR/duplicate-input.jsonl"
   printf '%s\n' '{"type":"sync_prepare","envelope_v":1,"cipher":"none","key_id":null,"recipients":[],"max_blob_bytes":1048576,"allow_new":true,"allow_new":false}' > "$input"
   run storage_sync_prepare_push demo "$SERVER_ID" "$TEAM_ID" 1 100 < "$input"
@@ -112,7 +112,7 @@ candidate_of() { printf '%s\n' "$1" | jq -c 'select(.type=="sync_push_candidate"
     {type:"sync_push_ack",local_position,id,server_seq:"1",disposition:"stored"}')
   printf '%s\n' "$ack" |
     storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
-  log="$(dirname "$(agmsg_db_path)")/events.jsonl"
+  log="$(dirname "$(agmsg_db_path demo)")/events.jsonl"
   rewritten="$BATS_TEST_TMPDIR/legacy-events.jsonl"
   jq -c 'if .type=="sync_prepare_commit" then del(.conflicts) |
       .reservations |= map(del(.payload_digest))
@@ -163,7 +163,7 @@ candidate_of() { printf '%s\n' "$1" | jq -c 'select(.type=="sync_push_candidate"
   after_cursor=$(printf '%s\n' "$second" |
     storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1 | jq -r .push_cursor)
   [ "$after_cursor" = "$before_cursor" ]
-  log="$(dirname "$(agmsg_db_path)")/events.jsonl"
+  log="$(dirname "$(agmsg_db_path demo)")/events.jsonl"
   [ "$(jq -s '[.[]|select(.type=="sync_reconcile_commit")|.conflicts[]|
     select(.kind=="ack_sequence_conflict" and .expected_server_seq=="1" and
            .observed_server_seq=="2")]|length' "$log")" -eq 1 ]
@@ -192,7 +192,7 @@ candidate_of() { printf '%s\n' "$1" | jq -c 'select(.type=="sync_push_candidate"
     storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1)
   [ "$(printf '%s\n' "$result" | jq -r .push_cursor)" = \
     "$(printf '%s\n' "$second_candidate" | jq -r .local_position)" ]
-  log="$(dirname "$(agmsg_db_path)")/events.jsonl"
+  log="$(dirname "$(agmsg_db_path demo)")/events.jsonl"
   jq -e -s '[.[]|select(.type=="sync_reconcile_commit")][-1] |
     (.acks|length)==1 and (.acks[0].server_seq=="2") and
     (.conflicts|length)==1 and (.conflicts[0].observed_server_seq=="3")' "$log" >/dev/null
@@ -204,7 +204,7 @@ candidate_of() { printf '%s\n' "$1" | jq -c 'select(.type=="sync_push_candidate"
 @test "jsonl prepare durably rejects one local id with different payloads" {
   local id log first_at
   id=$(storage_send demo alice bob first-payload)
-  log="$(dirname "$(agmsg_db_path)")/events.jsonl"
+  log="$(dirname "$(agmsg_db_path demo)")/events.jsonl"
   first_at=$(jq -r --arg id "$id" 'select(.id==$id)|.at' "$log")
   jq -nc --arg id "$id" --arg at "$first_at" '
     {type:"message_sent",id:$id,team:"demo",from:"alice",to:"bob",
@@ -223,7 +223,7 @@ candidate_of() { printf '%s\n' "$1" | jq -c 'select(.type=="sync_push_candidate"
   local clean conflict_id at log before
   clean=$(storage_send demo alice bob clean)
   conflict_id=$(storage_send demo alice bob first)
-  log="$(dirname "$(agmsg_db_path)")/events.jsonl"
+  log="$(dirname "$(agmsg_db_path demo)")/events.jsonl"
   at=$(jq -r --arg id "$conflict_id" 'select(.id==$id)|.at' "$log")
   jq -nc --arg id "$conflict_id" --arg at "$at" '
     {type:"message_sent",id:$id,team:"demo",from:"alice",to:"bob",body:"second",at:$at}' >> "$log"
@@ -243,7 +243,7 @@ candidate_of() { printf '%s\n' "$1" | jq -c 'select(.type=="sync_push_candidate"
 
 @test "jsonl reconcile validates every ack before creating sync state" {
   local log
-  log="$(dirname "$(agmsg_db_path)")/events.jsonl"
+  log="$(dirname "$(agmsg_db_path demo)")/events.jsonl"
   run storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1 <<'EOF'
 {"type":"sync_push_ack","local_position":"1","id":"not-a-wire-id","server_seq":"1","disposition":"stored"}
 EOF
@@ -300,7 +300,7 @@ EOF
   [ "$(prepare_push | jq -s '[.[]|select(.type=="sync_push_candidate")]|length')" -eq 0 ]
   storage_compact >/dev/null
   [ "$(storage_history demo | jq -s '[.[]|select(.body=="incoming")]|length')" -eq 1 ]
-  log="$(dirname "$(agmsg_db_path)")/events.jsonl"
+  log="$(dirname "$(agmsg_db_path demo)")/events.jsonl"
   jq -e -s '[.[]|select(.type=="sync_pull_commit")][0]
     | (.transport_cursor=="2" and ([.messages[]|select(.local_event!=null)]|length)==1)' \
     "$log" >/dev/null
@@ -362,7 +362,7 @@ EOF
 
 @test "jsonl reprocess rejects a malformed page token before state initialization" {
   local log before
-  log="$(dirname "$(agmsg_db_path)")/events.jsonl"
+  log="$(dirname "$(agmsg_db_path demo)")/events.jsonl"
   before=$(cksum "$log")
   run storage_sync_reprocess demo "$SERVER_ID" "$TEAM_ID" 1 2 malformed-token
   [ "$status" -ne 0 ]
@@ -454,7 +454,7 @@ EOF
   storage_send demo alice bob rewrite-crash >/dev/null
   prepare_push >/dev/null
   local log before after
-  log="$(dirname "$(agmsg_db_path)")/events.jsonl"
+  log="$(dirname "$(agmsg_db_path demo)")/events.jsonl"
   before=$(cksum "$log")
   export AGMSG_SYNC_TEST_ABORT_AFTER_ROTATE_APPEND=1
   run storage_compact
@@ -478,7 +478,7 @@ EOF
   wait "$first_pid"; wait "$second_pid"
   [ "$(candidate_of "$(cat "$first")" | jq -c '{local_id,id,envelope}')" = \
     "$(candidate_of "$(cat "$second")" | jq -c '{local_id,id,envelope}')" ]
-  log="$(dirname "$(agmsg_db_path)")/events.jsonl"
+  log="$(dirname "$(agmsg_db_path demo)")/events.jsonl"
   [ "$(jq -s '[.[]|select(.type=="sync_prepare_commit")]|length' "$log")" -eq 1 ]
 }
 

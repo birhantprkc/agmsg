@@ -15,19 +15,19 @@ teardown() {
 @test "storage: default path resolves under the skill dir" {
   source "$SCRIPTS/lib/storage.sh"
   unset AGMSG_STORAGE_PATH
-  [ "$(agmsg_db_path demo)" = "$TEST_SKILL_DIR/db/messages.db" ]
+  [ "$(agmsg_db_path demo)" = "$TEST_SKILL_DIR/db/teams/demo/messages.db" ]
 }
 
 @test "storage: AGMSG_STORAGE_PATH overrides the storage dir" {
   source "$SCRIPTS/lib/storage.sh"
   export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/store"
-  [ "$(agmsg_db_path demo)" = "$BATS_TEST_TMPDIR/store/messages.db" ]
+  [ "$(agmsg_db_path demo)" = "$BATS_TEST_TMPDIR/store/teams/demo/messages.db" ]
 }
 
 @test "storage: trailing slash on the override is normalized" {
   source "$SCRIPTS/lib/storage.sh"
   export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/store/"
-  [ "$(agmsg_db_path demo)" = "$BATS_TEST_TMPDIR/store/messages.db" ]
+  [ "$(agmsg_db_path demo)" = "$BATS_TEST_TMPDIR/store/teams/demo/messages.db" ]
 }
 
 # --- agmsg_db_path() Windows path conversion (#197) ---
@@ -48,14 +48,14 @@ SH
   run env PATH="$bindir:$PATH" AGMSG_STORAGE_PATH="/c/Users/test/db" \
     bash -c 'source "'"$SCRIPTS"'/lib/storage.sh"; agmsg_db_path demo'
   [ "$status" -eq 0 ]
-  [ "$output" = "C:/Users/test/db/messages.db" ]
+  [ "$output" = "C:/Users/test/db/teams/demo/messages.db" ]
 }
 
 @test "storage: agmsg_db_path is a no-op without cygpath (off Windows)" {
   source "$SCRIPTS/lib/storage.sh"
   export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/store"
   # cygpath is absent on the test host, so the path is returned unchanged.
-  [ "$(agmsg_db_path demo)" = "$BATS_TEST_TMPDIR/store/messages.db" ]
+  [ "$(agmsg_db_path demo)" = "$BATS_TEST_TMPDIR/store/teams/demo/messages.db" ]
 }
 
 # --- init-db.sh honoring the override ---
@@ -161,7 +161,7 @@ SH
 
   [ "$(agmsg_runtime_lock_acquire codex-dispatcher:test 111)" = 111 ]
   bash "$SCRIPTS/send.sh" team alice bob "after lock init" --force
-  [ "$(agmsg_sqlite "$(agmsg_db_path demo)" "SELECT COUNT(*) FROM events WHERE type='message_sent' AND body = 'after lock init';")" = 1 ]
+  [ "$(agmsg_sqlite "$(agmsg_db_path team)" "SELECT COUNT(*) FROM events WHERE type='message_sent' AND body = 'after lock init';")" = 1 ]
 }
 
 @test "send: concurrent fan-out to N recipients all land (no SQLITE_BUSY)" {
@@ -173,7 +173,7 @@ SH
   done
   wait
   local n
-  n=$(sqlite3 "$TEST_SKILL_DIR/db/messages.db" \
+  n=$(sqlite3 "$TEST_SKILL_DIR/db/teams/team/messages.db" \
     "SELECT COUNT(*) FROM events WHERE type='message_sent' AND from_agent='leader';")
   [ "$n" -eq 10 ]
 }
@@ -189,7 +189,7 @@ SH
   done
   wait
   local n
-  n=$(sqlite3 "$AGMSG_STORAGE_PATH/messages.db" "SELECT COUNT(*) FROM events WHERE type='message_sent';")
+  n=$(sqlite3 "$AGMSG_STORAGE_PATH/teams/team/messages.db" "SELECT COUNT(*) FROM events WHERE type='message_sent';")
   [ "$n" -eq 10 ]
 }
 
@@ -233,24 +233,60 @@ SH
   [ "$(wc -l < "$count" | tr -d ' ')" -eq 5 ]
 }
 
-# --- team selector (preparation for splitting the store per team) ------------
+# --- per-team stores ---------------------------------------------------------
 #
-# These three fix what this change IS, and — just as importantly — what it is
-# NOT. Nothing is split here: every selector still resolves to the same file.
-# Without pinning that, a later split would change behaviour with no way to tell
-# which differences were intended and which were accidents.
+# The selector decides the file. Path equality is the cheap check; the one that
+# matters is the last test here, which reads through the driver and shows that
+# one team's messages are not reachable from another's store.
 
-@test "storage: the selector does not choose a path yet (nothing is split)" {
+@test "storage: the selector chooses the path" {
   export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/db"
   # shellcheck disable=SC1091
   source "$SCRIPTS/lib/storage.sh"
   local a b
   a="$(agmsg_db_path alpha)"
   b="$(agmsg_db_path bravo)"
-  [ -n "$a" ]
-  [ "$a" = "$b" ]
-  # And the same store the non-team resolver names, while they are one file.
-  [ "$a" = "$(_agmsg_runtime_db_path)" ]
+  [ "$a" = "$BATS_TEST_TMPDIR/db/teams/alpha/messages.db" ]
+  [ "$b" = "$BATS_TEST_TMPDIR/db/teams/bravo/messages.db" ]
+  [ "$a" != "$b" ]
+  # Runtime state did not follow the messages: a lock on a project is not a
+  # fact about any one team.
+  [ "$(_agmsg_runtime_db_path)" = "$BATS_TEST_TMPDIR/db/messages.db" ]
+  [ "$a" != "$(_agmsg_runtime_db_path)" ]
+}
+
+@test "storage: a selector that would escape the storage tree is refused" {
+  export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/db"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/storage.sh"
+  local bad
+  # A real store was found holding a project path as a team name, so this is
+  # reachable from data, not only from a hostile argument.
+  for bad in ".." "." "a/b" "/Users/someone/project"; do
+    run agmsg_db_path "$bad"
+    [ "$status" -ne 0 ]
+    [[ ! "$output" =~ "$BATS_TEST_TMPDIR/db/teams/$bad" ]]
+  done
+}
+
+@test "storage: one team cannot read another team's messages" {
+  export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/db" SKILL_DIR="$TEST_SKILL_DIR"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/storage.sh"
+  agmsg_storage_load
+  storage_init alpha >/dev/null
+  storage_init bravo >/dev/null
+  storage_send alpha ann bob "alpha-only" >/dev/null
+  storage_send bravo cid bob "bravo-only" >/dev/null
+
+  [[ "$(storage_list_unread alpha bob)" =~ "alpha-only" ]]
+  [[ ! "$(storage_list_unread alpha bob)" =~ "bravo-only" ]]
+  [[ "$(storage_list_unread bravo bob)" =~ "bravo-only" ]]
+  [[ ! "$(storage_list_unread bravo bob)" =~ "alpha-only" ]]
+
+  # Not just filtered on the way out — the other team's body is not in the file.
+  ! grep -q "bravo-only" "$(agmsg_db_path alpha)"
+  ! grep -q "alpha-only" "$(agmsg_db_path bravo)"
 }
 
 @test "storage: resolving a store without a selector is an error, not a default" {

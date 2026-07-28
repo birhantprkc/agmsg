@@ -68,10 +68,13 @@ _iid() {
     agmsg_normalize_instance_id "$1" claude-code 2>/dev/null )
 }
 
+# Takes the team, because there is a store per team and no default one to fall
+# back to. No caller today; a call without the argument fails loudly rather
+# than reading whichever store happened to be first.
 _max_message_id() {
   ( # shellcheck disable=SC1090
     source "$SCRIPTS/lib/storage.sh"
-    agmsg_sqlite "$(agmsg_db_path)" "SELECT COALESCE(MAX(id), 0) FROM messages;" )
+    agmsg_sqlite "$(agmsg_db_path "$1")" "SELECT COALESCE(MAX(id), 0) FROM messages;" )
 }
 
 # Read one pair's store-owned local frontier.

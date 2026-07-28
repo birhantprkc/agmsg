@@ -578,12 +578,22 @@ _jsonl_rename_team_locked() {
 }
 
 storage_rename_team() {
-  # Resolve paths through the NEW name: rename-team.sh moves the team's store
-  # directory before calling this, so the log and cursor files are already at
-  # the new location. Selecting on the old name would resolve to a directory
-  # that no longer exists, and _jsonl_init_file would helpfully recreate it —
-  # leaving an empty log beside the real one and losing the cursor.
-  # The old/new arguments below still drive the CONTENT rewrite.
+  # The team's files live under its own name, so a rename has to move them
+  # before it can rewrite them. rename-team.sh normally has already done so for
+  # every driver at once; this move is the case where the driver is called on
+  # its own, and it is guarded so the two never fight.
+  #
+  # Resolving on the old name after the move would find nothing, and
+  # _jsonl_init_file would helpfully recreate it — an empty log beside the real
+  # one, cursor lost. So paths resolve through the NEW name either way; the
+  # old/new arguments below drive the CONTENT rewrite, not the location.
+  local old_dir new_dir
+  old_dir="$(dirname "$(agmsg_db_path "$1")")"
+  new_dir="$(dirname "$(agmsg_db_path "$2")")"
+  if [ -d "$old_dir" ] && [ ! -e "$new_dir" ]; then
+    mkdir -p "$(dirname "$new_dir")"
+    mv "$old_dir" "$new_dir" || { echo runtime_error; return 13; }
+  fi
   _JSONL_TEAM="$2"
   _jsonl_init_file || { echo runtime_error; return 13; }
   _jsonl_with_lock _jsonl_rename_team_locked "$1" "$2" || {
