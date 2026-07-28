@@ -33,6 +33,19 @@ if ! declare -F agmsg_validate_team_name >/dev/null 2>&1; then
   fi
 fi
 
+# Built-in storage drivers use the shared UUIDv7 generator. Keep it available
+# through the storage facade so direct and registry-driven loads use one
+# implementation on every platform.
+if ! declare -F compat_uuid7 >/dev/null 2>&1; then
+  if [ -n "${BASH_SOURCE[0]:-}" ]; then
+    # shellcheck disable=SC1091
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compat.sh"
+  elif [ -n "${SKILL_DIR:-}" ]; then
+    # shellcheck disable=SC1091
+    source "$SKILL_DIR/scripts/lib/compat.sh"
+  fi
+fi
+
 # Echo the directory that holds (or will hold) the message store.
 agmsg_storage_dir() {
   if [ -n "${AGMSG_STORAGE_PATH:-}" ]; then

@@ -34,32 +34,6 @@ _sqlite_data() {
   ( set -o pipefail; agmsg_sqlite "$(_sqlite_db "$1")" "$2" | tr -d '\r' )
 }
 
-# UUIDv7: 48-bit ms timestamp + version/variant + random. python3 preferred;
-# fall back to a /dev/urandom shell build. No counter file (§2.5).
-_sqlite_uuid7() {
-  if command -v python3 >/dev/null 2>&1; then
-    python3 - <<'PY'
-import os, time
-ms = int(time.time() * 1000) & ((1 << 48) - 1)
-b = bytearray(os.urandom(16))
-b[0] = (ms >> 40) & 0xFF; b[1] = (ms >> 32) & 0xFF
-b[2] = (ms >> 24) & 0xFF; b[3] = (ms >> 16) & 0xFF
-b[4] = (ms >> 8) & 0xFF;  b[5] = ms & 0xFF
-b[6] = 0x70 | (b[6] & 0x0F)            # version 7
-b[8] = 0x80 | (b[8] & 0x3F)            # variant 10
-h = b.hex()
-print(f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}")
-PY
-    return
-  fi
-  local ms hex rnd
-  ms=$(( $(date -u +%s) * 1000 ))
-  hex=$(printf '%012x' "$ms")
-  rnd=$(head -c 10 /dev/urandom | od -An -tx1 | tr -d ' \n')
-  printf '%s-%s-7%s-8%s-%s\n' \
-    "${hex:0:8}" "${hex:8:4}" "${rnd:0:3}" "${rnd:3:3}" "${rnd:6:12}"
-}
-
 # IN (...) list of "team:agent" pairs.
 _sqlite_pair_in() {
   local out="" p t a
@@ -175,7 +149,7 @@ storage_init() {
 
 storage_send() {
   local team="$1" from="$2" to="$3" body="$4"
-  local id at db; id="$(_sqlite_uuid7)"; at="$(_sqlite_now)"; db="$(_sqlite_db "$team")"
+  local id at db; id="$(compat_uuid7)"; at="$(_sqlite_now)"; db="$(_sqlite_db "$team")"
   local insert="
     INSERT INTO events (type,id,team,from_agent,to_agent,body,at)
     VALUES ('message_sent','$(_sqlite_lit "$id")','$(_sqlite_lit "$team")',
@@ -219,7 +193,7 @@ storage_read_cursor_consume() {
   for id in "$@"; do
     sql="$sql
       INSERT INTO events(type,id,team,agent,msg_id,at)
-      SELECT 'message_read','$(_sqlite_lit "$(_sqlite_uuid7)")','$tl','$al',
+      SELECT 'message_read','$(_sqlite_lit "$(compat_uuid7)")','$tl','$al',
              '$(_sqlite_lit "$id")','$(_sqlite_lit "$at")'
        WHERE NOT EXISTS(SELECT 1 FROM events r WHERE r.type='message_read'
          AND r.team='$tl' AND r.agent='$al' AND r.msg_id='$(_sqlite_lit "$id")');"

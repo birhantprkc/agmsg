@@ -90,31 +90,6 @@ _jsonl_read_cursor_migrate() {
   rmdir "$lock" 2>/dev/null || true
 }
 
-# UUIDv7 (§2.5) — python3 preferred, /dev/urandom shell fallback. No counter file.
-_jsonl_uuid7() {
-  if command -v python3 >/dev/null 2>&1; then
-    python3 - <<'PY'
-import os, time
-ms = int(time.time() * 1000) & ((1 << 48) - 1)
-b = bytearray(os.urandom(16))
-b[0] = (ms >> 40) & 0xFF; b[1] = (ms >> 32) & 0xFF
-b[2] = (ms >> 24) & 0xFF; b[3] = (ms >> 16) & 0xFF
-b[4] = (ms >> 8) & 0xFF;  b[5] = ms & 0xFF
-b[6] = 0x70 | (b[6] & 0x0F)
-b[8] = 0x80 | (b[8] & 0x3F)
-h = b.hex()
-print(f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}")
-PY
-    return
-  fi
-  local ms hex rnd
-  ms=$(( $(date -u +%s) * 1000 ))
-  hex=$(printf '%012x' "$ms")
-  rnd=$(head -c 10 /dev/urandom | od -An -tx1 | tr -d ' \n')
-  printf '%s-%s-7%s-8%s-%s\n' \
-    "${hex:0:8}" "${hex:8:4}" "${rnd:0:3}" "${rnd:3:3}" "${rnd:6:12}"
-}
-
 # Serialize all log mutations (append / mark / compact / import) behind a portable
 # mkdir lock; record-returning reads hold the same lock through their snapshot EOF.
 _jsonl_with_lock() {
@@ -234,7 +209,7 @@ storage_sync_reprocess() {
 storage_send() {
   _JSONL_TEAM="$1"
   local team="$1" from="$2" to="$3" body="$4"
-  local id at line; id="$(_jsonl_uuid7)"; at="$(_jsonl_now)"
+  local id at line; id="$(compat_uuid7)"; at="$(_jsonl_now)"
   _jsonl_init_file
   line="$(jq -nc --arg id "$id" --arg team "$team" --arg from "$from" \
     --arg to "$to" --arg body "$body" --arg at "$at" \
@@ -384,7 +359,7 @@ _jsonl_mark() {
   for id in "$@"; do
     printf '%s\n' "$existing" | grep -Fxq "$id" && continue
     at="$(_jsonl_now)"
-    line="$(jq -nc --arg id "$(_jsonl_uuid7)" --arg msg_id "$id" --arg team "$team" \
+    line="$(jq -nc --arg id "$(compat_uuid7)" --arg msg_id "$id" --arg team "$team" \
       --arg agent "$agent" --arg at "$at" \
       '{type:"message_read",id:$id,msg_id:$msg_id,team:$team,agent:$agent,at:$at}')"
     printf '%s\n' "$line" >> "$log"

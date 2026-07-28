@@ -67,8 +67,8 @@ agmsg_lock_acquire "$TEAMS_DIR/$TEAM" || exit 1
 
 # --- Ensure team config exists ---
 if [ ! -f "$TEAM_CONFIG" ]; then
-  INITIAL_CONFIG=$(printf '{\n  "name": "%s",\n  "agents": {},\n  "created_at": "%s"\n}' \
-    "$TEAM" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+  INITIAL_CONFIG=$(printf '{\n  "name": "%s",\n  "team_id": "%s",\n  "agents": {},\n  "created_at": "%s"\n}' \
+    "$TEAM" "$(compat_uuid7)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
   agmsg_write_atomic "$TEAM_CONFIG" "$INITIAL_CONFIG"
   echo "Created team: $TEAM"
 fi
@@ -118,15 +118,27 @@ EXISTING=$(agmsg_sqlite_mem "
 ")
 
 if [ -z "$EXISTING" ] || [ "$EXISTING" = "null" ]; then
-  AGENT_OBJ=$(sqlite3 :memory: "SELECT json_object('registrations', json_array(json('$REGISTRATION_ESCAPED')));")
+  TEAM_HAS_IDS=$(agmsg_sqlite_mem "
+    SELECT json_type(CAST(readfile('$(agmsg_sql_readfile_path "$TEAM_CONFIG")') AS TEXT), '\$.team_id');
+  ")
+  if [ "$TEAM_HAS_IDS" = "text" ]; then
+    AGENT_OBJ=$(sqlite3 :memory: "SELECT json_object(
+      'member_id', '$(compat_uuid7)',
+      'registrations', json_array(json('$REGISTRATION_ESCAPED'))
+    );")
+  else
+    AGENT_OBJ=$(sqlite3 :memory: \
+      "SELECT json_object('registrations', json_array(json('$REGISTRATION_ESCAPED')));")
+  fi
 else
   EXISTING_ESCAPED=$(printf '%s' "$EXISTING" | sed "s/'/''/g")
   NORMALIZED=$(agmsg_sqlite_mem "
     WITH agent(a) AS (SELECT '$EXISTING_ESCAPED')
     SELECT CASE
       WHEN json_type(json_extract(a, '\$.registrations')) = 'array' THEN a
-      ELSE json_object(
-        'registrations',
+      ELSE json_set(
+        a,
+        '\$.registrations',
         json_array(json_object(
           'type', json_extract(a, '\$.type'),
           'project', json_extract(a, '\$.project')
