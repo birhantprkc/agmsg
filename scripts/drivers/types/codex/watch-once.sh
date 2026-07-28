@@ -81,7 +81,7 @@ fi
 deadline=$(( $(date +%s) + TIMEOUT ))
 
 while true; do
-  if storage_store_exists; then
+  {
     # Unread across the subscription via the storage facade (§2.1, events ∪ legacy)
     # — one storage_list_unread per pair, summed. max_id is an OPAQUE equality-only
     # token for codex-bridge stale-wake detection (never ordered): a cksum DIGEST of
@@ -92,6 +92,12 @@ while true; do
     all_ids=""
     while IFS=$'\t' read -r _team _agent; do
       [ -n "$_team" ] && [ -n "$_agent" ] || continue
+      # Asked per team, inside the loop: stores are per team, so whether one
+      # exists is a question about a team and there is no subscription-wide
+      # answer. It used to be asked once above the loop, when a single store
+      # served every team — that form skipped the whole subscription as soon as
+      # any store was missing. Mirrors check-inbox.sh and watch.sh.
+      storage_store_exists "$_team" || continue
       u="$(storage_list_unread "$_team" "$_agent" 2>/dev/null || true)"
       [ -n "$u" ] || continue
       uarr="[$(printf '%s' "$u" | paste -sd, -)]"
@@ -110,7 +116,7 @@ while true; do
       printf 'status=pending count=%s max_id=%s\n' "$count" "$max_id"
       exit 0
     fi
-  fi
+  }
 
   now=$(date +%s)
   if [ "$now" -ge "$deadline" ]; then

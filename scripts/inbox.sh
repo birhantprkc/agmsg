@@ -16,12 +16,15 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/storage.sh"
 agmsg_storage_load
 
-# Preserve the read-only "not initialized yet" behaviour: an inbox check must not
-# create the store. Ask the active driver whether one exists (driver-level, so it
-# works for jsonl's events.jsonl as well as sqlite's messages.db).
+# An inbox check must not create the store, so a team that has never been
+# written to has no file yet. Since the stores split per team that is the
+# ORDINARY state of a freshly joined team, not a broken install — before the
+# split one store was created for everyone at install time, so its absence
+# really did mean something was wrong. Report it as what it is: no messages.
+# Driver-level, so it covers jsonl's events.jsonl as well as sqlite's file.
 if ! storage_store_exists "$TEAM"; then
   if [ "$QUIET" = true ]; then exit 0; fi
-  echo "No messages (DB not initialized)"
+  echo "No new messages."
   exit 0
 fi
 

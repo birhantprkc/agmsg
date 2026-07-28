@@ -17,10 +17,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/storage.sh"
 agmsg_storage_load
 
-# Ask the active driver whether a store exists (driver-level, works for jsonl) —
-# a history read must not create one in a storeless project.
+# A history read must not create a store, so a team that has never been written
+# to has no file yet. Since the stores split per team that is the ordinary state
+# of a freshly joined team rather than a broken install, and it reads out the
+# same as an empty history. Driver-level, so it works for jsonl too.
 if ! storage_store_exists "$TEAM"; then
-  echo "No messages (DB not initialized)"
+  echo "No message history."
   exit 0
 fi
 

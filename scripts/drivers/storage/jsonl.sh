@@ -159,7 +159,9 @@ storage_check() {
 }
 
 storage_describe() {
-  _JSONL_TEAM="$1"
+  # Defaulted, not required: this is the one contract call with an optional
+  # selector (see below), and callers that omit it run under `set -u`.
+  _JSONL_TEAM="${1-}"
   # The selector is optional HERE and only here: describe reports driver
   # metadata, and the capabilities caller has no team to name. The path line
   # is the only team-dependent part, so it is reported only when a specific
