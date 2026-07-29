@@ -816,11 +816,21 @@ _remote_write_pulled_team() {
 # operator can answer, so the candidates are printed with what tells them apart
 # and --team-id is offered.
 _remote_resolve_team_id() {
-  local endpoint="$1" name="$2" result count doc
-  result="$("$SCRIPT_DIR/remote-sync.sh" resolve-team \
-    --endpoint "$endpoint" --name "$name" 2>/dev/null \
-    | grep '"team_lookup_result"' | tail -1)" || true
-  [ -n "$result" ] || { echo "agmsg: could not reach the server to look up '$name'" >&2; return 1; }
+  local endpoint="$1" name="$2" out status result count doc
+  # The engine's exit status is read on its own rather than through a pipeline,
+  # so a server that is unreachable and a server whose answer failed validation
+  # stay distinguishable from a name that simply matched nothing. Collapsing
+  # those into one message is how a rejected answer would get read as "no such
+  # team" -- the wrong conclusion to hand an operator about their own team.
+  out="$("$SCRIPT_DIR/remote-sync.sh" resolve-team \
+    --endpoint "$endpoint" --name "$name" 2>/dev/null)"
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    echo "agmsg: could not look up '$name': the server was unreachable, or its answer was rejected" >&2
+    return 1
+  fi
+  result="$(printf '%s\n' "$out" | grep '"team_lookup_result"' | tail -1)" || true
+  [ -n "$result" ] || { echo "agmsg: the server did not answer the lookup for '$name'" >&2; return 1; }
 
   doc="$(printf '%s' "$result" | sed "s/'/''/g")"
   count="$(agmsg_sqlite_mem "SELECT json_array_length(json_extract('$doc', '\$.teams'));")"

@@ -21,6 +21,10 @@ CREATE TABLE IF NOT EXISTS teams (
 ALTER TABLE teams ALTER COLUMN write_allowed_ciphers
   SET DEFAULT ARRAY['none', 'age-v1']::TEXT[];
 
+-- Name lookup is an equality probe from an unauthenticated route, so it must
+-- not be a sequential scan over every team.
+CREATE INDEX IF NOT EXISTS teams_name_idx ON teams(team_name);
+
 CREATE TABLE IF NOT EXISTS team_policy_history (
   team_id UUID NOT NULL REFERENCES teams(team_id) ON DELETE RESTRICT,
   policy_revision BIGINT NOT NULL CHECK (policy_revision >= 0),

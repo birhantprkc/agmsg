@@ -764,3 +764,51 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   [ "$status" -eq 0 ]
   [ -f "$TEST_SKILL_DIR/teams/pulled-team/config.json" ]
 }
+
+# A lookup answer decides this machine's team identity and gets printed for an
+# operator to read, so each of these asserts three things: the command failed,
+# no local team was built from the answer, and the poisoned value never reached
+# the terminal. The message is pinned too -- a bare non-zero status would also
+# be produced by the very fail-open this guards against.
+assert_lookup_rejected() {
+  local mode="$1"
+  MOCK_LOOKUP_BAD="$mode" restart_mock_server
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" pulled-team
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"its answer was rejected"* ]]
+  [[ "$output" != *"MARKER-INJECTED"* ]]
+  [ ! -d "$TEST_SKILL_DIR/teams/pulled-team" ]
+}
+
+@test "remote pull: a candidate failing field validation is refused, not shown" {
+  # team_id/timestamp/sequence are the fields that would reach a terminal or a
+  # config; name_mismatch is a server answering about a different team.
+  assert_lookup_rejected team_id
+  assert_lookup_rejected timestamp
+  assert_lookup_rejected sequence
+  assert_lookup_rejected name_mismatch
+}
+
+@test "remote pull: an otherwise valid candidate with an extra field is refused" {
+  # The strongest of these cases: everything the client uses is well formed, so
+  # without the key-set check the pull would succeed and the unasked-for field
+  # would have travelled with it.
+  assert_lookup_rejected extra_field
+}
+
+@test "remote pull: a poisoned second candidate is refused before listing" {
+  # The duplicate-name path prints candidates, which is exactly where an
+  # unvalidated value would be rendered.
+  assert_lookup_rejected multiple
+}
+
+@test "remote pull: more candidates than the bound are refused, not listed" {
+  # Forty candidates. Without the client-side bound this lists all of them.
+  assert_lookup_rejected flood
+}
+
+@test "remote pull: a wrong protocol, server id, or root name is refused" {
+  assert_lookup_rejected protocol
+  assert_lookup_rejected server_id
+  assert_lookup_rejected root_name
+}

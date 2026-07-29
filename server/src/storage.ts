@@ -44,6 +44,13 @@ const timestampSql = (column: string) => `to_char(${column} AT TIME ZONE 'UTC',
   'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
 const MAX_EXACT_PER_MEMBER = 4096;
 const MAX_EXACT_PER_TEAM = 65536;
+// A name matching more teams than this is answered with an error, not a
+// truncated list. Truncation would be the worse failure: a caller shown "the
+// first N" cannot tell whether its own team is among them, so it would choose
+// from a set that may not contain the right answer. The bound is also what
+// keeps the row count of an unauthenticated response from being chosen by
+// outside input -- every other public route answers about one known team.
+const MAX_TEAMS_PER_NAME = 16;
 
 async function serverInstanceId(client: PoolClient): Promise<string> {
   const result = await client.query<{ server_instance_id: string }>(
@@ -876,9 +883,19 @@ export async function resolveTeamsByName(
                 ${timestampSql("registered_at")} AS registered_at,
                 current_seq::text
            FROM teams WHERE team_name = $1
-          ORDER BY registered_at, team_id`,
-        [teamName],
+          ORDER BY registered_at, team_id
+          LIMIT $2`,
+        [teamName, MAX_TEAMS_PER_NAME + 1],
       );
+      if (rows.rows.length > MAX_TEAMS_PER_NAME) {
+        throw new ProtocolError(
+          409,
+          "team-name-match-limit-exceeded",
+          "too many teams share this name to choose between them",
+          { team_name: teamName, limit: MAX_TEAMS_PER_NAME },
+          { serverInstanceId: serverId },
+        );
+      }
       return {
         protocol_version: 1,
         server_instance_id: serverId,
