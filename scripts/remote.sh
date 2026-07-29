@@ -911,6 +911,31 @@ _remote_sync_engine_stop() {
   rm -f "$pidfile"
 }
 
+# Upgrade a team that predates local ids: mint a team_id AND a member_id for
+# every current member, in one shot, then persist. connect is the point an old
+# team first needs ids, and the invariant is all-or-none — a team carries ids
+# for every member or for none — so this never leaves a half-id-holding roster.
+_remote_mint_team_ids() {
+  local team="$1" cfg="$2" cfg_json escaped names name mid
+  agmsg_lock_acquire "$TEAMS_DIR/$team" || return 1
+  cfg_json="$(cat "$cfg")"
+  escaped="$(printf '%s' "$cfg_json" | sed "s/'/''/g")"
+  names="$(agmsg_sqlite_mem "SELECT key FROM json_each(json_extract('$escaped', '\$.agents'));")"
+  cfg_json="$(agmsg_sqlite_mem "SELECT json_set('$escaped', '\$.team_id', '$(compat_uuid7)');")"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    mid="$(compat_uuid7)"
+    escaped="$(printf '%s' "$cfg_json" | sed "s/'/''/g")"
+    # A quoted path key ("name") lets a member name carry characters a bare
+    # path token could not; the whole statement is a single-quoted SQL literal.
+    cfg_json="$(agmsg_sqlite_mem "SELECT json_set('$escaped', '\$.agents.\"$(printf '%s' "$name" | sed "s/'/''/g")\".member_id', '$mid');")"
+  done <<EOF_MINT_NAMES
+$names
+EOF_MINT_NAMES
+  agmsg_write_atomic "$cfg" "$cfg_json"
+  agmsg_lock_release
+}
+
 cmd_connect() {
   # Register a team you already own with a remote, then move it to its own
   # store and start syncing. No token, no credential: reaching the server is
@@ -938,8 +963,12 @@ cmd_connect() {
   team_name="$(_remote_read_config_field "$cfg" '$.name')"
   case "$team_id" in
     ''|null)
-      echo "agmsg: team '$team' has no team_id — it predates local ids. A team's ids are minted when it is created; only a team that already carries ids can connect." >&2
-      exit 1 ;;
+      # A team that predates local ids: mint them now (connect is the point it
+      # first needs them), for the whole roster at once, then re-read.
+      _remote_mint_team_ids "$team" "$cfg" || {
+        echo "agmsg: could not mint local ids for team '$team'" >&2; exit 1; }
+      team_id="$(_remote_read_config_field "$cfg" '$.team_id')"
+      ;;
   esac
 
   # The body: the team's id and name, plus the roster from .agents — each

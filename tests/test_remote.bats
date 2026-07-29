@@ -154,6 +154,24 @@ restart_mock_server() {
   wait_for_missing "$pidfile"
 }
 
+@test "connect: mints team_id and member_ids for a team that predates local ids" {
+  # A legacy team: agents but no team_id, members with no member_id. Give it an
+  # initialized store so the connect-time migration has something to move.
+  mkdir -p "$TEST_SKILL_DIR/teams/legacyteam"
+  printf '{"name":"legacyteam","agents":{"alice":{"type":"claude-code"},"bob":{"type":"codex"}},"created_at":"2026-01-01T00:00:00Z"}\n' \
+    > "$TEST_SKILL_DIR/teams/legacyteam/config.json"
+  bash -c '. "$1/scripts/lib/storage.sh"; agmsg_storage_load; storage_init "$2" >/dev/null' \
+    x "$SCRIPTS/.." legacyteam
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" legacyteam
+  [ "$status" -eq 0 ]
+  local cfg="$TEST_SKILL_DIR/teams/legacyteam/config.json"
+  # The whole roster is now id-holding (all-or-none): a team_id and a member_id
+  # for every member, minted at connect.
+  [[ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.team_id');")" =~ ^[0-9a-f]{8}- ]]
+  [ -n "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.agents.alice.member_id');")" ]
+  [ -n "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.agents.bob.member_id');")" ]
+}
+
 @test "connect: refuses a second connect for the same team_id with 409 (Done-when 5)" {
   bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
   # The mock keeps the registered team_id; a repeat is a uniqueness conflict.
