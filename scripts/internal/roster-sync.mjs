@@ -60,6 +60,15 @@ function timestamp(value) {
 }
 
 function projection(record) {
+  if (record.type === "key_rotated") {
+    return {
+      kind: record.type,
+      mutation_id: record.id,
+      epoch: record.epoch,
+      fingerprint: record.fingerprint,
+      occurred_at: timestamp(record.at),
+    };
+  }
   const common = {
     kind: record.type,
     mutation_id: record.id,
@@ -72,6 +81,15 @@ function projection(record) {
 }
 
 function mutation(value) {
+  if (value.kind === "key_rotated") {
+    return {
+      type: value.kind,
+      id: value.mutation_id,
+      epoch: value.epoch,
+      fingerprint: value.fingerprint,
+      at: value.occurred_at,
+    };
+  }
   const common = {
     type: value.kind,
     id: value.mutation_id,
@@ -118,7 +136,7 @@ function prepare() {
     record.server_instance_id === serverId &&
     record.remote_team_id === remoteTeamId).map((record) => record.mutation_id));
   const mutations = records.filter((record) =>
-    ["member_joined", "member_left", "member_renamed"].includes(record.type) &&
+    ["member_joined", "member_left", "member_renamed", "key_rotated"].includes(record.type) &&
     !synced.has(record.id) &&
     (request.allow_new || target.reservations[record.id])).slice(0, limit);
 
@@ -156,6 +174,7 @@ function prepare() {
       local_id: record.id,
       id: reserved.wire_id,
       envelope: reserved.envelope,
+      projection: projection(record),
     })}\n`);
   }
 }
@@ -194,7 +213,7 @@ function apply() {
   const state = readState();
   const target = binding(state);
   const mutations = new Map(records.filter((record) =>
-    ["member_joined", "member_left", "member_renamed"].includes(record.type))
+    ["member_joined", "member_left", "member_renamed", "key_rotated"].includes(record.type))
     .map((record) => [record.id, record]));
   const synced = new Set(records.filter((record) =>
     record.type === "roster_synced" &&
@@ -206,7 +225,8 @@ function apply() {
       continue;
     }
     if (item.type !== "sync_pull_message" || item.status !== "importable" ||
-        !item.projection?.kind?.startsWith("member_")) {
+        !["member_joined", "member_left", "member_renamed", "key_rotated"]
+          .includes(item.projection?.kind)) {
       throw new Error("roster pull input is invalid");
     }
     const incoming = mutation(item.projection);

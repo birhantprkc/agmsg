@@ -141,6 +141,24 @@ test("legacy messages remain discriminator-free while roster mutations use kind"
     envelope: rosterEnvelope,
     max_blob_bytes: 1_048_576,
   }), roster);
+
+  const rotation = {
+    kind: "key_rotated",
+    mutation_id: "018f3f7e-0000-7000-8000-000000000012",
+    epoch: "epoch-20260729010000-abcd",
+    fingerprint: "a".repeat(64),
+    occurred_at: "2026-07-29T01:00:00.000000Z",
+  };
+  const rotationEnvelope = sealEnvelope({
+    ...base,
+    wire_id: "550e8400-e29b-41d4-a716-446655440002",
+    projection: rotation,
+  });
+  assert.deepEqual(await openEnvelope({
+    envelope: rotationEnvelope,
+    max_blob_bytes: 1_048_576,
+  }), rotation);
+  assert.equal(Buffer.from(rotationEnvelope.blob, "base64").toString("utf8").includes("age1"), false);
 });
 
 test("age-v1 accepts only native X25519 identity files", () => {

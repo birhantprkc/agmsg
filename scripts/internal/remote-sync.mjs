@@ -90,6 +90,86 @@ function credentialPath(team) {
   return join(connectionRoot, "run", "remote-credentials", `${team}.json`);
 }
 
+function replacementIdentityPath(team, epoch) {
+  const connectionRoot = process.env.AGMSG_SYNC_CONNECTION_DIR ?? process.env.SKILL_DIR;
+  if (!connectionRoot) throw new Error("sync connection root is unavailable");
+  return join(connectionRoot, "run", "remote-credentials", team, "keys", `${epoch}.key`);
+}
+
+function rosterJournalPath(team) {
+  return join(dirname(teamConfigPath(team)), "roster.jsonl");
+}
+
+async function journalKeyRotations(config) {
+  let records;
+  try {
+    records = parseStrictJsonl(await readFile(rosterJournalPath(config.local_team), "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+  const sequences = new Map(records.filter((record) =>
+    record.type === "roster_synced" &&
+    record.server_instance_id === config.server_instance_id &&
+    record.remote_team_id === config.remote_team_id)
+    .map((record) => [record.mutation_id, sequence(record.server_seq, "key rotation server sequence")]));
+  return records.filter((record) => record.type === "key_rotated" && sequences.has(record.id))
+    .map((record) => ({ ...record, server_seq: sequences.get(record.id) }))
+    .sort((left, right) => BigInt(left.server_seq) < BigInt(right.server_seq) ? -1 :
+      BigInt(left.server_seq) > BigInt(right.server_seq) ? 1 : 0);
+}
+
+export async function activateKeyRotations(config) {
+  const rotations = await journalKeyRotations(config);
+  if (rotations.length === 0) {
+    config.age_v1_runtime_history = [];
+    return;
+  }
+  if (config.cipher_profile !== "age-v1" || !config.age_v1) {
+    throw new Error("key rotation requires an age-v1 sync configuration");
+  }
+  const base = config.age_v1.epoch_snapshot.history;
+  let revision = BigInt(base.at(-1).epoch_revision);
+  const runtime = [];
+  for (const rotation of rotations) {
+    if (!UUID_V7.test(rotation.id ?? "") ||
+        !/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(rotation.epoch ?? "") ||
+        !/^[0-9a-f]{64}$/u.test(rotation.fingerprint ?? "")) {
+      throw new Error("key rotation journal record is invalid");
+    }
+    const identityPath = replacementIdentityPath(config.local_team, rotation.epoch);
+    try {
+      await lstat(identityPath);
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        throw new Error(
+          `key rotation at server sequence ${rotation.server_seq} requires replacement epoch ` +
+          `${rotation.epoch}; import that key out of band before sync can continue`);
+      }
+      throw error;
+    }
+    const identity = readNativeAgeIdentity(identityPath);
+    const fingerprint = createHash("sha256").update(identity.recipient, "utf8").digest("hex");
+    if (fingerprint !== rotation.fingerprint) {
+      throw new Error(`replacement key for epoch ${rotation.epoch} does not match the announced fingerprint`);
+    }
+    revision += 1n;
+    config.age_v1.identity_files[rotation.epoch] = identityPath;
+    runtime.push({
+      epoch_revision: revision.toString(),
+      // The announcement itself is sealed with the old epoch so a removed
+      // holder can learn that rotation happened without receiving the new
+      // key. The first envelope that uses the replacement is therefore the
+      // sequence immediately after the announcement.
+      effective_from_seq: (BigInt(rotation.server_seq) + 1n).toString(),
+      cipher: "age-v1",
+      key_id: rotation.epoch,
+      recipients: [identity.recipient],
+    });
+  }
+  config.age_v1_runtime_history = runtime;
+}
+
 function connectedBinding(value, team) {
   const binding = value?.remote_binding;
   if (value?.name !== team || !binding || typeof binding !== "object" ||
@@ -232,6 +312,7 @@ export async function loadConfig(team) {
   if (value.cipher_profile === "age-v1") {
     validateAgeConfiguration(value);
     await validateRetainedAgeCheckpoint(value);
+    await activateKeyRotations(value);
   }
   else if (value.cipher_profile !== "none") throw new Error("sync cipher profile is unsupported");
   await readConnectedCredential(value);
@@ -733,7 +814,10 @@ function currentLocalPolicy(config, serverSeq) {
 }
 
 function currentAgeEpoch(config, serverSeq) {
-  const history = config.age_v1?.epoch_snapshot?.history;
+  const history = [
+    ...(config.age_v1?.epoch_snapshot?.history ?? []),
+    ...(config.age_v1_runtime_history ?? []),
+  ];
   if (!Array.isArray(history) || history.length < 1) return null;
   const target = BigInt(sequence(serverSeq, "age epoch server_seq"));
   const candidates = history.filter((entry) =>
@@ -1340,6 +1424,7 @@ export async function cycle(config, { pushLimit, pullLimit }, dependencies = {})
   const evaluateCall = dependencies.evaluateCall ?? evaluatePull;
   const logApplyCall = dependencies.logApplyCall ?? logApplyOutcomes;
   const readStateCycleCall = dependencies.readStateCycleCall ?? readStateCycle;
+  const activateKeyRotationsCall = dependencies.activateKeyRotationsCall ?? activateKeyRotations;
 
   const ready = await healthCall(config.server_url);
   if (ready.server_instance_id !== config.server_instance_id) throw new Error("health server instance changed");
@@ -1361,12 +1446,16 @@ export async function cycle(config, { pushLimit, pullLimit }, dependencies = {})
   // Registry mutations lead the page. They establish the identity needed to
   // interpret every following message, and UUIDv7 values minted in the same
   // millisecond are not a reliable cross-axis ordering key.
-  const candidates = [
-    ...rosterPrepared.filter((record) => record.type === "roster_sync_push_candidate")
-      .map((record) => ({ ...record, sync_axis: "roster" })),
+  const rosterCandidates = rosterPrepared
+    .filter((record) => record.type === "roster_sync_push_candidate")
+    .map((record) => ({ ...record, sync_axis: "roster" }));
+  const rotationIndex = rosterCandidates.findIndex((record) =>
+    record.projection?.kind === "key_rotated");
+  const candidates = (rotationIndex === -1 ? [
+    ...rosterCandidates,
     ...prepared.filter((record) => record.type === "sync_push_candidate")
       .map((record) => ({ ...record, sync_axis: "messages" })),
-  ].slice(0, pushLimit);
+  ] : rosterCandidates.slice(0, rotationIndex + 1)).slice(0, pushLimit);
   if (!state) throw new Error("driver omitted sync_state");
   sequence(state.transport_cursor, "transport_cursor");
   await eventCall("push.prepared", { count: candidates.length, local_positions: candidates.map((item) => item.local_position),
@@ -1386,6 +1475,11 @@ export async function cycle(config, { pushLimit, pullLimit }, dependencies = {})
       messageAcks.length > 0 ? driverCall("reconcile", config, messageAcks) : [],
       rosterAcks.length > 0 ? rosterDriverCall("reconcile", config, rosterAcks) : [],
     ]);
+    if (rosterAcks.some((_, index) =>
+      candidates.filter((candidate) => candidate.sync_axis === "roster")[index]
+        ?.projection?.kind === "key_rotated")) {
+      await activateKeyRotationsCall(config);
+    }
     await eventCall("push.reconciled", {
       result: reconciled[0] ?? null,
       roster_result: rosterReconciled[0] ?? null,
@@ -1427,7 +1521,13 @@ export async function cycle(config, { pushLimit, pullLimit }, dependencies = {})
     const records = [];
     for (const message of page.messages) {
       const evaluated = await evaluateCall(config, pullCapabilities, message);
-      records.push({ type: "sync_pull_message", ...message, ...evaluated });
+      const record = { type: "sync_pull_message", ...message, ...evaluated };
+      if (record.status === "importable" && record.projection?.kind === "key_rotated") {
+        await rosterDriverCall("apply", config, [record]);
+        await activateKeyRotationsCall(config);
+      } else {
+        records.push(record);
+      }
     }
     records.push({ type: "sync_pull_cursor", next_after: page.next_after });
     await eventCall("pull.received", { after: cursor, next_after: page.next_after,
@@ -1435,7 +1535,7 @@ export async function cycle(config, { pushLimit, pullLimit }, dependencies = {})
     const cursorRecord = records.at(-1);
     const rosterRecords = records.filter((record) =>
       record.type === "sync_pull_message" && record.status === "importable" &&
-      record.projection?.kind?.startsWith("member_"));
+      ["member_joined", "member_left", "member_renamed"].includes(record.projection?.kind));
     const messageRecords = records.filter((record) =>
       record.type !== "sync_pull_message" || !record.projection?.kind);
     const rosterApplied = rosterRecords.length > 0 ?

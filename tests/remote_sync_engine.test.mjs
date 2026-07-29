@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readdir, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
   ageSnapshotDigest,
+  activateKeyRotations,
   consistentReadStateContext,
   configure,
   cycle,
@@ -52,6 +54,52 @@ const candidates = [
 ];
 
 const credentialId = "018f3f7e-0000-7000-8000-000000000020";
+
+test("a synced rotation halts until an out-of-band identity matches its fingerprint", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agmsg-key-rotation-"));
+  const previous = process.env.AGMSG_SYNC_CONNECTION_DIR;
+  process.env.AGMSG_SYNC_CONNECTION_DIR = root;
+  const epoch = "epoch-20260729010000-abcd";
+  const mutationId = "018f3f7e-0000-7000-8000-000000000025";
+  const recipient = "age1ykvctct4aklx4f4mnjd8rmzqs7p2le9ufg4faydljsk5mvcy0pls27mu64";
+  const identity = "AGE-SECRET-KEY-14Z7XMNPZTPEMMM6DG2FSKEH042L7UMU79T645GAQJKU2LLJGPM2S7GWNLQ";
+  const fingerprint = createHash("sha256").update(recipient).digest("hex");
+  const rotationConfig = {
+    ...config,
+    cipher_profile: "age-v1",
+    age_v1: {
+      epoch_snapshot: { history: [{
+        epoch_revision: "0", effective_from_seq: "1", cipher: "age-v1",
+        key_id: "epoch-0", recipients: [recipient],
+      }] },
+      identity_files: {},
+    },
+  };
+  try {
+    await mkdir(join(root, "teams", "demo"), { recursive: true });
+    await writeFile(join(root, "teams", "demo", "roster.jsonl"), [
+      JSON.stringify({ type: "key_rotated", id: mutationId, epoch, fingerprint,
+        at: "2026-07-29T01:00:00.000000Z" }),
+      JSON.stringify({ type: "roster_synced", mutation_id: mutationId, server_seq: "8",
+        wire_id: "550e8400-e29b-41d4-a716-446655440006",
+        server_instance_id: config.server_instance_id,
+        remote_team_id: config.remote_team_id }),
+      "",
+    ].join("\n"));
+    await assert.rejects(activateKeyRotations(rotationConfig), /import that key out of band/u);
+    const keyDir = join(root, "run", "remote-credentials", "demo", "keys");
+    await mkdir(keyDir, { recursive: true });
+    await writeFile(join(keyDir, `${epoch}.key`), `${identity}\n`, { mode: 0o600 });
+    await activateKeyRotations(rotationConfig);
+    assert.equal(rotationConfig.age_v1_runtime_history[0].key_id, epoch);
+    assert.equal(rotationConfig.age_v1_runtime_history[0].effective_from_seq, "9");
+    assert.deepEqual(rotationConfig.age_v1_runtime_history[0].recipients, [recipient]);
+  } finally {
+    if (previous === undefined) delete process.env.AGMSG_SYNC_CONNECTION_DIR;
+    else process.env.AGMSG_SYNC_CONNECTION_DIR = previous;
+    await rm(root, { recursive: true });
+  }
+});
 
 async function withConnectedCredential(callback) {
   const root = await mkdtemp(join(tmpdir(), "agmsg-connected-credential-"));
@@ -1090,6 +1138,117 @@ test("cycle routes roster payloads through the existing message transport", asyn
   });
   assert.equal(posted, true);
   assert.deepEqual(rosterOperations, ["prepare", "reconcile", "apply"]);
+});
+
+test("cycle pushes a key rotation alone and activates its acknowledged boundary", async () => {
+  const rotationWire = "550e8400-e29b-41d4-a716-446655440003";
+  const messageWire = "550e8400-e29b-41d4-a716-446655440004";
+  const projection = {
+    kind: "key_rotated",
+    mutation_id: "018f3f7e-0000-7000-8000-000000000023",
+    epoch: "epoch-20260729010000-abcd",
+    fingerprint: "c".repeat(64),
+    occurred_at: "2026-07-29T01:00:00.000000Z",
+  };
+  let activated = 0;
+  await cycle(config, { pushLimit: 100, pullLimit: 1000 }, {
+    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    requestCall: async (_config, path, init) => {
+      if (path === "/v1/capabilities") return capsFor(["none"]);
+      if (path === "/v1/messages" && init?.method === "POST") {
+        assert.deepEqual(JSON.parse(init.body).messages.map((item) => item.id), [rotationWire]);
+        return { acks: [{ id: rotationWire, server_seq: "1", disposition: "stored" }] };
+      }
+      if (path.startsWith("/v1/messages?after=")) {
+        return { messages: [], next_after: "0", has_more: false };
+      }
+      throw new Error(`unexpected request ${path}`);
+    },
+    driverCall: async (operation) => {
+      if (operation === "prepare") return [{
+        type: "sync_state",
+        driver_generation: "018f3f7e-0000-7000-8000-000000000099",
+        transport_cursor: "0",
+      }, {
+        type: "sync_push_candidate", local_position: "1", local_id: "message",
+        id: messageWire, envelope: { v: 1, cipher: "none", key_id: null, blob: "e30=" },
+      }];
+      if (operation === "apply") return [{ type: "sync_apply_result", transport_cursor: "0" }];
+      throw new Error(`unexpected storage operation ${operation}`);
+    },
+    rosterDriverCall: async (operation) => {
+      if (operation === "prepare") return [{
+        type: "roster_sync_push_candidate",
+        local_position: projection.mutation_id,
+        local_id: projection.mutation_id,
+        id: rotationWire,
+        envelope: { v: 1, cipher: "none", key_id: null, blob: "e30=" },
+        projection,
+      }];
+      if (operation === "reconcile") return [{ type: "roster_sync_reconcile_result", count: 1 }];
+      throw new Error(`unexpected roster operation ${operation}`);
+    },
+    activateKeyRotationsCall: async () => { activated += 1; },
+    logApplyCall: async () => {},
+    eventCall: async () => {},
+    readStateCycleCall: async () => {},
+  });
+  assert.equal(activated, 1);
+});
+
+test("cycle records a pulled key rotation before halting for a missing replacement key", async () => {
+  const projection = {
+    kind: "key_rotated",
+    mutation_id: "018f3f7e-0000-7000-8000-000000000024",
+    epoch: "epoch-20260729010000-bcde",
+    fingerprint: "d".repeat(64),
+    occurred_at: "2026-07-29T01:00:00.000000Z",
+  };
+  let recorded = false;
+  let storageApplied = false;
+  await assert.rejects(cycle(config, { pushLimit: 100, pullLimit: 1000 }, {
+    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    requestCall: async (_config, path) => {
+      if (path === "/v1/capabilities") return {
+        ...capsFor(["none"]), current_seq: "1", next_sequence_boundary: "2",
+      };
+      if (path.startsWith("/v1/messages?after=")) return {
+        messages: [{
+          server_seq: "1", id: "550e8400-e29b-41d4-a716-446655440005",
+          server_received_at: "2026-07-29T01:00:01.000000Z",
+          envelope: { v: 1, cipher: "none", key_id: null, blob: "e30=" },
+        }],
+        next_after: "1", has_more: false,
+      };
+      throw new Error(`unexpected request ${path}`);
+    },
+    driverCall: async (operation) => {
+      if (operation === "prepare") return [{
+        type: "sync_state",
+        driver_generation: "018f3f7e-0000-7000-8000-000000000099",
+        transport_cursor: "0",
+      }];
+      if (operation === "apply") storageApplied = true;
+      return [];
+    },
+    rosterDriverCall: async (operation, _config, input) => {
+      if (operation === "prepare") return [{ type: "roster_sync_state", transport_cursor: "0" }];
+      if (operation === "apply") {
+        assert.equal(input[0].projection.kind, "key_rotated");
+        recorded = true;
+        return [];
+      }
+      return [];
+    },
+    evaluateCall: async () => ({ status: "importable", projection }),
+    activateKeyRotationsCall: async () => {
+      throw new Error("replacement epoch is missing; import that key out of band");
+    },
+    eventCall: async () => {},
+    readStateCycleCall: async () => {},
+  }), /import that key out of band/u);
+  assert.equal(recorded, true);
+  assert.equal(storageApplied, false);
 });
 
 // ---- pushSaturated is computed by cycle itself (B2 test gate) ----

@@ -101,11 +101,27 @@ function canonicalMessage(projection) {
 
 function canonicalRosterMutation(projection) {
   if (!projection || Array.isArray(projection) || typeof projection !== "object" ||
-      !["member_joined", "member_left", "member_renamed"].includes(projection.kind) ||
+      !["member_joined", "member_left", "member_renamed", "key_rotated"].includes(projection.kind) ||
       !UUID_V7.test(projection.mutation_id ?? "") ||
-      !UUID_V7.test(projection.member_id ?? "") ||
       typeof projection.occurred_at !== "string" ||
       !TIMESTAMP.test(projection.occurred_at) || !validTimestamp(projection.occurred_at)) {
+    malformed("roster mutation projection is invalid");
+  }
+  if (projection.kind === "key_rotated") {
+    if (!KEY_ID.test(projection.epoch ?? "") ||
+        typeof projection.fingerprint !== "string" ||
+        !/^[0-9a-f]{64}$/u.test(projection.fingerprint)) {
+      malformed("key rotation projection is invalid");
+    }
+    return Buffer.from(JSON.stringify({
+      kind: projection.kind,
+      mutation_id: projection.mutation_id,
+      epoch: projection.epoch,
+      fingerprint: projection.fingerprint,
+      occurred_at: projection.occurred_at,
+    }), "utf8");
+  }
+  if (!UUID_V7.test(projection.member_id ?? "")) {
     malformed("roster mutation projection is invalid");
   }
   if (projection.kind === "member_renamed") {
