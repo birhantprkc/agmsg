@@ -1037,7 +1037,7 @@ VALUES ('remote-pending.$key', $owner_pid, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
   [[ "$output" == *"[x] node on PATH"* ]]
 }
 
-@test "remote doctor: passes overall only when age, python3, AND node are all usable" {
+@test "remote doctor: passes with the full toolchain installed" {
   command -v age >/dev/null 2>&1 && command -v age-keygen >/dev/null 2>&1 \
     && command -v python3 >/dev/null 2>&1 && command -v node >/dev/null 2>&1 \
     || skip "all doctor prerequisites are not installed"
@@ -1100,4 +1100,26 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   [ "$status" -eq 0 ]
   [[ "$output" == *"history one"* ]]
   [[ "$output" == *"history two"* ]]
+}
+
+@test "remote doctor: age is optional — its absence does not fail the run" {
+  # cipher "none" is the base and e2ee is available rather than required, so a
+  # new user running doctor must not be told they are missing something they
+  # were never obliged to have.
+  local no_age; no_age="$(path_without_age)"
+  run env PATH="$no_age" bash "$SCRIPTS/remote.sh" doctor
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"All checks passed"* ]]
+  [[ "$output" == *"optional"* ]]
+  [[ "$output" != *"is required for end-to-end encryption"* ]]
+}
+
+@test "remote doctor: python3 stays required while age is optional" {
+  # The three are not interchangeable: without python3 the remote control plane
+  # does not run at all, so it keeps failing the check.
+  local no_py3; no_py3="$(path_without_python3)"
+  run env PATH="$no_py3" bash "$SCRIPTS/remote.sh" doctor
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"[ ] python3 on PATH"* ]]
+  [[ "$output" == *"Some checks failed"* ]]
 }

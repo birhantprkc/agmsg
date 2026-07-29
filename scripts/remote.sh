@@ -140,17 +140,27 @@ cmd_doctor() {
   echo "Checking prerequisites${team:+ for team '$team'}..."
   echo
   local failed=0
+  # age is optional, and the wording has to say so. Remote sync defaults to
+  # cipher "none"; end-to-end encryption is a capability, not a prerequisite.
+  # Reporting its absence as a failure told every new user they were unfit for
+  # a feature they had not asked for -- and, because it set failed=1, doctor
+  # exited non-zero on a machine where everything actually required was present.
+  #
+  # python3 and node below stay required: without them the remote control plane
+  # and data plane do not run at all. The three are not interchangeable and are
+  # deliberately not reported the same way.
   if command -v age >/dev/null 2>&1 && command -v age-keygen >/dev/null 2>&1; then
-    echo "  [x] age / age-keygen on PATH"
+    echo "  [x] age / age-keygen on PATH  (optional)"
   else
-    echo "  [ ] age / age-keygen on PATH"
+    echo "  [ ] age / age-keygen on PATH  (optional)"
     echo
-    echo "'age' is required for end-to-end encryption and was not found on this device. Install it, then retry:"
+    echo "'age' enables end-to-end encryption. Remote sync works without it: teams"
+    echo "default to cipher \"none\", where the server stores blobs it does not read"
+    echo "but which are not encrypted end to end. Install it only if you want E2EE:"
     echo "  macOS (Homebrew):      brew install age"
     echo "  Debian/Ubuntu:         sudo apt install age"
     echo "  Windows (winget):      winget install FiloSottile.age"
     echo "See https://github.com/FiloSottile/age for other install methods."
-    failed=1
   fi
   echo
   if agmsg_python3_usable; then
