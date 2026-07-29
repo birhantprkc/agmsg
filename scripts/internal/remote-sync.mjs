@@ -1843,9 +1843,15 @@ export async function resyncCycle(config, acceptedFloor, dependencies = {}) {
 // A machine that has none of this taking a team from the server. It is not a
 // cycle: there is no local team to reconcile against, no push side, and no
 // credential. What it shares with the normal pull is the part that must not
-// diverge -- evaluatePull decides what may be imported, and the driver applies
-// the same records.
-export async function pullBootstrap(args) {
+// diverge -- evaluatePull decides what may be imported, then roster mutations
+// and chat records go through the same two drivers as a connected cycle.
+export async function pullBootstrap(args, dependencies = {}) {
+  const publicSnapshotCall = dependencies.publicSnapshotCall ?? publicSnapshot;
+  const requestPublicCall = dependencies.requestPublicCall ?? requestPublic;
+  const evaluateCall = dependencies.evaluateCall ?? evaluatePull;
+  const driverCall = dependencies.driverCall ?? driver;
+  const rosterDriverCall = dependencies.rosterDriverCall ?? rosterDriver;
+  const eventCall = dependencies.eventCall ?? event;
   const team = requireName(args.team, "team");
   const teamId = args["team-id"] ?? "";
   if (!UUID_V7.test(teamId)) throw new Error("team-id must be a canonical UUIDv7");
@@ -1854,9 +1860,9 @@ export async function pullBootstrap(args) {
   const limit = Number(args.limit ?? 1000);
   if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new Error("limit must be 1..1000");
 
-  // Fetched before a config exists, so this one call validates itself rather
-  // than going through the binding checks the rest of the pull relies on.
-  const snapshot = await publicSnapshot(serverUrl, teamId);
+  // There is no connected binding yet, so this one call validates itself
+  // rather than going through the checks the rest of the pull relies on.
+  const snapshot = await publicSnapshotCall(serverUrl, teamId);
   const config = {
     format_version: 1,
     local_team: team,
@@ -1870,7 +1876,7 @@ export async function pullBootstrap(args) {
       minimum_security_mode: "plaintext-allowed",
     }],
   };
-  await event("pull.bootstrap.snapshot", {
+  await eventCall("pull.bootstrap.snapshot", {
     team_id: snapshot.team_id, team_name: snapshot.team_name,
     min_available_seq: snapshot.min_available_seq,
   });
@@ -1878,18 +1884,28 @@ export async function pullBootstrap(args) {
   let cursor = String(snapshot.min_available_seq ?? "0");
   let imported = 0;
   for (;;) {
-    const page = await requestPublic(config,
+    const page = await requestPublicCall(config,
       `/v1/teams/${teamId}/messages?after=${cursor}&limit=${limit}`);
     const records = [];
     for (const message of page.messages) {
       records.push({ type: "sync_pull_message", ...message,
-        ...(await evaluatePull(config, snapshot, message)) });
+        ...(await evaluateCall(config, snapshot, message)) });
     }
-    records.push({ type: "sync_pull_cursor", next_after: page.next_after });
-    const applied = await driver("apply", config, records);
-    await event("pull.bootstrap.applied", {
+    const cursorRecord = { type: "sync_pull_cursor", next_after: page.next_after };
+    const rosterRecords = records.filter((record) =>
+      record.status === "importable" &&
+      ["member_joined", "member_left", "member_renamed"].includes(record.projection?.kind));
+    const messageRecords = records.filter((record) => !record.projection?.kind);
+    if (rosterRecords.length + messageRecords.length !== records.length) {
+      throw new Error("pull bootstrap cannot apply this projection kind");
+    }
+    const rosterApplied = rosterRecords.length > 0 ?
+      await rosterDriverCall("apply", config, [...rosterRecords, cursorRecord]) : [];
+    const applied = await driverCall("apply", config, [...messageRecords, cursorRecord]);
+    await eventCall("pull.bootstrap.applied", {
       after: cursor, next_after: page.next_after,
       messages: page.messages.length, result: applied[0] ?? null,
+      roster_result: rosterApplied[0] ?? null,
     });
     imported += page.messages.length;
     cursor = page.next_after;
