@@ -73,9 +73,18 @@ it, out of band.
 That one restraint settles both hard parts.
 
 **When machines switch** is decided by the record's place in the server's
-sequence. Before it, the old key; from it, the new one — a boundary every
-machine reads the same way, for the same reason renames get their order for
-free. No cutover protocol, and no need to stop the other machines first.
+sequence — a boundary every machine reads the same way, for the same reason
+renames get their order for free. No cutover protocol, and no need to stop the
+other machines first.
+
+The record is itself sealed, and which key seals it settles the rest. **It is
+sealed with the OLD key, and the new one takes effect from the sequence after
+it.** Sealing it with the new key would make the boundary land one position
+earlier, and would cost the thing the announcement exists for: someone holding
+only the old key would see an undecryptable blob rather than a reason. A machine
+should be able to say "the key changed and I do not have the new one", not merely
+stop understanding its own team. The fingerprint is not the key, so reading the
+announcement gains a removed member nothing but the fact.
 
 **Who ends up holding the new key** is settled by leaving it out. Someone who
 has been removed still holds the old key, so they can read the announcement —
