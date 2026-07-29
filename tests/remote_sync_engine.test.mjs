@@ -1334,6 +1334,44 @@ test("pull bootstrap dispatches a real mixed roster and message page", async () 
   assert.deepEqual(storageInputs[0].at(-1), { type: "sync_pull_cursor", next_after: "80" });
 });
 
+test("pull bootstrap rejects unsupported projection kinds before either cursor advances", async () => {
+  const teamId = "018f3f7e-0000-7000-8000-000000000001";
+  const serverId = "018f3f7e-0000-7000-8000-000000000002";
+  let storageApplied = false;
+  let rosterApplied = false;
+  await assert.rejects(pullBootstrap({
+    team: "clone", "team-id": teamId, endpoint: "http://127.0.0.1:8787",
+  }, {
+    publicSnapshotCall: async () => ({
+      server_instance_id: serverId, team_id: teamId, team_name: "source",
+      min_available_seq: "0",
+    }),
+    requestPublicCall: async () => ({
+      messages: [{
+        server_seq: "1", id: "10000000-0000-4000-8000-000000000001",
+        server_received_at: "2026-07-29T05:00:00.000000Z",
+        envelope: { v: 1, cipher: "none", key_id: null, blob: "e30=" },
+      }],
+      next_after: "1", has_more: false,
+    }),
+    evaluateCall: async () => ({
+      status: "importable",
+      projection: {
+        kind: "key_rotated",
+        mutation_id: "018f3f7e-0000-7000-8000-000000000010",
+        epoch: "1", key_id: "epoch-1", fingerprint: "a".repeat(64),
+        occurred_at: "2026-07-29T05:00:00.000000Z",
+      },
+      policy_revision: "0", local_security_revision: "0",
+    }),
+    driverCall: async () => { storageApplied = true; },
+    rosterDriverCall: async () => { rosterApplied = true; },
+    eventCall: async () => {},
+  }), /cannot apply this projection kind/u);
+  assert.equal(storageApplied, false);
+  assert.equal(rosterApplied, false);
+});
+
 test("cycle pushes a key rotation alone and waits for ordered pull before activation", async () => {
   const rotationWire = "550e8400-e29b-41d4-a716-446655440003";
   const messageWire = "550e8400-e29b-41d4-a716-446655440004";

@@ -1896,6 +1896,9 @@ export async function pullBootstrap(args, dependencies = {}) {
       record.status === "importable" &&
       ["member_joined", "member_left", "member_renamed"].includes(record.projection?.kind));
     const messageRecords = records.filter((record) => !record.projection?.kind);
+    if (rosterRecords.length + messageRecords.length !== records.length) {
+      throw new Error("pull bootstrap cannot apply this projection kind");
+    }
     const rosterApplied = rosterRecords.length > 0 ?
       await rosterDriverCall("apply", config, [...rosterRecords, cursorRecord]) : [];
     const applied = await driverCall("apply", config, [...messageRecords, cursorRecord]);
