@@ -146,3 +146,33 @@ test("roster mutations use the message transport and converge by server sequence
     await rm(scratch, { recursive: true });
   }
 });
+
+test("key rotation is transported as a fingerprint-only journal mutation", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "agmsg-key-rotation-sync-"));
+  try {
+    const config = join(scratch, "config.json");
+    const mutationId = "018f3f7e-0000-7000-8000-000000000022";
+    await writeFile(config, `${JSON.stringify({
+      name: "demo", team_id: teamId, agents: {},
+    })}\n`);
+    await writeFile(join(scratch, "roster.jsonl"), `${JSON.stringify({
+      type: "key_rotated",
+      id: mutationId,
+      epoch: "1",
+      key_id: "epoch-20260729010000-abcd",
+      fingerprint: "b".repeat(64),
+      at: "2026-07-29T01:00:00Z",
+    })}\n`);
+    const candidate = call("prepare", config, [{
+      type: "sync_prepare", envelope_v: 1, cipher: "none", key_id: null,
+      recipients: [], max_blob_bytes: 1_048_576, allow_new: true,
+    }], ["10"]).find((record) => record.type === "roster_sync_push_candidate");
+    assert.equal(candidate.projection.kind, "key_rotated");
+    const opened = await openEnvelope({ envelope: candidate.envelope, max_blob_bytes: 1_048_576 });
+    assert.deepEqual(opened, candidate.projection);
+    assert.equal(JSON.stringify(opened).includes("age1"), false);
+    assert.equal(JSON.stringify(opened).includes("AGE-SECRET"), false);
+  } finally {
+    await rm(scratch, { recursive: true });
+  }
+});

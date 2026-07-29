@@ -197,23 +197,81 @@ skip_if_no_age() {
   [ "$epochs" -eq 1 ]
 }
 
-# --- rotate (NOT READY) --------------------------------------------------
+# --- rotate ---------------------------------------------------------------
 
-@test "key rotate: refuses unconditionally and changes no state (NOT READY)" {
+@test "key rotate: creates a replacement identity and journals only its fingerprint" {
   skip_if_no_age
   bash "$SCRIPTS/key.sh" generate testteam
-  before=$(cat "$SCRIPTS/../teams/testteam/config.json")
   run bash "$SCRIPTS/key.sh" rotate testteam
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"not available in this release"* ]]
-  after=$(cat "$SCRIPTS/../teams/testteam/config.json")
-  [ "$before" = "$after" ]
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Generated replacement key"* ]]
+  journal="$SCRIPTS/../teams/testteam/roster.jsonl"
+  epoch=$(python3 -c "import json; print([json.loads(x) for x in open('$journal') if json.loads(x).get('type') == 'key_rotated'][-1]['epoch'])")
+  key_id=$(python3 -c "import json; print([json.loads(x) for x in open('$journal') if json.loads(x).get('type') == 'key_rotated'][-1]['key_id'])")
+  fingerprint=$(python3 -c "import json; print([json.loads(x) for x in open('$journal') if json.loads(x).get('type') == 'key_rotated'][-1]['fingerprint'])")
+  [ "$epoch" = "1" ]
+  [[ "$key_id" == epoch-* ]]
+  [[ "$fingerprint" =~ ^[0-9a-f]{64}$ ]]
+  [ -f "$SCRIPTS/../run/remote-credentials/testteam/keys/$key_id.key" ]
+  ! grep -q 'AGE-SECRET-KEY\\|age1' "$journal"
+  run bash "$SCRIPTS/key.sh" show testteam --key-id "$key_id"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Public recipient: age1"* ]]
 }
 
-@test "key rotate: refuses even for a team with no key at all" {
+@test "key rotate: an old identity cannot decrypt data for the replacement epoch" {
+  skip_if_no_age
+  bash "$SCRIPTS/key.sh" generate testteam
+  old_epoch=$(python3 -c "import json; print(json.load(open('$SCRIPTS/../teams/testteam/config.json'))['remote_key']['current']['key_id'])")
+  old_identity="$SCRIPTS/../run/remote-credentials/testteam/keys/$old_epoch.key"
+  bash "$SCRIPTS/key.sh" rotate testteam
+  journal="$SCRIPTS/../teams/testteam/roster.jsonl"
+  new_key_id=$(python3 -c "import json; print([json.loads(x) for x in open('$journal') if json.loads(x).get('type') == 'key_rotated'][-1]['key_id'])")
+  new_identity="$SCRIPTS/../run/remote-credentials/testteam/keys/$new_key_id.key"
+  new_recipient=$(age-keygen -y "$new_identity")
+  ciphertext="$TEST_SKILL_DIR/replacement.age"
+  printf 'future message' | age -r "$new_recipient" -o "$ciphertext"
+  run age -d -i "$old_identity" "$ciphertext"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"future message"* ]]
+}
+
+@test "key import: installs an out-of-band replacement only after its fingerprint is announced" {
+  skip_if_no_age
+  bash "$SCRIPTS/key.sh" generate testteam
+  bash "$SCRIPTS/key.sh" rotate testteam
+  journal="$SCRIPTS/../teams/testteam/roster.jsonl"
+  key_id=$(python3 -c "import json; print([json.loads(x) for x in open('$journal') if json.loads(x).get('type') == 'key_rotated'][-1]['key_id'])")
+  identity="$SCRIPTS/../run/remote-credentials/testteam/keys/$key_id.key"
+  secret=$(grep '^AGE-SECRET-KEY-' "$identity")
+  rm -f "$identity"
+  run bash -c "printf '%s' '$secret' | bash '$SCRIPTS/key.sh' import testteam --identity-stdin"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Imported replacement key"* ]]
+  [ -f "$identity" ]
+}
+
+@test "key rotate: advances the shared epoch only after the previous winner is synchronized" {
+  skip_if_no_age
+  bash "$SCRIPTS/key.sh" generate testteam
+  config="$SCRIPTS/../teams/testteam/config.json"
+  journal="$SCRIPTS/../teams/testteam/roster.jsonl"
+  server_id="018f3f7e-0000-7000-8000-000000000000"
+  team_id="018f3f7e-0000-7000-8000-000000000001"
+  python3 -c "import json; p='$config'; d=json.load(open(p)); d['remote_binding']={'server_instance_id':'$server_id','remote_team_id':'$team_id'}; open(p,'w').write(json.dumps(d)+'\n')"
+  bash "$SCRIPTS/key.sh" rotate testteam
+  mutation_id=$(python3 -c "import json; print([json.loads(x) for x in open('$journal') if json.loads(x).get('type') == 'key_rotated'][-1]['id'])")
+  printf '%s\n' "{\"type\":\"roster_synced\",\"mutation_id\":\"$mutation_id\",\"server_seq\":\"8\",\"wire_id\":\"550e8400-e29b-41d4-a716-446655440006\",\"server_instance_id\":\"$server_id\",\"remote_team_id\":\"$team_id\"}" >> "$journal"
+  run bash "$SCRIPTS/key.sh" rotate testteam
+  [ "$status" -eq 0 ]
+  latest_epoch=$(python3 -c "import json; print([json.loads(x) for x in open('$journal') if json.loads(x).get('type') == 'key_rotated'][-1]['epoch'])")
+  [ "$latest_epoch" = "2" ]
+}
+
+@test "key rotate: refuses a team with no current key" {
   run bash "$SCRIPTS/key.sh" rotate testteam
   [ "$status" -ne 0 ]
-  [[ "$output" == *"not available in this release"* ]]
+  [[ "$output" == *"no current key"* ]]
 }
 
 # --- dispatch --------------------------------------------------------------

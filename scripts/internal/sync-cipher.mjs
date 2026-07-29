@@ -17,6 +17,7 @@ const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/u;
 const KEY_ID = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
+const EPOCH_REVISION = /^(0|[1-9][0-9]*)$/u;
 const AGE_RECIPIENT = /^age1[0-9a-z]{58}$/u;
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
 const MAGIC = Buffer.concat([Buffer.from("agmsg-age-v1", "ascii"), Buffer.alloc(4)]);
@@ -101,11 +102,29 @@ function canonicalMessage(projection) {
 
 function canonicalRosterMutation(projection) {
   if (!projection || Array.isArray(projection) || typeof projection !== "object" ||
-      !["member_joined", "member_left", "member_renamed"].includes(projection.kind) ||
+      !["member_joined", "member_left", "member_renamed", "key_rotated"].includes(projection.kind) ||
       !UUID_V7.test(projection.mutation_id ?? "") ||
-      !UUID_V7.test(projection.member_id ?? "") ||
       typeof projection.occurred_at !== "string" ||
       !TIMESTAMP.test(projection.occurred_at) || !validTimestamp(projection.occurred_at)) {
+    malformed("roster mutation projection is invalid");
+  }
+  if (projection.kind === "key_rotated") {
+    if (!EPOCH_REVISION.test(projection.epoch ?? "") ||
+        !KEY_ID.test(projection.key_id ?? "") ||
+        typeof projection.fingerprint !== "string" ||
+        !/^[0-9a-f]{64}$/u.test(projection.fingerprint)) {
+      malformed("key rotation projection is invalid");
+    }
+    return Buffer.from(JSON.stringify({
+      kind: projection.kind,
+      mutation_id: projection.mutation_id,
+      epoch: projection.epoch,
+      key_id: projection.key_id,
+      fingerprint: projection.fingerprint,
+      occurred_at: projection.occurred_at,
+    }), "utf8");
+  }
+  if (!UUID_V7.test(projection.member_id ?? "")) {
     malformed("roster mutation projection is invalid");
   }
   if (projection.kind === "member_renamed") {

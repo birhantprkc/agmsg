@@ -141,6 +141,122 @@ test("legacy messages remain discriminator-free while roster mutations use kind"
     envelope: rosterEnvelope,
     max_blob_bytes: 1_048_576,
   }), roster);
+
+  const rotation = {
+    kind: "key_rotated",
+    mutation_id: "018f3f7e-0000-7000-8000-000000000012",
+    epoch: "1",
+    key_id: "epoch-20260729010000-abcd",
+    fingerprint: "a".repeat(64),
+    occurred_at: "2026-07-29T01:00:00.000000Z",
+  };
+  const rotationEnvelope = sealEnvelope({
+    ...base,
+    wire_id: "550e8400-e29b-41d4-a716-446655440002",
+    projection: rotation,
+  });
+  assert.deepEqual(await openEnvelope({
+    envelope: rotationEnvelope,
+    max_blob_bytes: 1_048_576,
+  }), rotation);
+  assert.equal(Buffer.from(rotationEnvelope.blob, "base64").toString("utf8").includes("age1"), false);
+});
+
+test("a late concurrent rotation may use the preceding key but ordinary data may not", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "agmsg-age-rotation-race-"));
+  const oldIdentity = join(scratch, "old.identity");
+  const newIdentity = join(scratch, "new.identity");
+  await writeFile(oldIdentity, `${manifest.recipient_sets.team_a.identity}\n`, { mode: 0o600 });
+  await writeFile(newIdentity, `${manifest.recipient_sets.team_b.identity}\n`, { mode: 0o600 });
+  const oldKeyId = "epoch-old";
+  const newKeyId = "epoch-winner";
+  const rotation = {
+    kind: "key_rotated",
+    mutation_id: "018f3f7e-0000-7000-8000-000000000013",
+    epoch: "1",
+    key_id: "epoch-loser",
+    fingerprint: "b".repeat(64),
+    occurred_at: "2026-07-29T01:00:00.000000Z",
+  };
+  const wireId = "550e8400-e29b-41d4-a716-446655440003";
+  const rotationEnvelope = sealEnvelope({
+    type: "sync_seal",
+    envelope_v: 1,
+    max_blob_bytes: 1_048_576,
+    wire_id: wireId,
+    team_id: manifest.binding.team_id,
+    protocol_version: 1,
+    cipher: "age-v1",
+    key_id: oldKeyId,
+    recipients: [manifest.recipient_sets.team_a.recipient],
+    projection: rotation,
+  });
+  const raceConfig = {
+    local_team: "demo",
+    server_instance_id: "018f3f7e-0000-7000-8000-000000000000",
+    remote_team_id: manifest.binding.team_id,
+    protocol_version: 1,
+    cipher_profile: "age-v1",
+    local_security_history: [{ local_security_revision: "0", effective_from_seq: "1",
+      minimum_security_mode: "e2ee-required" }],
+    age_v1: {
+      epoch_snapshot: { history: [{
+        epoch_revision: "0", effective_from_seq: "1", cipher: "age-v1",
+        key_id: oldKeyId, recipients: [manifest.recipient_sets.team_a.recipient],
+      }] },
+      identity_files: { [oldKeyId]: oldIdentity, [newKeyId]: newIdentity },
+    },
+    age_v1_runtime_history: [{
+      epoch_revision: "1", effective_from_seq: "2", cipher: "age-v1",
+      key_id: newKeyId, recipients: [manifest.recipient_sets.team_b.recipient],
+    }],
+  };
+  try {
+    const accepted = await evaluatePull(raceConfig, capabilities(raceConfig, "age-v1"), {
+      server_seq: "2",
+      id: wireId,
+      server_received_at: "2026-07-29T01:00:01.000000Z",
+      envelope: rotationEnvelope,
+    });
+    assert.equal(accepted.status, "importable");
+    assert.deepEqual(accepted.projection, rotation);
+
+    raceConfig.age_v1.identity_files["epoch-current"] = newIdentity;
+    raceConfig.age_v1_runtime_history.push({
+      epoch_revision: "2", effective_from_seq: "3", cipher: "age-v1",
+      key_id: "epoch-current", recipients: [manifest.recipient_sets.team_b.recipient],
+    });
+    const stale = await evaluatePull(raceConfig, capabilities(raceConfig, "age-v1"), {
+      server_seq: "3",
+      id: wireId,
+      server_received_at: "2026-07-29T01:00:02.000000Z",
+      envelope: rotationEnvelope,
+    });
+    assert.equal(stale.status, "policy_violation");
+
+    const messageId = "550e8400-e29b-41d4-a716-446655440004";
+    const oldKeyMessage = sealEnvelope({
+      type: "sync_seal",
+      envelope_v: 1,
+      max_blob_bytes: 1_048_576,
+      wire_id: messageId,
+      team_id: manifest.binding.team_id,
+      protocol_version: 1,
+      cipher: "age-v1",
+      key_id: oldKeyId,
+      recipients: [manifest.recipient_sets.team_a.recipient],
+      projection: manifest.canonical_message,
+    });
+    const rejected = await evaluatePull(raceConfig, capabilities(raceConfig, "age-v1"), {
+      server_seq: "2",
+      id: messageId,
+      server_received_at: "2026-07-29T01:00:01.000000Z",
+      envelope: oldKeyMessage,
+    });
+    assert.equal(rejected.status, "policy_violation");
+  } finally {
+    await rm(scratch, { recursive: true });
+  }
 });
 
 test("age-v1 accepts only native X25519 identity files", () => {
