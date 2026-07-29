@@ -917,7 +917,11 @@ _remote_sync_engine_start() {
   fi
   # nohup so the engine outlives this connect; remote-sync.sh execs node, so $!
   # stays the engine's own pid and is exactly what _remote_sync_engine_stop signals.
-  nohup bash "$SCRIPT_DIR/remote-sync.sh" run --team "$team" >> "$logfile" 2>&1 &
+  # fds 3 and 4 are closed explicitly: under bats, fd 3 is the TAP pipe, and a
+  # daemon inheriting it keeps the whole test file open until the CI timeout —
+  # the last-ok-then-orphan hang this repo has met before, this time spawned by
+  # production code rather than a test.
+  nohup bash "$SCRIPT_DIR/remote-sync.sh" run --team "$team" >> "$logfile" 2>&1 3>&- 4>&- &
   echo $! > "$pidfile"
   disown 2>/dev/null || true
 }
