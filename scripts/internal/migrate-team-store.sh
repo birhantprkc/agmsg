@@ -18,6 +18,11 @@ TEAM="${1:?Usage: migrate-team-store.sh <team>}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# The team config and its lock live under the connection root, exactly where
+# remote.sh connect wrote them — AGMSG_SYNC_CONNECTION_DIR when set, the skill
+# dir otherwise. Resolving them from the skill dir alone would miss the config a
+# connect with a custom connection dir just created.
+CONNECTION_ROOT="${AGMSG_SYNC_CONNECTION_DIR:-$SKILL_DIR}"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/../lib/storage.sh"
 # shellcheck disable=SC1091
@@ -30,7 +35,7 @@ source "$SCRIPT_DIR/../lib/driver-registry.sh"
 
 agmsg_validate_team_name "$TEAM" || exit 1
 
-CONFIG="$SKILL_DIR/teams/$TEAM/config.json"
+CONFIG="$CONNECTION_ROOT/teams/$TEAM/config.json"
 [ -f "$CONFIG" ] || { echo "Team not found: $TEAM" >&2; exit 1; }
 
 SHARED="$(_agmsg_runtime_db_path)"
@@ -142,7 +147,7 @@ done
 # Point the team at its new store, under the lock every other config writer
 # takes. This is the ordering that matters: until it lands the team still
 # resolves to the shared store, so everything above is a copy nothing reads.
-agmsg_lock_acquire "$SKILL_DIR/teams/$TEAM" || exit 1
+agmsg_lock_acquire "$CONNECTION_ROOT/teams/$TEAM" || exit 1
 updated="$(agmsg_sqlite_mem "SELECT json_set(CAST(readfile('$(agmsg_sql_readfile_path "$CONFIG")') AS TEXT),
   '\$.drivers.layout', 'per-team');")"
 agmsg_write_atomic "$CONFIG" "$updated"
