@@ -876,10 +876,10 @@ test("age-v1 write selection exposes only public epoch material", () => {
   assert.equal(JSON.stringify(selected).includes("identity"), false);
 });
 
-test("age-v1 configuration verifies the complete snapshot hash chain", () => {
+test("age-v1 configuration verifies the complete epoch snapshot hash chain", () => {
   assert.throws(() => ageSnapshotDigest({ bad: "\ud800" }), /lone surrogate/u);
   assert.throws(() => ageSnapshotDigest({ ["\udc00"]: "bad-key" }), /lone surrogate/u);
-  const snapshot = {
+  const initialAgeSnapshot = {
     profile: "age-v1",
     server_instance_id: config.server_instance_id,
     team_id: config.remote_team_id,
@@ -893,9 +893,10 @@ test("age-v1 configuration verifies the complete snapshot hash chain", () => {
       ] }],
   };
   const ageConfig = { ...config, cipher_profile: "age-v1", age_v1: {
-    epoch_snapshot: snapshot,
+    epoch_snapshot: initialAgeSnapshot,
     checkpoint: { epoch_revision: "0", writer_generation: "0",
-      snapshot_sha256: ageSnapshotDigest(snapshot), confirmed_at: "2026-07-21T00:00:00.000Z" },
+      snapshot_sha256: ageSnapshotDigest(initialAgeSnapshot),
+      confirmed_at: "2026-07-21T00:00:00.000Z" },
     identity_files: {}, age_version: "v1.3.1",
   } };
   assert.doesNotThrow(() => validateAgeConfiguration(ageConfig));
@@ -904,49 +905,52 @@ test("age-v1 configuration verifies the complete snapshot hash chain", () => {
       snapshot_sha256: "0".repeat(64) },
   } }), /checkpoint/u);
   assert.throws(() => validateAgeConfiguration({ ...ageConfig, age_v1: {
-    ...ageConfig.age_v1, epoch_snapshot: { ...snapshot, previous_snapshot_sha256: "1".repeat(64) },
-  } }), /hash chain/u);
-  const rotated = { ...snapshot, epoch_revision: "1",
-    writer_generation: "1", previous_snapshot_sha256: ageSnapshotDigest(snapshot),
-    history: [...snapshot.history, { ...snapshot.history[0], epoch_revision: "1",
-      effective_from_seq: "2", key_id: "epoch-2" }] };
-  const chained = { ...ageConfig, age_v1: {
     ...ageConfig.age_v1,
-    epoch_snapshots: [snapshot, rotated],
+    epoch_snapshot: { ...initialAgeSnapshot, previous_snapshot_sha256: "1".repeat(64) },
+  } }), /hash chain/u);
+  const rotatedAgeSnapshot = { ...initialAgeSnapshot, epoch_revision: "1",
+    writer_generation: "1", previous_snapshot_sha256: ageSnapshotDigest(initialAgeSnapshot),
+    history: [...initialAgeSnapshot.history, { ...initialAgeSnapshot.history[0], epoch_revision: "1",
+      effective_from_seq: "2", key_id: "epoch-2" }] };
+  const chainedAgeConfig = { ...ageConfig, age_v1: {
+    ...ageConfig.age_v1,
+    epoch_snapshots: [initialAgeSnapshot, rotatedAgeSnapshot],
     epoch_snapshot: undefined,
     checkpoint: { ...ageConfig.age_v1.checkpoint, epoch_revision: "1",
       writer_generation: "1",
-      snapshot_sha256: ageSnapshotDigest(rotated) },
+      snapshot_sha256: ageSnapshotDigest(rotatedAgeSnapshot) },
   } };
-  assert.doesNotThrow(() => validateAgeConfiguration(chained));
+  assert.doesNotThrow(() => validateAgeConfiguration(chainedAgeConfig));
 
-  const tamperedInitial = { ...snapshot, authorized_writers: ["writer-b"] };
-  assert.throws(() => validateAgeConfiguration({ ...chained, age_v1: {
-    ...chained.age_v1, epoch_snapshots: [tamperedInitial, rotated],
+  const tamperedInitial = { ...initialAgeSnapshot, authorized_writers: ["writer-b"] };
+  assert.throws(() => validateAgeConfiguration({ ...chainedAgeConfig, age_v1: {
+    ...chainedAgeConfig.age_v1,
+    epoch_snapshots: [tamperedInitial, rotatedAgeSnapshot],
   } }), /hash chain/u);
 
   const reusedKeyId = {
-    ...rotated,
-    history: [...snapshot.history, {
-      ...rotated.history.at(-1),
-      key_id: snapshot.history[0].key_id,
+    ...rotatedAgeSnapshot,
+    history: [...initialAgeSnapshot.history, {
+      ...rotatedAgeSnapshot.history.at(-1),
+      key_id: initialAgeSnapshot.history[0].key_id,
       recipients: ["age1ykvctct4aklx4f4mnjd8rmzqs7p2le9ufg4faydljsk5mvcy0pls27mu64"],
     }],
   };
-  assert.throws(() => validateAgeConfiguration({ ...chained, age_v1: {
-    ...chained.age_v1,
-    epoch_snapshots: [snapshot, reusedKeyId],
-    checkpoint: { ...chained.age_v1.checkpoint,
+  assert.throws(() => validateAgeConfiguration({ ...chainedAgeConfig, age_v1: {
+    ...chainedAgeConfig.age_v1,
+    epoch_snapshots: [initialAgeSnapshot, reusedKeyId],
+    checkpoint: { ...chainedAgeConfig.age_v1.checkpoint,
       snapshot_sha256: ageSnapshotDigest(reusedKeyId) },
   } }), /conflicting recipient manifests/u);
 
-  const revisionTwo = { ...rotated, epoch_revision: "2", writer_generation: "2",
-    previous_snapshot_sha256: ageSnapshotDigest(rotated),
-    history: [...rotated.history, { ...rotated.history.at(-1), epoch_revision: "2",
+  const revisionTwo = { ...rotatedAgeSnapshot, epoch_revision: "2", writer_generation: "2",
+    previous_snapshot_sha256: ageSnapshotDigest(rotatedAgeSnapshot),
+    history: [...rotatedAgeSnapshot.history, {
+      ...rotatedAgeSnapshot.history.at(-1), epoch_revision: "2",
       effective_from_seq: "3", key_id: "epoch-3" }] };
-  assert.throws(() => validateAgeConfiguration({ ...chained, age_v1: {
-    ...chained.age_v1, epoch_snapshots: [snapshot, revisionTwo],
-    checkpoint: { ...chained.age_v1.checkpoint, epoch_revision: "2",
+  assert.throws(() => validateAgeConfiguration({ ...chainedAgeConfig, age_v1: {
+    ...chainedAgeConfig.age_v1, epoch_snapshots: [initialAgeSnapshot, revisionTwo],
+    checkpoint: { ...chainedAgeConfig.age_v1.checkpoint, epoch_revision: "2",
       writer_generation: "2", snapshot_sha256: ageSnapshotDigest(revisionTwo) },
   } }), /missing revision/u);
 });
@@ -957,7 +961,7 @@ test("retained age checkpoint survives sync config reset and rejects same-revisi
   const previousStorage = process.env.AGMSG_SYNC_STORAGE_DIR;
   process.env.AGMSG_SYNC_TRUST_DIR = join(root, "trust");
   process.env.AGMSG_SYNC_STORAGE_DIR = join(root, "resettable-store");
-  const snapshot = {
+  const initialAgeSnapshot = {
     profile: "age-v1", server_instance_id: config.server_instance_id,
     team_id: config.remote_team_id, epoch_revision: "0", writer_generation: "0",
     authorized_writers: ["writer-a"], previous_snapshot_sha256: null,
@@ -973,35 +977,38 @@ test("retained age checkpoint survives sync config reset and rejects same-revisi
     identity_files: {}, age_version: "v1.3.1",
   } });
   try {
-    await assert.rejects(retainAgeCheckpoint(makeConfig(snapshot), undefined), /operator-live/u);
-    const retained = await retainAgeCheckpoint(makeConfig(snapshot), "operator-live");
-    assert.equal(retained.snapshot_sha256, ageSnapshotDigest(snapshot));
+    await assert.rejects(
+      retainAgeCheckpoint(makeConfig(initialAgeSnapshot), undefined), /operator-live/u);
+    const retained = await retainAgeCheckpoint(
+      makeConfig(initialAgeSnapshot), "operator-live");
+    assert.equal(retained.snapshot_sha256, ageSnapshotDigest(initialAgeSnapshot));
     const resettableConfig = join(process.env.AGMSG_SYNC_STORAGE_DIR, "remote-sync", "demo.json");
     await mkdir(join(process.env.AGMSG_SYNC_STORAGE_DIR, "remote-sync"), { recursive: true });
     await writeFile(resettableConfig, "{}\n");
     await unlink(resettableConfig);
-    const conflicting = { ...snapshot, authorized_writers: ["writer-b"] };
+    const conflicting = { ...initialAgeSnapshot, authorized_writers: ["writer-b"] };
     await assert.rejects(retainAgeCheckpoint(makeConfig(conflicting), "operator-live"),
       /same-revision conflict/u);
-    const rotated = {
-      ...snapshot,
+    const rotatedAgeSnapshot = {
+      ...initialAgeSnapshot,
       epoch_revision: "1",
       writer_generation: "1",
-      previous_snapshot_sha256: ageSnapshotDigest(snapshot),
-      history: [...snapshot.history, {
-        ...snapshot.history[0], epoch_revision: "1",
+      previous_snapshot_sha256: ageSnapshotDigest(initialAgeSnapshot),
+      history: [...initialAgeSnapshot.history, {
+        ...initialAgeSnapshot.history[0], epoch_revision: "1",
         effective_from_seq: "2", key_id: "epoch-2",
       }],
     };
     const advanced = { ...config, cipher_profile: "age-v1", age_v1: {
-      epoch_snapshots: [snapshot, rotated],
+      epoch_snapshots: [initialAgeSnapshot, rotatedAgeSnapshot],
       checkpoint: { epoch_revision: "1", writer_generation: "1",
-        snapshot_sha256: ageSnapshotDigest(rotated), confirmed_at: "2026-07-22T00:00:00.000Z" },
+        snapshot_sha256: ageSnapshotDigest(rotatedAgeSnapshot),
+        confirmed_at: "2026-07-22T00:00:00.000Z" },
       identity_files: {}, age_version: "v1.3.1",
     } };
     const retainedAdvanced = await retainAgeCheckpoint(advanced, "operator-live");
     assert.equal(retainedAdvanced.epoch_revision, "1");
-    await assert.rejects(retainAgeCheckpoint(makeConfig(snapshot), "operator-live"),
+    await assert.rejects(retainAgeCheckpoint(makeConfig(initialAgeSnapshot), "operator-live"),
       /rollback/u);
   } finally {
     if (previousTrust === undefined) delete process.env.AGMSG_SYNC_TRUST_DIR;
@@ -1016,7 +1023,7 @@ test("age configure authenticates the connected credential before retaining trus
   const previousFetch = globalThis.fetch;
   await withConnectedCredential(async (root) => {
     await writeConnectedTeam(root, { capabilities: { write_allowed_ciphers: ["age-v1"] } });
-    const snapshot = {
+    const ageSnapshot = {
       authorized_writers: ["writer-a"],
       epoch_revision: "0",
       history: [{ cipher: "age-v1", effective_from_seq: "1", epoch_revision: "0",
@@ -1029,8 +1036,8 @@ test("age configure authenticates the connected credential before retaining trus
       team_id: config.remote_team_id,
       writer_generation: "0",
     };
-    const snapshotPath = join(root, "snapshot.json");
-    await writeFile(snapshotPath, JSON.stringify(snapshot));
+    const ageSnapshotPath = join(root, "epoch-snapshot.json");
+    await writeFile(ageSnapshotPath, JSON.stringify(ageSnapshot));
     const fakeAge = join(root, "age");
     await writeFile(fakeAge, "#!/bin/sh\necho v1.3.1\n", { mode: 0o700 });
     const saved = {
@@ -1058,8 +1065,8 @@ test("age configure authenticates the connected credential before retaining trus
     try {
       await assert.rejects(configure({ team: "demo", server: "https://sync.example",
         "team-id": config.remote_team_id, "minimum-security": "e2ee-required",
-        cipher: "age-v1", "age-snapshot": snapshotPath,
-        "age-checkpoint": `0:${ageSnapshotDigest(snapshot)}`,
+        cipher: "age-v1", "age-snapshot": ageSnapshotPath,
+        "age-checkpoint": `0:${ageSnapshotDigest(ageSnapshot)}`,
         "age-confirmation": "operator-live" }), /unauthenticated/u);
       assert.equal(calls, 2);
       await assert.rejects(readdir(process.env.AGMSG_SYNC_TRUST_DIR),
@@ -1082,7 +1089,7 @@ test("age configure imports a complete chain without activating its future epoch
     await writeConnectedTeam(root, { capabilities: { write_allowed_ciphers: ["age-v1"] } });
     const recipient0 = "age1mmqjrejftea4f6xh47lhpc0jn4vw0yuhz349sw2e3sfl22k5gcjsv6xcvp";
     const recipient1 = "age1ykvctct4aklx4f4mnjd8rmzqs7p2le9ufg4faydljsk5mvcy0pls27mu64";
-    const snapshot0 = {
+    const ageSnapshot0 = {
       authorized_writers: ["writer-a"],
       epoch_revision: "0",
       history: [{ cipher: "age-v1", effective_from_seq: "1", epoch_revision: "0",
@@ -1093,20 +1100,20 @@ test("age configure imports a complete chain without activating its future epoch
       team_id: config.remote_team_id,
       writer_generation: "0",
     };
-    const snapshot1 = {
-      ...snapshot0,
+    const ageSnapshot1 = {
+      ...ageSnapshot0,
       epoch_revision: "1",
-      history: [...snapshot0.history, {
+      history: [...ageSnapshot0.history, {
         cipher: "age-v1", effective_from_seq: "2", epoch_revision: "1",
         key_id: "epoch-1", recipients: [recipient1],
       }],
-      previous_snapshot_sha256: ageSnapshotDigest(snapshot0),
+      previous_snapshot_sha256: ageSnapshotDigest(ageSnapshot0),
       writer_generation: "1",
     };
-    const snapshot0Path = join(root, "snapshot-0.json");
-    const snapshot1Path = join(root, "snapshot-1.json");
-    await writeFile(snapshot0Path, JSON.stringify(snapshot0));
-    await writeFile(snapshot1Path, JSON.stringify(snapshot1));
+    const ageSnapshot0Path = join(root, "epoch-snapshot-0.json");
+    const ageSnapshot1Path = join(root, "epoch-snapshot-1.json");
+    await writeFile(ageSnapshot0Path, JSON.stringify(ageSnapshot0));
+    await writeFile(ageSnapshot1Path, JSON.stringify(ageSnapshot1));
     const fakeAge = join(root, "age");
     await writeFile(fakeAge, "#!/bin/sh\necho v1.3.1\n", { mode: 0o700 });
     const saved = {
@@ -1130,8 +1137,8 @@ test("age configure imports a complete chain without activating its future epoch
     try {
       await configure({ team: "demo", server: "https://sync.example",
         "team-id": config.remote_team_id, "minimum-security": "e2ee-required",
-        cipher: "age-v1", "age-snapshot": [snapshot0Path, snapshot1Path],
-        "age-checkpoint": `1:${ageSnapshotDigest(snapshot1)}`,
+        cipher: "age-v1", "age-snapshot": [ageSnapshot0Path, ageSnapshot1Path],
+        "age-checkpoint": `1:${ageSnapshotDigest(ageSnapshot1)}`,
         "age-confirmation": "operator-live" });
       const stored = JSON.parse(await readFile(
         join(process.env.AGMSG_SYNC_STORAGE_DIR, "remote-sync", "demo.json"), "utf8"));
@@ -1409,7 +1416,7 @@ test("pull bootstrap dispatches a real mixed roster and message page", async () 
       messages: [...roster, ...messages].map(({ projection: _projection, ...message }) => message),
       next_after: "80", has_more: false,
     }),
-    evaluateCall: async (_config, _snapshot, message) => ({
+    evaluateCall: async (_config, _teamSnapshot, message) => ({
       status: "importable",
       projection: [...roster, ...messages].find((entry) => entry.id === message.id).projection,
       policy_revision: "0", local_security_revision: "0",

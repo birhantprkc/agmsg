@@ -65,7 +65,8 @@ scripts/remote-sync.sh once --team example-team
 
 For an `age-v1` binding, install the standard `age` CLI and provision a
 freshness-confirmed epoch snapshot outside the message server. Identity files
-must be regular files with mode `0600` on POSIX systems. The snapshot is public
+must be regular files with mode `0600` on POSIX systems. The epoch snapshot is
+public
 key material and its file must use compact RFC 8785 JCS; the expanded example
 below shows its minimum initial-epoch data shape:
 
@@ -111,8 +112,8 @@ scripts/remote-sync.sh configure \
 ```
 
 For a rotated team, pass the complete authority-confirmed chain in ascending
-revision order, repeating `--age-snapshot` once per compact JCS snapshot. The
-checkpoint names the final snapshot:
+revision order, repeating `--age-snapshot` once per compact JCS epoch snapshot.
+The checkpoint names the final epoch snapshot:
 
 ```sh
 scripts/remote-sync.sh configure \
@@ -129,19 +130,20 @@ scripts/remote-sync.sh configure \
   --age-identity epoch-2=/secure/path/epoch-2.identity
 ```
 
-Importing a future snapshot does not activate it. The synchronized
+Importing a future epoch snapshot does not activate it. The synchronized
 `key_rotated` record is the activation trigger, and its epoch, key ID,
 recipient fingerprint, and sequence boundary must all match the provisioned
-snapshot. A missing or mismatched snapshot stops synchronization with an
-explicit error before the new epoch is used.
+epoch snapshot. A missing or mismatched epoch snapshot stops synchronization
+with an explicit error before the new epoch is used.
 
 `AGMSG_SYNC_TRUST_DIR` is the retained anti-rollback trust-anchor store. It is
 mandatory for `age-v1`, must be outside `AGMSG_STORAGE_PATH`, and must not be
 deleted by sync-state reset or local-store replacement. The first configuration
 requires `--age-confirmation operator-live`, which records that the operator
 verified the exact revision and digest through a separate live channel. A lower
-revision, same-revision/different-digest snapshot, broken predecessor hash, or
-missing revision is rejected even if the ordinary sync config has been removed.
+revision, same-revision/different-digest epoch snapshot, broken predecessor
+hash, or missing revision is rejected even if the ordinary sync config has
+been removed.
 
 Only the public recipient list crosses the storage-driver seam. The private
 identity path stays in the engine configuration and is used only while opening
