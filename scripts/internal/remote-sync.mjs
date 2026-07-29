@@ -794,11 +794,31 @@ export function validateMembers(config, value) {
   return value.members.map(({ member_id, name }) => ({ member_id, name }));
 }
 
-export async function driver(operation, config, input, extra = []) {
-  const script = process.env.AGMSG_SYNC_DRIVER;
-  if (!script) throw new Error("AGMSG_SYNC_DRIVER is not set");
-  const args = [script, operation, config.local_team, config.server_instance_id,
-    config.remote_team_id, String(config.protocol_version), ...extra];
+// One lifecycle for both drivers, because every way a driver call can fail has
+// to end the same way: the promise settles exactly once, and no child outlives
+// the call that started it.
+//
+// Each failure route used to be handled on its own and two of them escaped the
+// promise entirely. A write to a driver that has stopped reading takes EPIPE on
+// the *stdin stream*, and unparseable output throws inside the 'close' handler;
+// an unhandled stream 'error' and a throw from a listener are both raised, not
+// returned, so they bypassed the caller and killed the process. They now arrive
+// here like any other failure.
+//
+// Killing on failure is the other half. Rejecting alone leaves the child
+// running, which only trades "the process dies" for "the process cannot exit" --
+// its handles pin the loop -- and lets failures pile up children as cycles
+// retry.
+//
+// Every failure settles at 'exit' and drops our own ends of the pipes as it
+// goes -- including the ordinary one, a driver that simply exits non-zero.
+// 'close' waits for every stdio stream to end, and a driver's own grandchild
+// inherits those pipes and can hold them open indefinitely; SIGKILL reaches the
+// driver but nothing it started. So no failure route may depend on 'close', and
+// only success does, because only success has to read all of stdout. What this
+// process owns is what it can be sure of releasing, so that is what it releases:
+// a grandchild is left to the operator, not chased through the process tree.
+function runDriver({ args, label, operation, parse, input }) {
   return new Promise((resolve, reject) => {
     const childEnvironment = { ...process.env };
     delete childEnvironment.AGMSG_SYNC_TOKEN;
@@ -810,7 +830,33 @@ export async function driver(operation, config, input, extra = []) {
       }
     }
     const child = spawn("bash", args, { stdio: ["pipe", "pipe", "pipe"], env: childEnvironment });
-    let stdout = ""; let stderr = "";
+    let stdout = ""; let stderr = ""; let settled = false; let failure = null;
+
+    const settle = (error, value) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error); else resolve(value);
+    };
+    // Records the failure, stops the child, and lets go of our pipe ends; 'exit'
+    // then settles. A child that never started -- a spawn failure -- has no
+    // 'exit' to wait for, so that case settles here instead.
+    const fail = (error) => {
+      if (settled) return;
+      failure ??= error;
+      const running = child.pid !== undefined &&
+        child.exitCode === null && child.signalCode === null;
+      for (const stream of [child.stdin, child.stdout, child.stderr]) {
+        stream?.destroy();
+      }
+      if (running) {
+        try {
+          child.kill("SIGKILL");
+          return;
+        } catch { /* already gone; fall through and settle now */ }
+      }
+      settle(failure, null);
+    };
+
     child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => { stdout += chunk; });
     child.stderr.on("data", (chunk) => {
@@ -821,45 +867,64 @@ export async function driver(operation, config, input, extra = []) {
       // is the JSONL event stream, so this is the only channel for it.
       process.stderr.write(chunk);
     });
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code === 0) resolve(["resync-status", "resync"].includes(operation) ?
-        parseStrictJsonl(stdout) : parseJsonl(stdout));
-      else reject(new Error(`storage sync ${operation} failed (${code}): ${stderr.trim()}`));
+    child.on("error", fail);
+    child.stdin.on("error", (error) => {
+      // Where the failure came from, recorded at the boundary because the OS
+      // code cannot be asked for it: a write whose reader is gone is EPIPE on
+      // Linux, and on macOS -- socketpairs -- either ENOTCONN or EPIPE
+      // depending on how far the write got. That set is not closed, so nothing
+      // downstream can recognise this failure by errno without going stale on
+      // the next platform. The error is otherwise passed through untouched, so
+      // its code and message survive for diagnostics.
+      error.driverFailurePhase = "stdin-write";
+      fail(error);
+    });
+    // Every failure ends here, at 'exit'. A driver that merely exits non-zero is
+    // the ordinary case and it needs this as much as a stream error does: it too
+    // can leave a grandchild holding the inherited pipes, and waiting for 'close'
+    // would then wait forever for output nobody is going to end. Only success
+    // goes on to 'close', because only success has to parse all of stdout.
+    child.on("exit", (code, signal) => {
+      if (failure) { fail(failure); return; }
+      if (code === 0 && !signal) return;
+      fail(new Error(`${label} ${operation} failed (${signal ?? code}): ${stderr.trim()}`));
+    });
+    child.on("close", () => {
+      if (failure) { settle(failure, null); return; }
+      try {
+        settle(null, parse(stdout));
+      } catch (error) {
+        settle(error, null);
+      }
     });
     child.stdin.end(input.map((record) => `${JSON.stringify(record)}\n`).join(""));
+  });
+}
+
+export async function driver(operation, config, input, extra = []) {
+  const script = process.env.AGMSG_SYNC_DRIVER;
+  if (!script) throw new Error("AGMSG_SYNC_DRIVER is not set");
+  return runDriver({
+    args: [script, operation, config.local_team, config.server_instance_id,
+      config.remote_team_id, String(config.protocol_version), ...extra],
+    label: "storage sync",
+    operation,
+    parse: (stdout) => (["resync-status", "resync"].includes(operation) ?
+      parseStrictJsonl(stdout) : parseJsonl(stdout)),
+    input,
   });
 }
 
 export async function rosterDriver(operation, config, input, extra = []) {
   const script = process.env.AGMSG_SYNC_ROSTER_DRIVER ??
     join(dirname(fileURLToPath(import.meta.url)), "roster-sync-driver.sh");
-  const args = [script, operation, config.local_team, config.server_instance_id,
-    config.remote_team_id, String(config.protocol_version), ...extra];
-  return new Promise((resolvePromise, reject) => {
-    const childEnvironment = { ...process.env };
-    delete childEnvironment.AGMSG_SYNC_TOKEN;
-    delete childEnvironment.AGMSG_SYNC_CONNECTION_DIR;
-    delete childEnvironment.AGMSG_SYNC_TRUST_DIR;
-    for (const key of Object.keys(childEnvironment)) {
-      if (/^(?:AGMSG_AGE_IDENTITY|AGMSG_SYNC_AGE_IDENTITY)/u.test(key)) {
-        delete childEnvironment[key];
-      }
-    }
-    const child = spawn("bash", args, {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: childEnvironment,
-    });
-    let stdout = ""; let stderr = "";
-    child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
-    child.stderr.on("data", (chunk) => { stderr += chunk; process.stderr.write(chunk); });
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code === 0) resolvePromise(parseJsonl(stdout));
-      else reject(new Error(`roster sync ${operation} failed (${code}): ${stderr.trim()}`));
-    });
-    child.stdin.end(input.map((record) => `${JSON.stringify(record)}\n`).join(""));
+  return runDriver({
+    args: [script, operation, config.local_team, config.server_instance_id,
+      config.remote_team_id, String(config.protocol_version), ...extra],
+    label: "roster sync",
+    operation,
+    parse: parseJsonl,
+    input,
   });
 }
 
