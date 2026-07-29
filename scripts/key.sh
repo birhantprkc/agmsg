@@ -361,6 +361,11 @@ cmd_import() {
         echo "agmsg: imported identity does not match the current key or an announced rotation — refusing to import." >&2
         exit 1
       fi
+      printf '%s\n' "$staged_epoch" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$' || {
+        agmsg_lock_release
+        echo "agmsg: announced replacement epoch is invalid — refusing to import." >&2
+        exit 1
+      }
       _key_write_identity_atomic "$cred_dir/$staged_epoch.key" "$identity"
       agmsg_lock_release
       unset identity
@@ -409,6 +414,11 @@ cmd_rotate() {
   fi
   agmsg_roster_ensure "$team_dir" "$cfg"
   journal="$(agmsg_roster_journal_path "$team_dir")"
+  if [ ! -f "$journal" ]; then
+    agmsg_lock_release
+    echo "agmsg: team '$team' has no identity journal; connect or migrate it before rotating." >&2
+    exit 1
+  fi
   journal_sql="$(_agmsg_sqlesc "$journal")"
   pending="$(agmsg_sqlite_mem "
     WITH source(doc) AS (
@@ -448,7 +458,12 @@ cmd_rotate() {
   chmod 600 "$identity_file"
   recipient="$(grep '^# public key:' "$identity_file" | sed 's/^# public key: //')"
   fingerprint="$(_key_fingerprint_sha256 "$recipient")"
-  agmsg_roster_append_key_rotated "$team_dir" "$key_id" "$fingerprint" "$created_at"
+  if ! agmsg_roster_append_key_rotated "$team_dir" "$key_id" "$fingerprint" "$created_at"; then
+    rm -f "$identity_file"
+    agmsg_lock_release
+    echo "agmsg: failed to publish the key rotation; no replacement was announced." >&2
+    exit 1
+  fi
   agmsg_lock_release
 
   echo "Generated replacement key for team '$team' (epoch=$key_id)."
