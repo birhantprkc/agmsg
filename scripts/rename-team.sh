@@ -91,9 +91,17 @@ if [ "$MOVES_STORE" = true ] && [ -e "$NEW_STORE_DIR" ]; then
   exit 1
 fi
 
-# Move the config into the locked, reserved target dir. Move the file (not the
-# dir) because the target dir already exists — we created and locked it.
+# Move the registry files into the locked, reserved target dir. Move the files
+# (not the dir) because the target dir already exists — we created and locked
+# it. The roster journal is name-independent identity history and follows the
+# config unchanged.
 mv "$OLD_DIR/config.json" "$NEW_DIR/config.json"
+if [ -f "$OLD_DIR/roster.jsonl" ]; then
+  mv "$OLD_DIR/roster.jsonl" "$NEW_DIR/roster.jsonl"
+fi
+if [ -f "$OLD_DIR/roster-sync.json" ]; then
+  mv "$OLD_DIR/roster-sync.json" "$NEW_DIR/roster-sync.json"
+fi
 
 # Move the store with it, when the team has one of its own. A team that never
 # sent anything has no store yet, which is not an error — the next send creates

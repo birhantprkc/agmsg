@@ -30,6 +30,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/storage.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/registry-lock.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/roster-journal.sh"
 # Reject team names that would escape teams/ as a path segment (#140).
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/validate.sh"
@@ -52,6 +54,8 @@ fi
 agmsg_lock_acquire "$TEAMS_DIR/$TEAM" || exit 1
 
 # --- Update team config ---
+agmsg_roster_ensure "$TEAMS_DIR/$TEAM" "$TEAM_CONFIG"
+agmsg_roster_project_config "$TEAMS_DIR/$TEAM" "$TEAM_CONFIG"
 CONFIG_ESCAPED=$(sed "s/'/''/g" "$TEAM_CONFIG")
 
 # Check old exists
@@ -70,9 +74,29 @@ if [ -n "$NEW_VAL" ] && [ "$NEW_VAL" != "null" ]; then
   exit 1
 fi
 
-# Rename: set new key with old value, remove old key
-UPDATED=$(agmsg_sqlite_mem \
-  "SELECT json_remove(json_set('$CONFIG_ESCAPED', '\$.agents.' || '$NEW_NAME_SQL', json_extract('$CONFIG_ESCAPED', '\$.agents.' || '$OLD_NAME_SQL')), '\$.agents.' || '$OLD_NAME_SQL');")
+if agmsg_roster_has_journal "$TEAMS_DIR/$TEAM"; then
+  MEMBER_ID=$(agmsg_sqlite_mem \
+    "SELECT COALESCE(json_extract('$CONFIG_ESCAPED', '\$.agents.' || '$OLD_NAME_SQL' || '.member_id'),'');")
+  [ -n "$MEMBER_ID" ] || {
+    echo "agmsg: journaled member '$OLD_NAME' has no member_id" >&2
+    exit 1
+  }
+  NAME_OWNER=$(agmsg_roster_name_owner "$TEAMS_DIR/$TEAM" "$NEW_NAME")
+  if [ -n "$NAME_OWNER" ] && [ "$NAME_OWNER" != "$MEMBER_ID" ]; then
+    echo "Agent name $NEW_NAME belongs to another identity in team $TEAM" >&2
+    exit 1
+  fi
+  RENAMED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  agmsg_roster_append_renamed "$TEAMS_DIR/$TEAM" "$MEMBER_ID" \
+    "$OLD_NAME" "$NEW_NAME" "$RENAMED_AT"
+  agmsg_roster_project_config "$TEAMS_DIR/$TEAM" "$TEAM_CONFIG"
+  UPDATED=$(cat "$TEAM_CONFIG")
+else
+  # Name-only legacy teams keep the pre-journal cache mutation.
+  UPDATED=$(agmsg_sqlite_mem \
+    "SELECT json_remove(json_set('$CONFIG_ESCAPED', '\$.agents.' || '$NEW_NAME_SQL', json_extract('$CONFIG_ESCAPED', '\$.agents.' || '$OLD_NAME_SQL')), '\$.agents.' || '$OLD_NAME_SQL');")
+  RENAMED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+fi
 
 # Tombstone the old name so a later join/actas can't silently revive it (#360):
 # a CLI's slash-command history can resubmit `/agmsg actas <old_name>` well
@@ -82,7 +106,6 @@ UPDATED=$(agmsg_sqlite_mem \
 # the old name) so a name containing a single quote can't break the JSON path
 # expression the way `$.agents.$OLD_NAME` above requires it not to — from/to
 # are bound as ordinary SQL string values, never spliced into a path.
-RENAMED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 UPDATED_ESCAPED=$(printf '%s' "$UPDATED" | sed "s/'/''/g")
 UPDATED=$(agmsg_sqlite_mem \
   "SELECT json_set('$UPDATED_ESCAPED', '\$.renamed',

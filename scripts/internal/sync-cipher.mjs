@@ -99,7 +99,47 @@ function canonicalMessage(projection) {
   }), "utf8");
 }
 
-function parseCanonicalMessage(bytes) {
+function canonicalRosterMutation(projection) {
+  if (!projection || Array.isArray(projection) || typeof projection !== "object" ||
+      !["member_joined", "member_left", "member_renamed"].includes(projection.kind) ||
+      !UUID_V7.test(projection.mutation_id ?? "") ||
+      !UUID_V7.test(projection.member_id ?? "") ||
+      typeof projection.occurred_at !== "string" ||
+      !TIMESTAMP.test(projection.occurred_at) || !validTimestamp(projection.occurred_at)) {
+    malformed("roster mutation projection is invalid");
+  }
+  if (projection.kind === "member_renamed") {
+    requireName(projection.from, "from");
+    requireName(projection.to, "to");
+    if (projection.from === projection.to) malformed("roster rename is a no-op");
+    return Buffer.from(JSON.stringify({
+      kind: projection.kind,
+      mutation_id: projection.mutation_id,
+      member_id: projection.member_id,
+      from: projection.from,
+      to: projection.to,
+      occurred_at: projection.occurred_at,
+    }), "utf8");
+  }
+  requireName(projection.name, "name");
+  return Buffer.from(JSON.stringify({
+    kind: projection.kind,
+    mutation_id: projection.mutation_id,
+    member_id: projection.member_id,
+    name: projection.name,
+    occurred_at: projection.occurred_at,
+  }), "utf8");
+}
+
+// Legacy message plaintext has no discriminator and remains canonical forever.
+// Only new union branches carry `kind`; requiring it for messages would make
+// every existing sealed blob unreadable.
+function canonicalProjection(projection) {
+  return projection?.kind === undefined ?
+    canonicalMessage(projection) : canonicalRosterMutation(projection);
+}
+
+function parseCanonicalProjection(bytes) {
   let text;
   let value;
   try {
@@ -108,8 +148,8 @@ function parseCanonicalMessage(bytes) {
   } catch {
     malformed("message is not valid UTF-8 JSON");
   }
-  const canonical = canonicalMessage(value);
-  if (!canonical.equals(bytes)) malformed("message is not canonical JCS");
+  const canonical = canonicalProjection(value);
+  if (!canonical.equals(bytes)) malformed("projection is not canonical JCS");
   return value;
 }
 
@@ -159,7 +199,7 @@ export function ageBindingContext({ protocol_version: protocolVersion, team_id: 
 
 export function agePlaintextFrame(binding, projection) {
   const context = ageBindingContext(binding);
-  const message = canonicalMessage(projection);
+  const message = canonicalProjection(projection);
   return Buffer.concat([MAGIC, u32(context.length), context, u32(message.length), message]);
 }
 
@@ -428,7 +468,7 @@ export function sealEnvelope(input) {
   }
   const profile = cipherProfiles[input.cipher];
   if (!profile) throw new CipherStateError("unsupported_cipher", `unsupported cipher ${input.cipher}`);
-  const message = canonicalMessage(input.projection);
+  const message = canonicalProjection(input.projection);
   return profile.seal(input, message);
 }
 
@@ -611,7 +651,7 @@ function sealWorkerMain() {
 
 function openNone(envelope, maxBlobBytes) {
   if (envelope.v !== 1 || envelope.key_id !== null) malformed("none envelope metadata is invalid");
-  return parseCanonicalMessage(canonicalBlob(envelope.blob, maxBlobBytes));
+  return parseCanonicalProjection(canonicalBlob(envelope.blob, maxBlobBytes));
 }
 
 async function openAge({ envelope, protocol_version: protocolVersion, team_id: teamId, wire_id: wireId,
@@ -653,7 +693,7 @@ async function openAge({ envelope, protocol_version: protocolVersion, team_id: t
   if (messageLength > bytes.length - messageStart || messageStart + messageLength !== bytes.length) {
     authenticationFailed("age plaintext frame length is invalid");
   }
-  return parseCanonicalMessage(bytes.subarray(messageStart));
+  return parseCanonicalProjection(bytes.subarray(messageStart));
 }
 
 export async function openEnvelope(input) {

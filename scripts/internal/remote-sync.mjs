@@ -657,6 +657,38 @@ export async function driver(operation, config, input, extra = []) {
   });
 }
 
+export async function rosterDriver(operation, config, input, extra = []) {
+  const script = process.env.AGMSG_SYNC_ROSTER_DRIVER ??
+    join(dirname(fileURLToPath(import.meta.url)), "roster-sync-driver.sh");
+  const args = [script, operation, config.local_team, config.server_instance_id,
+    config.remote_team_id, String(config.protocol_version), ...extra];
+  return new Promise((resolvePromise, reject) => {
+    const childEnvironment = { ...process.env };
+    delete childEnvironment.AGMSG_SYNC_TOKEN;
+    delete childEnvironment.AGMSG_SYNC_CONNECTION_DIR;
+    delete childEnvironment.AGMSG_SYNC_TRUST_DIR;
+    for (const key of Object.keys(childEnvironment)) {
+      if (/^(?:AGMSG_AGE_IDENTITY|AGMSG_SYNC_AGE_IDENTITY)/u.test(key)) {
+        delete childEnvironment[key];
+      }
+    }
+    const child = spawn("bash", args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: childEnvironment,
+    });
+    let stdout = ""; let stderr = "";
+    child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; process.stderr.write(chunk); });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) resolvePromise(parseJsonl(stdout));
+      else reject(new Error(`roster sync ${operation} failed (${code}): ${stderr.trim()}`));
+    });
+    child.stdin.end(input.map((record) => `${JSON.stringify(record)}\n`).join(""));
+  });
+}
+
 function parseJsonl(value) {
   return value.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
 }
@@ -1301,6 +1333,9 @@ export async function cycle(config, { pushLimit, pullLimit }, dependencies = {})
   const healthCall = dependencies.healthCall ?? health;
   const requestCall = dependencies.requestCall ?? request;
   const driverCall = dependencies.driverCall ?? driver;
+  const rosterDriverCall = dependencies.rosterDriverCall ??
+    (dependencies.driverCall ? async (operation) => operation === "prepare" ?
+      [{ type: "roster_sync_state", transport_cursor: "0" }] : [] : rosterDriver);
   const eventCall = dependencies.eventCall ?? event;
   const evaluateCall = dependencies.evaluateCall ?? evaluatePull;
   const logApplyCall = dependencies.logApplyCall ?? logApplyOutcomes;
@@ -1314,12 +1349,24 @@ export async function cycle(config, { pushLimit, pullLimit }, dependencies = {})
     policy_revision: capabilities.policy_revision });
 
   const writeProfile = selectWriteProfile(config, capabilities);
-  const prepared = await driverCall("prepare", config, [{ type: "sync_prepare", envelope_v: 1,
+  const prepareInput = [{ type: "sync_prepare", envelope_v: 1,
     cipher: writeProfile.profile, key_id: writeProfile.key_id ?? null,
     recipients: writeProfile.recipients ?? [], max_blob_bytes: Number(capabilities.max_blob_bytes),
-    allow_new: writeProfile.eligible }], [String(pushLimit)]);
+    allow_new: writeProfile.eligible }];
+  const [prepared, rosterPrepared] = await Promise.all([
+    driverCall("prepare", config, prepareInput, [String(pushLimit)]),
+    rosterDriverCall("prepare", config, prepareInput, [String(pushLimit)]),
+  ]);
   const state = prepared.find((record) => record.type === "sync_state");
-  const candidates = prepared.filter((record) => record.type === "sync_push_candidate");
+  // Registry mutations lead the page. They establish the identity needed to
+  // interpret every following message, and UUIDv7 values minted in the same
+  // millisecond are not a reliable cross-axis ordering key.
+  const candidates = [
+    ...rosterPrepared.filter((record) => record.type === "roster_sync_push_candidate")
+      .map((record) => ({ ...record, sync_axis: "roster" })),
+    ...prepared.filter((record) => record.type === "sync_push_candidate")
+      .map((record) => ({ ...record, sync_axis: "messages" })),
+  ].slice(0, pushLimit);
   if (!state) throw new Error("driver omitted sync_state");
   sequence(state.transport_cursor, "transport_cursor");
   await eventCall("push.prepared", { count: candidates.length, local_positions: candidates.map((item) => item.local_position),
@@ -1333,8 +1380,16 @@ export async function cycle(config, { pushLimit, pullLimit }, dependencies = {})
       body: JSON.stringify({ messages: candidates.map(({ id, envelope }) => ({ id, envelope })) }) });
     const ackRecords = validateAckMapping(candidates, posted.acks);
     await eventCall("push.ack", { acks: ackRecords.map(({ id, server_seq, disposition }) => ({ id, server_seq, disposition })) });
-    const reconciled = await driverCall("reconcile", config, ackRecords);
-    await eventCall("push.reconciled", { result: reconciled[0] ?? null });
+    const messageAcks = ackRecords.filter((_, index) => candidates[index].sync_axis === "messages");
+    const rosterAcks = ackRecords.filter((_, index) => candidates[index].sync_axis === "roster");
+    const [reconciled, rosterReconciled] = await Promise.all([
+      messageAcks.length > 0 ? driverCall("reconcile", config, messageAcks) : [],
+      rosterAcks.length > 0 ? rosterDriverCall("reconcile", config, rosterAcks) : [],
+    ]);
+    await eventCall("push.reconciled", {
+      result: reconciled[0] ?? null,
+      roster_result: rosterReconciled[0] ?? null,
+    });
   }
   // A full push page (and eligible) means at least a full page was available,
   // so the loop treats it as "more remains" and stays in catch-up. An exactly-
@@ -1377,9 +1432,23 @@ export async function cycle(config, { pushLimit, pullLimit }, dependencies = {})
     records.push({ type: "sync_pull_cursor", next_after: page.next_after });
     await eventCall("pull.received", { after: cursor, next_after: page.next_after,
       messages: page.messages.map((message) => ({ id: message.id, server_seq: message.server_seq })) });
-    const applied = await driverCall("apply", config, records);
-    await logApplyCall(config, records, applied);
-    await eventCall("pull.applied", { result: applied[0] ?? null });
+    const cursorRecord = records.at(-1);
+    const rosterRecords = records.filter((record) =>
+      record.type === "sync_pull_message" && record.status === "importable" &&
+      record.projection?.kind?.startsWith("member_"));
+    const messageRecords = records.filter((record) =>
+      record.type !== "sync_pull_message" || !record.projection?.kind);
+    const rosterApplied = rosterRecords.length > 0 ?
+      await rosterDriverCall("apply", config, [...rosterRecords, cursorRecord]) : [];
+    // The storage cursor is the transport checkpoint. Apply the idempotent
+    // roster side first so a registry failure cannot advance past an event it
+    // did not durably record; a later storage failure simply replays roster.
+    const applied = await driverCall("apply", config, messageRecords);
+    await logApplyCall(config, messageRecords, applied);
+    await eventCall("pull.applied", {
+      result: applied[0] ?? null,
+      roster_result: rosterApplied[0] ?? null,
+    });
     cursor = page.next_after;
     if (!page.has_more) break;
   }

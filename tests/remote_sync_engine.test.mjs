@@ -1005,6 +1005,93 @@ test("cycle: a large pull page (backlog present) is requested and accepted at pu
   assert.equal(result.pushSaturated, false);
 });
 
+test("cycle routes roster payloads through the existing message transport", async () => {
+  let posted = false;
+  let advanced = false;
+  const wireId = "550e8400-e29b-41d4-a716-446655440001";
+  const mutationId = "018f3f7e-0000-7000-8000-000000000020";
+  const projection = {
+    kind: "member_joined",
+    mutation_id: mutationId,
+    member_id: "018f3f7e-0000-7000-8000-000000000010",
+    name: "alice",
+    occurred_at: "2026-07-28T23:00:00.000000Z",
+  };
+  const capability = () => ({
+    ...capsFor(["none"]),
+    current_seq: advanced ? "1" : "0",
+    next_sequence_boundary: advanced ? "2" : "1",
+  });
+  const rosterOperations = [];
+  await cycle(config, { pushLimit: 100, pullLimit: 1000 }, {
+    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    requestCall: async (_config, path, init) => {
+      if (path === "/v1/capabilities") return capability();
+      if (path === "/v1/messages" && init?.method === "POST") {
+        const body = JSON.parse(init.body);
+        assert.deepEqual(body.messages, [{
+          id: wireId,
+          envelope: { v: 1, cipher: "none", key_id: null, blob: "e30=" },
+        }]);
+        posted = true;
+        advanced = true;
+        return { acks: [{ id: wireId, server_seq: "1", disposition: "stored" }] };
+      }
+      if (path.startsWith("/v1/messages?after=")) {
+        return {
+          messages: [{
+            server_seq: "1",
+            id: wireId,
+            server_received_at: "2026-07-28T23:00:01.000000Z",
+            envelope: { v: 1, cipher: "none", key_id: null, blob: "e30=" },
+          }],
+          next_after: "1",
+          has_more: false,
+        };
+      }
+      throw new Error(`unexpected request ${path}`);
+    },
+    driverCall: async (operation, _config, input) => {
+      if (operation === "prepare") return [{
+        type: "sync_state",
+        driver_generation: "018f3f7e-0000-7000-8000-000000000099",
+        transport_cursor: "0",
+      }];
+      if (operation === "apply") {
+        assert.deepEqual(input, [{ type: "sync_pull_cursor", next_after: "1" }]);
+        return [{ type: "sync_apply_result", transport_cursor: "1", corrupt_count: 0 }];
+      }
+      throw new Error(`unexpected storage operation ${operation}`);
+    },
+    rosterDriverCall: async (operation, _config, input) => {
+      rosterOperations.push(operation);
+      if (operation === "prepare") return [{
+        type: "roster_sync_push_candidate",
+        local_position: mutationId,
+        local_id: mutationId,
+        id: wireId,
+        envelope: { v: 1, cipher: "none", key_id: null, blob: "e30=" },
+      }];
+      if (operation === "reconcile") {
+        assert.equal(input[0].local_position, mutationId);
+        return [{ type: "roster_sync_reconcile_result", count: 1 }];
+      }
+      if (operation === "apply") {
+        assert.equal(input[0].projection.kind, "member_joined");
+        assert.deepEqual(input.at(-1), { type: "sync_pull_cursor", next_after: "1" });
+        return [{ type: "roster_sync_apply_outcome", status: "reconciled" }];
+      }
+      throw new Error(`unexpected roster operation ${operation}`);
+    },
+    evaluateCall: async () => ({ status: "importable", projection }),
+    logApplyCall: async () => {},
+    eventCall: async () => {},
+    readStateCycleCall: async () => {},
+  });
+  assert.equal(posted, true);
+  assert.deepEqual(rosterOperations, ["prepare", "reconcile", "apply"]);
+});
+
 // ---- pushSaturated is computed by cycle itself (B2 test gate) ----
 // These exercise cycle's own `writeProfile.eligible && candidates.length ===
 // pushLimit`; the runLoop tests above hand-write pushSaturated, so without
