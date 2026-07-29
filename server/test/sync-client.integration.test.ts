@@ -1,15 +1,14 @@
 import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createApp } from "../src/app.js";
 import type { Config } from "../src/config.js";
-import { issuePairingToken } from "../src/credentials.js";
 import { migrate } from "../src/db.js";
 import { envelopeDigest } from "../src/protocol.js";
 import { retainThrough } from "../src/storage.js";
@@ -47,32 +46,11 @@ describeDatabase("Stage-1 polling sync client", () => {
     await admin.query(`CREATE SCHEMA ${schema}`);
     pool = new Pool({ connectionString: databaseUrl, options: `-c search_path=${schema}` });
     await migrate(pool);
-    await pool.query("INSERT INTO teams(team_id,team_name) VALUES($1,$2)", [teamId, localTeam]);
-    await pool.query(
-      `INSERT INTO team_policy_history
-         (team_id,policy_revision,effective_from_seq,
-          accepted_envelope_versions,write_allowed_ciphers)
-       VALUES($1,0,1,ARRAY[1],ARRAY['none','age-v1']::TEXT[])`,
-      [teamId],
-    );
-    await pool.query(
-      `INSERT INTO members(team_id,member_id,name) VALUES
-       ($1,$2,'machine-a'),($1,$3,'machine-b')`,
-      [teamId, memberA, memberB],
-    );
-    await pool.query("INSERT INTO teams(team_id,team_name) VALUES($1,$2)", [crossTeamId, crossTeam]);
-    await pool.query(
-      `INSERT INTO team_policy_history
-         (team_id,policy_revision,effective_from_seq,
-          accepted_envelope_versions,write_allowed_ciphers)
-       VALUES($1,0,1,ARRAY[1],ARRAY['none','age-v1']::TEXT[])`,
-      [crossTeamId],
-    );
-    await pool.query(
-      `INSERT INTO members(team_id,member_id,name) VALUES
-       ($1,$2,'machine-a'),($1,$3,'machine-b')`,
-      [crossTeamId, memberA, memberB],
-    );
+    // No team is pre-inserted server-side. In the register model the team,
+    // its opening policy row, and its members are all created by connectTeam
+    // from the connect body — the first machine's `connect` below registers
+    // the team it owns. Pre-creating it here (the pairing-era assumption) would
+    // make that first connect a 409.
     const config: Config = {
       databaseUrl: databaseUrl ?? "",
       host: "127.0.0.1", port: 8787, logLevel: "silent",
@@ -89,18 +67,49 @@ describeDatabase("Stage-1 polling sync client", () => {
     connectionB = join(root, "connection-b");
     crossConnectionSqlite = join(root, "connection-cross-sqlite");
     crossConnectionJsonl = join(root, "connection-cross-jsonl");
-    const bindings: Array<[string, string, string]> = [
-      [connectionA, teamId, localTeam], [connectionB, teamId, localTeam],
-      [crossConnectionSqlite, crossTeamId, crossTeam],
-      [crossConnectionJsonl, crossTeamId, crossTeam],
+    // The first machine for a team owns it: it writes a locally-minted team and
+    // `connect` registers that team server-side. A second machine for the same
+    // team_id cannot connect again — a repeat team_id is a 409 by design — so it
+    // `pull`s the team the first machine registered (#527). That is why the two
+    // machines bound to one team_id take different paths here. Each uses the same
+    // per-machine environment as the sync operations below (isolated store +
+    // connection dir).
+    const members = [
+      { member_id: memberA, name: "machine-a" },
+      { member_id: memberB, name: "machine-b" },
     ];
-    for (const [connectionRoot, boundTeamId, boundTeam] of bindings) {
-      const issued = await issuePairingToken(pool, boundTeamId);
-      await execFileAsync("bash", [join(repositoryRoot, "scripts/remote.sh"), "connect",
-        "--endpoint", serverUrl, issued.token, boundTeam], {
-        cwd: repositoryRoot,
-        env: { ...process.env, AGMSG_SYNC_CONNECTION_DIR: connectionRoot },
-      });
+    const remoteSh = join(repositoryRoot, "scripts/remote.sh");
+    const machines: Array<[string, string, string, "connect" | "pull"]> = [
+      [storeA, teamId, localTeam, "connect"],
+      [storeB, teamId, localTeam, "pull"],
+      [crossStoreSqlite, crossTeamId, crossTeam, "connect"],
+      [crossStoreJsonl, crossTeamId, crossTeam, "pull"],
+    ];
+    for (const [store, boundTeamId, boundTeam, mode] of machines) {
+      const env = environment(store);
+      if (mode === "connect") {
+        // The registering machine needs an initialized store (so the connect-
+        // time per-team migration has a shared store to move from) and a local
+        // team config that connect POSTs to /v1/connect to register.
+        const initStore = `. "$1/scripts/lib/storage.sh"
+agmsg_storage_load
+storage_init "$2" >/dev/null`;
+        await execFileAsync("bash", ["-c", initStore, "stage1-test", repositoryRoot, boundTeam],
+          { cwd: repositoryRoot, env });
+        const teamConfig = join(env.AGMSG_SYNC_CONNECTION_DIR, "teams", boundTeam, "config.json");
+        await mkdir(dirname(teamConfig), { recursive: true });
+        await writeFile(teamConfig, JSON.stringify({
+          name: boundTeam,
+          team_id: boundTeamId,
+          agents: Object.fromEntries(members.map((m) => [m.name, { member_id: m.member_id }])),
+          created_at: new Date().toISOString(),
+        }));
+        await execFileAsync("bash", [remoteSh, "connect", "--endpoint", serverUrl, boundTeam],
+          { cwd: repositoryRoot, env });
+      } else {
+        await execFileAsync("bash", [remoteSh, "pull", "--endpoint", serverUrl,
+          "--team-id", boundTeamId, boundTeam], { cwd: repositoryRoot, env });
+      }
     }
     rosterFile = join(root, "local-roster.json");
     await writeFile(rosterFile, JSON.stringify({
@@ -284,7 +293,11 @@ storage_list_unread "$2" "$3"`;
       cwd: repositoryRoot,
       env: { ...process.env, AGMSG_SYNC_CONNECTION_DIR: connectionB },
     });
-    expect(disconnected.stdout).toContain("Revoking credential with server... ok.");
+    // The register model's disconnect stops the engine and clears local state;
+    // it does not revoke server-side (there is no credential), so we assert the
+    // disconnect confirmation, not the old "Revoking credential..." line — that
+    // is old-path output removed with the credential/E2EE cleanup.
+    expect(disconnected.stdout).toContain(`Disconnected '${localTeam}'. Local sync state cleared`);
     await expect(sync(storeB, "once", "--team", localTeam)).rejects.toMatchObject({
       stderr: expect.stringContaining("invalid or disconnected"),
     });
