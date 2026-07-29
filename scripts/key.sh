@@ -11,9 +11,10 @@ set -euo pipefail
 # docs/spec/ref/age-v1-profile.md). Scope: initial single-writer onboarding
 # (generate the very first key, import one obtained out-of-band, or announce a
 # replacement through the team journal).
-# This script does not implement age-v1's anti-rollback epoch-snapshot hash
-# chain. Rotation protects messages written after the acknowledged boundary;
-# anyone who retained an old key can still read the history encrypted with it.
+# Authority-confirmed epoch snapshots are imported separately through
+# remote-sync configure. Rotation protects messages written after the
+# acknowledged boundary; anyone who retained an old key can still read the
+# history encrypted with it.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"

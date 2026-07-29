@@ -110,20 +110,44 @@ scripts/remote-sync.sh configure \
   --age-identity epoch-1=/secure/path/epoch-1.identity
 ```
 
+For a rotated team, pass the complete authority-confirmed chain in ascending
+revision order, repeating `--age-snapshot` once per compact JCS snapshot. The
+checkpoint names the final snapshot:
+
+```sh
+scripts/remote-sync.sh configure \
+  --team example-team \
+  --server https://sync.example \
+  --team-id 018f3f7e-0000-7000-8000-000000000001 \
+  --minimum-security e2ee-required \
+  --cipher age-v1 \
+  --age-snapshot /authenticated/path/epoch-0.json \
+  --age-snapshot /authenticated/path/epoch-1.json \
+  --age-checkpoint '1:CONFIRMED_LOWERCASE_SHA256' \
+  --age-confirmation operator-live \
+  --age-identity epoch-1=/secure/path/epoch-1.identity \
+  --age-identity epoch-2=/secure/path/epoch-2.identity
+```
+
+Importing a future snapshot does not activate it. The synchronized
+`key_rotated` record is the activation trigger, and its epoch, key ID,
+recipient fingerprint, and sequence boundary must all match the provisioned
+snapshot. A missing or mismatched snapshot stops synchronization with an
+explicit error before the new epoch is used.
+
 `AGMSG_SYNC_TRUST_DIR` is the retained anti-rollback trust-anchor store. It is
 mandatory for `age-v1`, must be outside `AGMSG_STORAGE_PATH`, and must not be
 deleted by sync-state reset or local-store replacement. The first configuration
 requires `--age-confirmation operator-live`, which records that the operator
-verified the exact revision and digest through a separate live channel. A later
-same-revision/different-digest snapshot is rejected even if the ordinary sync
-config has been removed.
+verified the exact revision and digest through a separate live channel. A lower
+revision, same-revision/different-digest snapshot, broken predecessor hash, or
+missing revision is rejected even if the ordinary sync config has been removed.
 
 Only the public recipient list crosses the storage-driver seam. The private
 identity path stays in the engine configuration and is used only while opening
-pulled envelopes. The current dogfood command accepts only an initial revision-0
-snapshot. Joining an established rotated binding or rotating an active binding
-requires complete chain verification, quiesce, drain, a server authorization
-fence, and the fresh-boundary procedure in the
+pulled envelopes. Joining an established rotated binding or rotating an active
+binding requires complete chain verification, quiesce, drain, a server
+authorization fence, and the fresh-boundary procedure in the
 [`age-v1` profile](spec/ref/age-v1-profile.md#multi-writer-cutover-protocol), which
 is not yet automated by this client.
 
