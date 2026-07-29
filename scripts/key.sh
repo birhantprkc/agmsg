@@ -396,7 +396,6 @@ cmd_import() {
 cmd_rotate() {
   local team="${1:?Usage: key.sh rotate [<team>]}"
   agmsg_validate_team_name "$team" || exit 1
-  _key_require_age || exit 1
   local cfg team_dir cred_dir current_key journal journal_sql pending
   cfg="$(_key_team_config "$team")"
   team_dir="$TEAMS_DIR/$team"
@@ -410,6 +409,10 @@ cmd_rotate() {
   if [ -z "$current_key" ] || [ "$current_key" = "null" ]; then
     agmsg_lock_release
     echo "agmsg: team '$team' has no current key — generate or import the first key before rotating." >&2
+    exit 1
+  fi
+  if ! _key_require_age; then
+    agmsg_lock_release
     exit 1
   fi
   agmsg_roster_ensure "$team_dir" "$cfg"
