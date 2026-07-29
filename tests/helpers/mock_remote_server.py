@@ -33,6 +33,7 @@ REVOKE_FAIL = os.environ.get("MOCK_REVOKE_FAIL") == "1"
 REVOKE_BAD_HEADER = os.environ.get("MOCK_REVOKE_BAD_HEADER") == "1"
 REVOKE_BAD_BODY = os.environ.get("MOCK_REVOKE_BAD_BODY") == "1"
 REVOKE_LARGE_BODY = os.environ.get("MOCK_REVOKE_LARGE_BODY") == "1"
+PULL_MIXED = os.environ.get("MOCK_PULL_MIXED") == "1"
 ISSUED_CREDENTIAL_IDS = set()
 REVOKED_CREDENTIAL_IDS = []
 
@@ -60,8 +61,18 @@ def _blob(from_agent, to_agent, body, at):
                          separators=(",", ":"), sort_keys=True)
     return base64.b64encode(payload.encode()).decode()
 
+def _roster_blob(index):
+    import base64
+    payload = json.dumps({
+        "kind": "member_joined",
+        "mutation_id": "018f3f7e-3333-7000-8000-%012d" % (index + 1),
+        "member_id": "018f3f7e-4444-7000-8000-%012d" % (index + 1),
+        "name": "member-%d" % (index + 1),
+        "occurred_at": "2026-01-01T00:00:%02d.000000Z" % index,
+    }, separators=(",", ":"))
+    return base64.b64encode(payload.encode()).decode()
 
-PULL_MESSAGES = [
+BASE_PULL_MESSAGES = [
     {"id": "11111111-1111-4111-8111-111111111111", "server_seq": "1",
      "server_received_at": "2026-01-01T00:00:00.000000Z",
      "envelope": {"v": 1, "cipher": "none", "key_id": None,
@@ -71,6 +82,27 @@ PULL_MESSAGES = [
      "envelope": {"v": 1, "cipher": "none", "key_id": None,
                   "blob": _blob("bob", "alice", "history two", "2026-01-02T00:00:00.000000Z")}},
 ]
+
+if PULL_MIXED:
+    PULL_MESSAGES = [
+        {"id": "10000000-0000-4000-8000-%012d" % (index + 1),
+         "server_seq": str(index + 1),
+         "server_received_at": "2026-01-01T00:00:%02d.000000Z" % index,
+         "envelope": {"v": 1, "cipher": "none", "key_id": None,
+                      "blob": _roster_blob(index)}}
+        for index in range(7)
+    ] + [
+        {"id": "20000000-0000-4000-8000-%012d" % (index + 1),
+         "server_seq": str(index + 8),
+         "server_received_at": "2026-01-02T00:00:00.000000Z",
+         "envelope": {"v": 1, "cipher": "none", "key_id": None,
+                      "blob": _blob("member-1", "member-2",
+                                    "mixed history %d" % (index + 1),
+                                    "2026-01-02T00:00:00.000000Z")}}
+        for index in range(73)
+    ]
+else:
+    PULL_MESSAGES = BASE_PULL_MESSAGES
 
 
 class LoopbackHTTPServer(HTTPServer):

@@ -3,6 +3,7 @@ set -euo pipefail
 
 # Usage:
 #   remote.sh connect --endpoint <url> [<token>] [--token-stdin] [<team>] [--force]
+#   remote.sh pull --endpoint <url> --team-id <uuid> <team>
 #   remote.sh status [<team>] [--json]
 #   remote.sh disconnect <team>
 #   remote.sh doctor [<team>]
@@ -786,34 +787,25 @@ _remote_json_field() {
 # roster taken from anywhere else at this moment would be a guess presented as
 # fact. It is derived by replaying the team journal.
 _remote_write_pulled_team() {
-  local team="$1" team_id="$2" endpoint="$3" server_instance_id="$4" \
-    remote_team_name="$5" protocol_version="$6" capabilities="$7" \
-    cfg initial cap_escaped connected_at
+  local team="$1" team_id="$2" cfg initial existing_id
   cfg="$(_remote_team_config "$team")"
   mkdir -p "$TEAMS_DIR/$team"
   agmsg_lock_acquire "$TEAMS_DIR/$team" || return 1
-  cap_escaped="$(printf '%s' "$capabilities" | sed "s/'/''/g")"
-  connected_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  # A pulled team records a connected binding — the same shape connect writes —
-  # so the sync engine keeps it in sync afterwards ("Machine two ... and
-  # continues", docs/design/remote-sync.md). No credential: the register-model
-  # data plane carries none. The roster stays empty; it is replayed from the
-  # journal, not taken from the server.
-  initial=$(agmsg_sqlite_mem "
-    SELECT json_object('name','$(_agmsg_sqlesc "$team")',
-                       'team_id','$(_agmsg_sqlesc "$team_id")',
-                       'agents', json_object(),
-                       'created_at','$connected_at',
-                       'remote_binding', json_object(
-                         'endpoint','$(_agmsg_sqlesc "$endpoint")',
-                         'server_instance_id','$(_agmsg_sqlesc "$server_instance_id")',
-                         'remote_team_id','$(_agmsg_sqlesc "$team_id")',
-                         'remote_team_name','$(_agmsg_sqlesc "$remote_team_name")',
-                         'protocol_version', $protocol_version,
-                         'capabilities', json('$cap_escaped'),
-                         'connected_at','$connected_at',
-                         'disconnected_at', null));")
-  agmsg_write_atomic "$cfg" "$initial"
+  if [ -f "$cfg" ]; then
+    existing_id="$(_remote_read_config_field "$cfg" '$.team_id')"
+    if [ "$existing_id" != "$team_id" ]; then
+      echo "agmsg: local team '$team' has a different team id" >&2
+      agmsg_lock_release
+      return 1
+    fi
+  else
+    initial=$(agmsg_sqlite_mem "
+      SELECT json_object('name','$(_agmsg_sqlesc "$team")',
+                         'team_id','$(_agmsg_sqlesc "$team_id")',
+                         'agents', json_object(),
+                         'created_at','$(date -u +%Y-%m-%dT%H:%M:%SZ)');")
+    agmsg_write_atomic "$cfg" "$initial"
+  fi
   agmsg_lock_release
 }
 
@@ -852,8 +844,14 @@ cmd_pull() {
     fi
   fi
 
+  # The roster driver projects imported identity events into this config while
+  # the bootstrap is running. Publish the empty identity-bearing shell first;
+  # retries reuse it, and the successful projection is never overwritten.
+  _remote_write_pulled_team "$team" "$team_id" || exit 1
+
   local result pulled_id pulled_name imported pulled_sid pulled_protocol pulled_caps
   result="$(AGMSG_SYNC_CONNECTION_DIR="$CONNECTION_ROOT" \
+    AGMSG_SYNC_LOCAL_ROSTER_FILE="$cfg" \
     "$SCRIPT_DIR/remote-sync.sh" pull-bootstrap \
       --team "$team" --team-id "$team_id" --endpoint "$endpoint")" || {
     echo "agmsg: pull failed" >&2; exit 1; }
@@ -869,8 +867,30 @@ cmd_pull() {
   [ "$pulled_id" = "$team_id" ] || {
     echo "agmsg: server answered with a different team id" >&2; exit 1; }
 
-  _remote_write_pulled_team "$team" "$pulled_id" "$endpoint" "$pulled_sid" \
-    "$pulled_name" "$pulled_protocol" "$pulled_caps" || exit 1
+  # Bind AFTER the bootstrap, and by updating the config in place: the roster
+  # driver has been projecting identity events into this file while the
+  # bootstrap ran, so rewriting it wholesale would discard the roster it just
+  # built. The binding is what lets the sync engine keep this team in sync
+  # afterwards ("Machine two ... and continues", docs/design/remote-sync.md).
+  case "$pulled_protocol" in ''|*[!0-9]*)
+    echo "agmsg: server answered with an invalid protocol version" >&2; exit 1 ;; esac
+  agmsg_lock_acquire "$TEAMS_DIR/$team" || exit 1
+  local bind_at escaped caps_escaped updated
+  bind_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  escaped=$(sed "s/'/''/g" "$cfg")
+  caps_escaped=$(printf '%s' "$pulled_caps" | sed "s/'/''/g")
+  updated=$(agmsg_sqlite_mem \
+    "SELECT json_set('$escaped', '\$.remote_binding', json_object(
+       'endpoint', '$(_agmsg_sqlesc "$endpoint")',
+       'server_instance_id', '$(_agmsg_sqlesc "$pulled_sid")',
+       'remote_team_id', '$(_agmsg_sqlesc "$pulled_id")',
+       'remote_team_name', '$(_agmsg_sqlesc "$pulled_name")',
+       'protocol_version', $pulled_protocol,
+       'capabilities', json('$caps_escaped'),
+       'connected_at', '$bind_at',
+       'disconnected_at', null));")
+  agmsg_write_atomic "$cfg" "$updated"
+  agmsg_lock_release
   echo "Pulled '$pulled_name' into local team '$team' ($imported message(s))."
 }
 
@@ -1277,6 +1297,6 @@ case "${1:-}" in
   doctor) shift; cmd_doctor "$@" ;;
   pending) shift; agmsg_require_python3 "remote pending" || exit 1; cmd_pending "$@" ;;
   *)
-    echo "Usage: remote.sh <connect|status|disconnect|doctor|pending> ..." >&2
+    echo "Usage: remote.sh <connect|pull|status|disconnect|doctor|pending> ..." >&2
     exit 1 ;;
 esac

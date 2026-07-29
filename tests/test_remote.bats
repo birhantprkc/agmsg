@@ -15,6 +15,7 @@ setup() {
   MOCK_REVOKE_BAD_HEADER="${MOCK_REVOKE_BAD_HEADER:-}" \
   MOCK_REVOKE_BAD_BODY="${MOCK_REVOKE_BAD_BODY:-}" \
   MOCK_REVOKE_LARGE_BODY="${MOCK_REVOKE_LARGE_BODY:-}" \
+  MOCK_PULL_MIXED="${MOCK_PULL_MIXED:-}" \
     "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
     </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
   MOCK_SERVER_PID=$!
@@ -36,6 +37,7 @@ restart_mock_server() {
   MOCK_REVOKE_BAD_HEADER="${MOCK_REVOKE_BAD_HEADER:-}" \
   MOCK_REVOKE_BAD_BODY="${MOCK_REVOKE_BAD_BODY:-}" \
   MOCK_REVOKE_LARGE_BODY="${MOCK_REVOKE_LARGE_BODY:-}" \
+  MOCK_PULL_MIXED="${MOCK_PULL_MIXED:-}" \
     "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
       </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
   MOCK_SERVER_PID=$!
@@ -530,6 +532,7 @@ VALUES ('remote-pending.$key', $owner_pid, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
   run bash "$SCRIPTS/remote.sh" bogus
   [ "$status" -ne 0 ]
   [[ "$output" == *"Usage:"* ]]
+  [[ "$output" == *"pull"* ]]
 }
 
 # --- python3 preflight (dependency tiering: remote = +python3) -------------
@@ -657,6 +660,26 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   [ "$status" -eq 0 ]
   [[ "$output" == *"history one"* ]]
   [[ "$output" == *"history two"* ]]
+}
+
+@test "remote pull: applies seven roster events alongside seventy-three messages" {
+  MOCK_PULL_MIXED=1
+  restart_mock_server
+
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" mixed
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"80 message(s)"* ]]
+
+  local cfg journal
+  cfg="$TEST_SKILL_DIR/teams/mixed/config.json"
+  journal="$TEST_SKILL_DIR/teams/mixed/roster.jsonl"
+  [ "$(sqlite_mem "SELECT COUNT(*) FROM json_each(
+      json_extract(readfile('$(rf "$cfg")'), '\$.agents'));")" -eq 7 ]
+  [ "$(jq -s '[.[] | select(.type=="member_joined")] | length' "$journal")" -eq 7 ]
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/storage.sh"
+  agmsg_storage_load
+  [ "$(storage_history mixed | jq -s 'length')" -eq 73 ]
 }
 
 @test "remote doctor: age is optional — its absence does not fail the run" {
