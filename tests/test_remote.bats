@@ -618,6 +618,22 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   [ "$(sqlite_mem "SELECT json_extract(readfile('$(rf "$cfg")'), '\$.team_id');")" = "$PULL_TEAM_ID" ]
 }
 
+@test "remote pull: starts a background sync engine that disconnect stops" {
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" cloned
+  [ "$status" -eq 0 ]
+  # "Machine two ... pulls the team down, and continues" — continuing IS the
+  # engine. A pulled team that only cloned would report a send as "Sent" and
+  # stay local while status answered "connected"; pin the engine running and the
+  # binding it continues against. This is what a green 56/0 slipped past.
+  [[ "$output" == *"Sync engine running."* ]]
+  local pidfile="$SCRIPTS/../run/remote-sync.cloned.pid"
+  wait_for_file "$pidfile"
+  local cfg="$TEST_SKILL_DIR/teams/cloned/config.json"
+  [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.remote_binding.endpoint');")" = "$ENDPOINT" ]
+  bash "$SCRIPTS/remote.sh" disconnect cloned
+  wait_for_missing "$pidfile"
+}
+
 @test "remote pull: does not take a roster from the server" {
   # The server holds no membership -- it travels inside the envelope, so under
   # e2ee the server cannot read it. A roster invented here would be a guess
