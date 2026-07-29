@@ -73,9 +73,33 @@ it, out of band.
 That one restraint settles both hard parts.
 
 **When machines switch** is decided by the record's place in the server's
-sequence. Before it, the old key; from it, the new one — a boundary every
-machine reads the same way, for the same reason renames get their order for
-free. No cutover protocol, and no need to stop the other machines first.
+sequence — a boundary every machine reads the same way, for the same reason
+renames get their order for free. No cutover protocol, and no need to stop the
+other machines first.
+
+The record is itself sealed, and which key seals it settles the rest. **A
+`key_rotated` is sealed with the epoch immediately before the one it announces,
+and the new epoch takes effect from the sequence after the record.** Sealing it
+with the new key would make the boundary land one position earlier, and would
+cost the thing the announcement exists for: someone holding only the old key
+would see an undecryptable blob rather than a reason. A machine should be able to
+say "the key changed and I do not have the new one", not merely stop
+understanding its own team. The fingerprint is not the key, so reading the
+announcement gains a removed member nothing but the fact.
+
+**Two machines can rotate at once, and the sequence decides.** Both seal their
+announcement with the same preceding epoch, and both claim the epoch after it;
+the first one the server orders is adopted, and a later record claiming an epoch
+already taken is ignored. The machine that lost holds a key nobody uses and no
+key for the epoch that won — so it halts, exactly as any other machine missing
+the current key does, and resumes once it is handed the winner's. Nothing new is
+needed to handle it: the rule that a machine without the current key stops is
+already the whole mechanism.
+
+Stating the seal as "the preceding epoch" rather than "the old key" is what makes
+that work, and it was the more accurate statement to begin with — the property
+being relied on is that whoever is *about* to be cut off can still read the
+notice.
 
 **Who ends up holding the new key** is settled by leaving it out. Someone who
 has been removed still holds the old key, so they can read the announcement —
