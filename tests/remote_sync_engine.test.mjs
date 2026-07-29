@@ -18,7 +18,6 @@ import {
   pullBootstrap,
   parseStrictJsonl,
   readStateCycle,
-  readConnectedCredential,
   readStateUpdateBatches,
   reprocessCycle,
   request,
@@ -233,10 +232,6 @@ async function withConnectedCredential(callback) {
   const root = await mkdtemp(join(tmpdir(), "agmsg-connected-credential-"));
   const previous = process.env.AGMSG_SYNC_CONNECTION_DIR;
   process.env.AGMSG_SYNC_CONNECTION_DIR = root;
-  await mkdir(join(root, "run", "remote-credentials"), { recursive: true });
-  await writeFile(join(root, "run", "remote-credentials", "demo.json"),
-    `${JSON.stringify({ credential: "fixture-token", credential_id: credentialId })}\n`,
-    { mode: 0o600 });
   try {
     return await callback(root);
   } finally {
@@ -250,7 +245,6 @@ async function writeConnectedTeam(root, overrides = {}) {
   await mkdir(join(root, "teams", "demo"), { recursive: true });
   const remoteBinding = {
     endpoint: "https://sync.example",
-    credential_id: credentialId,
     server_instance_id: config.server_instance_id,
     remote_team_id: config.remote_team_id,
     remote_team_name: "demo",
@@ -263,53 +257,6 @@ async function writeConnectedTeam(root, overrides = {}) {
   await writeFile(join(root, "teams", "demo", "config.json"),
     `${JSON.stringify({ name: "demo", agents: {}, remote_binding: remoteBinding }, null, 2)}\n`);
 }
-
-test("connected binding and private credential are the default engine configuration", async () => {
-  await withConnectedCredential(async (root) => {
-    await writeConnectedTeam(root);
-    const previousStorage = process.env.AGMSG_SYNC_STORAGE_DIR;
-    const previousAmbient = process.env.AGMSG_SYNC_TOKEN;
-    process.env.AGMSG_SYNC_STORAGE_DIR = join(root, "store");
-    process.env.AGMSG_SYNC_TOKEN = "ambient-token-must-not-win";
-    try {
-      const loaded = await loadConfig("demo");
-      assert.equal(loaded.server_url, "https://sync.example");
-      assert.equal(loaded.remote_team_id, config.remote_team_id);
-      assert.equal(loaded.credential_id, credentialId);
-      assert.equal(loaded.cipher_profile, "none");
-      assert.equal(await readConnectedCredential(loaded), "fixture-token");
-    } finally {
-      if (previousStorage === undefined) delete process.env.AGMSG_SYNC_STORAGE_DIR;
-      else process.env.AGMSG_SYNC_STORAGE_DIR = previousStorage;
-      if (previousAmbient === undefined) delete process.env.AGMSG_SYNC_TOKEN;
-      else process.env.AGMSG_SYNC_TOKEN = previousAmbient;
-    }
-  });
-});
-
-test("credential loader rejects binding mismatch and non-private files", async () => {
-  await withConnectedCredential(async (root) => {
-    const path = join(root, "run", "remote-credentials", "demo.json");
-    await writeFile(path, `${JSON.stringify({ credential: "fixture-token",
-      credential_id: "other-credential" })}\n`, { mode: 0o600 });
-    await assert.rejects(readConnectedCredential({ ...config, credential_id: credentialId }),
-      /does not match/u);
-    if (process.platform !== "win32") {
-      await writeFile(path, `${JSON.stringify({ credential: "fixture-token",
-        credential_id: credentialId })}\n`, { mode: 0o600 });
-      await chmod(path, 0o644);
-      await assert.rejects(readConnectedCredential({ ...config, credential_id: credentialId }),
-        /private regular file/u);
-      await unlink(path);
-      const target = join(root, "credential-target.json");
-      await writeFile(target, `${JSON.stringify({ credential: "fixture-token",
-        credential_id: credentialId })}\n`, { mode: 0o600 });
-      await symlink(target, path);
-      await assert.rejects(readConnectedCredential({ ...config, credential_id: credentialId }),
-        /private regular file/u);
-    }
-  });
-});
 
 test("connected binding is a bounded non-writable nofollow authority", async () => {
   await withConnectedCredential(async (root) => {
@@ -730,7 +677,7 @@ test("headerless non-JSON intermediary failures remain retryable", async () => {
   }
 });
 
-test("request callers cannot override binding or credential headers", async () => {
+test("request callers cannot override the binding headers, and it sends no Authorization", async () => {
   const previousFetch = globalThis.fetch;
   let captured;
   try {
@@ -742,15 +689,15 @@ test("request callers cannot override binding or credential headers", async () =
           status: 200, headers: { "Agmsg-Protocol-Version": "1" },
         });
       };
-      await request({ ...config, credential_id: credentialId,
-        server_url: "https://sync.example" }, "/v1/messages", { headers: {
-        Authorization: "Bearer attacker-value",
-        "Agmsg-Team-ID": "018f3f7e-9999-7000-8000-000000000009",
-        "Agmsg-Protocol-Version": "99",
-      } });
-      assert.equal(captured.Authorization, "Bearer fixture-token");
+      await request({ ...config, server_url: "https://sync.example" },
+        "/v1/messages", { headers: {
+          "Agmsg-Team-ID": "018f3f7e-9999-7000-8000-000000000009",
+          "Agmsg-Protocol-Version": "99",
+        } });
       assert.equal(captured["Agmsg-Team-ID"], config.remote_team_id);
       assert.equal(captured["Agmsg-Protocol-Version"], "1");
+      // No per-request credential on the remote-sync data plane anymore.
+      assert.equal(captured.Authorization, undefined);
     });
   } finally {
     globalThis.fetch = previousFetch;

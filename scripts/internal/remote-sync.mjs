@@ -19,7 +19,6 @@ const TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/;
 const PROTOCOL = "1";
 const MAX_SEQUENCE = 9_223_372_036_854_775_807n;
 const MAX_CONNECTION_CONFIG_BYTES = 2 * 1024 * 1024;
-const MAX_CREDENTIAL_BYTES = 64 * 1024;
 
 function usage() {
   return `usage:
@@ -33,8 +32,9 @@ function usage() {
   remote-sync.sh resync --team NAME --accept-floor SEQUENCE
   remote-sync.sh unblock-read --team NAME --member-id UUID
 
-Run remote.sh connect first. The engine reads that team's private credential
-file directly; credentials are never accepted through argv or environment.`;
+Run remote.sh connect first. The engine reads that team's connection binding
+directly; the remote-sync data plane carries no per-request credential — see
+docs/design/remote-sync.md.`;
 }
 
 function options(args) {
@@ -82,12 +82,6 @@ function teamConfigPath(team) {
   const connectionRoot = process.env.AGMSG_SYNC_CONNECTION_DIR ?? process.env.SKILL_DIR;
   if (!connectionRoot) throw new Error("sync connection root is unavailable");
   return join(connectionRoot, "teams", team, "config.json");
-}
-
-function credentialPath(team) {
-  const connectionRoot = process.env.AGMSG_SYNC_CONNECTION_DIR ?? process.env.SKILL_DIR;
-  if (!connectionRoot) throw new Error("sync connection root is unavailable");
-  return join(connectionRoot, "run", "remote-credentials", `${team}.json`);
 }
 
 function replacementIdentityPath(team, epoch) {
@@ -193,7 +187,6 @@ function connectedBinding(value, team) {
   const binding = value?.remote_binding;
   if (value?.name !== team || !binding || typeof binding !== "object" ||
       typeof binding.endpoint !== "string" || binding.endpoint.length < 1 ||
-      !UUID_V7.test(binding.credential_id ?? "") ||
       !UUID_V7.test(binding.server_instance_id ?? "") ||
       !UUID_V7.test(binding.remote_team_id ?? "") || binding.protocol_version !== 1 ||
       typeof binding.connected_at !== "string" || Number.isNaN(Date.parse(binding.connected_at)) ||
@@ -250,23 +243,6 @@ async function readConnectedBinding(team) {
   return connectedBinding(parseStrictJson(source), team);
 }
 
-export async function readConnectedCredential(config) {
-  const path = credentialPath(config.local_team);
-  const source = new TextDecoder("utf-8", { fatal: true }).decode(
-    await readBoundedAuthorityFile(path, MAX_CREDENTIAL_BYTES, true));
-  const records = parseStrictJsonl(source);
-  const value = records[0];
-  if (records.length !== 1 || !value || typeof value !== "object" || Array.isArray(value) ||
-      Object.keys(value).sort().join(",") !== "credential,credential_id" ||
-      typeof value.credential !== "string" || value.credential.length < 1 ||
-      /[\u0000-\u001f\u007f]/u.test(value.credential) ||
-      !UUID_V7.test(value.credential_id) ||
-      (config.credential_id && value.credential_id !== config.credential_id)) {
-    throw new Error("remote credential file is invalid or does not match the binding");
-  }
-  return value.credential;
-}
-
 function ageTrustPath(config) {
   const root = process.env.AGMSG_SYNC_TRUST_DIR;
   if (!root) throw new Error("AGMSG_SYNC_TRUST_DIR is required for age-v1 and must survive sync-state reset");
@@ -321,7 +297,6 @@ export async function loadConfig(team) {
       value.protocol_version !== binding.protocol_version) {
     throw new Error("sync configuration does not match the connected team binding");
   }
-  value.credential_id = binding.credential_id;
   if (value.local_team !== team || value.protocol_version !== 1 ||
       !UUID_V7.test(value.server_instance_id) || !UUID_V7.test(value.remote_team_id)) {
     throw new Error("sync config binding is invalid");
@@ -334,7 +309,6 @@ export async function loadConfig(team) {
     await activateKeyRotations(value);
   }
   else if (value.cipher_profile !== "none") throw new Error("sync cipher profile is unsupported");
-  await readConnectedCredential(value);
   return value;
 }
 
@@ -583,8 +557,11 @@ function endpoint(base, path) {
 }
 
 export async function request(config, path, init = {}) {
-  const token = await readConnectedCredential(config);
-  return send(config, path, init, { Authorization: `Bearer ${token}` });
+  // The data plane no longer authenticates per request — reaching the server is
+  // the permission (docs/design/remote-sync.md and the server's scopedTeamId).
+  // So request() carries no credential; it is now the same as requestPublic,
+  // kept as the name the pre-pull data-plane callers use.
+  return send(config, path, init, {});
 }
 
 // The pull routes carry no credential, for the reason /v1/connect has none:
@@ -1313,7 +1290,7 @@ export async function configure(args) {
   const config = {
     format_version: 1, local_team: team, server_url: serverUrl,
     server_instance_id: ready.server_instance_id, remote_team_id: args["team-id"],
-    protocol_version: 1, credential_id: binding.credential_id, cipher_profile: cipherProfile,
+    protocol_version: 1, cipher_profile: cipherProfile,
     local_security_history: [{ local_security_revision: "0", effective_from_seq: "1",
       minimum_security_mode: minimumSecurity }],
   };
@@ -1914,7 +1891,14 @@ export async function pullBootstrap(args, dependencies = {}) {
   process.stdout.write(`${JSON.stringify({
     type: "pull_bootstrap_result", team: config.local_team,
     team_id: config.remote_team_id, team_name: snapshot.team_name,
-    server_instance_id: config.server_instance_id, imported,
+    server_instance_id: config.server_instance_id,
+    // The binding the second machine records so it keeps syncing (the design's
+    // "and continues"): the same capability snapshot connect stores, plus the
+    // protocol version. Without it the pulled team has no connected binding and
+    // the sync engine refuses to run.
+    protocol_version: config.protocol_version,
+    capabilities: snapshot,
+    imported,
   })}\n`);
 }
 

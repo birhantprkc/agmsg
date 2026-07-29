@@ -389,7 +389,7 @@ export async function syncReadState(
     // row. Members without a row receive the same floor logically in the page
     // query below.
     await client.query(
-      `UPDATE read_frontiers SET server_seq = GREATEST(server_seq, $2)
+      `UPDATE read_frontiers SET server_seq = GREATEST(server_seq, $2::bigint)
         WHERE team_id = $1`,
       [teamId, floor.toString()],
     );
@@ -569,12 +569,12 @@ async function retainThroughLocked(
        (team_id, id, original_team_seq, envelope_digest)
      SELECT team_id, id, team_seq, envelope_digest
        FROM messages
-      WHERE team_id = $1 AND team_seq <= $2
+      WHERE team_id = $1 AND team_seq <= $2::bigint
      RETURNING id`,
     [teamId, through.toString()],
   );
   const deleted = await client.query(
-    "DELETE FROM messages WHERE team_id = $1 AND team_seq <= $2",
+    "DELETE FROM messages WHERE team_id = $1 AND team_seq <= $2::bigint",
     [teamId, through.toString()],
   );
   if (deleted.rowCount !== tombstones.rowCount) {
@@ -585,7 +585,7 @@ async function retainThroughLocked(
     [teamId, through.toString()],
   );
   await client.query(
-    `UPDATE read_frontiers SET server_seq = GREATEST(server_seq, $2)
+    `UPDATE read_frontiers SET server_seq = GREATEST(server_seq, $2::bigint)
       WHERE team_id = $1`,
     [teamId, through.toString()],
   );
@@ -657,8 +657,8 @@ export async function getMessages(
         `SELECT id::text, team_seq::text, ${timestampSql} AS server_received_at,
                 envelope_v, cipher, key_id, blob, envelope_digest
            FROM messages
-          WHERE team_id = $1 AND team_seq > $2
-          ORDER BY team_seq ASC
+          WHERE team_id = $1 AND team_seq > $2::bigint
+          ORDER BY team_seq::bigint ASC
           LIMIT $3`,
         [teamId, after.toString(), limit + 1],
       );

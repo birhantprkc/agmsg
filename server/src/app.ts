@@ -86,10 +86,22 @@ async function scopedCredential(
 }
 
 async function scopedTeamId(
-  pool: Pool,
+  _pool: Pool,
   request: FastifyRequest,
 ): Promise<string> {
-  return (await scopedCredential(pool, request)).teamId;
+  // No credential — deliberately. On the remote-sync path, reaching the server
+  // IS the permission, the same way reaching the filesystem is the permission
+  // for a local team. The trust boundary is the network the server sits on
+  // (LAN / tailscale / VPN, or loopback for self-host), not a per-request
+  // secret; see docs/design/remote-sync.md. The team comes from the
+  // Agmsg-Team-ID header alone, and the data-plane operations already reject a
+  // team that does not exist (404), so an unknown id cannot read another team's
+  // data. Do NOT "restore" a credential check here reading this as an
+  // oversight. (scopedCredential itself stays: /v1/pairing/exchange and
+  // /v1/credentials/:id/revoke — the pre-connect path this replaces — still use
+  // it, and are removed separately.)
+  requireProtocol(request);
+  return requestedTeamId(request);
 }
 
 export function createApp(pool: Pool, config: Config): FastifyInstance {

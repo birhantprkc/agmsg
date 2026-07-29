@@ -57,7 +57,7 @@ json_field() {
   wait_for_file_contains "$TEST_SKILL_DIR/server.port" '^[0-9][0-9]*$'
   local mock_port; mock_port="$(cat "$TEST_SKILL_DIR/server.port")"
   local endpoint="http://127.0.0.1:$mock_port"
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$endpoint" good-token myteam
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$endpoint" myteam
   local committed_remote_team_id
   committed_remote_team_id=$(python3 -c "import json; print(json.load(open('$SCRIPTS/../teams/myteam/config.json'))['remote_binding']['remote_team_id'])")
 
@@ -80,7 +80,7 @@ json_field() {
   wait_for_file_contains "$TEST_SKILL_DIR/server.port" '^[0-9][0-9]*$'
   local mock_port; mock_port="$(cat "$TEST_SKILL_DIR/server.port")"
   local endpoint="http://127.0.0.1:$mock_port"
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$endpoint" good-token myteam
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$endpoint" myteam
   bash "$SCRIPTS/remote.sh" disconnect myteam
   kill "$mock_pid" 2>/dev/null || true
 

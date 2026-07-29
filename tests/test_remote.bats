@@ -77,7 +77,9 @@ restart_mock_server() {
 }
 
 @test "connect: http://127.0.0.1 (loopback) is accepted without https" {
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
+  # Loopback passes endpoint validation, then connect proceeds to register a
+  # real local team. testteam was minted with a team_id in setup().
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
   [ "$status" -eq 0 ]
 }
 
@@ -125,308 +127,59 @@ restart_mock_server() {
   [[ "$output" == *"userinfo"* ]]
 }
 
-@test "connect: rejects an exchange response with a path-injection-shaped credential_id" {
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" malformed-credential-id-token myteam
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"invalid exchange response"* ]]
-  # Must not have mutated any local state on the way to rejecting it.
-  run bash "$SCRIPTS/remote.sh" status myteam
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"never been connected"* ]]
-}
-
-@test "connect: rejects an exchange response missing a required field" {
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" missing-field-token myteam
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"invalid exchange response"* ]]
-}
-
-@test "connect: rejects an exchange response with a duplicate JSON key (D4)" {
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" duplicate-key-token myteam
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"invalid exchange response"* ]]
-  [[ "$output" == *"duplicate"* ]]
-  run bash "$SCRIPTS/remote.sh" status myteam
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"never been connected"* ]]
-}
-
-@test "connect: rejects an exchange response with an unrecognized field (D4)" {
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" unknown-field-token myteam
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"invalid exchange response"* ]]
-  [[ "$output" == *"unrecognized"* ]]
-}
-
-@test "connect: rejects a credential containing a raw control character (E3)" {
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" control-char-credential-token myteam
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"invalid exchange response"* ]]
-  [[ "$output" == *"control character"* ]]
-  run bash "$SCRIPTS/remote.sh" status myteam
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"never been connected"* ]]
-}
-
 # --- connect -------------------------------------------------------------
 
-@test "connect: happy path, no encryption required" {
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
+@test "connect: registers a client-owned team (happy path, Done-when 1)" {
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Connected: team 'myteam'"* ]]
-  [ -f "$SCRIPTS/../run/remote-credentials/myteam.json" ]
+  [[ "$output" == *"Connected: team 'testteam'"* ]]
+  # A binding is recorded on the team config, and it carries no credential:
+  # the register model writes none and none is fetched back.
+  [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$SCRIPTS/../teams/testteam/config.json') AS TEXT), '\$.remote_binding.connected_at');")" != "" ]
+  [ ! -f "$SCRIPTS/../run/remote-credentials/testteam.json" ]
 }
 
-@test "connect: credential file is 0600 and never appears in team config.json" {
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
-  perms=$(stat -c "%a" "$SCRIPTS/../run/remote-credentials/myteam.json" 2>/dev/null || stat -f "%Lp" "$SCRIPTS/../run/remote-credentials/myteam.json")
-  [ "$perms" = "600" ]
-  run grep -c "session-credential" "$SCRIPTS/../teams/myteam/config.json"
-  [ "$output" -eq 0 ]
-}
-
-@test "connect: bare positional token warns on stderr; --token-stdin does not" {
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
-  [[ "$output" == *"prefer --token-stdin"* ]]
-  bash "$SCRIPTS/remote.sh" disconnect myteam >/dev/null
-  run bash -c "printf 'good-token' | bash '$SCRIPTS/remote.sh' connect --endpoint '$ENDPOINT' --token-stdin myteam"
+@test "connect: moves the team into its own per-team store (Done-when 2)" {
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
   [ "$status" -eq 0 ]
-  [[ "$output" != *"prefer --token-stdin"* ]]
+  # A connected team's rows are migrated out of the shared store into a
+  # per-team one; connect exits non-zero if that migration fails.
+  run find "$TEST_SKILL_DIR" -path '*teams/testteam/messages.db'
+  [ -n "$output" ]
 }
 
-@test "connect: bad token surfaces the exchange endpoint's HTTP error" {
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" bad-token myteam
+@test "connect: starts a background sync engine that disconnect stops (Done-when 4)" {
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  local pidfile="$SCRIPTS/../run/remote-sync.testteam.pid"
+  wait_for_file "$pidfile"
+  bash "$SCRIPTS/remote.sh" disconnect testteam
+  wait_for_missing "$pidfile"
+}
+
+@test "connect: mints team_id and member_ids for a team that predates local ids" {
+  # A legacy team: agents but no team_id, members with no member_id. Give it an
+  # initialized store so the connect-time migration has something to move.
+  mkdir -p "$TEST_SKILL_DIR/teams/legacyteam"
+  printf '{"name":"legacyteam","agents":{"alice":{"type":"claude-code"},"bob":{"type":"codex"}},"created_at":"2026-01-01T00:00:00Z"}\n' \
+    > "$TEST_SKILL_DIR/teams/legacyteam/config.json"
+  bash -c '. "$1/scripts/lib/storage.sh"; agmsg_storage_load; storage_init "$2" >/dev/null' \
+    x "$SCRIPTS/.." legacyteam
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" legacyteam
+  [ "$status" -eq 0 ]
+  local cfg="$TEST_SKILL_DIR/teams/legacyteam/config.json"
+  # The whole roster is now id-holding (all-or-none): a team_id and a member_id
+  # for every member, minted at connect.
+  [[ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.team_id');")" =~ ^[0-9a-f]{8}- ]]
+  [ -n "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.agents.alice.member_id');")" ]
+  [ -n "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.agents.bob.member_id');")" ]
+}
+
+@test "connect: refuses a second connect for the same team_id with 409 (Done-when 5)" {
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  # The mock keeps the registered team_id; a repeat is a uniqueness conflict.
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
   [ "$status" -ne 0 ]
-  [[ "$output" == *"HTTP 401"* ]]
-}
-
-@test "connect: refuses to rebind an already-connected team without --force" {
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"already connected"* ]]
-  [[ "$output" == *"--force"* ]]
-}
-
-@test "connect: --force allows rebinding an already-connected team" {
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam --force
-  [ "$status" -eq 0 ]
-}
-
-@test "connect: --force revokes the OLD credential before establishing the new one (B5)" {
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token-one myteam
-  old_credential_id=$(python3 -c "import json; print(json.load(open('$SCRIPTS/../teams/myteam/config.json'))['remote_binding']['credential_id'])")
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token-two myteam --force
-  [ "$status" -eq 0 ]
-  new_credential_id=$(python3 -c "import json; print(json.load(open('$SCRIPTS/../teams/myteam/config.json'))['remote_binding']['credential_id'])")
-  [ "$old_credential_id" != "$new_credential_id" ]
-  revoked=$(curl -s "$ENDPOINT/_test/revoked")
-  [[ "$revoked" == *"$old_credential_id"* ]]
-}
-
-@test "connect: --force refuses to rebind if the old credential can't be confirmed revoked" {
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token-one myteam
-  # Kill the mock server so revoke can't be reached at all.
-  kill "$MOCK_SERVER_PID" 2>/dev/null
-  wait "$MOCK_SERVER_PID" 2>/dev/null || true
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token-two myteam --force
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"could not confirm the existing credential"* ]]
-  # Old binding must still be intact — refusal must not have half-applied.
-  run bash "$SCRIPTS/remote.sh" status myteam
-  [[ "$output" == *"connected"* ]]
-}
-
-@test "connect: --force rejects a 200 revoke body that does not match the binding" {
-  MOCK_REVOKE_BAD_BODY=1
-  restart_mock_server
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token-one myteam
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token-two myteam --force
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"could not confirm the existing credential"* ]]
-  run bash "$SCRIPTS/remote.sh" status myteam
-  [[ "$output" == *"connected"* ]]
-}
-
-@test "connect: --force bounds revoke response before validation" {
-  MOCK_REVOKE_LARGE_BODY=1
-  restart_mock_server
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token-one myteam
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token-two myteam --force
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"could not confirm the existing credential"* ]]
-}
-
-@test "connect: --force requires an explicit <team> (refuses when omitted)" {
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token --force
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"--force requires an explicit"* ]]
-}
-
-@test "connect: --force does not blindly overwrite an unexpected binding it never revoked (D1)" {
-  # Simulates the race D1 flagged: an exchange already completed (its
-  # result sits in a pending record — reachable without --force's own
-  # pre-check/revoke step, exactly like a resumed crash-recovery would
-  # be) for a credential the team's CURRENT binding was never revoked
-  # against. --force must still refuse here rather than treat "force" as
-  # an unconditional license to overwrite whatever's there.
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token-one myteam
-  current_credential_id=$(python3 -c "import json; print(json.load(open('$SCRIPTS/../teams/myteam/config.json'))['remote_binding']['credential_id'])")
-
-  local token="unrelated-inflight-token"
-  local key
-  key=$(python3 -c "import hashlib; print(hashlib.sha256('$ENDPOINT'.encode()+b'\x00'+'$token'.encode()).hexdigest())")
-  pending_dir="$SCRIPTS/../run/remote-connect-pending"
-  mkdir -p "$pending_dir"
-  python3 -c "
-import json
-response = {
-    'credential': 'unrelated-credential-value',
-    'credential_id': '018f3f7e-5555-7000-8000-000000000005',
-    'server_instance_id': '018f3f7e-1111-7000-8000-000000000001',
-    'remote_team_id': '018f3f7e-2222-7000-8000-000000000002',
-    'remote_team_name': 'myteam',
-    'protocol_version': 1,
-    'capabilities': {
-        'protocol_version': 1,
-        'server_instance_id': '018f3f7e-1111-7000-8000-000000000001',
-        'team_id': '018f3f7e-2222-7000-8000-000000000002',
-        'team_name': 'myteam',
-        'accepted_envelope_versions': [1],
-        'write_allowed_ciphers': ['none'],
-        'policy_revision': '0', 'effective_from_seq': '1',
-        'current_seq': '0', 'next_sequence_boundary': '1',
-        'min_available_seq': '0', 'max_blob_bytes': '1048576',
-        'policy_history': [{
-            'policy_revision': '0', 'effective_from_seq': '1',
-            'accepted_envelope_versions': [1],
-            'write_allowed_ciphers': ['none'],
-        }],
-    },
-}
-json.dump({
-    'endpoint': '$ENDPOINT',
-    'protocol_header_verified': True,
-    'raw_response_text': json.dumps(response),
-}, open('$pending_dir/$key.json', 'w'))
-"
-  chmod 600 "$pending_dir/$key.json"
-
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" "$token" myteam --force
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"unexpected binding"* ]]
-  # The original binding must be untouched — no silent overwrite.
-  after_credential_id=$(python3 -c "import json; print(json.load(open('$SCRIPTS/../teams/myteam/config.json'))['remote_binding']['credential_id'])")
-  [ "$after_credential_id" = "$current_credential_id" ]
-}
-
-@test "connect: after disconnect, reconnecting the same team needs no --force" {
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
-  bash "$SCRIPTS/remote.sh" disconnect myteam
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
-  [ "$status" -eq 0 ]
-}
-
-@test "connect: uses the exchange response's remote_team_name when <team> is omitted" {
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token
-  [ "$status" -eq 0 ]
-  [ -f "$SCRIPTS/../teams/myteam/config.json" ]
-}
-
-@test "connect: encryption required + empty stream still requires an explicit 'g' to generate" {
-  # B3 (adversarial review): local/server "stream empty" signals cannot
-  # prove first-writer status (an honest server can show current_seq==0 to
-  # two simultaneous devices; a malicious one can fake it to either) — so
-  # generate is never an automatic default, empty stream or not. Explicit
-  # 'g' still works.
-  command -v age >/dev/null 2>&1 || skip "age not installed"
-  run bash -c "echo g | bash '$SCRIPTS/remote.sh' connect --endpoint '$ENDPOINT' good-token-enc myteam"
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"requires end-to-end encryption"* ]]
-  [[ "$output" == *"Generated a new key for team 'myteam'"* ]]
-  [[ "$output" == *"Connected: team 'myteam'"* ]]
-  run bash -c "python3 -c \"import json; print(json.load(open('$SCRIPTS/../teams/myteam/config.json'))['remote_key']['current']['key_id'])\""
-  [ "$status" -eq 0 ]
-}
-
-@test "connect: token stdin remains separate from the E2EE generate prompt" {
-  skip_on_windows "PTY-backed secure prompt test requires POSIX controlling-terminal semantics"
-  command -v age >/dev/null 2>&1 || skip "age not installed"
-  token_file="$(mktemp "$BATS_TEST_TMPDIR/remote-token.XXXXXX")"
-  chmod 600 "$token_file"
-  printf '%s' 'good-token-enc' > "$token_file"
-  run python3 "$BATS_TEST_DIRNAME/helpers/run_remote_connect_tty.py" \
-    "$SCRIPTS/remote.sh" "$ENDPOINT" "$token_file" generate
-  rm -f "$token_file"
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"requires end-to-end encryption"* ]]
-  [[ "$output" == *"Generated a new key for team 'myteam'"* ]]
-  [[ "$output" == *"Connected: team 'myteam'"* ]]
-  [[ "$output" != *"prefer --token-stdin"* ]]
-  [[ "$output" != *"good-token-enc"* ]]
-}
-
-@test "connect: encryption required + existing history still requires an explicit 'i' to import" {
-  command -v age >/dev/null 2>&1 || skip "age not installed"
-  bash "$SCRIPTS/join.sh" myteam alice claude-code /tmp/project-a >/dev/null
-  bash "$SCRIPTS/send.sh" myteam alice alice "seed message so the stream isn't empty" >/dev/null
-  identity=$(age-keygen 2>/dev/null | grep '^AGE-SECRET-KEY-')
-  run bash -c "printf 'i\n%s\n' '$identity' | bash '$SCRIPTS/remote.sh' connect --endpoint '$ENDPOINT' good-token-enc myteam"
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"Imported key for team 'myteam'"* ]]
-  [[ "$output" == *"Connected: team 'myteam'"* ]]
-}
-
-@test "connect: token stdin remains separate from the E2EE import prompts" {
-  skip_on_windows "PTY-backed secure prompt test requires POSIX controlling-terminal semantics"
-  command -v age >/dev/null 2>&1 || skip "age not installed"
-  identity=$(age-keygen 2>/dev/null | grep '^AGE-SECRET-KEY-')
-  token_file="$(mktemp "$BATS_TEST_TMPDIR/remote-token.XXXXXX")"
-  identity_file="$(mktemp "$BATS_TEST_TMPDIR/remote-identity.XXXXXX")"
-  chmod 600 "$token_file" "$identity_file"
-  printf '%s' 'good-token-enc' > "$token_file"
-  printf '%s' "$identity" > "$identity_file"
-  run python3 "$BATS_TEST_DIRNAME/helpers/run_remote_connect_tty.py" \
-    "$SCRIPTS/remote.sh" "$ENDPOINT" "$token_file" import "$identity_file"
-  rm -f "$token_file" "$identity_file"
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"Imported key for team 'myteam'"* ]]
-  [[ "$output" == *"Connected: team 'myteam'"* ]]
-  [[ "$output" != *"prefer --token-stdin"* ]]
-  [[ "$output" != *"$identity"* ]]
-}
-
-@test "connect: encryption required + empty/EOF input on the choice prompt safely aborts (never auto-generates)" {
-  command -v age >/dev/null 2>&1 || skip "age not installed"
-  run bash -c "echo | bash '$SCRIPTS/remote.sh' connect --endpoint '$ENDPOINT' good-token-enc myteam"
-  [ "$status" -ne 0 ]
-  [[ "$output" != *"Generated a new key"* ]]
-  run bash -c "python3 -c \"import json; print(json.load(open('$SCRIPTS/../teams/myteam/config.json')).get('remote_key'))\""
-  [[ "$output" == "None" ]]
-}
-
-@test "connect: aborting the encryption prompt leaves the binding but no key, visible via status" {
-  command -v age >/dev/null 2>&1 || skip "age not installed"
-  run bash -c "echo a | bash '$SCRIPTS/remote.sh' connect --endpoint '$ENDPOINT' good-token-enc myteam"
-  [ "$status" -ne 0 ]
-  run bash "$SCRIPTS/remote.sh" status myteam
-  [[ "$output" == *"no local key"* ]]
-}
-
-@test "connect: missing age binary blocks the encryption bootstrap with an install hint" {
-  # Build a PATH containing everything connect's call chain needs EXCEPT
-  # age/age-keygen, so the absence check is exercised for real rather than
-  # by replacing all of $PATH (which would also break curl/python3/sqlite3
-  # and make this fail for the wrong reason).
-  fakebin=$(mktemp -d)
-  for tool in bash sh sqlite3 curl python3 mkdir chmod date mktemp mkfifo rmdir rm cat sed mv grep dirname tr basename env sleep; do
-    p="$(command -v "$tool" 2>/dev/null)" && ln -s "$p" "$fakebin/$tool"
-  done
-  run bash -c "PATH='$fakebin' bash '$SCRIPTS/remote.sh' connect --endpoint '$ENDPOINT' good-token-enc myteam"
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"'age' is required"* ]]
-  [[ "$output" == *"brew install age"* ]]
+  [[ "$output" == *"already registered"* ]]
 }
 
 # --- status --------------------------------------------------------------
@@ -438,193 +191,29 @@ json.dump({
 }
 
 @test "status: with no <team> lists every locally-known connected team" {
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
   bash "$SCRIPTS/join.sh" secondteam alice claude-code /tmp/project-a >/dev/null
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token secondteam --force >/dev/null
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" secondteam >/dev/null
   run bash "$SCRIPTS/remote.sh" status
   [ "$status" -eq 0 ]
-  [[ "$output" == *"myteam"* ]]
+  [[ "$output" == *"testteam"* ]]
   [[ "$output" == *"secondteam"* ]]
 }
 
 # --- connect: pending/resume (B5) -----------------------------------------
 
-@test "connect: quarantines legacy pending recovery material without committing it" {
-  local token="legacy-pending-token"
-  local key
-  key=$(python3 -c "import hashlib; print(hashlib.sha256('$ENDPOINT'.encode()+b'\x00'+'$token'.encode()).hexdigest())")
-  pending_dir="$SCRIPTS/../run/remote-connect-pending"
-  mkdir -p "$pending_dir"
-  printf '%s\n' '{"endpoint":"'$ENDPOINT'","raw_response_text":"{\"credential_id\":\"018f3f7e-8888-7000-8000-000000000008\"}"}' > "$pending_dir/$key.json"
-  chmod 600 "$pending_dir/$key.json"
-
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" "$token" myteam
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"refusing to resume a legacy pending exchange"* ]]
-  [[ "$output" == *"preserved the 0600 recovery record"* ]]
-  [ ! -f "$pending_dir/$key.json" ]
-  local quarantined=("$pending_dir/$key.json.unverified."*)
-  [ "${#quarantined[@]}" -eq 1 ]
-  [ -f "${quarantined[0]}" ]
-  mode=$(stat -c '%a' "${quarantined[0]}" 2>/dev/null || stat -f '%Lp' "${quarantined[0]}")
-  [ "$mode" = "600" ]
-  recovered_id=$(python3 -c "import json; p=json.load(open('${quarantined[0]}')); print(json.loads(p['raw_response_text'])['credential_id'])")
-  [ "$recovered_id" = "018f3f7e-8888-7000-8000-000000000008" ]
-}
-
-@test "connect: resumes from a hand-crafted pending record without a fresh network call" {
-  # Simulates the crash-recovery scenario: an exchange already succeeded
-  # once (its result was durably saved to the pending file) but the local
-  # commit never finished. Re-running `connect` with the SAME
-  # (endpoint, token) must complete the commit from the pending record
-  # rather than attempting a new exchange — proven here by killing the
-  # mock server first: if connect still succeeds, it didn't need the
-  # network.
-  local token="resume-test-token"
-  local key
-  key=$(python3 -c "import hashlib; print(hashlib.sha256('$ENDPOINT'.encode()+b'\x00'+'$token'.encode()).hexdigest())")
-  pending_dir="$SCRIPTS/../run/remote-connect-pending"
-  mkdir -p "$pending_dir"
-  python3 -c "
-import json
-response = {
-    'credential': 'resumed-credential-value',
-    'credential_id': '018f3f7e-6666-7000-8000-000000000006',
-    'server_instance_id': '018f3f7e-3333-7000-8000-000000000003',
-    'remote_team_id': '018f3f7e-4444-7000-8000-000000000004',
-    'remote_team_name': 'resumedteam',
-    'protocol_version': 1,
-    'capabilities': {
-        'protocol_version': 1,
-        'server_instance_id': '018f3f7e-3333-7000-8000-000000000003',
-        'team_id': '018f3f7e-4444-7000-8000-000000000004',
-        'team_name': 'resumedteam',
-        'accepted_envelope_versions': [1],
-        'write_allowed_ciphers': ['none'],
-        'policy_revision': '0', 'effective_from_seq': '1',
-        'current_seq': '0', 'next_sequence_boundary': '1',
-        'min_available_seq': '0', 'max_blob_bytes': '1048576',
-        'policy_history': [{
-            'policy_revision': '0', 'effective_from_seq': '1',
-            'accepted_envelope_versions': [1],
-            'write_allowed_ciphers': ['none'],
-        }],
-    },
-}
-json.dump({
-    'endpoint': '$ENDPOINT',
-    'protocol_header_verified': True,
-    'raw_response_text': json.dumps(response),
-}, open('$pending_dir/$key.json', 'w'))
-"
-  chmod 600 "$pending_dir/$key.json"
-
-  kill "$MOCK_SERVER_PID" 2>/dev/null
-  wait "$MOCK_SERVER_PID" 2>/dev/null || true
-
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" "$token" myteam
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"resuming an exchange"* ]]
-  [[ "$output" == *"Connected: team 'myteam'"* ]]
-  # Committed content must match the PENDING record's data, not a fresh
-  # exchange (there was no live server to get one from).
-  credential_id=$(python3 -c "import json; print(json.load(open('$SCRIPTS/../teams/myteam/config.json'))['remote_binding']['credential_id'])")
-  [ "$credential_id" = "018f3f7e-6666-7000-8000-000000000006" ]
-  # Pending record consumed on success — not left behind.
-  [ ! -f "$pending_dir/$key.json" ]
-}
-
-@test "connect: resuming after the commit already fully succeeded is an idempotent no-op (R3)" {
-  # Simulates a crash AFTER _remote_commit finished but BEFORE the pending
-  # file was removed: the binding is already correct, so a retry must not
-  # treat its own prior work as a foreign "someone else connected this
-  # team" conflict.
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" resume-idempotent-token myteam
-  committed_credential_id=$(python3 -c "import json; print(json.load(open('$SCRIPTS/../teams/myteam/config.json'))['remote_binding']['credential_id'])")
-
-  local token="resume-idempotent-token"
-  local key
-  key=$(python3 -c "import hashlib; print(hashlib.sha256('$ENDPOINT'.encode()+b'\x00'+'$token'.encode()).hexdigest())")
-  pending_dir="$SCRIPTS/../run/remote-connect-pending"
-  mkdir -p "$pending_dir"
-  python3 -c "
-import json
-response = {
-    'credential': 'session-credential-resume-idempotent-token',
-    'credential_id': '$committed_credential_id',
-    'server_instance_id': '018f3f7e-1111-7000-8000-000000000001',
-    'remote_team_id': '018f3f7e-2222-7000-8000-000000000002',
-    'remote_team_name': 'myteam',
-    'protocol_version': 1,
-    'capabilities': {
-        'protocol_version': 1,
-        'server_instance_id': '018f3f7e-1111-7000-8000-000000000001',
-        'team_id': '018f3f7e-2222-7000-8000-000000000002',
-        'team_name': 'myteam',
-        'accepted_envelope_versions': [1],
-        'write_allowed_ciphers': ['none'],
-        'policy_revision': '0', 'effective_from_seq': '1',
-        'current_seq': '0', 'next_sequence_boundary': '1',
-        'min_available_seq': '0', 'max_blob_bytes': '1048576',
-        'policy_history': [{
-            'policy_revision': '0', 'effective_from_seq': '1',
-            'accepted_envelope_versions': [1],
-            'write_allowed_ciphers': ['none'],
-        }],
-    },
-}
-json.dump({
-    'endpoint': '$ENDPOINT',
-    'protocol_header_verified': True,
-    'raw_response_text': json.dumps(response),
-}, open('$pending_dir/$key.json', 'w'))
-"
-  chmod 600 "$pending_dir/$key.json"
-
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" "$token" myteam
-  [ "$status" -eq 0 ]
-  [[ "$output" != *"became connected by another process"* ]]
-  [ ! -f "$pending_dir/$key.json" ]
-}
-
 # --- disconnect ------------------------------------------------------------
 
-@test "disconnect: revokes server-side then clears local state" {
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
-  run bash "$SCRIPTS/remote.sh" disconnect myteam
+@test "disconnect: stops the engine and clears local state" {
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  run bash "$SCRIPTS/remote.sh" disconnect testteam
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Revoking credential with server... ok."* ]]
-  [ ! -f "$SCRIPTS/../run/remote-credentials/myteam.json" ]
-  run bash "$SCRIPTS/remote.sh" status myteam
-  [[ "$output" == *"was connected until"* ]]
-}
-
-@test "disconnect: server unreachable for revoke still clears local state, with a warning" {
-  MOCK_REVOKE_FAIL=1
-  kill "$MOCK_SERVER_PID" 2>/dev/null
-  MOCK_REVOKE_FAIL=1 "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
-    </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
-  MOCK_SERVER_PID=$!
-  wait_for_file_contains "$TEST_SKILL_DIR/server.port" '^[0-9][0-9]*$'
-  MOCK_PORT="$(cat "$TEST_SKILL_DIR/server.port")"
-  ENDPOINT="http://127.0.0.1:$MOCK_PORT"
-
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
-  run bash "$SCRIPTS/remote.sh" disconnect myteam
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"could not be reached to revoke"* ]]
-  [ ! -f "$SCRIPTS/../run/remote-credentials/myteam.json" ]
-}
-
-@test "disconnect: does not claim revoke success without the protocol response header" {
-  MOCK_REVOKE_BAD_HEADER=1
-  restart_mock_server
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
-  run bash "$SCRIPTS/remote.sh" disconnect myteam
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"could not be reached to revoke"* ]]
-  [[ "$output" != *"Revoking credential with server... ok."* ]]
-  [ ! -f "$SCRIPTS/../run/remote-credentials/myteam.json" ]
+  [[ "$output" == *"Disconnected 'testteam'. Local sync state cleared"* ]]
+  # The binding is marked disconnected locally (no server round-trip is needed
+  # to disconnect in the register model). We do NOT assert on the "Revoking
+  # credential..." line: it is old-path output that runs with no credential
+  # present and is removed with the credential/E2EE cleanup.
+  [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$SCRIPTS/../teams/testteam/config.json') AS TEXT), '\$.remote_binding.disconnected_at');")" != "" ]
 }
 
 @test "disconnect: fails for a team that isn't connected" {
@@ -636,30 +225,26 @@ json.dump({
 # --- status --json (ADR 0007 addendum) --------------------------------------
 
 @test "status --json: reports the strict schema for an active connection" {
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
-  local committed_credential_id
-  committed_credential_id=$(python3 -c "import json; print(json.load(open('$SCRIPTS/../teams/myteam/config.json'))['remote_binding']['credential_id'])")
-  run bash "$SCRIPTS/remote.sh" status myteam --json
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  run bash "$SCRIPTS/remote.sh" status testteam --json
   [ "$status" -eq 0 ]
   [ "$(echo "$output" | wc -l | tr -d ' ')" -eq 1 ]
-  [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.local_team');")" = "myteam" ]
+  [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.local_team');")" = "testteam" ]
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.endpoint');")" = "$ENDPOINT" ]
-  [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.credential_id');")" = "$committed_credential_id" ]
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.state');")" = "active" ]
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.server_instance_id');")" != "" ]
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.remote_team_id');")" != "" ]
+  # The register binding carries no credential; the field is still emitted for
+  # a stable schema, but as null (removed with the credential/E2EE cleanup).
+  [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.credential_id');")" = "" ]
 }
 
 @test "status --json: reports state=disconnected after disconnect" {
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
-  local committed_credential_id
-  committed_credential_id=$(python3 -c "import json; print(json.load(open('$SCRIPTS/../teams/myteam/config.json'))['remote_binding']['credential_id'])")
-  bash "$SCRIPTS/remote.sh" disconnect myteam
-  run bash "$SCRIPTS/remote.sh" status myteam --json
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  bash "$SCRIPTS/remote.sh" disconnect testteam
+  run bash "$SCRIPTS/remote.sh" status testteam --json
   [ "$status" -eq 0 ]
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.state');")" = "disconnected" ]
-  # credential_id from the old binding is still informative, not a live secret.
-  [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.credential_id');")" = "$committed_credential_id" ]
 }
 
 @test "status --json: errors for a team that has never been connected" {
@@ -675,25 +260,25 @@ json.dump({
 }
 
 @test "status --json: with no <team>, emits one JSONL line per connected team" {
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
   bash "$SCRIPTS/join.sh" otherteam bob claude-code /tmp/project-b
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token otherteam
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" otherteam
   run bash "$SCRIPTS/remote.sh" status --json
   [ "$status" -eq 0 ]
   [ "$(echo "$output" | wc -l | tr -d ' ')" -eq 2 ]
-  local myteam_line otherteam_line
-  myteam_line="$(echo "$output" | grep myteam | grep -v otherteam)"
+  local testteam_line otherteam_line
+  testteam_line="$(echo "$output" | grep testteam | grep -v otherteam)"
   otherteam_line="$(echo "$output" | grep otherteam)"
-  [ -n "$myteam_line" ]
+  [ -n "$testteam_line" ]
   [ -n "$otherteam_line" ]
-  [ "$(sqlite_mem "SELECT json_extract('$(echo "$myteam_line" | sed "s/'/''/g")', '\$.local_team');")" = "myteam" ]
+  [ "$(sqlite_mem "SELECT json_extract('$(echo "$testteam_line" | sed "s/'/''/g")', '\$.local_team');")" = "testteam" ]
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$otherteam_line" | sed "s/'/''/g")', '\$.local_team');")" = "otherteam" ]
 }
 
 @test "status: a team name containing a single quote doesn't break status or status --json (#87-class / .param set fix)" {
   local team="o'brien-team"
   bash "$SCRIPTS/join.sh" "$team" carol claude-code /tmp/project-c
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token "$team"
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" "$team"
   [ "$status" -eq 0 ]
   [[ ! "$output" =~ ".parameter" ]]
   run bash "$SCRIPTS/remote.sh" status "$team"
@@ -758,13 +343,6 @@ json.dump({'endpoint': '$endpoint', 'protocol_header_verified': True, 'raw_respo
   run bash "$SCRIPTS/remote.sh" pending list
   [ "$status" -eq 0 ]
   [[ "$output" == *"No pending connect records"* ]]
-  run bash "$SCRIPTS/remote.sh" pending list --json
-  [ "$status" -eq 0 ]
-  [ -z "$output" ]
-}
-
-@test "pending list: does not list a record that already fully committed" {
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
   run bash "$SCRIPTS/remote.sh" pending list --json
   [ "$status" -eq 0 ]
   [ -z "$output" ]
@@ -924,27 +502,6 @@ VALUES ('remote-pending.$key', $owner_pid, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
   [ -f "$pending_dir/$key.json" ]
 }
 
-@test "connect: blocks (does not resume/commit) when a concurrent pending abort already holds this pending_id's lock (barrier test)" {
-  local token="lock-barrier-connect-token"
-  local key
-  key=$(python3 -c "import hashlib; print(hashlib.sha256('$ENDPOINT'.encode()+b'\x00'+'$token'.encode()).hexdigest())")
-  local pending_dir="$SCRIPTS/../run/remote-connect-pending"
-  local resp
-  resp=$(_valid_pending_response_json \
-    "018f3f7e-9999-7000-8000-000000000009" \
-    "018f3f7e-3333-7000-8000-000000000003" \
-    "018f3f7e-4444-7000-8000-000000000004" \
-    "barrierteam")
-  _write_pending_record "$key" "$ENDPOINT" "$resp" "$pending_dir"
-  _insert_pending_lock_row "$key" "$$"
-
-  AGMSG_PENDING_LOCK_TRIES=3 run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" "$token" barrierteam
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"timed out acquiring pending lock"* ]]
-  [ ! -f "$SCRIPTS/../teams/barrierteam/config.json" ]
-  [ -f "$pending_dir/$key.json" ]
-}
-
 @test "pending abort: reclaims a stale lock left by a dead owner instead of blocking forever (barrier test)" {
   local token="lock-barrier-stale-token"
   local key
@@ -1059,6 +616,22 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   [ -f "$cfg" ]
   # Not minted here: the id is the one the server answered with.
   [ "$(sqlite_mem "SELECT json_extract(readfile('$(rf "$cfg")'), '\$.team_id');")" = "$PULL_TEAM_ID" ]
+}
+
+@test "remote pull: starts a background sync engine that disconnect stops" {
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" cloned
+  [ "$status" -eq 0 ]
+  # "Machine two ... pulls the team down, and continues" — continuing IS the
+  # engine. A pulled team that only cloned would report a send as "Sent" and
+  # stay local while status answered "connected"; pin the engine running and the
+  # binding it continues against. This is what a green 56/0 slipped past.
+  [[ "$output" == *"Sync engine running."* ]]
+  local pidfile="$SCRIPTS/../run/remote-sync.cloned.pid"
+  wait_for_file "$pidfile"
+  local cfg="$TEST_SKILL_DIR/teams/cloned/config.json"
+  [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.remote_binding.endpoint');")" = "$ENDPOINT" ]
+  bash "$SCRIPTS/remote.sh" disconnect cloned
+  wait_for_missing "$pidfile"
 }
 
 @test "remote pull: does not take a roster from the server" {

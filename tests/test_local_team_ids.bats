@@ -84,27 +84,6 @@ write_legacy_team() {
   [ "$(config_field "$new_cfg" '$.name')" = "new-team" ]
 }
 
-@test "remote-created local config starts with a stable team identity" {
-  local python_bin
-  python_bin="$(command -v python3)"
-  "$python_bin" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
-    </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
-  local server_pid=$!
-  wait_for_file_contains "$TEST_SKILL_DIR/server.port" '^[0-9][0-9]*$'
-  local endpoint="http://127.0.0.1:$(cat "$TEST_SKILL_DIR/server.port")"
-
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$endpoint" good-token remote-demo
-  kill "$server_pid" 2>/dev/null || true
-  wait "$server_pid" 2>/dev/null || true
-
-  local cfg="$TEST_SKILL_DIR/teams/remote-demo/config.json"
-  local team_id
-  team_id="$(config_field "$cfg" '$.team_id')"
-  [[ "$team_id" =~ $UUID7_RE ]]
-  [ "$(config_field "$cfg" '$.agents')" = "{}" ]
-  [ "$(config_field "$cfg" '$.team_id')" = "$team_id" ]
-}
-
 @test "core join does not require python3" {
   local no_python cmd
   no_python="$(mktemp -d)"

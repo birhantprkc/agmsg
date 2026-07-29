@@ -37,6 +37,12 @@ PULL_MIXED = os.environ.get("MOCK_PULL_MIXED") == "1"
 ISSUED_CREDENTIAL_IDS = set()
 REVOKED_CREDENTIAL_IDS = []
 
+# POST /v1/connect registers a client-owned team once. No credential is issued
+# or returned — reaching the server is the permission. A team_id already
+# registered is refused 409 (a uniqueness conflict, like a non-fast-forward).
+CONNECT_SERVER_ID = "018f3f7e-3333-7000-8000-000000000001"
+REGISTERED_TEAM_IDS = set()
+
 
 PULL_SERVER_ID = "018f3f7e-2222-7000-8000-000000000001"
 PULL_TEAM_ID = "018f3f7e-2222-7000-8000-000000000002"
@@ -183,6 +189,39 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b""
+
+        if self.path == "/v1/connect":
+            try:
+                data = json.loads(raw) if raw else {}
+            except Exception:
+                self._send_json(400, {"error": {"code": "invalid-request"}})
+                return
+            team_id = data.get("team_id", "")
+            if team_id in REGISTERED_TEAM_IDS:
+                self._send_json(409, {"protocol_version": 1,
+                                      "error": {"code": "team-already-exists"}})
+                return
+            REGISTERED_TEAM_IDS.add(team_id)
+            # The capability snapshot the client reads back into its binding.
+            self._send_json(200, {
+                "protocol_version": 1,
+                "server_instance_id": CONNECT_SERVER_ID,
+                "team_id": team_id,
+                "team_name": data.get("team_name", ""),
+                "min_available_seq": "0",
+                "current_seq": "0",
+                "next_sequence_boundary": "1",
+                "accepted_envelope_versions": [1],
+                "write_allowed_ciphers": ["none", "age-v1"],
+                "policy_revision": "0",
+                "effective_from_seq": "1",
+                "max_blob_bytes": "1048576",
+                "policy_history": [{"policy_revision": "0",
+                                    "effective_from_seq": "1",
+                                    "accepted_envelope_versions": [1],
+                                    "write_allowed_ciphers": ["none", "age-v1"]}],
+            })
+            return
 
         if self.path == "/v1/pairing/exchange":
             try:
