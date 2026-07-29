@@ -221,6 +221,41 @@ describeDatabase("remote storage HTTP API v1", () => {
     );
   });
 
+  it("pages by numeric sequence, not lexical order, past ten messages", async () => {
+    // The pull cursor is `team_seq > $after`; passing $after as text coerced the
+    // comparison and ORDER BY to string order (1, 10, 11, ..., 2, ...), so paging
+    // stalled at "9" once a team crossed ten messages — invisible under ten, and
+    // first seen in dogfood at ~80. A dedicated team keeps these twelve messages
+    // out of the shared team's sequence, which other tests assert exact values on.
+    const orderTeam = "018f3f7e-0000-7000-8000-0000000000a1";
+    await pool.query(`INSERT INTO teams (team_id, team_name) VALUES ($1, 'order-team')`, [orderTeam]);
+    await pool.query(
+      `INSERT INTO team_policy_history (team_id, policy_revision, effective_from_seq,
+         accepted_envelope_versions, write_allowed_ciphers)
+       VALUES ($1, 0, 1, ARRAY[1], ARRAY['none','age-v1']::TEXT[])`,
+      [orderTeam],
+    );
+    const entries = Array.from({ length: 12 }, (_, i) =>
+      message(`900e8400-e29b-41d4-a716-4466554400${(i + 10).toString().padStart(2, "0")}`, `m${i}`));
+    await postMessages(pool, orderTeam, entries);
+
+    const orderHeaders = { ...headers, "agmsg-team-id": orderTeam };
+    const seqs: number[] = [];
+    let after = "0";
+    for (;;) {
+      const page = await app.inject({
+        method: "GET", url: `/v1/messages?after=${after}&limit=5`, headers: orderHeaders,
+      });
+      expect(page.statusCode).toBe(200);
+      const body = page.json();
+      for (const row of body.messages) seqs.push(Number(row.server_seq));
+      after = body.next_after;
+      if (!body.has_more) break;
+    }
+    // Contiguous 1..12 in ascending numeric order — nothing skipped past nine.
+    expect(seqs).toEqual(Array.from({ length: 12 }, (_, i) => i + 1));
+  });
+
   it("advertises one-snapshot capabilities and operator-provisioned members", async () => {
     const capabilities = await app.inject({
       method: "GET",
