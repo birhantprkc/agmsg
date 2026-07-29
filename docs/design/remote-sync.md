@@ -59,6 +59,58 @@ What this removes is the machinery for making key distribution *convenient*:
 the `key request` / `key approve` handshake between two of your machines.
 Capability kept, convenience dropped.
 
+### Changing a key
+
+A key has to be replaceable — a leaked one is otherwise permanent, and a member
+who leaves otherwise reads everything that follows. The replacement rides the
+journal, and the shape is what keeps it small:
+
+**The journal carries the fact of the rotation, never the key.** A
+`key_rotated` record names the new epoch and a fingerprint of the key. The key
+material itself is handed over the same way the first one is: by whoever rotated
+it, out of band.
+
+That one restraint settles both hard parts.
+
+**When machines switch** is decided by the record's place in the server's
+sequence. Before it, the old key; from it, the new one — a boundary every
+machine reads the same way, for the same reason renames get their order for
+free. No cutover protocol, and no need to stop the other machines first.
+
+**Who ends up holding the new key** is settled by leaving it out. Someone who
+has been removed still holds the old key, so they can read the announcement —
+they learn a rotation happened, and are stopped by it. What they cannot do is
+obtain the new key from a stream that never carries it. **A machine that sees
+`key_rotated` and holds no matching key halts, and says why.** Putting the
+material in the journal would hand it to exactly the party the rotation exists
+to exclude.
+
+**What this does not do is make the past unreadable.** Whoever held the old key
+keeps whatever they already decrypted. No mechanism recovers that; the guarantee
+is "not from here on", and it should be stated that way rather than implied to
+be more.
+
+### Rollback resistance is part of this, not an extra
+
+`age-v1` already specifies epoch snapshots: a strictly increasing
+`epoch_revision`, the full key-epoch history, and `previous_snapshot_sha256`
+linking each to the one before. It is designed and unimplemented, and it belongs
+in this work.
+
+The tempting argument for deferring it is that a server hiding `key_rotated`
+from one machine leaves that machine on the old key, writing what nobody else
+can read — isolated, and visibly so. **That covers only the case where machines
+disagree.** Shown the same older state, every machine stays consistent with
+every other; the roster and the epoch are simply stale, everything presented
+decrypts correctly, and nothing looks wrong. Rollback arrives as "everyone
+consistently behind", not as a divergence.
+
+Underneath the specific attack, deferring it contradicts the premise.
+Encryption here exists so that the server does not have to be trusted. Leaving
+history and ordering untestable is a way of saying the server is trusted about
+those, and a promise to protect you from whoever runs the server does not
+survive being rewound without noticing.
+
 ## Identity is minted locally
 
 A team gets a `team_id` and each member a `member_id`, generated **on the
@@ -98,7 +150,11 @@ second team: it arrives empty and clones.
 - **Anyone who can reach the server and knows a `team_id` can pull it.**
   Accepted for the minimum.
 - Per-device revocation. There are no per-device credentials to revoke.
-- Automated key distribution.
+- Automated key distribution — including for a rotation. The journal announces
+  that a key changed; handing over the new one stays manual, which is what lets
+  a rotation exclude somebody.
+- The multi-writer cutover protocol. The server's sequence already fixes the
+  moment every machine switches.
 - Merging two populated teams.
 
 ## Removed, not deprecated
