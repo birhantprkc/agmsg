@@ -1902,10 +1902,28 @@ export async function pullBootstrap(args, dependencies = {}) {
   })}\n`);
 }
 
-async function publicSnapshot(serverUrl, teamId) {
+// Resolve a team name to the teams carrying it. Like publicSnapshot this runs
+// before any config exists, so it validates its own answer rather than going
+// through the binding checks the rest of the client relies on.
+export async function resolveTeam(args) {
+  const serverUrl = args.endpoint ?? "";
+  if (!serverUrl) throw new Error("endpoint is required");
+  const name = args.name ?? "";
+  if (!name) throw new Error("name is required");
+  const body = await publicGet(serverUrl,
+    `/v1/teams?name=${encodeURIComponent(name)}`);
+  if (!Array.isArray(body.teams)) {
+    throw new Error("team lookup did not return a list");
+  }
+  process.stdout.write(`${JSON.stringify({
+    type: "team_lookup_result", team_name: name, teams: body.teams,
+  })}\n`);
+}
+
+async function publicGet(serverUrl, path) {
   let response;
   try {
-    response = await fetch(endpoint(serverUrl, `/v1/teams/${teamId}`), {
+    response = await fetch(endpoint(serverUrl, path), {
       headers: { "Agmsg-Protocol-Version": PROTOCOL },
       redirect: "error", signal: AbortSignal.timeout(15_000),
     });
@@ -1922,6 +1940,11 @@ async function publicSnapshot(serverUrl, teamId) {
     error.status = response.status;
     throw error;
   }
+  return body;
+}
+
+async function publicSnapshot(serverUrl, teamId) {
+  const body = await publicGet(serverUrl, `/v1/teams/${teamId}`);
   if (body.team_id !== teamId || !UUID_V7.test(body.server_instance_id ?? "")) {
     throw new Error("team snapshot is not bound to the requested team");
   }
@@ -1932,11 +1955,12 @@ async function main() {
   const [command, ...rest] = process.argv.slice(2);
   const args = options(rest);
   if (!["configure", "once", "run", "reprocess", "resync", "unblock-read",
-        "pull-bootstrap"].includes(command)) {
+        "pull-bootstrap", "resolve-team"].includes(command)) {
     throw new Error(usage());
   }
   if (command === "configure") { await configure(args); return; }
-  // Before any local team exists, so it cannot go through loadConfig.
+  // Before any local team exists, so neither can go through loadConfig.
+  if (command === "resolve-team") { await resolveTeam(args); return; }
   if (command === "pull-bootstrap") { await pullBootstrap(args); return; }
   const team = requireName(args.team, "team");
   const limit = Number(args.limit ?? 100);

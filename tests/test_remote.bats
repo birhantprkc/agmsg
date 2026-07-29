@@ -719,3 +719,48 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   [[ "$output" == *"[ ] python3 on PATH"* ]]
   [[ "$output" == *"Some checks failed"* ]]
 }
+
+@test "remote pull: a name is enough — no UUID is carried by hand" {
+  # The team_id requirement existed to stand in for authentication, and this
+  # server has none to stand in for. The second machine should never need a
+  # UUID typed across from the first.
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" pulled-team
+  [ "$status" -eq 0 ]
+  local cfg
+  cfg="$TEST_SKILL_DIR/teams/pulled-team/config.json"
+  [ -f "$cfg" ]
+  # And the id still ends up recorded, resolved rather than typed.
+  [ "$(sqlite_mem "SELECT json_extract(readfile('$(rf "$cfg")'), '\$.team_id');")" = "$PULL_TEAM_ID" ]
+}
+
+@test "remote pull: an unknown name fails without inventing a team" {
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" nosuchteam
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"no team named"* ]]
+  [ ! -d "$TEST_SKILL_DIR/teams/nosuchteam" ]
+}
+
+@test "remote pull: two teams sharing a name list the candidates and stop" {
+  # Not bad data — a question only the operator can answer. The listing has to
+  # carry what tells them apart, and must not pull one of them on a guess.
+  MOCK_DUPLICATE_NAME=pulled-team restart_mock_server
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" pulled-team
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"2 teams are named"* ]]
+  [[ "$output" == *"$PULL_TEAM_ID"* ]]
+  [[ "$output" == *"018f3f7e-2222-7000-8000-0000000000ff"* ]]
+  # What distinguishes them, and only from outside the envelope.
+  [[ "$output" == *"registered 2026-07-29"* ]]
+  [[ "$output" == *"registered 2026-07-12"* ]]
+  [[ "$output" == *"messages"* ]]
+  [[ "$output" == *"--team-id"* ]]
+  # Nothing was pulled on a guess.
+  [ ! -d "$TEST_SKILL_DIR/teams/pulled-team" ]
+}
+
+@test "remote pull: --team-id still resolves a shared name" {
+  MOCK_DUPLICATE_NAME=pulled-team restart_mock_server
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" pulled-team
+  [ "$status" -eq 0 ]
+  [ -f "$TEST_SKILL_DIR/teams/pulled-team/config.json" ]
+}
