@@ -205,6 +205,22 @@ setup_live_owner() {
 # lib/require-python3.sh) -- deliberately NOT built by filtering the real
 # PATH's directories, so it can't accidentally still contain a python3
 # from some other directory.
+# A PATH holding what doctor needs and no age. Shadowing with a stub does not
+# work: `command -v` skips a non-executable entry and finds the real binary
+# further along, so the lookup only fails if the PATH is built from scratch --
+# the same approach path_without_python3 takes.
+path_without_age() {
+  local dir tool
+  dir="$(mktemp -d)"
+  for tool in bash dirname basename readlink python3 node uname sed grep \
+              awk cat tr mktemp; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      ln -s "$(command -v "$tool")" "$dir/$tool" 2>/dev/null || true
+    fi
+  done
+  printf '%s' "$dir"
+}
+
 path_without_python3() {
   local dir
   dir="$(mktemp -d)"
