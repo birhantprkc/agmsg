@@ -15,6 +15,7 @@ import {
   runLoop,
   loadConfig,
   plaintextWriteEligible,
+  pullBootstrap,
   parseStrictJsonl,
   readStateCycle,
   readConnectedCredential,
@@ -1265,6 +1266,72 @@ test("cycle routes roster payloads through the existing message transport", asyn
   });
   assert.equal(posted, true);
   assert.deepEqual(rosterOperations, ["prepare", "reconcile", "apply"]);
+});
+
+test("pull bootstrap dispatches a real mixed roster and message page", async () => {
+  const teamId = "018f3f7e-0000-7000-8000-000000000001";
+  const serverId = "018f3f7e-0000-7000-8000-000000000002";
+  const roster = Array.from({ length: 7 }, (_, index) => ({
+    server_seq: String(index + 1),
+    id: `10000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+    server_received_at: "2026-07-29T05:00:00.000000Z",
+    envelope: { v: 1, cipher: "none", key_id: null, blob: "e30=" },
+    projection: {
+      kind: "member_joined",
+      mutation_id: `018f3f7e-0000-7000-8000-${String(index + 10).padStart(12, "0")}`,
+      member_id: `018f3f7e-0000-7000-8000-${String(index + 20).padStart(12, "0")}`,
+      name: `member-${index + 1}`,
+      occurred_at: "2026-07-29T05:00:00.000000Z",
+    },
+  }));
+  const messages = Array.from({ length: 73 }, (_, index) => ({
+    server_seq: String(index + 8),
+    id: `20000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+    server_received_at: "2026-07-29T05:00:00.000000Z",
+    envelope: { v: 1, cipher: "none", key_id: null, blob: "e30=" },
+    projection: {
+      body: `message-${index + 1}`,
+      created_at: "2026-07-29T05:00:00.000000Z",
+      from_agent: "member-1",
+      to_agent: "member-2",
+    },
+  }));
+  const storageInputs = [];
+  const rosterInputs = [];
+  await pullBootstrap({
+    team: "clone", "team-id": teamId, endpoint: "http://127.0.0.1:8787",
+  }, {
+    publicSnapshotCall: async () => ({
+      server_instance_id: serverId, team_id: teamId, team_name: "source",
+      min_available_seq: "0",
+    }),
+    requestPublicCall: async () => ({
+      messages: [...roster, ...messages].map(({ projection: _projection, ...message }) => message),
+      next_after: "80", has_more: false,
+    }),
+    evaluateCall: async (_config, _snapshot, message) => ({
+      status: "importable",
+      projection: [...roster, ...messages].find((entry) => entry.id === message.id).projection,
+      policy_revision: "0", local_security_revision: "0",
+    }),
+    driverCall: async (operation, _config, input) => {
+      assert.equal(operation, "apply");
+      storageInputs.push(input);
+      return [{ type: "sync_apply_result", transport_cursor: "80", corrupt_count: 0 }];
+    },
+    rosterDriverCall: async (operation, _config, input) => {
+      assert.equal(operation, "apply");
+      rosterInputs.push(input);
+      return [{ type: "roster_sync_apply_outcome", status: "imported" }];
+    },
+    eventCall: async () => {},
+  });
+  assert.equal(rosterInputs.length, 1);
+  assert.equal(rosterInputs[0].filter((record) => record.type === "sync_pull_message").length, 7);
+  assert.deepEqual(rosterInputs[0].at(-1), { type: "sync_pull_cursor", next_after: "80" });
+  assert.equal(storageInputs.length, 1);
+  assert.equal(storageInputs[0].filter((record) => record.type === "sync_pull_message").length, 73);
+  assert.deepEqual(storageInputs[0].at(-1), { type: "sync_pull_cursor", next_after: "80" });
 });
 
 test("cycle pushes a key rotation alone and waits for ordered pull before activation", async () => {

@@ -3,6 +3,7 @@ set -euo pipefail
 
 # Usage:
 #   remote.sh connect --endpoint <url> [<token>] [--token-stdin] [<team>] [--force]
+#   remote.sh pull --endpoint <url> --team-id <uuid> <team>
 #   remote.sh status [<team>] [--json]
 #   remote.sh disconnect <team>
 #   remote.sh doctor [<team>]
@@ -780,16 +781,25 @@ _remote_json_field() {
 # roster taken from anywhere else at this moment would be a guess presented as
 # fact. It is derived by replaying the team journal.
 _remote_write_pulled_team() {
-  local team="$1" team_id="$2" cfg initial
+  local team="$1" team_id="$2" cfg initial existing_id
   cfg="$(_remote_team_config "$team")"
   mkdir -p "$TEAMS_DIR/$team"
   agmsg_lock_acquire "$TEAMS_DIR/$team" || return 1
-  initial=$(agmsg_sqlite_mem "
-    SELECT json_object('name','$(_agmsg_sqlesc "$team")',
-                       'team_id','$(_agmsg_sqlesc "$team_id")',
-                       'agents', json_object(),
-                       'created_at','$(date -u +%Y-%m-%dT%H:%M:%SZ)');")
-  agmsg_write_atomic "$cfg" "$initial"
+  if [ -f "$cfg" ]; then
+    existing_id="$(_remote_read_config_field "$cfg" '$.team_id')"
+    if [ "$existing_id" != "$team_id" ]; then
+      echo "agmsg: local team '$team' has a different team id" >&2
+      agmsg_lock_release
+      return 1
+    fi
+  else
+    initial=$(agmsg_sqlite_mem "
+      SELECT json_object('name','$(_agmsg_sqlesc "$team")',
+                         'team_id','$(_agmsg_sqlesc "$team_id")',
+                         'agents', json_object(),
+                         'created_at','$(date -u +%Y-%m-%dT%H:%M:%SZ)');")
+    agmsg_write_atomic "$cfg" "$initial"
+  fi
   agmsg_lock_release
 }
 
@@ -828,8 +838,14 @@ cmd_pull() {
     fi
   fi
 
+  # The roster driver projects imported identity events into this config while
+  # the bootstrap is running. Publish the empty identity-bearing shell first;
+  # retries reuse it, and the successful projection is never overwritten.
+  _remote_write_pulled_team "$team" "$team_id" || exit 1
+
   local result pulled_id pulled_name imported
   result="$(AGMSG_SYNC_CONNECTION_DIR="$CONNECTION_ROOT" \
+    AGMSG_SYNC_LOCAL_ROSTER_FILE="$cfg" \
     "$SCRIPT_DIR/remote-sync.sh" pull-bootstrap \
       --team "$team" --team-id "$team_id" --endpoint "$endpoint")" || {
     echo "agmsg: pull failed" >&2; exit 1; }
@@ -842,7 +858,6 @@ cmd_pull() {
   [ "$pulled_id" = "$team_id" ] || {
     echo "agmsg: server answered with a different team id" >&2; exit 1; }
 
-  _remote_write_pulled_team "$team" "$pulled_id" || exit 1
   echo "Pulled '$pulled_name' into local team '$team' ($imported message(s))."
 }
 
@@ -1483,6 +1498,6 @@ case "${1:-}" in
   doctor) shift; cmd_doctor "$@" ;;
   pending) shift; agmsg_require_python3 "remote pending" || exit 1; cmd_pending "$@" ;;
   *)
-    echo "Usage: remote.sh <connect|status|disconnect|doctor|pending> ..." >&2
+    echo "Usage: remote.sh <connect|pull|status|disconnect|doctor|pending> ..." >&2
     exit 1 ;;
 esac
