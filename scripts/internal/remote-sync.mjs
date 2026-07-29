@@ -23,7 +23,8 @@ const MAX_CONNECTION_CONFIG_BYTES = 2 * 1024 * 1024;
 function usage() {
   return `usage:
   remote-sync.sh configure --team NAME --server URL --team-id UUID --minimum-security e2ee-required \\
-    --cipher age-v1 --age-snapshot FILE --age-checkpoint REVISION:SHA256 \\
+    --cipher age-v1 --age-snapshot FILE [--age-snapshot FILE ...] \\
+    --age-checkpoint REVISION:SHA256 \\
     --age-confirmation operator-live \\
     [--age-identity KEY_ID=FILE ...]
   remote-sync.sh once --team NAME [--limit N]
@@ -45,7 +46,7 @@ function options(args) {
     const next = args[index + 1];
     if (next === undefined || next.startsWith("--")) throw new Error(`missing value for ${value}`);
     const key = value.slice(2);
-    if (key === "age-identity") {
+    if (key === "age-identity" || key === "age-snapshot") {
       if (!Array.isArray(result[key])) result[key] = [];
       result[key].push(next);
     } else {
@@ -122,7 +123,8 @@ export async function activateKeyRotations(config) {
   if (config.cipher_profile !== "age-v1" || !config.age_v1) {
     throw new Error("key rotation requires an age-v1 sync configuration");
   }
-  const base = config.age_v1.epoch_snapshot.history;
+  const ageSnapshots = ageSnapshotChain(config.age_v1);
+  const base = ageSnapshots[0].history;
   let revision = BigInt(base.at(-1).epoch_revision);
   const winners = [];
   const announcedEpochs = new Set();
@@ -145,8 +147,26 @@ export async function activateKeyRotations(config) {
       throw new Error(
         `key rotation epoch ${rotation.epoch} is not the next epoch ${expectedRevision}`);
     }
+    const ageSnapshot = ageSnapshots[Number(expectedRevision)];
+    if (!ageSnapshot) {
+      throw new Error(
+        `key rotation at server sequence ${rotation.server_seq} selected epoch ` +
+        `${rotation.epoch}; import its authority-confirmed epoch snapshot before sync can continue`);
+    }
     if (BigInt(rotation.server_seq) === MAX_SEQUENCE) {
       throw new Error("key rotation cannot be activated at the final server sequence");
+    }
+    const epoch = ageSnapshot.history.at(-1);
+    const effectiveFrom = (BigInt(rotation.server_seq) + 1n).toString();
+    if (epoch.epoch_revision !== rotation.epoch ||
+        epoch.key_id !== rotation.key_id ||
+        epoch.effective_from_seq !== effectiveFrom ||
+        epoch.recipients.length !== 1 ||
+        createHash("sha256").update(epoch.recipients[0], "utf8").digest("hex") !==
+          rotation.fingerprint) {
+      throw new Error(
+        `authority-confirmed epoch snapshot ${rotation.epoch} does not match ` +
+        `the key rotation at server sequence ${rotation.server_seq}`);
     }
     const identityPath = replacementIdentityPath(config.local_team, rotation.key_id);
     try {
@@ -161,24 +181,14 @@ export async function activateKeyRotations(config) {
       throw error;
     }
     const identity = readNativeAgeIdentity(identityPath);
-    const fingerprint = createHash("sha256").update(identity.recipient, "utf8").digest("hex");
-    if (fingerprint !== rotation.fingerprint) {
+    if (identity.recipient !== epoch.recipients[0]) {
       throw new Error(
-        `replacement key ${rotation.key_id} for epoch ${rotation.epoch} does not match the announced fingerprint`);
+        `replacement key ${rotation.key_id} for epoch ${rotation.epoch} does not match ` +
+        "the authority-confirmed recipient manifest");
     }
     revision = expectedRevision;
     config.age_v1.identity_files[rotation.key_id] = identityPath;
-    runtime.push({
-      epoch_revision: rotation.epoch,
-      // The announcement itself is sealed with the old epoch so a removed
-      // holder can learn that rotation happened without receiving the new
-      // key. The first envelope that uses the replacement is therefore the
-      // sequence immediately after the announcement.
-      effective_from_seq: (BigInt(rotation.server_seq) + 1n).toString(),
-      cipher: "age-v1",
-      key_id: rotation.key_id,
-      recipients: [identity.recipient],
-    });
+    runtime.push(epoch);
   }
   config.age_v1_runtime_history = runtime;
 }
@@ -346,25 +356,30 @@ function requireUnicodeScalars(value, label) {
 function canonicalJson(value) {
   if (value === null || typeof value === "boolean") return JSON.stringify(value);
   if (typeof value === "string") {
-    requireUnicodeScalars(value, "snapshot string");
+    requireUnicodeScalars(value, "age snapshot string");
     return JSON.stringify(value);
   }
   if (typeof value === "number") {
-    if (!Number.isFinite(value)) throw new Error("snapshot contains a non-finite number");
+    if (!Number.isFinite(value)) throw new Error("age snapshot contains a non-finite number");
     return JSON.stringify(value);
   }
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   if (typeof value === "object") {
     return `{${Object.keys(value).sort().map((key) => {
-      requireUnicodeScalars(key, "snapshot key");
+      requireUnicodeScalars(key, "age snapshot key");
       return `${JSON.stringify(key)}:${canonicalJson(value[key])}`;
     }).join(",")}}`;
   }
-  throw new Error("snapshot contains a non-JSON value");
+  throw new Error("age snapshot contains a non-JSON value");
 }
 
 export function ageSnapshotDigest(value) {
   return createHash("sha256").update(canonicalJson(value), "utf8").digest("hex");
+}
+
+function ageSnapshotChain(age) {
+  if (Array.isArray(age?.epoch_snapshots)) return age.epoch_snapshots;
+  return age?.epoch_snapshot ? [age.epoch_snapshot] : [];
 }
 
 function validateLocalSecurityHistory(history) {
@@ -388,62 +403,98 @@ function validateLocalSecurityHistory(history) {
 
 export function validateAgeConfiguration(config) {
   const age = config.age_v1;
-  const snapshot = age?.epoch_snapshot;
+  const ageSnapshots = ageSnapshotChain(age);
+  const latestAgeSnapshot = ageSnapshots.at(-1);
   const checkpoint = age?.checkpoint;
-  if (!age || !snapshot || !checkpoint || snapshot.profile !== "age-v1" ||
-      snapshot.server_instance_id !== config.server_instance_id || snapshot.team_id !== config.remote_team_id ||
-      !Array.isArray(snapshot.authorized_writers) || snapshot.authorized_writers.length < 1 ||
-      new Set(snapshot.authorized_writers).size !== snapshot.authorized_writers.length ||
-      snapshot.authorized_writers.some((writer) => typeof writer !== "string" || writer.length < 1) ||
-      !Array.isArray(snapshot.history) || snapshot.history.length < 1 || snapshot.history.length > 4096 ||
+  if (!age || ageSnapshots.length < 1 || ageSnapshots.length > 4096 || !checkpoint ||
       !age.identity_files || typeof age.identity_files !== "object" || Array.isArray(age.identity_files) ||
       Object.entries(age.identity_files).some(([keyId, path]) =>
         !/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(keyId) || typeof path !== "string" || path.length < 1) ||
       typeof age.age_version !== "string" || age.age_version.length < 1) {
     throw new Error("age-v1 configuration is invalid");
   }
-  const snapshotRevision = sequence(snapshot.epoch_revision, "epoch_revision");
-  sequence(snapshot.writer_generation, "writer_generation");
-  if (snapshotRevision !== "0") {
-    throw new Error("age-v1 dogfood currently accepts only an initial revision-0 epoch snapshot");
-  }
-  if ((snapshotRevision === "0" && snapshot.previous_snapshot_sha256 !== null) ||
-      (snapshotRevision !== "0" && (typeof snapshot.previous_snapshot_sha256 !== "string" ||
-        !/^[0-9a-f]{64}$/u.test(snapshot.previous_snapshot_sha256)))) {
-    throw new Error("epoch snapshot previous digest is invalid");
-  }
-  let priorRevision = -1n;
-  let priorBoundary = 0n;
-  for (const entry of snapshot.history) {
-    const revision = BigInt(sequence(entry.epoch_revision, "epoch history revision"));
-    const boundary = BigInt(sequence(entry.effective_from_seq, "epoch history boundary"));
-    if (revision <= priorRevision || boundary <= priorBoundary || entry.cipher !== "age-v1" ||
-        typeof entry.key_id !== "string" || !/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(entry.key_id) ||
-        !Array.isArray(entry.recipients) || entry.recipients.length < 1 || entry.recipients.length > 256 ||
-        new Set(entry.recipients).size !== entry.recipients.length ||
-        entry.recipients.some((recipient) => typeof recipient !== "string" || !/^age1[0-9a-z]{58}$/u.test(recipient))) {
-      throw new Error("age epoch history is not canonical");
+  let previousAgeSnapshot;
+  let previousGeneration = -1n;
+  const recipientManifests = new Map();
+  for (let ageSnapshotIndex = 0;
+    ageSnapshotIndex < ageSnapshots.length;
+    ageSnapshotIndex += 1) {
+    const ageSnapshot = ageSnapshots[ageSnapshotIndex];
+    if (!ageSnapshot || ageSnapshot.profile !== "age-v1" ||
+        ageSnapshot.server_instance_id !== config.server_instance_id ||
+        ageSnapshot.team_id !== config.remote_team_id ||
+        !Array.isArray(ageSnapshot.authorized_writers) ||
+        ageSnapshot.authorized_writers.length < 1 ||
+        new Set(ageSnapshot.authorized_writers).size !== ageSnapshot.authorized_writers.length ||
+        ageSnapshot.authorized_writers.some((writer) =>
+          typeof writer !== "string" || writer.length < 1) ||
+        !Array.isArray(ageSnapshot.history) || ageSnapshot.history.length < 1 ||
+        ageSnapshot.history.length > 4096) {
+      throw new Error("age epoch snapshot is invalid");
     }
-    priorRevision = revision;
-    priorBoundary = boundary;
+    const ageSnapshotRevision = BigInt(
+      sequence(ageSnapshot.epoch_revision, "epoch_revision"));
+    const writerGeneration = BigInt(sequence(ageSnapshot.writer_generation, "writer_generation"));
+    if (ageSnapshotRevision !== BigInt(ageSnapshotIndex)) {
+      throw new Error("age epoch snapshot chain has a missing revision");
+    }
+    if (writerGeneration <= previousGeneration) {
+      throw new Error("age epoch snapshot writer generation is not strictly increasing");
+    }
+    const expectedPrevious = previousAgeSnapshot ? ageSnapshotDigest(previousAgeSnapshot) : null;
+    if (ageSnapshot.previous_snapshot_sha256 !== expectedPrevious) {
+      throw new Error("age epoch snapshot hash chain is broken");
+    }
+    let priorRevision = -1n;
+    let priorBoundary = 0n;
+    for (let historyIndex = 0; historyIndex < ageSnapshot.history.length; historyIndex += 1) {
+      const entry = ageSnapshot.history[historyIndex];
+      const revision = BigInt(sequence(entry.epoch_revision, "epoch history revision"));
+      const boundary = BigInt(sequence(entry.effective_from_seq, "epoch history boundary"));
+      if (revision !== BigInt(historyIndex) || boundary <= priorBoundary ||
+          entry.cipher !== "age-v1" ||
+          typeof entry.key_id !== "string" || !/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(entry.key_id) ||
+          !Array.isArray(entry.recipients) || entry.recipients.length < 1 ||
+          entry.recipients.length > 256 ||
+          new Set(entry.recipients).size !== entry.recipients.length ||
+          entry.recipients.some((recipient) =>
+            typeof recipient !== "string" || !/^age1[0-9a-z]{58}$/u.test(recipient))) {
+        throw new Error("age epoch history is not canonical");
+      }
+      const manifest = canonicalJson(entry.recipients);
+      const existingManifest = recipientManifests.get(entry.key_id);
+      if (existingManifest !== undefined && existingManifest !== manifest) {
+        throw new Error("age key_id is bound to conflicting recipient manifests");
+      }
+      recipientManifests.set(entry.key_id, manifest);
+      priorRevision = revision;
+      priorBoundary = boundary;
+    }
+    if (ageSnapshot.history[0].effective_from_seq !== "1" ||
+        priorRevision !== ageSnapshotRevision ||
+        (previousAgeSnapshot &&
+          canonicalJson(ageSnapshot.history.slice(0, -1)) !==
+            canonicalJson(previousAgeSnapshot.history))) {
+      throw new Error("age epoch snapshot does not contain the complete immutable history");
+    }
+    previousAgeSnapshot = ageSnapshot;
+    previousGeneration = writerGeneration;
   }
-  if (snapshot.history[0].effective_from_seq !== "1" ||
-      snapshot.history.at(-1).epoch_revision !== snapshot.epoch_revision) {
-    throw new Error("age epoch history does not cover the snapshot revision");
-  }
-  const digest = ageSnapshotDigest(snapshot);
-  if (checkpoint.epoch_revision !== snapshot.epoch_revision || checkpoint.snapshot_sha256 !== digest ||
-      checkpoint.writer_generation !== snapshot.writer_generation ||
+  const digest = ageSnapshotDigest(latestAgeSnapshot);
+  if (checkpoint.epoch_revision !== latestAgeSnapshot.epoch_revision ||
+      checkpoint.snapshot_sha256 !== digest ||
+      checkpoint.writer_generation !== latestAgeSnapshot.writer_generation ||
       typeof checkpoint.confirmed_at !== "string" || Number.isNaN(Date.parse(checkpoint.confirmed_at))) {
-    throw new Error("age epoch checkpoint does not match the snapshot");
+    throw new Error("age epoch checkpoint does not match the epoch snapshot");
   }
   return digest;
 }
 
 export function validateConfiguredAgeIdentities(config) {
+  const latestAgeSnapshot = ageSnapshotChain(config.age_v1).at(-1);
   for (const [keyId, path] of Object.entries(config.age_v1.identity_files)) {
     const identity = readNativeAgeIdentity(path);
-    const matchingEpochs = config.age_v1.epoch_snapshot.history.filter((entry) => entry.key_id === keyId);
+    const matchingEpochs = latestAgeSnapshot.history.filter((entry) => entry.key_id === keyId);
     if (matchingEpochs.length < 1 || matchingEpochs.some((entry) => !entry.recipients.includes(identity.recipient))) {
       throw new Error(`age identity for ${keyId} does not match its recipient manifest`);
     }
@@ -468,21 +519,32 @@ function compareRetainedCheckpoint(config, retained) {
   const proposed = checkpointRecord(config, retained.confirmation?.method);
   if (retained.format_version !== 1 || retained.profile !== "age-v1" ||
       retained.server_instance_id !== proposed.server_instance_id || retained.team_id !== proposed.team_id ||
-      retained.protocol_version !== proposed.protocol_version || retained.confirmation?.method !== "operator-live") {
+      retained.protocol_version !== proposed.protocol_version ||
+      typeof retained.snapshot_sha256 !== "string" ||
+      !/^[0-9a-f]{64}$/u.test(retained.snapshot_sha256) ||
+      retained.confirmation?.method !== "operator-live" ||
+      typeof retained.confirmation.confirmed_at !== "string" ||
+      Number.isNaN(Date.parse(retained.confirmation.confirmed_at))) {
     throw new Error("retained age checkpoint is invalid");
   }
   const retainedRevision = BigInt(sequence(retained.epoch_revision, "retained epoch revision"));
   const proposedRevision = BigInt(sequence(proposed.epoch_revision, "proposed epoch revision"));
   const retainedGeneration = BigInt(sequence(retained.writer_generation, "retained writer generation"));
   const proposedGeneration = BigInt(sequence(proposed.writer_generation, "proposed writer generation"));
+  const retainedAgeSnapshot = ageSnapshotChain(config.age_v1)
+    .find((ageSnapshot) => ageSnapshot.epoch_revision === retained.epoch_revision);
   if (proposedRevision < retainedRevision || proposedGeneration < retainedGeneration ||
-      (proposedRevision === retainedRevision && retained.snapshot_sha256 !== proposed.snapshot_sha256)) {
+      !retainedAgeSnapshot ||
+      ageSnapshotDigest(retainedAgeSnapshot) !== retained.snapshot_sha256 ||
+      retainedAgeSnapshot.writer_generation !== retained.writer_generation) {
     throw new Error("age checkpoint rollback or same-revision conflict detected");
   }
-  if (proposedRevision !== retainedRevision || proposedGeneration !== retainedGeneration) {
-    throw new Error("age checkpoint advancement requires the fenced rotation workflow");
+  if (proposedRevision === retainedRevision &&
+      (proposed.snapshot_sha256 !== retained.snapshot_sha256 ||
+       proposedGeneration !== retainedGeneration)) {
+    throw new Error("age checkpoint rollback or same-revision conflict detected");
   }
-  return retained;
+  return proposedRevision === retainedRevision ? "same" : "advance";
 }
 
 async function readRetainedCheckpointFile(path) {
@@ -491,18 +553,43 @@ async function readRetainedCheckpointFile(path) {
       (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
     throw new Error("retained age checkpoint must be a private regular file");
   }
-  return JSON.parse(await readFile(path, "utf8"));
+  const records = parseStrictJsonl(await readFile(path, "utf8"));
+  if (records.length < 1 || records.length > 4096) {
+    throw new Error("retained age checkpoint history is invalid");
+  }
+  return records;
 }
 
 export async function retainAgeCheckpoint(config, confirmation) {
   const path = ageTrustPath(config);
+  let records;
   try {
-    return compareRetainedCheckpoint(config, await readRetainedCheckpointFile(path));
+    records = await readRetainedCheckpointFile(path);
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
   if (confirmation !== "operator-live") {
-    throw new Error("initial age checkpoint requires --age-confirmation operator-live");
+    throw new Error("age checkpoint import requires --age-confirmation operator-live");
+  }
+  if (records) {
+    let current;
+    for (const retained of records) {
+      const relation = compareRetainedCheckpoint(config, retained);
+      if (relation === "same") current = retained;
+    }
+    if (current) return current;
+    if (records.length >= 4096) {
+      throw new Error("retained age checkpoint history reached the 4096 entry limit");
+    }
+    const retained = checkpointRecord(config, confirmation);
+    const handle = await open(path, "a", 0o600);
+    try {
+      await handle.writeFile(`${JSON.stringify(retained)}\n`, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    return retained;
   }
   const retained = checkpointRecord(config, confirmation);
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
@@ -530,13 +617,19 @@ export async function retainAgeCheckpoint(config, confirmation) {
     return retained;
   } catch (error) {
     if (error?.code !== "EEXIST") throw error;
-    return compareRetainedCheckpoint(config, await readRetainedCheckpointFile(path));
+    return retainAgeCheckpoint(config, confirmation);
   }
 }
 
 export async function validateRetainedAgeCheckpoint(config) {
-  const retained = await readRetainedCheckpointFile(ageTrustPath(config));
-  compareRetainedCheckpoint(config, retained);
+  const records = await readRetainedCheckpointFile(ageTrustPath(config));
+  let retained;
+  for (const record of records) {
+    if (compareRetainedCheckpoint(config, record) === "same") retained = record;
+  }
+  if (!retained) {
+    throw new Error("sync config is behind the retained age checkpoint");
+  }
   if (retained.confirmation.confirmed_at !== config.age_v1.checkpoint.confirmed_at) {
     throw new Error("sync config does not match the retained age checkpoint confirmation");
   }
@@ -810,8 +903,9 @@ function currentLocalPolicy(config, serverSeq) {
 }
 
 function ageHistory(config) {
+  const initial = ageSnapshotChain(config.age_v1)[0]?.history ?? [];
   return [
-    ...(config.age_v1?.epoch_snapshot?.history ?? []),
+    ...initial,
     ...(config.age_v1_runtime_history ?? []),
   ];
 }
@@ -1298,19 +1392,26 @@ export async function configure(args) {
     if (!args["age-snapshot"] || !args["age-checkpoint"]) {
       throw new Error("age-v1 requires --age-snapshot and --age-checkpoint");
     }
-    const snapshotText = await readFile(resolve(args["age-snapshot"]), "utf8");
-    const snapshot = JSON.parse(snapshotText);
-    if (snapshotText.trim() !== canonicalJson(snapshot)) {
-      throw new Error("age snapshot must be RFC 8785 JCS without duplicate or noncanonical fields");
+    const ageSnapshotPaths = Array.isArray(args["age-snapshot"]) ?
+      args["age-snapshot"] : [args["age-snapshot"]];
+    const ageSnapshots = [];
+    for (const ageSnapshotPath of ageSnapshotPaths) {
+      const ageSnapshotText = await readFile(resolve(ageSnapshotPath), "utf8");
+      const ageSnapshot = parseStrictJson(ageSnapshotText);
+      if (ageSnapshotText.trim() !== canonicalJson(ageSnapshot)) {
+        throw new Error("age snapshot must be RFC 8785 JCS without duplicate or noncanonical fields");
+      }
+      ageSnapshots.push(ageSnapshot);
     }
+    const latestAgeSnapshot = ageSnapshots.at(-1);
     const checkpoint = parseCheckpoint(args["age-checkpoint"]);
     const confirmation = args["age-confirmation"];
     if (confirmation !== "operator-live") {
       throw new Error("age-v1 requires explicit --age-confirmation operator-live");
     }
     config.age_v1 = {
-      epoch_snapshot: snapshot,
-      checkpoint: { ...checkpoint, writer_generation: snapshot.writer_generation,
+      epoch_snapshots: ageSnapshots,
+      checkpoint: { ...checkpoint, writer_generation: latestAgeSnapshot.writer_generation,
         confirmed_at: new Date().toISOString() },
       identity_files: await identityFiles(args["age-identity"]),
       age_version: ageExecutableVersion(),
@@ -1325,12 +1426,6 @@ export async function configure(args) {
   if (previous && (previous.server_instance_id !== config.server_instance_id ||
       previous.remote_team_id !== config.remote_team_id || previous.cipher_profile !== config.cipher_profile)) {
     throw new Error("configure cannot replace an existing binding or cipher profile");
-  }
-  if (previous?.cipher_profile === "age-v1" &&
-      (previous.age_v1.checkpoint.epoch_revision !== config.age_v1.checkpoint.epoch_revision ||
-       previous.age_v1.checkpoint.snapshot_sha256 !== config.age_v1.checkpoint.snapshot_sha256 ||
-       previous.age_v1.checkpoint.writer_generation !== config.age_v1.checkpoint.writer_generation)) {
-    throw new Error("age epoch changes require the fenced cutover procedure");
   }
   const capabilities = await request(config, "/v1/capabilities");
   validateCapabilities(config, capabilities);
@@ -1839,13 +1934,13 @@ export async function pullBootstrap(args, dependencies = {}) {
 
   // There is no connected binding yet, so this one call validates itself
   // rather than going through the checks the rest of the pull relies on.
-  const snapshot = await publicSnapshotCall(serverUrl, teamId);
+  const teamSnapshot = await publicSnapshotCall(serverUrl, teamId);
   const config = {
     format_version: 1,
     local_team: team,
     server_url: serverUrl,
-    server_instance_id: snapshot.server_instance_id,
-    remote_team_id: snapshot.team_id,
+    server_instance_id: teamSnapshot.server_instance_id,
+    remote_team_id: teamSnapshot.team_id,
     protocol_version: Number(PROTOCOL),
     cipher_profile: "none",
     local_security_history: [{
@@ -1854,11 +1949,11 @@ export async function pullBootstrap(args, dependencies = {}) {
     }],
   };
   await eventCall("pull.bootstrap.snapshot", {
-    team_id: snapshot.team_id, team_name: snapshot.team_name,
-    min_available_seq: snapshot.min_available_seq,
+    team_id: teamSnapshot.team_id, team_name: teamSnapshot.team_name,
+    min_available_seq: teamSnapshot.min_available_seq,
   });
 
-  let cursor = String(snapshot.min_available_seq ?? "0");
+  let cursor = String(teamSnapshot.min_available_seq ?? "0");
   let imported = 0;
   for (;;) {
     const page = await requestPublicCall(config,
@@ -1866,7 +1961,7 @@ export async function pullBootstrap(args, dependencies = {}) {
     const records = [];
     for (const message of page.messages) {
       records.push({ type: "sync_pull_message", ...message,
-        ...(await evaluateCall(config, snapshot, message)) });
+        ...(await evaluateCall(config, teamSnapshot, message)) });
     }
     const cursorRecord = { type: "sync_pull_cursor", next_after: page.next_after };
     const rosterRecords = records.filter((record) =>
@@ -1890,14 +1985,14 @@ export async function pullBootstrap(args, dependencies = {}) {
   }
   process.stdout.write(`${JSON.stringify({
     type: "pull_bootstrap_result", team: config.local_team,
-    team_id: config.remote_team_id, team_name: snapshot.team_name,
+    team_id: config.remote_team_id, team_name: teamSnapshot.team_name,
     server_instance_id: config.server_instance_id,
     // The binding the second machine records so it keeps syncing (the design's
     // "and continues"): the same capability snapshot connect stores, plus the
     // protocol version. Without it the pulled team has no connected binding and
     // the sync engine refuses to run.
     protocol_version: config.protocol_version,
-    capabilities: snapshot,
+    capabilities: teamSnapshot,
     imported,
   })}\n`);
 }
