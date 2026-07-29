@@ -891,7 +891,15 @@ cmd_pull() {
        'disconnected_at', null));")
   agmsg_write_atomic "$cfg" "$updated"
   agmsg_lock_release
-  echo "Pulled '$pulled_name' into local team '$team' ($imported message(s))."
+
+  # "Machine two runs the same three in reverse: it registers, pulls the team
+  # down, and continues" (docs/design/remote-sync.md). Continuing IS the engine:
+  # without it a send on this machine reports success, stays local, and nothing
+  # says this team has an upstream it never reached. Found by the first real
+  # second machine, whose pulled team answered "connected" while running nothing.
+  _remote_sync_engine_start "$team"
+
+  echo "Pulled '$pulled_name' into local team '$team' ($imported message(s)). Sync engine running."
 }
 
 # The remote-sync engine runs as a background daemon: one per connected team,
