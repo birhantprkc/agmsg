@@ -21,6 +21,29 @@ CREATE TABLE IF NOT EXISTS teams (
 ALTER TABLE teams ALTER COLUMN write_allowed_ciphers
   SET DEFAULT ARRAY['none', 'age-v1']::TEXT[];
 
+-- When this team was registered, so a human choosing between two teams that
+-- share a name has something to choose by. Added in three steps rather than one
+-- because this file is re-executed on every start: the column arrives nullable,
+-- rows without a value are filled once, and only then does it become NOT NULL.
+--
+-- The backfill takes the team's first message rather than the migration clock.
+-- Stamping "now" would say a team registered in July was registered today,
+-- which is a lie told by the exact field a human is about to trust. It is also
+-- why the fill is restricted to NULL rows: retention can delete old messages,
+-- so MIN() moves forward over time, and an unrestricted UPDATE would push a
+-- team's registration date later on every restart.
+ALTER TABLE teams ADD COLUMN IF NOT EXISTS registered_at TIMESTAMPTZ(6);
+
+UPDATE teams t
+   SET registered_at = COALESCE(
+         (SELECT MIN(m.server_received_at) FROM messages m
+           WHERE m.team_id = t.team_id),
+         clock_timestamp())
+ WHERE t.registered_at IS NULL;
+
+ALTER TABLE teams ALTER COLUMN registered_at SET DEFAULT clock_timestamp();
+ALTER TABLE teams ALTER COLUMN registered_at SET NOT NULL;
+
 CREATE TABLE IF NOT EXISTS team_policy_history (
   team_id UUID NOT NULL REFERENCES teams(team_id) ON DELETE RESTRICT,
   policy_revision BIGINT NOT NULL CHECK (policy_revision >= 0),

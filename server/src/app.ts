@@ -22,6 +22,7 @@ import {
   parseSequence,
   postMessagesSchema,
   readStateSyncSchema,
+  teamNameSchema,
   uuidV7Schema,
 } from "./protocol.js";
 import {
@@ -29,6 +30,7 @@ import {
   getCapabilities,
   getMembers,
   getTeamSnapshot,
+  resolveTeamsByName,
   getMessages,
   health,
   postMessages,
@@ -39,6 +41,7 @@ const emptyQuerySchema = z.object({}).strict();
 const pairingExchangeSchema = z.object({ token: z.string().min(32).max(256) }).strict();
 const credentialParamsSchema = z.object({ credentialId: uuidV7Schema }).strict();
 const teamParamsSchema = z.object({ teamId: uuidV7Schema }).strict();
+const teamLookupQuerySchema = z.object({ name: teamNameSchema }).strict();
 
 function requireProtocol(request: FastifyRequest): void {
   const version = request.headers["agmsg-protocol-version"];
@@ -288,6 +291,17 @@ async function dataPlaneRoutes(
   // /v1/connect has none — reaching the server is the permission. Knowing a
   // team_id is therefore enough to read a team, which the design records as
   // accepted for this minimum rather than overlooked.
+  // Look a team up by name, so a second machine does not have to be handed a
+  // UUID by a human. A name is not unique -- only team_id is -- so this always
+  // answers with a list and the caller decides; one match is the ordinary case,
+  // not a guarantee.
+  app.get("/v1/teams", async (request, reply) => {
+    requireProtocol(request);
+    const query = teamLookupQuerySchema.parse(request.query);
+    reply.header("Cache-Control", "no-store");
+    return resolveTeamsByName(pool, query.name);
+  });
+
   app.get("/v1/teams/:teamId", async (request, reply) => {
     requireProtocol(request);
     emptyQuerySchema.parse(request.query);

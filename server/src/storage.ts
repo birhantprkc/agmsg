@@ -37,7 +37,10 @@ type ExistingRecord =
   | { kind: "live"; row: LiveMessageRow }
   | { kind: "tombstone"; sequence: string; digest: Buffer };
 
-const timestampSql = `to_char(server_received_at AT TIME ZONE 'UTC',
+// Takes the column, the way credentials.ts already does: this file needs the
+// same rendering for more than one timestamp now, and two spellings of the same
+// format string is how they drift apart.
+const timestampSql = (column: string) => `to_char(${column} AT TIME ZONE 'UTC',
   'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
 const MAX_EXACT_PER_MEMBER = 4096;
 const MAX_EXACT_PER_TEAM = 65536;
@@ -132,7 +135,7 @@ export async function postMessages(
 
     const ids = [...firstById.keys()];
     const liveResult = await client.query<LiveMessageRow>(
-      `SELECT id::text, team_seq::text, ${timestampSql} AS server_received_at,
+      `SELECT id::text, team_seq::text, ${timestampSql("server_received_at")} AS server_received_at,
               envelope_v, cipher, key_id, blob, envelope_digest
          FROM messages WHERE team_id = $1 AND id = ANY($2::uuid[])`,
       [teamId, ids],
@@ -241,7 +244,7 @@ export async function postMessages(
         `INSERT INTO messages
            (team_id, id, team_seq, envelope_v, cipher, key_id, blob, envelope_digest)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         RETURNING id::text, team_seq::text, ${timestampSql} AS server_received_at,
+         RETURNING id::text, team_seq::text, ${timestampSql("server_received_at")} AS server_received_at,
                    envelope_v, cipher, key_id, blob, envelope_digest`,
         [
           teamId,
@@ -654,7 +657,7 @@ export async function getMessages(
         );
       }
       const result = await client.query<LiveMessageRow>(
-        `SELECT id::text, team_seq::text, ${timestampSql} AS server_received_at,
+        `SELECT id::text, team_seq::text, ${timestampSql("server_received_at")} AS server_received_at,
                 envelope_v, cipher, key_id, blob, envelope_digest
            FROM messages
           WHERE team_id = $1 AND team_seq > $2::bigint
@@ -845,6 +848,48 @@ async function roster(
 // managing it, and it follows from what e2ee is for here: if encryption
 // protects you from whoever runs the server, who is on the team is theirs to
 // know too. Each machine derives the roster by replaying the team journal.
+// Every team registered under a name. A name is not unique -- only team_id is
+// -- so this answers with a list and lets the caller decide, rather than
+// picking one and being right most of the time.
+//
+// What comes back is deliberately thin: the id to pull with, when the team was
+// registered, and how much history it holds. That is enough for a human to tell
+// two same-named teams apart, and it is all operational metadata that lives
+// outside the envelope. The roster is not here, and must not be: it travels
+// inside the envelope, so an e2ee team could not offer it and a plaintext one
+// offering it anyway would make plaintext the better-featured choice.
+export async function resolveTeamsByName(
+  pool: Pool,
+  teamName: string,
+): Promise<Record<string, unknown>> {
+  return inTransaction(
+    pool,
+    async (client) => {
+      const serverId = await serverInstanceId(client);
+      const rows = await client.query<{
+        team_id: string;
+        team_name: string;
+        registered_at: string;
+        current_seq: string;
+      }>(
+        `SELECT team_id::text, team_name,
+                ${timestampSql("registered_at")} AS registered_at,
+                current_seq::text
+           FROM teams WHERE team_name = $1
+          ORDER BY registered_at, team_id`,
+        [teamName],
+      );
+      return {
+        protocol_version: 1,
+        server_instance_id: serverId,
+        team_name: teamName,
+        teams: rows.rows,
+      };
+    },
+    { readOnly: true, repeatableRead: true },
+  );
+}
+
 export async function getTeamSnapshot(
   pool: Pool,
   teamId: string,
