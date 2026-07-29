@@ -1875,7 +1875,14 @@ export async function pullBootstrap(args) {
   process.stdout.write(`${JSON.stringify({
     type: "pull_bootstrap_result", team: config.local_team,
     team_id: config.remote_team_id, team_name: snapshot.team_name,
-    server_instance_id: config.server_instance_id, imported,
+    server_instance_id: config.server_instance_id,
+    // The binding the second machine records so it keeps syncing (the design's
+    // "and continues"): the same capability snapshot connect stores, plus the
+    // protocol version. Without it the pulled team has no connected binding and
+    // the sync engine refuses to run.
+    protocol_version: config.protocol_version,
+    capabilities: snapshot,
+    imported,
   })}\n`);
 }
 

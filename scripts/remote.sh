@@ -786,15 +786,33 @@ _remote_json_field() {
 # roster taken from anywhere else at this moment would be a guess presented as
 # fact. It is derived by replaying the team journal.
 _remote_write_pulled_team() {
-  local team="$1" team_id="$2" cfg initial
+  local team="$1" team_id="$2" endpoint="$3" server_instance_id="$4" \
+    remote_team_name="$5" protocol_version="$6" capabilities="$7" \
+    cfg initial cap_escaped connected_at
   cfg="$(_remote_team_config "$team")"
   mkdir -p "$TEAMS_DIR/$team"
   agmsg_lock_acquire "$TEAMS_DIR/$team" || return 1
+  cap_escaped="$(printf '%s' "$capabilities" | sed "s/'/''/g")"
+  connected_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # A pulled team records a connected binding — the same shape connect writes —
+  # so the sync engine keeps it in sync afterwards ("Machine two ... and
+  # continues", docs/design/remote-sync.md). No credential: the register-model
+  # data plane carries none. The roster stays empty; it is replayed from the
+  # journal, not taken from the server.
   initial=$(agmsg_sqlite_mem "
     SELECT json_object('name','$(_agmsg_sqlesc "$team")',
                        'team_id','$(_agmsg_sqlesc "$team_id")',
                        'agents', json_object(),
-                       'created_at','$(date -u +%Y-%m-%dT%H:%M:%SZ)');")
+                       'created_at','$connected_at',
+                       'remote_binding', json_object(
+                         'endpoint','$(_agmsg_sqlesc "$endpoint")',
+                         'server_instance_id','$(_agmsg_sqlesc "$server_instance_id")',
+                         'remote_team_id','$(_agmsg_sqlesc "$team_id")',
+                         'remote_team_name','$(_agmsg_sqlesc "$remote_team_name")',
+                         'protocol_version', $protocol_version,
+                         'capabilities', json('$cap_escaped'),
+                         'connected_at','$connected_at',
+                         'disconnected_at', null));")
   agmsg_write_atomic "$cfg" "$initial"
   agmsg_lock_release
 }
@@ -834,7 +852,7 @@ cmd_pull() {
     fi
   fi
 
-  local result pulled_id pulled_name imported
+  local result pulled_id pulled_name imported pulled_sid pulled_protocol pulled_caps
   result="$(AGMSG_SYNC_CONNECTION_DIR="$CONNECTION_ROOT" \
     "$SCRIPT_DIR/remote-sync.sh" pull-bootstrap \
       --team "$team" --team-id "$team_id" --endpoint "$endpoint")" || {
@@ -845,10 +863,14 @@ cmd_pull() {
   pulled_id="$(_remote_json_field "$result" '$.team_id')"
   pulled_name="$(_remote_json_field "$result" '$.team_name')"
   imported="$(_remote_json_field "$result" '$.imported')"
+  pulled_sid="$(_remote_json_field "$result" '$.server_instance_id')"
+  pulled_protocol="$(_remote_json_field "$result" '$.protocol_version')"
+  pulled_caps="$(_remote_json_field "$result" '$.capabilities')"
   [ "$pulled_id" = "$team_id" ] || {
     echo "agmsg: server answered with a different team id" >&2; exit 1; }
 
-  _remote_write_pulled_team "$team" "$pulled_id" || exit 1
+  _remote_write_pulled_team "$team" "$pulled_id" "$endpoint" "$pulled_sid" \
+    "$pulled_name" "$pulled_protocol" "$pulled_caps" || exit 1
   echo "Pulled '$pulled_name' into local team '$team' ($imported message(s))."
 }
 
