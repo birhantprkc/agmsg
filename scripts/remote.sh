@@ -809,6 +809,54 @@ _remote_write_pulled_team() {
   agmsg_lock_release
 }
 
+# Resolve a team name to one team_id, or explain why it cannot be resolved.
+#
+# A name is not unique on the server -- only team_id is -- so the answer is a
+# list. One entry settles it. Several is not bad data: it is a question only the
+# operator can answer, so the candidates are printed with what tells them apart
+# and --team-id is offered.
+_remote_resolve_team_id() {
+  local endpoint="$1" name="$2" out status result count doc
+  # The engine's exit status is read on its own rather than through a pipeline,
+  # so a server that is unreachable and a server whose answer failed validation
+  # stay distinguishable from a name that simply matched nothing. Collapsing
+  # those into one message is how a rejected answer would get read as "no such
+  # team" -- the wrong conclusion to hand an operator about their own team.
+  out="$("$SCRIPT_DIR/remote-sync.sh" resolve-team \
+    --endpoint "$endpoint" --name "$name" 2>/dev/null)"
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    echo "agmsg: could not look up '$name': the server was unreachable, or its answer was rejected" >&2
+    return 1
+  fi
+  result="$(printf '%s\n' "$out" | grep '"team_lookup_result"' | tail -1)" || true
+  [ -n "$result" ] || { echo "agmsg: the server did not answer the lookup for '$name'" >&2; return 1; }
+
+  doc="$(printf '%s' "$result" | sed "s/'/''/g")"
+  count="$(agmsg_sqlite_mem "SELECT json_array_length(json_extract('$doc', '\$.teams'));")"
+  case "$count" in ''|*[!0-9]*) count=0 ;; esac
+
+  if [ "$count" -eq 0 ]; then
+    echo "agmsg: no team named '$name' on this server" >&2
+    return 1
+  fi
+  if [ "$count" -eq 1 ]; then
+    agmsg_sqlite_mem "SELECT json_extract('$doc', '\$.teams[0].team_id');"
+    return 0
+  fi
+
+  {
+    echo "agmsg: $count teams are named '$name' on this server:"
+    agmsg_sqlite_mem "
+      SELECT '  ' || json_extract(value, '\$.team_id') ||
+             '   registered ' || substr(json_extract(value, '\$.registered_at'), 1, 10) ||
+             '   ' || json_extract(value, '\$.current_seq') || ' messages'
+        FROM json_each('$doc', '\$.teams');"
+    echo "re-run with --team-id <one of the above>"
+  } >&2
+  return 1
+}
+
 # The other half of connect: this machine takes a team it does not have.
 cmd_pull() {
   local endpoint="" team_id="" team="" positional=()
@@ -821,13 +869,20 @@ cmd_pull() {
       *) positional+=("$1"); shift ;;
     esac
   done
-  : "${endpoint:?Usage: remote.sh pull --endpoint <url> --team-id <uuid> <team>}"
-  : "${team_id:?Usage: remote.sh pull --endpoint <url> --team-id <uuid> <team>}"
+  : "${endpoint:?Usage: remote.sh pull --endpoint <url> [--team-id <uuid>] <team>}"
   _remote_validate_endpoint "$endpoint" || exit 1
   endpoint="${endpoint%/}"
   team="${positional[0]:-}"
   [ -n "$team" ] || { echo "agmsg: pull requires a local team name" >&2; exit 1; }
   agmsg_validate_team_name "$team" || exit 1
+
+  # The name is normally enough. A team_id had to be carried between machines by
+  # hand only because it stood in for authentication, and this server has none
+  # to stand in for. --team-id remains for the case a name cannot settle -- two
+  # teams sharing it -- and for anyone who scripted the old form.
+  if [ -z "$team_id" ]; then
+    team_id="$(_remote_resolve_team_id "$endpoint" "$team")" || exit 1
+  fi
 
   # Refused for the reason git refuses a non-fast-forward push: two teams that
   # each grew their own history do not become one by pointing at the same

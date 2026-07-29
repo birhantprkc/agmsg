@@ -144,6 +144,85 @@ class Handler(BaseHTTPRequestHandler):
         parts = self.path.split("?", 1)
         route = parts[0]
         query = parts[1] if len(parts) > 1 else ""
+        if route == "/v1/teams":
+            # MOCK_DUPLICATE_NAME makes the lookup answer with two teams sharing
+            # the requested name, which is the branch the client cannot resolve
+            # on its own.
+            wanted = ""
+            for pair in query.split("&"):
+                if pair.startswith("name="):
+                    from urllib.parse import unquote
+                    wanted = unquote(pair[len("name="):])
+            # A server the client must not believe. Each mode carries a marker
+            # that would be visible on a terminal if the value reached one, so a
+            # test can assert on its absence rather than on an exit status
+            # alone. MOCK_LOOKUP_BAD names which field goes wrong.
+            bad = os.environ.get("MOCK_LOOKUP_BAD", "")
+            if bad and wanted:
+                poison = "\x1b[2K\rMARKER-INJECTED"
+                good = {"team_id": PULL_TEAM_ID, "team_name": wanted,
+                        "registered_at": "2026-07-29T00:00:00.000000Z",
+                        "current_seq": "2"}
+                other = dict(good, team_id="018f3f7e-2222-7000-8000-0000000000ff",
+                             registered_at="2026-07-12T00:00:00.000000Z")
+                teams, root = [good], {}
+                if bad == "team_id":
+                    teams = [dict(good, team_id="not-a-uuid" + poison)]
+                elif bad == "name_mismatch":
+                    teams = [dict(good, team_name=wanted + poison)]
+                elif bad == "timestamp":
+                    teams = [dict(good, registered_at="2026-07-29" + poison)]
+                elif bad == "sequence":
+                    teams = [dict(good, current_seq="-1" + poison)]
+                elif bad == "extra_field":
+                    teams = [dict(good, roster=poison)]
+                elif bad == "multiple":
+                    teams = [good, dict(other, registered_at="2026-07-12" + poison)]
+                elif bad == "flood":
+                    teams = [dict(good, team_id="018f3f7e-%04d-7000-8000-0000000000ff" % i)
+                             for i in range(40)]
+                elif bad == "protocol":
+                    root = {"protocol_version": 2}
+                elif bad == "server_id":
+                    root = {"server_instance_id": "not-a-uuid" + poison}
+                elif bad == "root_name":
+                    root = {"team_name": wanted + poison}
+                self._send_json(200, {
+                    **{"protocol_version": 1,
+                       "server_instance_id": PULL_SERVER_ID,
+                       "team_name": wanted,
+                       "teams": teams},
+                    **root,
+                })
+                return
+            if os.environ.get("MOCK_DUPLICATE_NAME") == wanted and wanted:
+                self._send_json(200, {
+                    "protocol_version": 1,
+                    "server_instance_id": PULL_SERVER_ID,
+                    "team_name": wanted,
+                    "teams": [
+                        {"team_id": PULL_TEAM_ID, "team_name": wanted,
+                         "registered_at": "2026-07-29T00:00:00.000000Z",
+                         "current_seq": "2"},
+                        {"team_id": "018f3f7e-2222-7000-8000-0000000000ff",
+                         "team_name": wanted,
+                         "registered_at": "2026-07-12T00:00:00.000000Z",
+                         "current_seq": "4"},
+                    ],
+                })
+                return
+            teams = []
+            if wanted == "pulled-team":
+                teams = [{"team_id": PULL_TEAM_ID, "team_name": wanted,
+                          "registered_at": "2026-07-29T00:00:00.000000Z",
+                          "current_seq": str(len(PULL_MESSAGES))}]
+            self._send_json(200, {
+                "protocol_version": 1,
+                "server_instance_id": PULL_SERVER_ID,
+                "team_name": wanted,
+                "teams": teams,
+            })
+            return
         if route == "/v1/teams/%s" % PULL_TEAM_ID:
             self._send_json(200, {
                 "protocol_version": 1,

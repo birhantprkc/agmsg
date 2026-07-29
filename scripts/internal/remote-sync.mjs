@@ -19,6 +19,10 @@ const TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/;
 const PROTOCOL = "1";
 const MAX_SEQUENCE = 9_223_372_036_854_775_807n;
 const MAX_CONNECTION_CONFIG_BYTES = 2 * 1024 * 1024;
+// Held here as well as on the server, and deliberately not read from the
+// answer: a bound a server can raise by saying so is not a bound. If the two
+// ever disagree, the client refuses rather than accepts the larger list.
+const MAX_TEAMS_PER_NAME = 16;
 
 function usage() {
   return `usage:
@@ -1997,10 +2001,52 @@ export async function pullBootstrap(args, dependencies = {}) {
   })}\n`);
 }
 
-async function publicSnapshot(serverUrl, teamId) {
+// Resolve a team name to the teams carrying it. Like publicSnapshot this runs
+// before any config exists, so it validates its own answer rather than going
+// through the binding checks the rest of the client relies on.
+export async function resolveTeam(args) {
+  const serverUrl = args.endpoint ?? "";
+  if (!serverUrl) throw new Error("endpoint is required");
+  const name = args.name ?? "";
+  if (!name) throw new Error("name is required");
+  const body = await publicGet(serverUrl,
+    `/v1/teams?name=${encodeURIComponent(name)}`);
+  // Nothing here is trusted. One candidate's team_id becomes this machine's
+  // team identity; several are printed for an operator to read. Both happen
+  // before a local team exists, so a bad answer has to stop the command rather
+  // than thin out into "no such team" or reach a terminal as raw bytes. The
+  // messages below deliberately quote no server value, for the same reason.
+  const keysOf = (value) => Object.keys(value).sort().join(",");
+  if (body.protocol_version !== 1 || !UUID_V7.test(body.server_instance_id ?? "") ||
+      body.team_name !== name || !Array.isArray(body.teams)) {
+    throw new Error("team lookup answer is not a lookup result for the requested name");
+  }
+  if (body.teams.length > MAX_TEAMS_PER_NAME) {
+    throw new Error("team lookup returned more candidates than the protocol allows");
+  }
+  const teams = body.teams.map((candidate) => {
+    if (!candidate || typeof candidate !== "object" ||
+        keysOf(candidate) !== "current_seq,registered_at,team_id,team_name" ||
+        !UUID_V7.test(candidate.team_id ?? "") || candidate.team_name !== name ||
+        !TIMESTAMP.test(candidate.registered_at ?? "")) {
+      throw new Error("a team lookup candidate is not a valid candidate");
+    }
+    sequence(candidate.current_seq, "team lookup current_seq");
+    // Rebuilt field by field so only what was checked travels onward.
+    return {
+      team_id: candidate.team_id, team_name: candidate.team_name,
+      registered_at: candidate.registered_at, current_seq: candidate.current_seq,
+    };
+  });
+  process.stdout.write(`${JSON.stringify({
+    type: "team_lookup_result", team_name: name, teams,
+  })}\n`);
+}
+
+async function publicGet(serverUrl, path) {
   let response;
   try {
-    response = await fetch(endpoint(serverUrl, `/v1/teams/${teamId}`), {
+    response = await fetch(endpoint(serverUrl, path), {
       headers: { "Agmsg-Protocol-Version": PROTOCOL },
       redirect: "error", signal: AbortSignal.timeout(15_000),
     });
@@ -2017,6 +2063,11 @@ async function publicSnapshot(serverUrl, teamId) {
     error.status = response.status;
     throw error;
   }
+  return body;
+}
+
+async function publicSnapshot(serverUrl, teamId) {
+  const body = await publicGet(serverUrl, `/v1/teams/${teamId}`);
   if (body.team_id !== teamId || !UUID_V7.test(body.server_instance_id ?? "")) {
     throw new Error("team snapshot is not bound to the requested team");
   }
@@ -2027,11 +2078,12 @@ async function main() {
   const [command, ...rest] = process.argv.slice(2);
   const args = options(rest);
   if (!["configure", "once", "run", "reprocess", "resync", "unblock-read",
-        "pull-bootstrap"].includes(command)) {
+        "pull-bootstrap", "resolve-team"].includes(command)) {
     throw new Error(usage());
   }
   if (command === "configure") { await configure(args); return; }
-  // Before any local team exists, so it cannot go through loadConfig.
+  // Before any local team exists, so neither can go through loadConfig.
+  if (command === "resolve-team") { await resolveTeam(args); return; }
   if (command === "pull-bootstrap") { await pullBootstrap(args); return; }
   const team = requireName(args.team, "team");
   const limit = Number(args.limit ?? 100);

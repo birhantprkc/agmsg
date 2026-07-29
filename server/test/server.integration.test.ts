@@ -121,6 +121,45 @@ describeDatabase("remote storage HTTP API v1", () => {
     });
   });
 
+  it("answers a name lookup, and refuses more names than it can disambiguate", async () => {
+    const lookupName = "lookup-by-name";
+    const ids = Array.from({ length: 17 }, (_, index) =>
+      `018f3f7e-0000-7000-8000-0000000004${(index + 10).toString()}`);
+    await pool.query(
+      "INSERT INTO teams(team_id, team_name) SELECT unnest($1::uuid[]), $2",
+      [ids.slice(0, 1), lookupName],
+    );
+
+    const one = await app.inject({
+      method: "GET",
+      url: `/v1/teams?name=${encodeURIComponent(lookupName)}`,
+      headers: { "agmsg-protocol-version": "1" },
+    });
+    expect(one.statusCode).toBe(200);
+    expect(one.json().teams).toHaveLength(1);
+    // Exactly the four agreed fields travel. The roster is absent by design: it
+    // lives inside the envelope, so an e2ee team could not offer it and a
+    // plaintext one offering it anyway would be the better-featured choice.
+    expect(Object.keys(one.json().teams[0]).sort()).toEqual([
+      "current_seq", "registered_at", "team_id", "team_name",
+    ]);
+
+    // One past the bound. The answer has to be an error, not the first sixteen:
+    // a caller cannot tell whether a truncated list contains its own team, so it
+    // would be choosing from a set that may not hold the right answer.
+    await pool.query(
+      "INSERT INTO teams(team_id, team_name) SELECT unnest($1::uuid[]), $2",
+      [ids.slice(1), lookupName],
+    );
+    const tooMany = await app.inject({
+      method: "GET",
+      url: `/v1/teams?name=${encodeURIComponent(lookupName)}`,
+      headers: { "agmsg-protocol-version": "1" },
+    });
+    expect(tooMany.statusCode).toBe(409);
+    expect(tooMany.json().error.code).toBe("team-name-match-limit-exceeded");
+  });
+
   it("requires a matching protocol and a valid team ID, with no data-plane credential", async () => {
     const noVersion = await app.inject({
       method: "GET",

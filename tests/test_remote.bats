@@ -719,3 +719,96 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   [[ "$output" == *"[ ] python3 on PATH"* ]]
   [[ "$output" == *"Some checks failed"* ]]
 }
+
+@test "remote pull: a name is enough — no UUID is carried by hand" {
+  # The team_id requirement existed to stand in for authentication, and this
+  # server has none to stand in for. The second machine should never need a
+  # UUID typed across from the first.
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" pulled-team
+  [ "$status" -eq 0 ]
+  local cfg
+  cfg="$TEST_SKILL_DIR/teams/pulled-team/config.json"
+  [ -f "$cfg" ]
+  # And the id still ends up recorded, resolved rather than typed.
+  [ "$(sqlite_mem "SELECT json_extract(readfile('$(rf "$cfg")'), '\$.team_id');")" = "$PULL_TEAM_ID" ]
+}
+
+@test "remote pull: an unknown name fails without inventing a team" {
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" nosuchteam
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"no team named"* ]]
+  [ ! -d "$TEST_SKILL_DIR/teams/nosuchteam" ]
+}
+
+@test "remote pull: two teams sharing a name list the candidates and stop" {
+  # Not bad data — a question only the operator can answer. The listing has to
+  # carry what tells them apart, and must not pull one of them on a guess.
+  MOCK_DUPLICATE_NAME=pulled-team restart_mock_server
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" pulled-team
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"2 teams are named"* ]]
+  [[ "$output" == *"$PULL_TEAM_ID"* ]]
+  [[ "$output" == *"018f3f7e-2222-7000-8000-0000000000ff"* ]]
+  # What distinguishes them, and only from outside the envelope.
+  [[ "$output" == *"registered 2026-07-29"* ]]
+  [[ "$output" == *"registered 2026-07-12"* ]]
+  [[ "$output" == *"messages"* ]]
+  [[ "$output" == *"--team-id"* ]]
+  # Nothing was pulled on a guess.
+  [ ! -d "$TEST_SKILL_DIR/teams/pulled-team" ]
+}
+
+@test "remote pull: --team-id still resolves a shared name" {
+  MOCK_DUPLICATE_NAME=pulled-team restart_mock_server
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" pulled-team
+  [ "$status" -eq 0 ]
+  [ -f "$TEST_SKILL_DIR/teams/pulled-team/config.json" ]
+}
+
+# A lookup answer decides this machine's team identity and gets printed for an
+# operator to read, so each of these asserts three things: the command failed,
+# no local team was built from the answer, and the poisoned value never reached
+# the terminal. The message is pinned too -- a bare non-zero status would also
+# be produced by the very fail-open this guards against.
+assert_lookup_rejected() {
+  local mode="$1"
+  MOCK_LOOKUP_BAD="$mode" restart_mock_server
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" pulled-team
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"its answer was rejected"* ]]
+  [[ "$output" != *"MARKER-INJECTED"* ]]
+  [ ! -d "$TEST_SKILL_DIR/teams/pulled-team" ]
+}
+
+@test "remote pull: a candidate failing field validation is refused, not shown" {
+  # team_id/timestamp/sequence are the fields that would reach a terminal or a
+  # config; name_mismatch is a server answering about a different team.
+  assert_lookup_rejected team_id
+  assert_lookup_rejected timestamp
+  assert_lookup_rejected sequence
+  assert_lookup_rejected name_mismatch
+}
+
+@test "remote pull: an otherwise valid candidate with an extra field is refused" {
+  # The strongest of these cases: everything the client uses is well formed, so
+  # without the key-set check the pull would succeed and the unasked-for field
+  # would have travelled with it.
+  assert_lookup_rejected extra_field
+}
+
+@test "remote pull: a poisoned second candidate is refused before listing" {
+  # The duplicate-name path prints candidates, which is exactly where an
+  # unvalidated value would be rendered.
+  assert_lookup_rejected multiple
+}
+
+@test "remote pull: more candidates than the bound are refused, not listed" {
+  # Forty candidates. Without the client-side bound this lists all of them.
+  assert_lookup_rejected flood
+}
+
+@test "remote pull: a wrong protocol, server id, or root name is refused" {
+  assert_lookup_rejected protocol
+  assert_lookup_rejected server_id
+  assert_lookup_rejected root_name
+}
