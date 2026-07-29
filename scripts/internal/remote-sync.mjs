@@ -130,40 +130,56 @@ export async function activateKeyRotations(config) {
   }
   const base = config.age_v1.epoch_snapshot.history;
   let revision = BigInt(base.at(-1).epoch_revision);
-  const runtime = [];
+  const winners = [];
+  const announcedEpochs = new Set();
   for (const rotation of rotations) {
     if (!UUID_V7.test(rotation.id ?? "") ||
-        !/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(rotation.epoch ?? "") ||
+        !SEQUENCE.test(rotation.epoch ?? "") ||
+        BigInt(rotation.epoch) > MAX_SEQUENCE ||
+        !/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(rotation.key_id ?? "") ||
         !/^[0-9a-f]{64}$/u.test(rotation.fingerprint ?? "")) {
       throw new Error("key rotation journal record is invalid");
     }
-    const identityPath = replacementIdentityPath(config.local_team, rotation.epoch);
+    if (BigInt(rotation.epoch) <= revision || announcedEpochs.has(rotation.epoch)) continue;
+    announcedEpochs.add(rotation.epoch);
+    winners.push(rotation);
+  }
+  const runtime = [];
+  for (const rotation of winners) {
+    const expectedRevision = revision + 1n;
+    if (BigInt(rotation.epoch) !== expectedRevision) {
+      throw new Error(
+        `key rotation epoch ${rotation.epoch} is not the next epoch ${expectedRevision}`);
+    }
+    const identityPath = replacementIdentityPath(config.local_team, rotation.key_id);
     try {
       await lstat(identityPath);
     } catch (error) {
       if (error?.code === "ENOENT") {
         throw new Error(
-          `key rotation at server sequence ${rotation.server_seq} requires replacement epoch ` +
-          `${rotation.epoch}; import that key out of band before sync can continue`);
+          `key rotation at server sequence ${rotation.server_seq} selected epoch ` +
+          `${rotation.epoch} with key_id=${rotation.key_id}; import that key out of band ` +
+          "before sync can continue");
       }
       throw error;
     }
     const identity = readNativeAgeIdentity(identityPath);
     const fingerprint = createHash("sha256").update(identity.recipient, "utf8").digest("hex");
     if (fingerprint !== rotation.fingerprint) {
-      throw new Error(`replacement key for epoch ${rotation.epoch} does not match the announced fingerprint`);
+      throw new Error(
+        `replacement key ${rotation.key_id} for epoch ${rotation.epoch} does not match the announced fingerprint`);
     }
-    revision += 1n;
-    config.age_v1.identity_files[rotation.epoch] = identityPath;
+    revision = expectedRevision;
+    config.age_v1.identity_files[rotation.key_id] = identityPath;
     runtime.push({
-      epoch_revision: revision.toString(),
+      epoch_revision: rotation.epoch,
       // The announcement itself is sealed with the old epoch so a removed
       // holder can learn that rotation happened without receiving the new
       // key. The first envelope that uses the replacement is therefore the
       // sequence immediately after the announcement.
       effective_from_seq: (BigInt(rotation.server_seq) + 1n).toString(),
       cipher: "age-v1",
-      key_id: rotation.epoch,
+      key_id: rotation.key_id,
       recipients: [identity.recipient],
     });
   }
@@ -813,11 +829,15 @@ function currentLocalPolicy(config, serverSeq) {
   return candidates.reduce((best, entry) => BigInt(entry.local_security_revision) > BigInt(best.local_security_revision) ? entry : best);
 }
 
-function currentAgeEpoch(config, serverSeq) {
-  const history = [
+function ageHistory(config) {
+  return [
     ...(config.age_v1?.epoch_snapshot?.history ?? []),
     ...(config.age_v1_runtime_history ?? []),
   ];
+}
+
+function currentAgeEpoch(config, serverSeq) {
+  const history = ageHistory(config);
   if (!Array.isArray(history) || history.length < 1) return null;
   const target = BigInt(sequence(serverSeq, "age epoch server_seq"));
   const candidates = history.filter((entry) =>
@@ -847,27 +867,49 @@ export async function evaluatePull(config, capabilities, message) {
       local_security_revision: localPolicy.local_security_revision };
   }
   let identityFile;
+  let openedEpoch;
+  let effectiveEpoch;
   if (message.envelope.cipher === "age-v1") {
     if (config.cipher_profile !== "age-v1" || !config.age_v1) {
       return { status: "unsupported_cipher", reason: "age-v1 is not configured",
         policy_revision: serverPolicy.policy_revision,
         local_security_revision: localPolicy.local_security_revision };
     }
-    const epoch = currentAgeEpoch(config, message.server_seq);
-    if (!epoch || message.envelope.key_id !== epoch.key_id) {
+    effectiveEpoch = currentAgeEpoch(config, message.server_seq);
+    if (!effectiveEpoch) {
       return { status: "policy_violation", reason: "envelope key_id violates effective epoch",
         policy_revision: serverPolicy.policy_revision,
         local_security_revision: localPolicy.local_security_revision };
     }
-    identityFile = config.age_v1.identity_files?.[epoch.key_id];
+    openedEpoch = ageHistory(config).find((entry) =>
+      entry.key_id === message.envelope.key_id &&
+      BigInt(sequence(entry.effective_from_seq, "age epoch effective_from_seq")) <=
+        BigInt(message.server_seq));
+    if (!openedEpoch) {
+      return { status: "policy_violation", reason: "envelope key_id violates effective epoch",
+        policy_revision: serverPolicy.policy_revision,
+        local_security_revision: localPolicy.local_security_revision };
+    }
+    identityFile = config.age_v1.identity_files?.[openedEpoch.key_id];
   }
   try {
     const projection = await openEnvelope({ envelope: message.envelope,
       protocol_version: config.protocol_version, team_id: config.remote_team_id,
       wire_id: message.id, identity_file: identityFile,
       expected_recipients: message.envelope.cipher === "age-v1" ?
-        currentAgeEpoch(config, message.server_seq).recipients : undefined,
+        openedEpoch.recipients : undefined,
       max_blob_bytes: 1_048_576 });
+    if (message.envelope.cipher === "age-v1" &&
+        openedEpoch.key_id !== effectiveEpoch.key_id) {
+      const announced = projection?.kind === "key_rotated" &&
+        SEQUENCE.test(projection.epoch ?? "") &&
+        BigInt(projection.epoch) === BigInt(openedEpoch.epoch_revision) + 1n;
+      if (!announced) {
+        return { status: "policy_violation", reason: "envelope key_id violates effective epoch",
+          policy_revision: serverPolicy.policy_revision,
+          local_security_revision: localPolicy.local_security_revision };
+      }
+    }
     return { status: "importable", projection,
       policy_revision: serverPolicy.policy_revision,
       local_security_revision: localPolicy.local_security_revision };
@@ -1475,11 +1517,6 @@ export async function cycle(config, { pushLimit, pullLimit }, dependencies = {})
       messageAcks.length > 0 ? driverCall("reconcile", config, messageAcks) : [],
       rosterAcks.length > 0 ? rosterDriverCall("reconcile", config, rosterAcks) : [],
     ]);
-    if (rosterAcks.some((_, index) =>
-      candidates.filter((candidate) => candidate.sync_axis === "roster")[index]
-        ?.projection?.kind === "key_rotated")) {
-      await activateKeyRotationsCall(config);
-    }
     await eventCall("push.reconciled", {
       result: reconciled[0] ?? null,
       roster_result: rosterReconciled[0] ?? null,

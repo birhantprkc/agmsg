@@ -158,7 +158,8 @@ test("key rotation is transported as a fingerprint-only journal mutation", async
     await writeFile(join(scratch, "roster.jsonl"), `${JSON.stringify({
       type: "key_rotated",
       id: mutationId,
-      epoch: "epoch-20260729010000-abcd",
+      epoch: "1",
+      key_id: "epoch-20260729010000-abcd",
       fingerprint: "b".repeat(64),
       at: "2026-07-29T01:00:00Z",
     })}\n`);

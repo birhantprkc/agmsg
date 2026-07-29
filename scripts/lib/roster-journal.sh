@@ -54,11 +54,12 @@ _agmsg_roster_rename_record() {
 }
 
 _agmsg_key_rotated_record() {
-  local epoch="$1" fingerprint="$2" at="$3"
+  local epoch="$1" key_id="$2" fingerprint="$3" at="$4"
   sqlite3 :memory: "SELECT json_object(
     'type','key_rotated',
     'id','$(compat_uuid7)',
     'epoch','$(_agmsg_roster_sqlesc "$epoch")',
+    'key_id','$(_agmsg_roster_sqlesc "$key_id")',
     'fingerprint','$(_agmsg_roster_sqlesc "$fingerprint")',
     'at','$(_agmsg_roster_sqlesc "$at")'
   );" | tr -d '\r'
@@ -91,8 +92,8 @@ agmsg_roster_append_renamed() {
 }
 
 agmsg_roster_append_key_rotated() {
-  local team_dir="$1" epoch="$2" fingerprint="$3" at="$4" record
-  record="$(_agmsg_key_rotated_record "$epoch" "$fingerprint" "$at")" || return 1
+  local team_dir="$1" epoch="$2" key_id="$3" fingerprint="$4" at="$5" record
+  record="$(_agmsg_key_rotated_record "$epoch" "$key_id" "$fingerprint" "$at")" || return 1
   _agmsg_roster_append_record "$team_dir" "$record"
 }
 

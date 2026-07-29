@@ -65,6 +65,7 @@ function projection(record) {
       kind: record.type,
       mutation_id: record.id,
       epoch: record.epoch,
+      key_id: record.key_id,
       fingerprint: record.fingerprint,
       occurred_at: timestamp(record.at),
     };
@@ -86,6 +87,7 @@ function mutation(value) {
       type: value.kind,
       id: value.mutation_id,
       epoch: value.epoch,
+      key_id: value.key_id,
       fingerprint: value.fingerprint,
       at: value.occurred_at,
     };
