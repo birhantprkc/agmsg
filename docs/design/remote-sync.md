@@ -18,6 +18,41 @@ identity of a local team can never depend on a service that is optional.
 
 That single constraint decides most of what follows.
 
+## Try it on one machine
+
+Everything below can be watched end to end with two installs on one host, no
+cloud, no auth. This is the exact path the design was verified on. `<A>` and
+`<B>` are two command names you pick — anything but the one your real install
+already uses, so this never touches it.
+
+```sh
+# 1. A reference server on localhost, backed by Postgres.
+cd server && npm ci
+DATABASE_URL=postgres://USER:PASS@127.0.0.1:5432/DB PORT=8787 npx tsx src/index.ts &
+
+# 2. Two installs beside your real one — each its own command name and store.
+bash install.sh --cmd <A> --agent-type claude-code
+bash install.sh --cmd <B> --agent-type claude-code
+
+# 3. On <A>, connect a team you already have. A team from before local ids
+#    works: connect mints them, moves the team to its own store, uploads its
+#    history, and leaves a sync engine running.
+~/.agents/skills/<A>/scripts/remote.sh connect --endpoint http://127.0.0.1:8787 myteam
+
+# 4. On <B>, pull it by name and keep syncing.
+~/.agents/skills/<B>/scripts/remote.sh pull --endpoint http://127.0.0.1:8787 myteam
+
+# 5. Send from either side; it reaches the other.
+~/.agents/skills/<A>/scripts/send.sh myteam alice bob "hello from machine one"
+```
+
+Two things are worth confirming yourself, because they are the whole point: a
+team you did **not** connect is untouched in the shared store and still readable,
+and the connected team's rows are gone from that shared store — a program that
+read the database file directly no longer sees them, by design. Ask the server
+for a team's location with `api.sh get teams <team> store` rather than assuming
+the path.
+
 ## Three things happen, and only three
 
 **Register.** Send the team you have. The server records it and answers.
@@ -117,9 +152,22 @@ be more.
 ### Rollback resistance is part of this, not an extra
 
 `age-v1` already specifies epoch snapshots: a strictly increasing
-`epoch_revision`, the full key-epoch history, and `previous_snapshot_sha256`
-linking each to the one before. It is designed and unimplemented, and it belongs
-in this work.
+`epoch_revision`, a strictly increasing `writer_generation`, the authorized
+writer roster for that generation, the full key-epoch history, and
+`previous_snapshot_sha256` linking each to the one before. It is designed and
+unimplemented, and it belongs in this work.
+
+**The `key_rotated` event does not carry a snapshot, and a machine must not
+build one from it.** The event has an epoch, a key id, a fingerprint, and a
+time — not the authorized roster, the generation, or the chain digest that make
+a snapshot trustworthy. So the snapshot travels the way the key material does:
+handed over out of band and taken in through `import`, authority and chain
+verified on the way in. The event only says *activate*: when a `key_rotated`
+matches the epoch, key id, fingerprint, and boundary of a snapshot already
+provisioned, the machine switches to it; when no such snapshot has been
+imported, it does the same thing it does for any missing key — it stops. The
+fingerprint's job is to confirm that the snapshot in hand is the one the event
+names, not to stand in for it.
 
 The tempting argument for deferring it is that a server hiding `key_rotated`
 from one machine leaves that machine on the old key, writing what nobody else
