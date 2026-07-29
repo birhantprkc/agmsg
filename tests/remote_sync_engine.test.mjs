@@ -103,6 +103,58 @@ test("a synced rotation halts until an out-of-band identity matches its fingerpr
   }
 });
 
+test("rotation cutover accepts MAX_SEQUENCE minus one and rejects the final sequence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agmsg-key-rotation-boundary-"));
+  const previous = process.env.AGMSG_SYNC_CONNECTION_DIR;
+  process.env.AGMSG_SYNC_CONNECTION_DIR = root;
+  const mutationId = "018f3f7e-0000-7000-8000-000000000028";
+  const keyId = "epoch-boundary";
+  const recipient = "age1ykvctct4aklx4f4mnjd8rmzqs7p2le9ufg4faydljsk5mvcy0pls27mu64";
+  const identity = "AGE-SECRET-KEY-14Z7XMNPZTPEMMM6DG2FSKEH042L7UMU79T645GAQJKU2LLJGPM2S7GWNLQ";
+  const fingerprint = createHash("sha256").update(recipient).digest("hex");
+  const rotationConfig = () => ({
+    ...config,
+    cipher_profile: "age-v1",
+    age_v1: {
+      epoch_snapshot: { history: [{
+        epoch_revision: "0", effective_from_seq: "1", cipher: "age-v1",
+        key_id: "epoch-0", recipients: [recipient],
+      }] },
+      identity_files: {},
+    },
+  });
+  try {
+    const teamDir = join(root, "teams", "demo");
+    const keyDir = join(root, "run", "remote-credentials", "demo", "keys");
+    await mkdir(teamDir, { recursive: true });
+    await mkdir(keyDir, { recursive: true });
+    await writeFile(join(keyDir, `${keyId}.key`), `${identity}\n`, { mode: 0o600 });
+    const writeRotation = async (serverSeq) => writeFile(join(teamDir, "roster.jsonl"), [
+      JSON.stringify({ type: "key_rotated", id: mutationId, epoch: "1",
+        key_id: keyId, fingerprint, at: "2026-07-29T01:00:00.000000Z" }),
+      JSON.stringify({ type: "roster_synced", mutation_id: mutationId, server_seq: serverSeq,
+        wire_id: "550e8400-e29b-41d4-a716-446655440009",
+        server_instance_id: config.server_instance_id,
+        remote_team_id: config.remote_team_id }),
+      "",
+    ].join("\n"));
+
+    await writeRotation("9223372036854775806");
+    const accepted = rotationConfig();
+    await activateKeyRotations(accepted);
+    assert.equal(accepted.age_v1_runtime_history[0].effective_from_seq,
+      "9223372036854775807");
+
+    await writeRotation("9223372036854775807");
+    await assert.rejects(activateKeyRotations(rotationConfig()),
+      /final server sequence/u);
+  } finally {
+    if (previous === undefined) delete process.env.AGMSG_SYNC_CONNECTION_DIR;
+    else process.env.AGMSG_SYNC_CONNECTION_DIR = previous;
+    await rm(root, { recursive: true });
+  }
+});
+
 test("concurrent rotations adopt the first server sequence and the loser must import it", async () => {
   const root = await mkdtemp(join(tmpdir(), "agmsg-key-rotation-race-"));
   const previous = process.env.AGMSG_SYNC_CONNECTION_DIR;

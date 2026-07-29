@@ -151,6 +151,9 @@ export async function activateKeyRotations(config) {
       throw new Error(
         `key rotation epoch ${rotation.epoch} is not the next epoch ${expectedRevision}`);
     }
+    if (BigInt(rotation.server_seq) === MAX_SEQUENCE) {
+      throw new Error("key rotation cannot be activated at the final server sequence");
+    }
     const identityPath = replacementIdentityPath(config.local_team, rotation.key_id);
     try {
       await lstat(identityPath);
@@ -903,7 +906,9 @@ export async function evaluatePull(config, capabilities, message) {
         openedEpoch.key_id !== effectiveEpoch.key_id) {
       const announced = projection?.kind === "key_rotated" &&
         SEQUENCE.test(projection.epoch ?? "") &&
-        BigInt(projection.epoch) === BigInt(openedEpoch.epoch_revision) + 1n;
+        BigInt(projection.epoch) === BigInt(effectiveEpoch.epoch_revision) &&
+        BigInt(openedEpoch.epoch_revision) + 1n ===
+          BigInt(effectiveEpoch.epoch_revision);
       if (!announced) {
         return { status: "policy_violation", reason: "envelope key_id violates effective epoch",
           policy_revision: serverPolicy.policy_revision,

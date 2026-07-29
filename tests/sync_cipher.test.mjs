@@ -221,6 +221,19 @@ test("a late concurrent rotation may use the preceding key but ordinary data may
     assert.equal(accepted.status, "importable");
     assert.deepEqual(accepted.projection, rotation);
 
+    raceConfig.age_v1.identity_files["epoch-current"] = newIdentity;
+    raceConfig.age_v1_runtime_history.push({
+      epoch_revision: "2", effective_from_seq: "3", cipher: "age-v1",
+      key_id: "epoch-current", recipients: [manifest.recipient_sets.team_b.recipient],
+    });
+    const stale = await evaluatePull(raceConfig, capabilities(raceConfig, "age-v1"), {
+      server_seq: "3",
+      id: wireId,
+      server_received_at: "2026-07-29T01:00:02.000000Z",
+      envelope: rotationEnvelope,
+    });
+    assert.equal(stale.status, "policy_violation");
+
     const messageId = "550e8400-e29b-41d4-a716-446655440004";
     const oldKeyMessage = sealEnvelope({
       type: "sync_seal",
