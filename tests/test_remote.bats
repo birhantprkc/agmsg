@@ -75,7 +75,9 @@ restart_mock_server() {
 }
 
 @test "connect: http://127.0.0.1 (loopback) is accepted without https" {
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
+  # Loopback passes endpoint validation, then connect proceeds to register a
+  # real local team. testteam was minted with a team_id in setup().
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
   [ "$status" -eq 0 ]
 }
 
@@ -125,18 +127,39 @@ restart_mock_server() {
 
 # --- connect -------------------------------------------------------------
 
-@test "connect: happy path, no encryption required" {
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
+@test "connect: registers a client-owned team (happy path, Done-when 1)" {
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Connected: team 'myteam'"* ]]
-  [ -f "$SCRIPTS/../run/remote-credentials/myteam.json" ]
+  [[ "$output" == *"Connected: team 'testteam'"* ]]
+  # A binding is recorded on the team config, and it carries no credential:
+  # the register model writes none and none is fetched back.
+  [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$SCRIPTS/../teams/testteam/config.json') AS TEXT), '\$.remote_binding.connected_at');")" != "" ]
+  [ ! -f "$SCRIPTS/../run/remote-credentials/testteam.json" ]
 }
 
-@test "connect: after disconnect, reconnecting the same team needs no --force" {
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
-  bash "$SCRIPTS/remote.sh" disconnect myteam
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
+@test "connect: moves the team into its own per-team store (Done-when 2)" {
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
   [ "$status" -eq 0 ]
+  # A connected team's rows are migrated out of the shared store into a
+  # per-team one; connect exits non-zero if that migration fails.
+  run find "$TEST_SKILL_DIR" -path '*teams/testteam/messages.db'
+  [ -n "$output" ]
+}
+
+@test "connect: starts a background sync engine that disconnect stops (Done-when 4)" {
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  local pidfile="$SCRIPTS/../run/remote-sync.testteam.pid"
+  wait_for_file "$pidfile"
+  bash "$SCRIPTS/remote.sh" disconnect testteam
+  wait_for_missing "$pidfile"
+}
+
+@test "connect: refuses a second connect for the same team_id with 409 (Done-when 5)" {
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  # The mock keeps the registered team_id; a repeat is a uniqueness conflict.
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"already registered"* ]]
 }
 
 # --- status --------------------------------------------------------------
@@ -148,12 +171,12 @@ restart_mock_server() {
 }
 
 @test "status: with no <team> lists every locally-known connected team" {
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
   bash "$SCRIPTS/join.sh" secondteam alice claude-code /tmp/project-a >/dev/null
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token secondteam --force >/dev/null
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" secondteam >/dev/null
   run bash "$SCRIPTS/remote.sh" status
   [ "$status" -eq 0 ]
-  [[ "$output" == *"myteam"* ]]
+  [[ "$output" == *"testteam"* ]]
   [[ "$output" == *"secondteam"* ]]
 }
 
@@ -161,42 +184,16 @@ restart_mock_server() {
 
 # --- disconnect ------------------------------------------------------------
 
-@test "disconnect: revokes server-side then clears local state" {
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
-  run bash "$SCRIPTS/remote.sh" disconnect myteam
+@test "disconnect: stops the engine and clears local state" {
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  run bash "$SCRIPTS/remote.sh" disconnect testteam
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Revoking credential with server... ok."* ]]
-  [ ! -f "$SCRIPTS/../run/remote-credentials/myteam.json" ]
-  run bash "$SCRIPTS/remote.sh" status myteam
-  [[ "$output" == *"was connected until"* ]]
-}
-
-@test "disconnect: server unreachable for revoke still clears local state, with a warning" {
-  MOCK_REVOKE_FAIL=1
-  kill "$MOCK_SERVER_PID" 2>/dev/null
-  MOCK_REVOKE_FAIL=1 "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
-    </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
-  MOCK_SERVER_PID=$!
-  wait_for_file_contains "$TEST_SKILL_DIR/server.port" '^[0-9][0-9]*$'
-  MOCK_PORT="$(cat "$TEST_SKILL_DIR/server.port")"
-  ENDPOINT="http://127.0.0.1:$MOCK_PORT"
-
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
-  run bash "$SCRIPTS/remote.sh" disconnect myteam
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"could not be reached to revoke"* ]]
-  [ ! -f "$SCRIPTS/../run/remote-credentials/myteam.json" ]
-}
-
-@test "disconnect: does not claim revoke success without the protocol response header" {
-  MOCK_REVOKE_BAD_HEADER=1
-  restart_mock_server
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
-  run bash "$SCRIPTS/remote.sh" disconnect myteam
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"could not be reached to revoke"* ]]
-  [[ "$output" != *"Revoking credential with server... ok."* ]]
-  [ ! -f "$SCRIPTS/../run/remote-credentials/myteam.json" ]
+  [[ "$output" == *"Disconnected 'testteam'. Local sync state cleared"* ]]
+  # The binding is marked disconnected locally (no server round-trip is needed
+  # to disconnect in the register model). We do NOT assert on the "Revoking
+  # credential..." line: it is old-path output that runs with no credential
+  # present and is removed with the credential/E2EE cleanup.
+  [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$SCRIPTS/../teams/testteam/config.json') AS TEXT), '\$.remote_binding.disconnected_at');")" != "" ]
 }
 
 @test "disconnect: fails for a team that isn't connected" {
@@ -208,30 +205,26 @@ restart_mock_server() {
 # --- status --json (ADR 0007 addendum) --------------------------------------
 
 @test "status --json: reports the strict schema for an active connection" {
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
-  local committed_credential_id
-  committed_credential_id=$(python3 -c "import json; print(json.load(open('$SCRIPTS/../teams/myteam/config.json'))['remote_binding']['credential_id'])")
-  run bash "$SCRIPTS/remote.sh" status myteam --json
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  run bash "$SCRIPTS/remote.sh" status testteam --json
   [ "$status" -eq 0 ]
   [ "$(echo "$output" | wc -l | tr -d ' ')" -eq 1 ]
-  [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.local_team');")" = "myteam" ]
+  [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.local_team');")" = "testteam" ]
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.endpoint');")" = "$ENDPOINT" ]
-  [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.credential_id');")" = "$committed_credential_id" ]
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.state');")" = "active" ]
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.server_instance_id');")" != "" ]
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.remote_team_id');")" != "" ]
+  # The register binding carries no credential; the field is still emitted for
+  # a stable schema, but as null (removed with the credential/E2EE cleanup).
+  [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.credential_id');")" = "" ]
 }
 
 @test "status --json: reports state=disconnected after disconnect" {
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
-  local committed_credential_id
-  committed_credential_id=$(python3 -c "import json; print(json.load(open('$SCRIPTS/../teams/myteam/config.json'))['remote_binding']['credential_id'])")
-  bash "$SCRIPTS/remote.sh" disconnect myteam
-  run bash "$SCRIPTS/remote.sh" status myteam --json
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  bash "$SCRIPTS/remote.sh" disconnect testteam
+  run bash "$SCRIPTS/remote.sh" status testteam --json
   [ "$status" -eq 0 ]
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.state');")" = "disconnected" ]
-  # credential_id from the old binding is still informative, not a live secret.
-  [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.credential_id');")" = "$committed_credential_id" ]
 }
 
 @test "status --json: errors for a team that has never been connected" {
@@ -247,25 +240,25 @@ restart_mock_server() {
 }
 
 @test "status --json: with no <team>, emits one JSONL line per connected team" {
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token myteam
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
   bash "$SCRIPTS/join.sh" otherteam bob claude-code /tmp/project-b
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token otherteam
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" otherteam
   run bash "$SCRIPTS/remote.sh" status --json
   [ "$status" -eq 0 ]
   [ "$(echo "$output" | wc -l | tr -d ' ')" -eq 2 ]
-  local myteam_line otherteam_line
-  myteam_line="$(echo "$output" | grep myteam | grep -v otherteam)"
+  local testteam_line otherteam_line
+  testteam_line="$(echo "$output" | grep testteam | grep -v otherteam)"
   otherteam_line="$(echo "$output" | grep otherteam)"
-  [ -n "$myteam_line" ]
+  [ -n "$testteam_line" ]
   [ -n "$otherteam_line" ]
-  [ "$(sqlite_mem "SELECT json_extract('$(echo "$myteam_line" | sed "s/'/''/g")', '\$.local_team');")" = "myteam" ]
+  [ "$(sqlite_mem "SELECT json_extract('$(echo "$testteam_line" | sed "s/'/''/g")', '\$.local_team');")" = "testteam" ]
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$otherteam_line" | sed "s/'/''/g")', '\$.local_team');")" = "otherteam" ]
 }
 
 @test "status: a team name containing a single quote doesn't break status or status --json (#87-class / .param set fix)" {
   local team="o'brien-team"
   bash "$SCRIPTS/join.sh" "$team" carol claude-code /tmp/project-c
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" good-token "$team"
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" "$team"
   [ "$status" -eq 0 ]
   [[ ! "$output" =~ ".parameter" ]]
   run bash "$SCRIPTS/remote.sh" status "$team"
