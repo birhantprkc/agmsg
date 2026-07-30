@@ -64,6 +64,7 @@ write_fake_node() {
     '  echo v23.0.0' \
     '  exit 0' \
     'fi' \
+    'echo '\''{"event":"capabilities"}'\''' \
     'trap "exit 0" TERM INT' \
     'while :; do sleep 1; done' > "$fake_node"
   chmod +x "$fake_node"
@@ -254,6 +255,23 @@ remember_engine_pid() {
   remember_engine_pid
   kill -0 "$ENGINE_PID"
   rm -f "$first_out" "$second_out"
+}
+
+@test "sync start reaps a ready-timeout child before releasing ownership" {
+  local fake_node="$TEST_SKILL_DIR/fake-node-timeout" fake_bin lock
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'trap "" TERM' \
+    'while :; do sleep 1; done' > "$fake_node"
+  chmod +x "$fake_node"
+  fake_bin="$(write_fake_node_ps_fixture "$fake_node")"
+
+  run env PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" \
+    bash "$SCRIPTS/remote.sh" sync start testteam
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"did not become ready"* ]]
+  [ ! -e "$TEST_SKILL_DIR/run/remote-sync.testteam.pid" ]
+  lock="$TEST_SKILL_DIR/teams/testteam/.config.lock"
+  [ ! -d "$lock" ]
 }
 
 @test "sync start: rejects a team whose binding is not active" {

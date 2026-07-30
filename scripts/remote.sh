@@ -1016,6 +1016,23 @@ _remote_sync_engine_status() {
   esac
 }
 
+_remote_sync_engine_reap_owned() {
+  local team="$1" owned_pid="$2" state pid signal attempts
+  for signal in TERM KILL; do
+    IFS=$'\t' read -r state pid < <(_remote_sync_engine_status "$team")
+    if ! _agmsg_pid_alive "$owned_pid"; then return 0; fi
+    [ "$state" = "running" ] && [ "$pid" = "$owned_pid" ] || return 1
+    kill "-$signal" "$owned_pid" 2>/dev/null || true
+    attempts=0
+    while [ "$attempts" -lt 100 ]; do
+      _agmsg_pid_alive "$owned_pid" || return 0
+      attempts=$((attempts + 1))
+      sleep 0.01
+    done
+  done
+  ! _agmsg_pid_alive "$owned_pid"
+}
+
 # Upgrade a team that predates local ids: mint a team_id AND a member_id for
 # every current member, in one shot, then persist. connect is the point an old
 # team first needs ids, and the invariant is all-or-none — a team carries ids
@@ -1331,7 +1348,7 @@ cmd_status() {
 
 cmd_sync_start() {
   local team="${1:?Usage: remote.sh sync start <team>}" cfg connected_at disconnected_at \
-    engine_state engine_pid started_pid ready_pid i=0
+    engine_state engine_pid started_pid ready_pid ready=0 i=0 logfile log_offset=1
   [ $# -eq 1 ] || { echo "Usage: remote.sh sync start <team>" >&2; exit 1; }
   agmsg_validate_team_name "$team" || exit 1
   agmsg_lock_acquire "$TEAMS_DIR/$team" || exit 1
@@ -1356,6 +1373,8 @@ cmd_sync_start() {
     return
   fi
 
+  logfile="$CONNECTION_ROOT/run/remote-sync.$team.log"
+  [ -f "$logfile" ] && log_offset=$(( $(wc -c < "$logfile" | tr -d ' ') + 1 ))
   if ! _remote_sync_engine_start "$team"; then
     agmsg_lock_release
     return 1
@@ -1363,15 +1382,20 @@ cmd_sync_start() {
   started_pid="$(cat "$(_remote_sync_engine_pidfile "$team")")"
   while [ "$i" -lt 100 ]; do
     IFS=$'\t' read -r engine_state ready_pid < <(_remote_sync_engine_status "$team")
-    if [ "$engine_state" = "running" ] && [ "$ready_pid" = "$started_pid" ]; then
+    if [ "$engine_state" = "running" ] && [ "$ready_pid" = "$started_pid" ] &&
+       tail -c "+$log_offset" "$logfile" 2>/dev/null | grep -q '"event":"capabilities"'; then
+      ready=1
       break
     fi
     i=$((i + 1))
     sleep 0.01
   done
-  if [ "$engine_state" != "running" ] || [ "$ready_pid" != "$started_pid" ]; then
-    kill "$started_pid" 2>/dev/null || true
-    rm -f "$(_remote_sync_engine_pidfile "$team")"
+  if [ "$ready" -ne 1 ]; then
+    if _remote_sync_engine_reap_owned "$team" "$started_pid"; then
+      rm -f "$(_remote_sync_engine_pidfile "$team")"
+    else
+      echo "agmsg: failed engine ownership was preserved in its pidfile for diagnosis" >&2
+    fi
     agmsg_lock_release
     echo "agmsg: sync engine for '$team' did not become ready" >&2
     return 1
