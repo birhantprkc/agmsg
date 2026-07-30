@@ -5,6 +5,7 @@ set -euo pipefail
 #   remote.sh connect --endpoint <url> <team>
 #   remote.sh pull --endpoint <url> [--team-id <uuid>] <team>
 #   remote.sh status [<team>] [--json]
+#   remote.sh sync start <team>
 #   remote.sh disconnect <team>
 #
 # Team-scoped cloud/self-hosted sync connection. The OSS CLI never assumes or
@@ -955,16 +956,16 @@ cmd_pull() {
 _remote_sync_engine_pidfile() { printf '%s' "$CONNECTION_ROOT/run/remote-sync.$1.pid"; }
 
 _remote_sync_engine_start() {
-  local team="$1" pidfile logfile old_pid
+  local team="$1" pidfile logfile old_pid old_state
   pidfile="$(_remote_sync_engine_pidfile "$team")"
   logfile="$CONNECTION_ROOT/run/remote-sync.$team.log"
   mkdir -p "$CONNECTION_ROOT/run" 2>/dev/null || true
-  # Stop a previous engine for this team before claiming the slot; a stale
-  # pidfile (its process already gone) is simply overwritten. _agmsg_pid_alive
-  # guards against a recycled pid pointing at an unrelated process.
-  if [ -f "$pidfile" ]; then
-    old_pid="$(cat "$pidfile" 2>/dev/null || true)"
-    [ -n "$old_pid" ] && _agmsg_pid_alive "$old_pid" && kill "$old_pid" 2>/dev/null || true
+  # Stop only an engine whose argv proves that it owns this team. A stale
+  # pidfile may point at a recycled, unrelated process and must never authorize
+  # signalling that process.
+  IFS=$'\t' read -r old_state old_pid < <(_remote_sync_engine_status "$team")
+  if [ "$old_state" = "running" ]; then
+    kill "$old_pid" 2>/dev/null || true
   fi
   # nohup so the engine outlives this connect; remote-sync.sh execs node, so $!
   # stays the engine's own pid and is exactly what _remote_sync_engine_stop signals.
@@ -984,6 +985,33 @@ _remote_sync_engine_stop() {
   pid="$(cat "$pidfile" 2>/dev/null || true)"
   [ -n "$pid" ] && _agmsg_pid_alive "$pid" && kill "$pid" 2>/dev/null || true
   rm -f "$pidfile"
+}
+
+# Print "<state>\t<pid>", where pid is empty when no valid pid is available.
+# A live PID is not enough: PID reuse can make an unrelated process pass
+# kill -0, so running requires the exact engine script/team suffix in argv.
+_remote_sync_engine_status() {
+  local team="$1" pidfile pid command expected
+  pidfile="$(_remote_sync_engine_pidfile "$team")"
+  if [ ! -f "$pidfile" ]; then
+    printf 'stopped\t\n'
+    return
+  fi
+  pid="$(cat "$pidfile" 2>/dev/null || true)"
+  if ! [[ "$pid" =~ ^[1-9][0-9]{0,9}$ ]]; then
+    printf 'stale\t\n'
+    return
+  fi
+  if ! _agmsg_pid_alive "$pid"; then
+    printf 'stale\t%s\n' "$pid"
+    return
+  fi
+  command="$(compat_get_cmdline "$pid" 2>/dev/null || true)"
+  expected="$SCRIPT_DIR/internal/remote-sync.mjs run --team $team"
+  case "$command" in
+    *"$expected") printf 'running\t%s\n' "$pid" ;;
+    *) printf 'stale\t%s\n' "$pid" ;;
+  esac
 }
 
 # Upgrade a team that predates local ids: mint a team_id AND a member_id for
@@ -1138,7 +1166,8 @@ cmd_connect() {
 # --- status --------------------------------------------------------------
 
 _remote_status_one() {
-  local team="$1" cfg connected_at disconnected_at write_allowed_ciphers key_id
+  local team="$1" cfg connected_at disconnected_at write_allowed_ciphers key_id \
+    engine_state engine_pid
   cfg="$(_remote_team_config "$team")"
   connected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.connected_at')"
   disconnected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.disconnected_at')"
@@ -1159,7 +1188,20 @@ _remote_status_one() {
     '['*']') [ "$write_allowed_ciphers" != "[]" ] && needs_encryption=1 ;;
   esac
 
-  echo "$team	connected (since $connected_at)"
+  IFS=$'\t' read -r engine_state engine_pid < <(_remote_sync_engine_status "$team")
+  case "$engine_state" in
+    running)
+      echo "$team	connected (engine running, pid $engine_pid) since $connected_at" ;;
+    stopped)
+      echo "$team	connected (engine stopped — run: remote.sh sync start $team) since $connected_at" ;;
+    stale)
+      if [ -n "$engine_pid" ]; then
+        echo "$team	connected (engine stale — pidfile $engine_pid points at a dead or foreign process) since $connected_at"
+      else
+        echo "$team	connected (engine stale — pidfile does not contain a valid process id) since $connected_at"
+      fi
+      ;;
+  esac
   if [ "$needs_encryption" -eq 1 ]; then
     if [ -z "$key_id" ] || [ "$key_id" = "null" ]; then
       echo "		encryption: required, no local key — run 'key.sh generate $team' or 'key.sh import $team'"
@@ -1202,7 +1244,7 @@ _remote_status_one() {
 # containing a quote/backslash must not silently produce malformed JSON the
 # way E3's hand-rolled credential escaping once did.
 _remote_status_json_one() {
-  local team="$1" cfg raw
+  local team="$1" cfg raw engine_state engine_pid
   cfg="$(_remote_team_config "$team")"
   [ -f "$cfg" ] || return 1
 
@@ -1210,9 +1252,10 @@ _remote_status_json_one() {
   raw="$(cat "$cfg" 2>/dev/null)"
   agmsg_lock_release
 
+  IFS=$'\t' read -r engine_state engine_pid < <(_remote_sync_engine_status "$team")
   printf '%s' "$raw" | python3 -c '
 import json, sys
-team = sys.argv[1]
+team, engine_state, engine_pid_text = sys.argv[1:4]
 try:
     cfg = json.loads(sys.stdin.read())
 except Exception:
@@ -1223,6 +1266,10 @@ binding = cfg.get("remote_binding")
 if not isinstance(binding, dict) or not binding.get("connected_at"):
     sys.exit(1)
 state = "disconnected" if binding.get("disconnected_at") else "active"
+engine_pid = int(engine_pid_text) if engine_pid_text else None
+if state == "disconnected":
+    engine_state = "stopped"
+    engine_pid = None
 print(json.dumps({
     "local_team": team,
     "endpoint": binding.get("endpoint"),
@@ -1230,8 +1277,10 @@ print(json.dumps({
     "remote_team_id": binding.get("remote_team_id"),
     "credential_id": binding.get("credential_id"),
     "state": state,
+    "engine_state": engine_state,
+    "engine_pid": engine_pid,
 }, sort_keys=True))
-' "$team"
+' "$team" "$engine_state" "$engine_pid"
 }
 
 cmd_status() {
@@ -1274,6 +1323,44 @@ cmd_status() {
   if [ "$any" -ne 1 ] && [ "$json" -ne 1 ]; then
     echo "No teams are connected."
   fi
+}
+
+# --- sync lifecycle --------------------------------------------------------
+
+cmd_sync_start() {
+  local team="${1:?Usage: remote.sh sync start <team>}" cfg connected_at disconnected_at \
+    engine_state engine_pid started_pid
+  [ $# -eq 1 ] || { echo "Usage: remote.sh sync start <team>" >&2; exit 1; }
+  agmsg_validate_team_name "$team" || exit 1
+  cfg="$(_remote_team_config "$team")"
+  connected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.connected_at')"
+  disconnected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.disconnected_at')"
+  if [ -z "$connected_at" ] || [ "$connected_at" = "null" ]; then
+    echo "agmsg: team '$team' has no active remote binding; connect or pull it first" >&2
+    exit 1
+  fi
+  if [ -n "$disconnected_at" ] && [ "$disconnected_at" != "null" ]; then
+    echo "agmsg: team '$team' is disconnected; connect or pull it before starting sync" >&2
+    exit 1
+  fi
+
+  IFS=$'\t' read -r engine_state engine_pid < <(_remote_sync_engine_status "$team")
+  if [ "$engine_state" = "running" ]; then
+    echo "Sync engine already running (pid $engine_pid)."
+    return
+  fi
+
+  _remote_sync_engine_start "$team"
+  started_pid="$(cat "$(_remote_sync_engine_pidfile "$team")")"
+  echo "Sync engine started for '$team' (pid $started_pid)."
+}
+
+cmd_sync() {
+  local action="${1:-}"
+  case "$action" in
+    start) shift; cmd_sync_start "$@" ;;
+    *) echo "Usage: remote.sh sync start <team>" >&2; exit 1 ;;
+  esac
 }
 
 # --- disconnect ------------------------------------------------------------
@@ -1348,10 +1435,11 @@ case "${1:-}" in
   connect) shift; agmsg_require_python3 "remote connect" || exit 1; cmd_connect "$@" ;;
   pull) shift; agmsg_require_python3 "remote pull" || exit 1; cmd_pull "$@" ;;
   status) shift; agmsg_require_python3 "remote status" || exit 1; cmd_status "$@" ;;
+  sync) shift; cmd_sync "$@" ;;
   disconnect) shift; agmsg_require_python3 "remote disconnect" || exit 1; cmd_disconnect "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;
   pending) shift; agmsg_require_python3 "remote pending" || exit 1; cmd_pending "$@" ;;
   *)
-    echo "Usage: remote.sh <connect|pull|status|disconnect|doctor|pending> ..." >&2
+    echo "Usage: remote.sh <connect|pull|status|sync|disconnect|doctor|pending> ..." >&2
     exit 1 ;;
 esac

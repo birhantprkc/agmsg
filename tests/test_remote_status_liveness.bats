@@ -1,0 +1,219 @@
+#!/usr/bin/env bats
+
+load test_helper
+
+setup() {
+  setup_test_env
+  bash "$SCRIPTS/join.sh" testteam alice claude-code /tmp/project-a
+
+  local cfg="$TEST_SKILL_DIR/teams/testteam/config.json" escaped updated
+  escaped="$(sed "s/'/''/g" "$cfg")"
+  updated="$(sqlite_mem "
+    SELECT json_set('$escaped', '\$.remote_binding', json_object(
+      'endpoint', 'https://remote.example',
+      'server_instance_id', '018f0000-0000-7000-8000-000000000001',
+      'remote_team_id', '018f0000-0000-7000-8000-000000000002',
+      'protocol_version', 1,
+      'capabilities', json_object('write_allowed_ciphers', json_array('none')),
+      'connected_at', '2026-07-30T00:00:00Z',
+      'disconnected_at', null
+    ));")"
+  printf '%s\n' "$updated" > "$cfg"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  ENGINE_PIDS=""
+}
+
+teardown() {
+  local pid
+  for pid in $ENGINE_PIDS; do
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
+  teardown_test_env
+}
+
+start_matching_engine() {
+  local engine="$SCRIPTS/internal/remote-sync.mjs"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'trap "exit 0" TERM INT' \
+    'while :; do sleep 1; done' > "$engine"
+  chmod +x "$engine"
+  bash "$engine" run --team testteam &
+  ENGINE_PID=$!
+  ENGINE_PIDS="${ENGINE_PIDS:+$ENGINE_PIDS }$ENGINE_PID"
+  printf '%s\n' "$ENGINE_PID" > "$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
+}
+
+write_matching_ps_fixture() {
+  local fake_bin="$TEST_SKILL_DIR/fake-bin"
+  mkdir -p "$fake_bin"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    "if [[ \" \$* \" == *\" -p $ENGINE_PID \"* ]]; then" \
+    "  printf '%s\\n' 'bash $SCRIPTS/internal/remote-sync.mjs run --team testteam'" \
+    '  exit 0' \
+    'fi' \
+    'exec /bin/ps "$@"' > "$fake_bin/ps"
+  chmod +x "$fake_bin/ps"
+  printf '%s\n' "$fake_bin"
+}
+
+write_fake_node() {
+  local fake_node="$TEST_SKILL_DIR/fake-node"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'if [ "${1:-}" = "--version" ]; then' \
+    '  echo v23.0.0' \
+    '  exit 0' \
+    'fi' \
+    'trap "exit 0" TERM INT' \
+    'while :; do sleep 1; done' > "$fake_node"
+  chmod +x "$fake_node"
+  printf '%s\n' "$fake_node"
+}
+
+remember_engine_pid() {
+  ENGINE_PID="$(cat "$TEST_SKILL_DIR/run/remote-sync.testteam.pid")"
+  ENGINE_PIDS="${ENGINE_PIDS:+$ENGINE_PIDS }$ENGINE_PID"
+}
+
+@test "status: reports an active binding whose engine is stopped" {
+  run bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"connected (engine stopped"* ]]
+  [[ "$output" == *"remote.sh sync start testteam"* ]]
+
+  run bash "$SCRIPTS/remote.sh" status testteam --json
+  [ "$status" -eq 0 ]
+  [ "$(sqlite_mem "SELECT json_extract('$(printf '%s' "$output" | sed "s/'/''/g")', '\$.engine_state');")" = stopped ]
+  [ "$(sqlite_mem "SELECT json_type('$(printf '%s' "$output" | sed "s/'/''/g")', '\$.engine_pid');")" = null ]
+}
+
+@test "status: reports a live engine only when argv matches this team" {
+  start_matching_engine
+  local fake_bin
+  fake_bin="$(write_matching_ps_fixture)"
+
+  run env PATH="$fake_bin:$PATH" bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"connected (engine running, pid $ENGINE_PID)"* ]]
+
+  run env PATH="$fake_bin:$PATH" bash "$SCRIPTS/remote.sh" status testteam --json
+  [ "$status" -eq 0 ]
+  [ "$(sqlite_mem "SELECT json_extract('$(printf '%s' "$output" | sed "s/'/''/g")', '\$.engine_state');")" = running ]
+  [ "$(sqlite_mem "SELECT json_extract('$(printf '%s' "$output" | sed "s/'/''/g")', '\$.engine_pid');")" -eq "$ENGINE_PID" ]
+}
+
+@test "status: rejects a live foreign process behind a recycled pidfile" {
+  sleep 30 &
+  local foreign_pid=$!
+  ENGINE_PIDS="${ENGINE_PIDS:+$ENGINE_PIDS }$foreign_pid"
+  printf '%s\n' "$foreign_pid" > "$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
+
+  run bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"connected (engine stale"* ]]
+  [[ "$output" == *"pidfile $foreign_pid points at a dead or foreign process"* ]]
+
+  run bash "$SCRIPTS/remote.sh" status testteam --json
+  [ "$status" -eq 0 ]
+  [ "$(sqlite_mem "SELECT json_extract('$(printf '%s' "$output" | sed "s/'/''/g")', '\$.engine_state');")" = stale ]
+  [ "$(sqlite_mem "SELECT json_extract('$(printf '%s' "$output" | sed "s/'/''/g")', '\$.engine_pid');")" -eq "$foreign_pid" ]
+}
+
+@test "status: reports a dead pidfile as stale without changing exit status" {
+  printf '%s\n' 2147483647 > "$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
+
+  run bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"connected (engine stale"* ]]
+  [[ "$output" == *"pidfile 2147483647 points at a dead or foreign process"* ]]
+}
+
+@test "status: rejects a malformed pidfile without interpreting it as a process" {
+  printf '%s\n' 0123 > "$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
+
+  run bash "$SCRIPTS/remote.sh" status testteam --json
+  [ "$status" -eq 0 ]
+  [ "$(sqlite_mem "SELECT json_extract('$(printf '%s' "$output" | sed "s/'/''/g")', '\$.engine_state');")" = stale ]
+  [ "$(sqlite_mem "SELECT json_type('$(printf '%s' "$output" | sed "s/'/''/g")', '\$.engine_pid');")" = null ]
+}
+
+@test "sync start: starts a stopped engine and status reports it running" {
+  local fake_node fake_bin first_pid
+  fake_node="$(write_fake_node)"
+
+  run env AGMSG_NODE="$fake_node" bash "$SCRIPTS/remote.sh" sync start testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Sync engine started for 'testteam' (pid "* ]]
+  remember_engine_pid
+  kill -0 "$ENGINE_PID"
+
+  fake_bin="$(write_matching_ps_fixture)"
+  run env PATH="$fake_bin:$PATH" bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"connected (engine running, pid $ENGINE_PID)"* ]]
+
+  first_pid="$ENGINE_PID"
+  kill "$first_pid"
+  wait_for_pid_exit "$first_pid"
+  run bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"connected (engine stale"* ]]
+
+  run env AGMSG_NODE="$fake_node" bash "$SCRIPTS/remote.sh" sync start testteam
+  [ "$status" -eq 0 ]
+  remember_engine_pid
+  [ "$ENGINE_PID" -ne "$first_pid" ]
+  fake_bin="$(write_matching_ps_fixture)"
+  run env PATH="$fake_bin:$PATH" bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"connected (engine running, pid $ENGINE_PID)"* ]]
+}
+
+@test "sync start: is a no-op when the verified engine is already running" {
+  local fake_node fake_bin original_pid
+  fake_node="$(write_fake_node)"
+  env AGMSG_NODE="$fake_node" bash "$SCRIPTS/remote.sh" sync start testteam
+  remember_engine_pid
+  original_pid="$ENGINE_PID"
+  fake_bin="$(write_matching_ps_fixture)"
+
+  run env PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" \
+    bash "$SCRIPTS/remote.sh" sync start testteam
+  [ "$status" -eq 0 ]
+  [ "$output" = "Sync engine already running (pid $original_pid)." ]
+  [ "$(cat "$TEST_SKILL_DIR/run/remote-sync.testteam.pid")" = "$original_pid" ]
+  kill -0 "$original_pid"
+}
+
+@test "sync start: replaces stale ownership without signalling a foreign process" {
+  local fake_node fake_bin foreign_pid
+  fake_node="$(write_fake_node)"
+  sleep 30 &
+  foreign_pid=$!
+  ENGINE_PIDS="${ENGINE_PIDS:+$ENGINE_PIDS }$foreign_pid"
+  printf '%s\n' "$foreign_pid" > "$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
+
+  run env AGMSG_NODE="$fake_node" bash "$SCRIPTS/remote.sh" sync start testteam
+  [ "$status" -eq 0 ]
+  kill -0 "$foreign_pid"
+  remember_engine_pid
+  [ "$ENGINE_PID" -ne "$foreign_pid" ]
+
+  fake_bin="$(write_matching_ps_fixture)"
+  run env PATH="$fake_bin:$PATH" bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"connected (engine running, pid $ENGINE_PID)"* ]]
+}
+
+@test "sync start: rejects a team whose binding is not active" {
+  local cfg="$TEST_SKILL_DIR/teams/testteam/config.json" escaped updated
+  escaped="$(sed "s/'/''/g" "$cfg")"
+  updated="$(sqlite_mem \
+    "SELECT json_set('$escaped', '\$.remote_binding.disconnected_at', '2026-07-30T01:00:00Z');")"
+  printf '%s\n' "$updated" > "$cfg"
+
+  run bash "$SCRIPTS/remote.sh" sync start testteam
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"team 'testteam' is disconnected"* ]]
+  [ ! -e "$TEST_SKILL_DIR/run/remote-sync.testteam.pid" ]
+}
