@@ -1037,8 +1037,13 @@ cmd_unlock() {
     echo "agmsg: handed identity does not match the authority-confirmed snapshot" >&2
     exit 1
   fi
-  bash "$SCRIPT_DIR/key.sh" import "$team" --key-id "$key_id" \
-    --identity-stdin < "$identity_tmp" || exit 1
+  # age-keygen writes a native identity file with comments followed by the
+  # secret line. key.sh import intentionally accepts the raw secret on stdin,
+  # so pass only that line after age-keygen -y has validated the whole file and
+  # matched its recipient to the authority snapshot above.
+  grep '^AGE-SECRET-KEY-' "$identity_tmp" |
+    bash "$SCRIPT_DIR/key.sh" import "$team" --key-id "$key_id" \
+      --identity-stdin || exit 1
   identity_dest="$CONNECTION_ROOT/run/remote-credentials/$team/keys/$key_id.key"
   rm -f "$identity_tmp"
   trap - EXIT INT TERM HUP
