@@ -4,6 +4,7 @@ load test_helper
 
 setup() {
   setup_test_env
+  export PEER_SKILL_DIR=""
   # Some cases deliberately remove python3 from PATH to verify the control-plane
   # gate. Resolve the fixture interpreter in each test process before that
   # system under test changes its environment.
@@ -30,6 +31,15 @@ setup() {
 
 teardown() {
   kill "$MOCK_SERVER_PID" 2>/dev/null || true
+  if [ -n "${PEER_SKILL_DIR:-}" ] && [ -d "$PEER_SKILL_DIR" ]; then
+    local peer_pidfile peer_pid
+    for peer_pidfile in "$PEER_SKILL_DIR"/run/remote-sync.*.pid; do
+      [ -f "$peer_pidfile" ] || continue
+      peer_pid="$(cat "$peer_pidfile" 2>/dev/null || true)"
+      [ -n "$peer_pid" ] && kill "$peer_pid" 2>/dev/null || true
+    done
+    rm -rf "$PEER_SKILL_DIR"
+  fi
   teardown_test_env
 }
 
@@ -817,36 +827,52 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   MOCK_PULL_AGE_ENVELOPE_FILE="$envelope"
   MOCK_PULL_TEAM_ID="$team_id"
   restart_mock_server
-  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$team_id" encrypted
+
+  # Machine B gets an independent install root. Reusing Machine A's root would
+  # reuse its retained checkpoint and would not test a first trust import.
+  PEER_SKILL_DIR="$(mktemp -d)"
+  export PEER_SKILL_DIR
+  mkdir -p "$PEER_SKILL_DIR"/{scripts,db,teams}
+  cp -R "$BATS_TEST_DIRNAME"/../scripts/. "$PEER_SKILL_DIR/scripts/"
+  chmod +x "$PEER_SKILL_DIR/scripts/"*.sh
+  chmod +x "$PEER_SKILL_DIR/scripts/"*.js 2>/dev/null || true
+  chmod +x "$PEER_SKILL_DIR/scripts/drivers/types/codex/"*.sh 2>/dev/null || true
+  bash "$PEER_SKILL_DIR/scripts/internal/init-db.sh"
+  local peer_scripts="$PEER_SKILL_DIR/scripts"
+
+  run bash "$peer_scripts/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$team_id" encrypted
   [ "$status" -eq 0 ]
   [[ "$output" == *"local but locked"* ]]
 
   digest="$(shasum -a 256 "$snapshot" | awk '{print $1}')"
-  run bash "$SCRIPTS/remote.sh" unlock encrypted \
+  run bash "$peer_scripts/remote.sh" unlock encrypted \
     --snapshot "$snapshot" --identity "$identity" \
     --confirm-digest "0000000000000000000000000000000000000000000000000000000000000000"
   [ "$status" -ne 0 ]
   [[ "$output" == *"does not match"* ]]
-  [ "$(sqlite_mem "SELECT json_type(json_extract(CAST(readfile('$(rf "$TEST_SKILL_DIR/teams/encrypted/config.json")') AS TEXT), '\$.remote_key'));")" = "" ]
+  [ "$(sqlite_mem "SELECT json_type(json_extract(CAST(readfile('$(rf "$PEER_SKILL_DIR/teams/encrypted/config.json")') AS TEXT), '\$.remote_key'));")" = "" ]
 
   local wrong_identity="$TEST_SKILL_DIR/wrong-identity.key"
   age-keygen -o "$wrong_identity" >/dev/null 2>&1
-  run bash "$SCRIPTS/remote.sh" unlock encrypted \
+  run bash "$peer_scripts/remote.sh" unlock encrypted \
     --snapshot "$snapshot" --identity "$wrong_identity" --confirm-digest "$digest"
   [ "$status" -ne 0 ]
   [[ "$output" == *"does not match the authority-confirmed snapshot"* ]]
-  [ "$(sqlite_mem "SELECT json_type(json_extract(CAST(readfile('$(rf "$TEST_SKILL_DIR/teams/encrypted/config.json")') AS TEXT), '\$.remote_key'));")" = "" ]
-  [ ! -d "$TEST_SKILL_DIR/run/remote-trust" ]
+  [ "$(sqlite_mem "SELECT json_type(json_extract(CAST(readfile('$(rf "$PEER_SKILL_DIR/teams/encrypted/config.json")') AS TEXT), '\$.remote_key'));")" = "" ]
+  [ ! -e "$PEER_SKILL_DIR/run/remote-credentials/encrypted" ]
+  [ ! -e "$PEER_SKILL_DIR/db/remote-sync/encrypted.json" ]
+  [ ! -d "$PEER_SKILL_DIR/run/remote-trust" ]
 
-  run bash "$SCRIPTS/remote.sh" unlock encrypted \
+  run bash "$peer_scripts/remote.sh" unlock encrypted \
     --snapshot "$snapshot" --identity "$identity" --confirm-digest "$digest"
   [ "$status" -eq 0 ]
   [[ "$output" == *"imported 1 envelope(s); engine running (pid "* ]]
   local pidfile first_pid second_pid
-  pidfile="$TEST_SKILL_DIR/run/remote-sync.encrypted.pid"
+  pidfile="$PEER_SKILL_DIR/run/remote-sync.encrypted.pid"
   wait_for_file "$pidfile"
   first_pid="$(cat "$pidfile")"
-  run bash "$SCRIPTS/remote.sh" unlock encrypted \
+  [ -d "$PEER_SKILL_DIR/run/remote-trust" ]
+  run bash "$peer_scripts/remote.sh" unlock encrypted \
     --snapshot "$snapshot" --identity "$identity" --confirm-digest "$digest"
   [ "$status" -eq 0 ]
   [[ "$output" == *"imported 0 envelope(s); engine running (pid "* ]]
@@ -855,7 +881,7 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   ! kill -0 "$first_pid" 2>/dev/null
   kill -0 "$second_pid" 2>/dev/null
 
-  run bash "$SCRIPTS/history.sh" encrypted member-1
+  run bash "$peer_scripts/history.sh" encrypted member-1
   [ "$status" -eq 0 ]
   [[ "$output" == *"handed ciphertext"* ]]
 
@@ -864,8 +890,8 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   wait_for_pid_exit "$second_pid"
   rm -f "$pidfile"
   before="$(curl -sS "$ENDPOINT/v1/teams/$team_id" | jq -r '.current_seq')"
-  bash "$SCRIPTS/send.sh" encrypted member-1 member-1 "encrypted outbound" >/dev/null
-  bash "$SCRIPTS/remote-sync.sh" once --team encrypted >/dev/null 2>&1 || true
+  bash "$peer_scripts/send.sh" encrypted member-1 member-1 "encrypted outbound" >/dev/null
+  bash "$peer_scripts/remote-sync.sh" once --team encrypted >/dev/null 2>&1 || true
   after="$(curl -sS "$ENDPOINT/v1/teams/$team_id" | jq -r '.current_seq')"
   [ "$after" -gt "$before" ]
   pushed_cipher="$(curl -sS "$ENDPOINT/_test/pushed" |
