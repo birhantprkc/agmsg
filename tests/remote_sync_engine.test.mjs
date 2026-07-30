@@ -1773,7 +1773,6 @@ test("age configure extends a stored chain and activates its announced epoch", a
   const previousFetch = globalThis.fetch;
   await withConnectedCredential(async (root) => {
     await writeConnectedTeam(root, { capabilities: { write_allowed_ciphers: ["age-v1"] } });
-    const recipient0 = "age1mmqjrejftea4f6xh47lhpc0jn4vw0yuhz349sw2e3sfl22k5gcjsv6xcvp";
     const identityDir = join(root, "run", "remote-credentials", "demo", "keys");
     const identity1 = join(identityDir, "epoch-1.key");
     await mkdir(identityDir, { recursive: true });
@@ -1781,6 +1780,7 @@ test("age configure extends a stored chain and activates its announced epoch", a
       "AGE-SECRET-KEY-14Z7XMNPZTPEMMM6DG2FSKEH042L7UMU79T645GAQJKU2LLJGPM2S7GWNLQ\n",
       { mode: 0o600 });
     const recipient1 = readNativeAgeIdentity(identity1).recipient;
+    const recipient0 = recipient1;
     const ageSnapshot0 = {
       authorized_writers: ["writer-a"],
       epoch_revision: "0",
@@ -1829,7 +1829,7 @@ test("age configure extends a stored chain and activates its announced epoch", a
         "team-id": config.remote_team_id, "minimum-security": "e2ee-required",
         cipher: "age-v1", "age-snapshot": [ageSnapshot0Path],
         "age-checkpoint": `0:${ageSnapshotDigest(ageSnapshot0)}`,
-        "age-confirmation": "operator-live" });
+        "age-confirmation": "operator-live", "age-identity": [`epoch-0=${identity1}`] });
       const mutationId = "018f3f7e-0000-7000-8000-000000000025";
       await writeFile(join(root, "teams", "demo", "roster.jsonl"), [
         JSON.stringify({ type: "key_rotated", id: mutationId, epoch: "1",
@@ -1848,6 +1848,8 @@ test("age configure extends a stored chain and activates its announced epoch", a
       const stored = JSON.parse(await readFile(
         join(process.env.AGMSG_SYNC_STORAGE_DIR, "remote-sync", "demo.json"), "utf8"));
       assert.equal(stored.age_v1.epoch_snapshots.length, 2);
+      assert.equal(stored.age_v1.identity_files["epoch-0"], identity1);
+      assert.equal(stored.age_v1.identity_files["epoch-1"], identity1);
       const loaded = await loadConfig("demo");
       assert.equal(loaded.age_v1_runtime_history.length, 1);
       assert.equal(loaded.age_v1_runtime_history[0].key_id, "epoch-1");
