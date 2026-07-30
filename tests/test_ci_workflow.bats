@@ -14,3 +14,12 @@
   run grep -F 'tests/test_remote*.bats' "$workflow"
   [ "$status" -eq 0 ]
 }
+
+@test "age-v1 CI exercises the encrypted onboarding CLI with pinned tools" {
+  local workflow="$BATS_TEST_DIRNAME/../.github/workflows/tests.yml"
+
+  run grep -F 'filippo.io/age/cmd/age-keygen@v1.3.1' "$workflow"
+  [ "$status" -eq 0 ]
+  run grep -F "bats --print-output-on-failure --filter 'remote unlock:' tests/test_remote.bats" "$workflow"
+  [ "$status" -eq 0 ]
+}

@@ -251,8 +251,10 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true'
         run: |
           go install filippo.io/age/cmd/age@v1.3.1
+          go install filippo.io/age/cmd/age-keygen@v1.3.1
           npm config set prefix "$HOME/.npm-global"
           npm install -g bats
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
 
       - name: Run age-v1 shared vectors
@@ -263,6 +265,10 @@ jobs:
           AGMSG_AGE_BIN="$age_bin" bats --print-output-on-failure tests/test_sync_cipher.bats
           AGMSG_AGE_BIN="$age_bin" bats --print-output-on-failure tests/test_jsonl_remote_sync.bats
           AGE_BIN="$age_bin" node docs/spec/vectors/verify-age-v1-vectors.mjs
+
+      - name: Run encrypted onboarding CLI roundtrip
+        if: needs.changes.outputs.docs_only != 'true'
+        run: bats --print-output-on-failure --filter 'remote unlock:' tests/test_remote.bats
 
   # Continuously verify that the storage contract is backend-portable: run the
   # SAME driver-agnostic contract suite against the jsonl driver (the sqlite run

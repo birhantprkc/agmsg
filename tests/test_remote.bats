@@ -768,8 +768,7 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" encrypted
   [ "$status" -eq 0 ]
   [[ "$output" == *"This team is encrypted"* ]]
-  [[ "$output" == *"key.sh import"* ]]
-  [[ "$output" == *"remote-sync.sh reprocess"* ]]
+  [[ "$output" == *"Run remote.sh unlock with the snapshot and identity you were handed."* ]]
 
   local cfg before after
   cfg="$TEST_SKILL_DIR/teams/encrypted/config.json"
