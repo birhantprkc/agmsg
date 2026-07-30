@@ -380,12 +380,8 @@ cmd_import() {
   cur_recipient="$(_key_read_config_field "$cfg" '$.remote_key.current.recipient')"
 
   if [ -n "$cur_key_id" ] && [ "$cur_key_id" != "null" ]; then
-    if [ -n "$requested_key_id" ] && [ "$requested_key_id" != "$cur_key_id" ]; then
-      agmsg_lock_release
-      echo "agmsg: imported authority key id does not match the team's current key." >&2
-      exit 1
-    fi
-    if [ "$cur_recipient" != "$recipient" ]; then
+    if { [ -n "$requested_key_id" ] && [ "$requested_key_id" != "$cur_key_id" ]; } ||
+       [ "$cur_recipient" != "$recipient" ]; then
       local journal journal_sql fingerprint staged_key_id
       journal="$(agmsg_roster_journal_path "$TEAMS_DIR/$team")"
       fingerprint="$(_key_fingerprint_sha256 "$recipient")"
@@ -407,6 +403,11 @@ cmd_import() {
       if [ -z "$staged_key_id" ]; then
         agmsg_lock_release
         echo "agmsg: imported identity does not match the current key or an announced rotation — refusing to import." >&2
+        exit 1
+      fi
+      if [ -n "$requested_key_id" ] && [ "$requested_key_id" != "$staged_key_id" ]; then
+        agmsg_lock_release
+        echo "agmsg: imported authority key id does not match the announced rotation." >&2
         exit 1
       fi
       printf '%s\n' "$staged_key_id" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$' || {

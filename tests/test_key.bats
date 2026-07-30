@@ -176,7 +176,7 @@ EOF
 @test "key import --identity-stdin: establishes the first epoch for a team with no key yet" {
   skip_if_no_age
   secret=$(age-keygen 2>/dev/null | grep '^AGE-SECRET-KEY-')
-  run bash -c "printf '%s' '$secret' | bash '$SCRIPTS/key.sh' import testteam --identity-stdin"
+  run bash -c "printf '%s' '$secret' | bash '$SCRIPTS/key.sh' import testteam --key-id '$key_id' --identity-stdin"
   [ "$status" -eq 0 ]
   [[ "$output" == *"Imported key for team 'testteam'"* ]]
 }
@@ -337,6 +337,17 @@ EOF
   [ "$status" -eq 0 ]
   [[ "$output" == *"Imported replacement key"* ]]
   [ -f "$identity" ]
+}
+
+@test "key import: rejects an authority key id absent from announced rotations" {
+  skip_if_no_age
+  bash "$SCRIPTS/key.sh" generate testteam
+  secret=$(age-keygen 2>/dev/null | grep '^AGE-SECRET-KEY-')
+
+  run bash -c "printf '%s' '$secret' | bash '$SCRIPTS/key.sh' import testteam --key-id epoch-unannounced --identity-stdin"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"does not match the current key or an announced rotation"* ]]
+  [ ! -f "$SCRIPTS/../run/remote-credentials/testteam/keys/epoch-unannounced.key" ]
 }
 
 @test "key rotate: advances the shared epoch only after the previous winner is synchronized" {
