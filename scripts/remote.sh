@@ -979,11 +979,13 @@ _remote_sync_engine_start() {
 }
 
 _remote_sync_engine_stop() {
-  local team="$1" pidfile pid
+  local team="$1" pidfile pid state
   pidfile="$(_remote_sync_engine_pidfile "$team")"
   [ -f "$pidfile" ] || return 0
-  pid="$(cat "$pidfile" 2>/dev/null || true)"
-  [ -n "$pid" ] && _agmsg_pid_alive "$pid" && kill "$pid" 2>/dev/null || true
+  IFS=$'\t' read -r state pid < <(_remote_sync_engine_status "$team")
+  if [ "$state" = "running" ]; then
+    kill "$pid" 2>/dev/null || true
+  fi
   rm -f "$pidfile"
 }
 
@@ -1329,29 +1331,52 @@ cmd_status() {
 
 cmd_sync_start() {
   local team="${1:?Usage: remote.sh sync start <team>}" cfg connected_at disconnected_at \
-    engine_state engine_pid started_pid
+    engine_state engine_pid started_pid ready_pid i=0
   [ $# -eq 1 ] || { echo "Usage: remote.sh sync start <team>" >&2; exit 1; }
   agmsg_validate_team_name "$team" || exit 1
+  agmsg_lock_acquire "$TEAMS_DIR/$team" || exit 1
   cfg="$(_remote_team_config "$team")"
   connected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.connected_at')"
   disconnected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.disconnected_at')"
   if [ -z "$connected_at" ] || [ "$connected_at" = "null" ]; then
     echo "agmsg: team '$team' has no active remote binding; connect or pull it first" >&2
+    agmsg_lock_release
     exit 1
   fi
   if [ -n "$disconnected_at" ] && [ "$disconnected_at" != "null" ]; then
     echo "agmsg: team '$team' is disconnected; connect or pull it before starting sync" >&2
+    agmsg_lock_release
     exit 1
   fi
 
   IFS=$'\t' read -r engine_state engine_pid < <(_remote_sync_engine_status "$team")
   if [ "$engine_state" = "running" ]; then
     echo "Sync engine already running (pid $engine_pid)."
+    agmsg_lock_release
     return
   fi
 
-  _remote_sync_engine_start "$team"
+  if ! _remote_sync_engine_start "$team"; then
+    agmsg_lock_release
+    return 1
+  fi
   started_pid="$(cat "$(_remote_sync_engine_pidfile "$team")")"
+  while [ "$i" -lt 100 ]; do
+    IFS=$'\t' read -r engine_state ready_pid < <(_remote_sync_engine_status "$team")
+    if [ "$engine_state" = "running" ] && [ "$ready_pid" = "$started_pid" ]; then
+      break
+    fi
+    i=$((i + 1))
+    sleep 0.01
+  done
+  if [ "$engine_state" != "running" ] || [ "$ready_pid" != "$started_pid" ]; then
+    kill "$started_pid" 2>/dev/null || true
+    rm -f "$(_remote_sync_engine_pidfile "$team")"
+    agmsg_lock_release
+    echo "agmsg: sync engine for '$team' did not become ready" >&2
+    return 1
+  fi
+  agmsg_lock_release
   echo "Sync engine started for '$team' (pid $started_pid)."
 }
 

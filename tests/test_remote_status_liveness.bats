@@ -70,6 +70,23 @@ write_fake_node() {
   printf '%s\n' "$fake_node"
 }
 
+write_fake_node_ps_fixture() {
+  local fake_node="$1" foreign_pid="${2:-}" fake_bin="$TEST_SKILL_DIR/fake-node-bin"
+  mkdir -p "$fake_bin"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'pid=""' \
+    'while [ $# -gt 0 ]; do' \
+    '  if [ "$1" = "-p" ]; then pid="$2"; shift 2; else shift; fi' \
+    'done' \
+    "if [ \"\$pid\" = '$foreign_pid' ]; then" \
+    "  printf '%s\\n' 'sleep 30'" \
+    'else' \
+    "  printf '%s\\n' 'bash $SCRIPTS/internal/remote-sync.mjs run --team testteam'" \
+    'fi' > "$fake_bin/ps"
+  chmod +x "$fake_bin/ps"
+  printf '%s\n' "$fake_bin"
+}
+
 remember_engine_pid() {
   ENGINE_PID="$(cat "$TEST_SKILL_DIR/run/remote-sync.testteam.pid")"
   ENGINE_PIDS="${ENGINE_PIDS:+$ENGINE_PIDS }$ENGINE_PID"
@@ -140,14 +157,14 @@ remember_engine_pid() {
 @test "sync start: starts a stopped engine and status reports it running" {
   local fake_node fake_bin first_pid
   fake_node="$(write_fake_node)"
+  fake_bin="$(write_fake_node_ps_fixture "$fake_node")"
 
-  run env AGMSG_NODE="$fake_node" bash "$SCRIPTS/remote.sh" sync start testteam
+  run env PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" bash "$SCRIPTS/remote.sh" sync start testteam
   [ "$status" -eq 0 ]
   [[ "$output" == *"Sync engine started for 'testteam' (pid "* ]]
   remember_engine_pid
   kill -0 "$ENGINE_PID"
 
-  fake_bin="$(write_matching_ps_fixture)"
   run env PATH="$fake_bin:$PATH" bash "$SCRIPTS/remote.sh" status testteam
   [ "$status" -eq 0 ]
   [[ "$output" == *"connected (engine running, pid $ENGINE_PID)"* ]]
@@ -159,11 +176,10 @@ remember_engine_pid() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"connected (engine stale"* ]]
 
-  run env AGMSG_NODE="$fake_node" bash "$SCRIPTS/remote.sh" sync start testteam
+  run env PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" bash "$SCRIPTS/remote.sh" sync start testteam
   [ "$status" -eq 0 ]
   remember_engine_pid
   [ "$ENGINE_PID" -ne "$first_pid" ]
-  fake_bin="$(write_matching_ps_fixture)"
   run env PATH="$fake_bin:$PATH" bash "$SCRIPTS/remote.sh" status testteam
   [ "$status" -eq 0 ]
   [[ "$output" == *"connected (engine running, pid $ENGINE_PID)"* ]]
@@ -172,10 +188,10 @@ remember_engine_pid() {
 @test "sync start: is a no-op when the verified engine is already running" {
   local fake_node fake_bin original_pid
   fake_node="$(write_fake_node)"
-  env AGMSG_NODE="$fake_node" bash "$SCRIPTS/remote.sh" sync start testteam
+  fake_bin="$(write_fake_node_ps_fixture "$fake_node")"
+  env PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" bash "$SCRIPTS/remote.sh" sync start testteam
   remember_engine_pid
   original_pid="$ENGINE_PID"
-  fake_bin="$(write_matching_ps_fixture)"
 
   run env PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" \
     bash "$SCRIPTS/remote.sh" sync start testteam
@@ -190,19 +206,54 @@ remember_engine_pid() {
   fake_node="$(write_fake_node)"
   sleep 30 &
   foreign_pid=$!
+  fake_bin="$(write_fake_node_ps_fixture "$fake_node" "$foreign_pid")"
   ENGINE_PIDS="${ENGINE_PIDS:+$ENGINE_PIDS }$foreign_pid"
   printf '%s\n' "$foreign_pid" > "$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
 
-  run env AGMSG_NODE="$fake_node" bash "$SCRIPTS/remote.sh" sync start testteam
+  run env PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" bash "$SCRIPTS/remote.sh" sync start testteam
   [ "$status" -eq 0 ]
   kill -0 "$foreign_pid"
   remember_engine_pid
   [ "$ENGINE_PID" -ne "$foreign_pid" ]
 
-  fake_bin="$(write_matching_ps_fixture)"
   run env PATH="$fake_bin:$PATH" bash "$SCRIPTS/remote.sh" status testteam
   [ "$status" -eq 0 ]
   [[ "$output" == *"connected (engine running, pid $ENGINE_PID)"* ]]
+}
+
+@test "disconnect removes stale ownership without signalling a foreign process" {
+  sleep 30 &
+  local foreign_pid=$!
+  ENGINE_PIDS="${ENGINE_PIDS:+$ENGINE_PIDS }$foreign_pid"
+  printf '%s\n' "$foreign_pid" > "$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
+
+  run bash "$SCRIPTS/remote.sh" disconnect testteam
+  [ "$status" -eq 0 ]
+  kill -0 "$foreign_pid"
+  [ ! -e "$TEST_SKILL_DIR/run/remote-sync.testteam.pid" ]
+}
+
+@test "concurrent sync start serializes ownership to one engine" {
+  local fake_node fake_bin first_out second_out first_status=0 second_status=0
+  fake_node="$(write_fake_node)"
+  fake_bin="$(write_fake_node_ps_fixture "$fake_node")"
+  first_out="$(mktemp)"
+  second_out="$(mktemp)"
+
+  env PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" bash "$SCRIPTS/remote.sh" sync start testteam >"$first_out" 2>&1 &
+  local first_start=$!
+  env PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" bash "$SCRIPTS/remote.sh" sync start testteam >"$second_out" 2>&1 &
+  local second_start=$!
+  wait "$first_start" || first_status=$?
+  wait "$second_start" || second_status=$?
+  [ "$first_status" -eq 0 ]
+  [ "$second_status" -eq 0 ]
+  [ "$(grep -h -c 'Sync engine started' "$first_out" "$second_out" | awk '{s += $1} END {print s}')" -eq 1 ]
+  [ "$(grep -h -c 'Sync engine already running' "$first_out" "$second_out" | awk '{s += $1} END {print s}')" -eq 1 ]
+
+  remember_engine_pid
+  kill -0 "$ENGINE_PID"
+  rm -f "$first_out" "$second_out"
 }
 
 @test "sync start: rejects a team whose binding is not active" {
