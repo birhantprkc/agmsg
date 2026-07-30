@@ -1369,7 +1369,7 @@ cmd_forget() {
   team="${positional[0]}"
   agmsg_validate_team_name "$team" || exit 1
 
-  local team_dir cfg connected_at disconnected_at
+  local team_dir cfg connected_at disconnected_at binding_before binding_current
   team_dir="$TEAMS_DIR/$team"
   cfg="$(_remote_team_config "$team")"
   [ -f "$cfg" ] || {
@@ -1378,6 +1378,7 @@ cmd_forget() {
   }
   connected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.connected_at')"
   disconnected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.disconnected_at')"
+  binding_before="$(_remote_read_config_field "$cfg" '$.remote_binding')"
   if [ -z "$connected_at" ] || [ "$connected_at" = "null" ]; then
     echo "agmsg: team '$team' has never been connected" >&2
     exit 1
@@ -1401,8 +1402,9 @@ cmd_forget() {
     }
     if printf '%s\n' "$tables" | grep -qx events; then
       event_count="$(agmsg_sqlite "$store_path" "SELECT COUNT(*) FROM events;")"
-    elif printf '%s\n' "$tables" | grep -qx messages; then
-      event_count="$(agmsg_sqlite "$store_path" "SELECT COUNT(*) FROM messages;")"
+    fi
+    if printf '%s\n' "$tables" | grep -qx messages; then
+      event_count="$((event_count + $(agmsg_sqlite "$store_path" "SELECT COUNT(*) FROM messages;")))"
     fi
   fi
 
@@ -1427,6 +1429,12 @@ cmd_forget() {
   # Revalidate under the registry lock after the operator has confirmed. A
   # reconnect racing the prompt must not have its new active binding deleted.
   agmsg_lock_acquire "$team_dir" || exit 1
+  binding_current="$(_remote_read_config_field "$cfg" '$.remote_binding')"
+  if [ "$binding_current" != "$binding_before" ]; then
+    agmsg_lock_release
+    echo "agmsg: team '$team' changed while forget was waiting; nothing was deleted" >&2
+    exit 1
+  fi
   disconnected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.disconnected_at')"
   if [ -z "$disconnected_at" ] || [ "$disconnected_at" = "null" ]; then
     agmsg_lock_release
@@ -1459,7 +1467,18 @@ cmd_forget() {
   _remote_sync_engine_stop "$team"
   rm -f "$sync_config" "$(_remote_cred_file "$team")" \
     "$CONNECTION_ROOT/run/remote-sync.$team.log"
-  rm -f "$trust_file"
+  local other_cfg trust_referenced=0
+  for other_cfg in "$TEAMS_DIR"/*/config.json; do
+    [ -f "$other_cfg" ] || continue
+    [ "$other_cfg" = "$cfg" ] && continue
+    if [ "$(_remote_read_config_field "$other_cfg" '$.remote_binding.server_instance_id')" = "$server_instance_id" ] &&
+       [ "$(_remote_read_config_field "$other_cfg" '$.remote_binding.remote_team_id')" = "$remote_team_id" ] &&
+       [ "$(_remote_read_config_field "$other_cfg" '$.remote_binding.protocol_version')" = "$protocol_version" ]; then
+      trust_referenced=1
+      break
+    fi
+  done
+  [ "$trust_referenced" -eq 1 ] || rm -f "$trust_file"
   [ ! -d "$CRED_ROOT/$team" ] || rm -r "$CRED_ROOT/$team"
   [ ! -d "$store_dir" ] || rm -r "$store_dir"
 

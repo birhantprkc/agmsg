@@ -36,6 +36,8 @@ CREATE TABLE events (
 INSERT INTO events(seq,type,team) VALUES
   (1,'message_sent','testteam'),
   (2,'member_joined','testteam');
+CREATE TABLE messages (id INTEGER PRIMARY KEY);
+INSERT INTO messages(id) VALUES (1);
 SQL
 }
 
@@ -72,11 +74,29 @@ set_disconnected_at() {
   run bash "$SCRIPTS/remote.sh" forget testteam
   [ "$status" -ne 0 ]
   [[ "$output" == *"Store: $store"* ]]
-  [[ "$output" == *"Events: 2"* ]]
+  [[ "$output" == *"Events: 3"* ]]
   [[ "$output" == *"The server copy remains."* ]]
   [[ "$output" == *"requires an interactive terminal or --yes"* ]]
   [ -f "$TEST_SKILL_DIR/teams/testteam/config.json" ]
   [ -f "$store" ]
+}
+
+@test "forget: rejects any binding ABA while confirmation is pending" {
+  local out="$TEST_SKILL_DIR/forget.out" cfg lock
+  lock="$TEST_SKILL_DIR/teams/testteam/.config.lock"
+  mkdir "$lock"
+  bash "$SCRIPTS/remote.sh" forget --yes testteam >"$out" 2>&1 &
+  local forget_pid=$!
+  wait_for_file_contains "$out" "Events: 3"
+  cfg="$TEST_SKILL_DIR/teams/testteam/config.json"
+  python3 -c "import json; p='$cfg'; d=json.load(open(p)); d['remote_binding']['endpoint']='https://changed.example'; open(p,'w').write(json.dumps(d)+'\\n')"
+  rmdir "$lock"
+  local status=0
+  wait "$forget_pid" || status=$?
+  [ "$status" -ne 0 ]
+  grep -q "changed while forget was waiting" "$out"
+  [ -f "$cfg" ]
+  [ -d "$TEST_SKILL_DIR/db/teams/testteam" ]
 }
 
 @test "forget: removes the complete local team without contacting the server" {
@@ -100,4 +120,16 @@ set_disconnected_at() {
   [ ! -d "$TEST_SKILL_DIR/run/remote-credentials/testteam" ]
   [ ! -e "$trust_file" ]
   [ ! -e "$TEST_SKILL_DIR/run/remote-sync.testteam.log" ]
+}
+
+@test "forget: preserves trust referenced by another local team" {
+  local trust_file="$TEST_SKILL_DIR/run/remote-trust/age-v1-$SERVER_ID-$TEAM_ID-v1.json"
+  bash "$SCRIPTS/join.sh" alias alice claude-code /tmp/project-b
+  cp "$TEST_SKILL_DIR/teams/testteam/config.json" "$TEST_SKILL_DIR/teams/alias/config.json"
+  mkdir -p "$TEST_SKILL_DIR/run/remote-trust"
+  printf '%s\n' '{}' > "$trust_file"
+
+  run bash "$SCRIPTS/remote.sh" forget --yes testteam
+  [ "$status" -eq 0 ]
+  [ -f "$trust_file" ]
 }
