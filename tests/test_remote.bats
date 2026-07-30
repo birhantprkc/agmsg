@@ -16,6 +16,7 @@ setup() {
   MOCK_REVOKE_BAD_BODY="${MOCK_REVOKE_BAD_BODY:-}" \
   MOCK_REVOKE_LARGE_BODY="${MOCK_REVOKE_LARGE_BODY:-}" \
   MOCK_PULL_MIXED="${MOCK_PULL_MIXED:-}" \
+  MOCK_PULL_AGE="${MOCK_PULL_AGE:-}" \
   MOCK_CONNECT_NO_AGE="${MOCK_CONNECT_NO_AGE:-}" \
     "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
     </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
@@ -39,6 +40,7 @@ restart_mock_server() {
   MOCK_REVOKE_BAD_BODY="${MOCK_REVOKE_BAD_BODY:-}" \
   MOCK_REVOKE_LARGE_BODY="${MOCK_REVOKE_LARGE_BODY:-}" \
   MOCK_PULL_MIXED="${MOCK_PULL_MIXED:-}" \
+  MOCK_PULL_AGE="${MOCK_PULL_AGE:-}" \
   MOCK_CONNECT_NO_AGE="${MOCK_CONNECT_NO_AGE:-}" \
     "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
       </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
@@ -139,7 +141,7 @@ skip_if_no_age() {
 @test "connect: registers a client-owned team (happy path, Done-when 1)" {
   run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Connected: team 'testteam'"* ]]
+  [[ "$output" == *"Connected: team 'testteam' (org 'testteam') (plain)."* ]]
   # A binding is recorded on the team config, and it carries no credential:
   # the register model writes none and none is fetched back.
   [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$SCRIPTS/../teams/testteam/config.json') AS TEXT), '\$.remote_binding.connected_at');")" != "" ]
@@ -151,6 +153,7 @@ skip_if_no_age() {
 
   run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam
   [ "$status" -eq 0 ]
+  [[ "$output" == *"Connected: team 'testteam' (org 'testteam') (age-v1 encrypted)."* ]]
   [[ "$output" == *"Back this up now"* ]]
   [[ "$output" == *"key.sh show testteam --snapshot --out <file>"* ]]
   sync_config="$TEST_SKILL_DIR/db/remote-sync/testteam.json"
@@ -752,6 +755,30 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   source "$SCRIPTS/lib/storage.sh"
   agmsg_storage_load
   [ "$(storage_history mixed | jq -s 'length')" -eq 73 ]
+}
+
+@test "remote pull: an observed age envelope prevents plaintext push" {
+  MOCK_PULL_AGE=1
+  restart_mock_server
+
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" encrypted
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"This team is encrypted"* ]]
+  [[ "$output" == *"key.sh import"* ]]
+  [[ "$output" == *"remote-sync.sh reprocess"* ]]
+
+  local cfg before after
+  cfg="$TEST_SKILL_DIR/teams/encrypted/config.json"
+  [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.remote_binding.cipher_profile');")" = "age-v1" ]
+  [ ! -f "$TEST_SKILL_DIR/run/remote-sync.encrypted.pid" ]
+
+  before="$(curl -sS "$ENDPOINT/v1/teams/$PULL_TEAM_ID" | jq -r '.current_seq')"
+  bash "$SCRIPTS/send.sh" encrypted member-1 member-1 "stays local" >/dev/null
+  run bash "$SCRIPTS/remote-sync.sh" once --team encrypted
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"selected age-v1"* ]]
+  after="$(curl -sS "$ENDPOINT/v1/teams/$PULL_TEAM_ID" | jq -r '.current_seq')"
+  [ "$after" = "$before" ]
 }
 
 @test "remote doctor: age is optional — its absence does not fail the run" {

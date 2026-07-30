@@ -2088,11 +2088,13 @@ export async function pullBootstrap(args, dependencies = {}) {
 
   let cursor = String(teamSnapshot.min_available_seq ?? "0");
   let imported = 0;
+  let ageV1Envelopes = 0;
   for (;;) {
     const page = await requestPublicCall(config,
       `/v1/teams/${teamId}/messages?after=${cursor}&limit=${limit}`);
     const records = [];
     for (const message of page.messages) {
+      if (message.envelope?.cipher === "age-v1") ageV1Envelopes += 1;
       records.push({ type: "sync_pull_message", ...message,
         ...(await evaluateCall(config, teamSnapshot, message)) });
     }
@@ -2116,7 +2118,7 @@ export async function pullBootstrap(args, dependencies = {}) {
     cursor = page.next_after;
     if (!page.has_more) break;
   }
-  process.stdout.write(`${JSON.stringify({
+  const result = {
     type: "pull_bootstrap_result", team: config.local_team,
     team_id: config.remote_team_id, team_name: teamSnapshot.team_name,
     server_instance_id: config.server_instance_id,
@@ -2127,7 +2129,10 @@ export async function pullBootstrap(args, dependencies = {}) {
     protocol_version: config.protocol_version,
     capabilities: teamSnapshot,
     imported,
-  })}\n`);
+    age_v1_envelopes: ageV1Envelopes,
+  };
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+  return result;
 }
 
 // Resolve a team name to the teams carrying it. Like publicSnapshot this runs

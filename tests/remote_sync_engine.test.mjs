@@ -1671,9 +1671,12 @@ test("pull bootstrap dispatches a real mixed roster and message page", async () 
       to_agent: "member-2",
     },
   }));
+  messages[0].envelope = {
+    v: 1, cipher: "age-v1", key_id: "epoch-0", blob: "encrypted",
+  };
   const storageInputs = [];
   const rosterInputs = [];
-  await pullBootstrap({
+  const result = await pullBootstrap({
     team: "clone", "team-id": teamId, endpoint: "http://127.0.0.1:8787",
   }, {
     publicSnapshotCall: async () => ({
@@ -1707,6 +1710,7 @@ test("pull bootstrap dispatches a real mixed roster and message page", async () 
   assert.equal(storageInputs.length, 1);
   assert.equal(storageInputs[0].filter((record) => record.type === "sync_pull_message").length, 73);
   assert.deepEqual(storageInputs[0].at(-1), { type: "sync_pull_cursor", next_after: "80" });
+  assert.equal(result.age_v1_envelopes, 1);
 });
 
 test("pull bootstrap rejects unsupported projection kinds before either cursor advances", async () => {

@@ -34,6 +34,7 @@ REVOKE_BAD_HEADER = os.environ.get("MOCK_REVOKE_BAD_HEADER") == "1"
 REVOKE_BAD_BODY = os.environ.get("MOCK_REVOKE_BAD_BODY") == "1"
 REVOKE_LARGE_BODY = os.environ.get("MOCK_REVOKE_LARGE_BODY") == "1"
 PULL_MIXED = os.environ.get("MOCK_PULL_MIXED") == "1"
+PULL_AGE = os.environ.get("MOCK_PULL_AGE") == "1"
 CONNECT_CIPHERS = (["none"] if os.environ.get("MOCK_CONNECT_NO_AGE") == "1"
                    else ["none", "age-v1"])
 ISSUED_CREDENTIAL_IDS = set()
@@ -46,7 +47,7 @@ CONNECT_SERVER_ID = "018f3f7e-3333-7000-8000-000000000001"
 REGISTERED_TEAM_IDS = set()
 
 
-PULL_SERVER_ID = "018f3f7e-2222-7000-8000-000000000001"
+PULL_SERVER_ID = CONNECT_SERVER_ID
 PULL_TEAM_ID = "018f3f7e-2222-7000-8000-000000000002"
 PULL_MEMBERS = [
     {"member_id": "018f3f7e-2222-7000-8000-000000000010",
@@ -85,7 +86,20 @@ BASE_PULL_MESSAGES = [
                   "blob": _blob("bob", "alice", "history two", "2026-01-02T00:00:00.000000Z")}},
 ]
 
-if PULL_MIXED:
+if PULL_AGE:
+    PULL_MESSAGES = [
+        {"id": "10000000-0000-4000-8000-000000000001",
+         "server_seq": "1",
+         "server_received_at": "2026-01-01T00:00:00.000000Z",
+         "envelope": {"v": 1, "cipher": "none", "key_id": None,
+                      "blob": _roster_blob(0)}},
+        {"id": "20000000-0000-4000-8000-000000000001",
+         "server_seq": "2",
+         "server_received_at": "2026-01-02T00:00:00.000000Z",
+         "envelope": {"v": 1, "cipher": "age-v1", "key_id": "epoch-0",
+                      "blob": "ZW5jcnlwdGVk"}},
+    ]
+elif PULL_MIXED:
     PULL_MESSAGES = [
         {"id": "10000000-0000-4000-8000-%012d" % (index + 1),
          "server_seq": str(index + 1),
@@ -105,6 +119,7 @@ if PULL_MIXED:
     ]
 else:
     PULL_MESSAGES = BASE_PULL_MESSAGES
+PUSHED_MESSAGES = []
 
 
 class LoopbackHTTPServer(HTTPServer):
@@ -146,12 +161,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/v1/capabilities":
             team_id = self.headers.get("Agmsg-Team-ID", "")
+            current_seq = (len(PULL_MESSAGES) + len(PUSHED_MESSAGES)
+                           if team_id == PULL_TEAM_ID else 0)
             self._send_json(200, {
                 "protocol_version": 1,
                 "server_instance_id": CONNECT_SERVER_ID,
                 "team_id": team_id,
-                "current_seq": "0",
-                "next_sequence_boundary": "1",
+                "current_seq": str(current_seq),
+                "next_sequence_boundary": str(current_seq + 1),
                 "min_available_seq": "0",
                 "accepted_envelope_versions": [1],
                 "write_allowed_ciphers": CONNECT_CIPHERS,
@@ -261,7 +278,7 @@ class Handler(BaseHTTPRequestHandler):
                 "team_id": PULL_TEAM_ID,
                 "team_name": "pulled-team",
                 "min_available_seq": "0",
-                "current_seq": str(len(PULL_MESSAGES)),
+                "current_seq": str(len(PULL_MESSAGES) + len(PUSHED_MESSAGES)),
                 "policy_revision": "0",
                 "accepted_envelope_versions": [1],
                 "write_allowed_ciphers": CONNECT_CIPHERS,
@@ -299,6 +316,23 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b""
+
+        if self.path == "/v1/messages":
+            try:
+                messages = json.loads(raw).get("messages", [])
+            except Exception:
+                self._send_json(400, {"error": "bad json"})
+                return
+            acks = []
+            for message in messages:
+                PUSHED_MESSAGES.append(message)
+                acks.append({
+                    "id": message.get("id"),
+                    "server_seq": str(len(PULL_MESSAGES) + len(PUSHED_MESSAGES)),
+                    "disposition": "stored",
+                })
+            self._send_json(200, {"acks": acks})
+            return
 
         if self.path == "/v1/connect":
             try:

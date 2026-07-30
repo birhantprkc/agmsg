@@ -888,7 +888,8 @@ cmd_pull() {
   # retries reuse it, and the successful projection is never overwritten.
   _remote_write_pulled_team "$team" "$team_id" || exit 1
 
-  local result pulled_id pulled_name imported pulled_sid pulled_protocol pulled_caps
+  local result pulled_id pulled_name imported pulled_sid pulled_protocol pulled_caps \
+    pulled_age_v1 binding_cipher
   result="$(AGMSG_SYNC_CONNECTION_DIR="$CONNECTION_ROOT" \
     AGMSG_SYNC_LOCAL_ROSTER_FILE="$cfg" \
     "$SCRIPT_DIR/remote-sync.sh" pull-bootstrap \
@@ -903,8 +904,13 @@ cmd_pull() {
   pulled_sid="$(_remote_json_field "$result" '$.server_instance_id')"
   pulled_protocol="$(_remote_json_field "$result" '$.protocol_version')"
   pulled_caps="$(_remote_json_field "$result" '$.capabilities')"
+  pulled_age_v1="$(_remote_json_field "$result" '$.age_v1_envelopes')"
   [ "$pulled_id" = "$team_id" ] || {
     echo "agmsg: server answered with a different team id" >&2; exit 1; }
+  case "$pulled_age_v1" in ''|*[!0-9]*)
+    echo "agmsg: pull returned an invalid encrypted-envelope count" >&2; exit 1 ;; esac
+  binding_cipher="none"
+  [ "$pulled_age_v1" -gt 0 ] && binding_cipher="age-v1"
 
   # Bind AFTER the bootstrap, and by updating the config in place: the roster
   # driver has been projecting identity events into this file while the
@@ -925,6 +931,7 @@ cmd_pull() {
        'remote_team_id', '$(_agmsg_sqlesc "$pulled_id")',
        'remote_team_name', '$(_agmsg_sqlesc "$pulled_name")',
        'protocol_version', $pulled_protocol,
+       'cipher_profile', '$binding_cipher',
        'capabilities', json('$caps_escaped'),
        'connected_at', '$bind_at',
        'disconnected_at', null));")
@@ -936,11 +943,16 @@ cmd_pull() {
   # without it a send on this machine reports success, stays local, and nothing
   # says this team has an upstream it never reached. Found by the first real
   # second machine, whose pulled team answered "connected" while running nothing.
-  _remote_sync_engine_start "$team"
-
   local cmd_name
   cmd_name="$(basename "$SKILL_DIR")"
-  echo "Pulled '$pulled_name' into local team '$team' ($imported message(s)). Sync engine running."
+  if [ "$pulled_age_v1" -gt 0 ]; then
+    echo "Pulled '$pulled_name' into local team '$team' ($imported message(s))."
+    echo "This team is encrypted; its sync engine is halted until the handed key material is imported and confirmed."
+    echo "Run key.sh import, configure age-v1 with operator-live confirmation, then run remote-sync.sh reprocess."
+  else
+    _remote_sync_engine_start "$team"
+    echo "Pulled '$pulled_name' into local team '$team' ($imported message(s)). Sync engine running."
+  fi
   echo "This team is now local and ready for normal use."
   echo "Open your agent and invoke its installed '$cmd_name' command, then join with a new agent name."
 }
@@ -1219,7 +1231,9 @@ cmd_connect() {
   # they are written. Stop it with 'remote.sh disconnect <team>'.
   _remote_sync_engine_start "$team"
 
-  echo "Connected: team '$team'${remote_team_name:+ (org '$remote_team_name')}. Sync engine running."
+  local connection_security="plain"
+  [ "$binding_cipher" = "age-v1" ] && connection_security="age-v1 encrypted"
+  echo "Connected: team '$team'${remote_team_name:+ (org '$remote_team_name')} ($connection_security). Sync engine running."
   if [ "$e2ee" -eq 1 ]; then
     echo "Export the public epoch snapshot with: key.sh show $team --snapshot --out <file>"
     echo "Transfer that snapshot and the key out of band; the other machine must import and live-confirm them before syncing."
