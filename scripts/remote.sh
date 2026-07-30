@@ -956,7 +956,7 @@ cmd_pull() {
 _remote_sync_engine_pidfile() { printf '%s' "$CONNECTION_ROOT/run/remote-sync.$1.pid"; }
 
 _remote_sync_engine_start() {
-  local team="$1" pidfile logfile old_pid old_state
+  local team="$1" startup_nonce="${2:-}" pidfile logfile old_pid old_state
   pidfile="$(_remote_sync_engine_pidfile "$team")"
   logfile="$CONNECTION_ROOT/run/remote-sync.$team.log"
   mkdir -p "$CONNECTION_ROOT/run" 2>/dev/null || true
@@ -973,7 +973,8 @@ _remote_sync_engine_start() {
   # daemon inheriting it keeps the whole test file open until the CI timeout —
   # the last-ok-then-orphan hang this repo has met before, this time spawned by
   # production code rather than a test.
-  nohup bash "$SCRIPT_DIR/remote-sync.sh" run --team "$team" >> "$logfile" 2>&1 3>&- 4>&- &
+  AGMSG_SYNC_START_NONCE="$startup_nonce" \
+    nohup bash "$SCRIPT_DIR/remote-sync.sh" run --team "$team" >> "$logfile" 2>&1 3>&- 4>&- &
   echo $! > "$pidfile"
   disown 2>/dev/null || true
 }
@@ -1348,7 +1349,8 @@ cmd_status() {
 
 cmd_sync_start() {
   local team="${1:?Usage: remote.sh sync start <team>}" cfg connected_at disconnected_at \
-    engine_state engine_pid started_pid ready_pid ready=0 i=0 logfile log_offset=1
+    engine_state engine_pid started_pid ready_pid startup_nonce ready=0 i=0 \
+    logfile log_offset=1
   [ $# -eq 1 ] || { echo "Usage: remote.sh sync start <team>" >&2; exit 1; }
   agmsg_validate_team_name "$team" || exit 1
   agmsg_lock_acquire "$TEAMS_DIR/$team" || exit 1
@@ -1375,15 +1377,18 @@ cmd_sync_start() {
 
   logfile="$CONNECTION_ROOT/run/remote-sync.$team.log"
   [ -f "$logfile" ] && log_offset=$(( $(wc -c < "$logfile" | tr -d ' ') + 1 ))
-  if ! _remote_sync_engine_start "$team"; then
+  startup_nonce="$(compat_uuid7)"
+  if ! _remote_sync_engine_start "$team" "$startup_nonce"; then
     agmsg_lock_release
     return 1
   fi
   started_pid="$(cat "$(_remote_sync_engine_pidfile "$team")")"
-  while [ "$i" -lt 100 ]; do
+  while [ "$i" -lt 1600 ]; do
     IFS=$'\t' read -r engine_state ready_pid < <(_remote_sync_engine_status "$team")
     if [ "$engine_state" = "running" ] && [ "$ready_pid" = "$started_pid" ] &&
-       tail -c "+$log_offset" "$logfile" 2>/dev/null | grep -q '"event":"capabilities"'; then
+       tail -c "+$log_offset" "$logfile" 2>/dev/null |
+         grep '"event":"capabilities"' |
+         grep -Fq "\"startup_nonce\":\"$startup_nonce\""; then
       ready=1
       break
     fi

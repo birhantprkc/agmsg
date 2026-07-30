@@ -64,7 +64,8 @@ write_fake_node() {
     '  echo v23.0.0' \
     '  exit 0' \
     'fi' \
-    'echo '\''{"event":"capabilities"}'\''' \
+    'echo "{\"event\":\"capabilities\",\"startup_nonce\":\"${AGMSG_SYNC_START_NONCE:-}\"}"' \
+    '[ -z "${AGMSG_TEST_CHILD_PID_FILE:-}" ] || printf '\''%s\\n'\'' "$$" > "$AGMSG_TEST_CHILD_PID_FILE"' \
     'trap "exit 0" TERM INT' \
     'while :; do sleep 1; done' > "$fake_node"
   chmod +x "$fake_node"
@@ -258,18 +259,23 @@ remember_engine_pid() {
 }
 
 @test "sync start reaps a ready-timeout child before releasing ownership" {
-  local fake_node="$TEST_SKILL_DIR/fake-node-timeout" fake_bin lock
+  local fake_node="$TEST_SKILL_DIR/fake-node-timeout" fake_bin lock child_pid_file child_pid
+  child_pid_file="$TEST_SKILL_DIR/timeout-child.pid"
   printf '%s\n' '#!/usr/bin/env bash' \
+    'printf '\''%s\\n'\'' "$$" > "$AGMSG_TEST_CHILD_PID_FILE"' \
     'trap "" TERM' \
     'while :; do sleep 1; done' > "$fake_node"
   chmod +x "$fake_node"
   fake_bin="$(write_fake_node_ps_fixture "$fake_node")"
 
   run env PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" \
+    AGMSG_TEST_CHILD_PID_FILE="$child_pid_file" \
     bash "$SCRIPTS/remote.sh" sync start testteam
   [ "$status" -ne 0 ]
   [[ "$output" == *"did not become ready"* ]]
   [ ! -e "$TEST_SKILL_DIR/run/remote-sync.testteam.pid" ]
+  child_pid="$(cat "$child_pid_file")"
+  ! kill -0 "$child_pid" 2>/dev/null
   lock="$TEST_SKILL_DIR/teams/testteam/.config.lock"
   [ ! -d "$lock" ]
 }

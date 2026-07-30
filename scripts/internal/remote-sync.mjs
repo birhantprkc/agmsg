@@ -1619,7 +1619,8 @@ export async function cycle(config, { pushLimit, pullLimit }, dependencies = {})
   const capabilities = await requestCall(config, "/v1/capabilities");
   validateCapabilities(config, capabilities);
   await eventCall("capabilities", { team: config.local_team, current_seq: capabilities.current_seq,
-    policy_revision: capabilities.policy_revision });
+    policy_revision: capabilities.policy_revision,
+    startup_nonce: process.env.AGMSG_SYNC_START_NONCE || undefined });
 
   const writeProfile = selectWriteProfile(config, capabilities);
   const prepareInput = [{ type: "sync_prepare", envelope_v: 1,
