@@ -268,7 +268,10 @@ jobs:
 
       - name: Run encrypted onboarding CLI roundtrip
         if: needs.changes.outputs.docs_only != 'true'
-        run: bats --print-output-on-failure --filter 'remote unlock:' tests/test_remote.bats
+        run: |
+          command -v age >/dev/null
+          command -v age-keygen >/dev/null
+          bats --print-output-on-failure --filter 'remote unlock:' tests/test_remote.bats
 
   # Continuously verify that the storage contract is backend-portable: run the
   # SAME driver-agnostic contract suite against the jsonl driver (the sqlite run
