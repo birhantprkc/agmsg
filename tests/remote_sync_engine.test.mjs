@@ -404,9 +404,17 @@ test("explicit reprocess walks past a permanent first keyset page", async () => 
   const applied = [];
   const driverCall = async (operation, _config, input, extra) => {
     if (operation === "apply") {
-      applied.push(...input.filter((record) => record.type === "sync_pull_message")
-        .map((record) => record.id));
-      return [{ type: "sync_apply_result", transport_cursor: "2", corrupt_count: 0 }];
+      const messages = input.filter((record) => record.type === "sync_pull_message");
+      applied.push(...messages.map((record) => record.id));
+      return [
+        { type: "sync_apply_result", transport_cursor: "2", corrupt_count: 0 },
+        ...messages.map((record) => ({
+          type: "sync_apply_outcome",
+          id: record.id,
+          server_seq: record.server_seq,
+          status: "authentication_failed",
+        })),
+      ];
     }
     assert.equal(operation, "reprocess");
     const pageIndex = extra.length === 1 ? 0 : 1;
@@ -423,7 +431,7 @@ test("explicit reprocess walks past a permanent first keyset page", async () => 
         has_more: pageIndex === 0 },
     ];
   };
-  await reprocessCycle(config, 1, {
+  const result = await reprocessCycle(config, 1, {
     healthCall: async () => ({ server_instance_id: config.server_instance_id }),
     requestCall: async () => capabilities,
     driverCall,
@@ -433,6 +441,55 @@ test("explicit reprocess walks past a permanent first keyset page", async () => 
     logApplyCall: async () => {},
   });
   assert.deepEqual(applied, ids);
+  assert.equal(result.imported_count, 0);
+  assert.equal(result.blocking_remaining, true);
+});
+
+test("reprocess completion counts imported outcomes and requires empty blocking quarantine", async () => {
+  const capabilities = {
+    protocol_version: 1, server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id, team_name: "demo", min_available_seq: "0",
+    current_seq: "1", next_sequence_boundary: "2", accepted_envelope_versions: [1],
+    write_allowed_ciphers: ["none"], policy_revision: "0", effective_from_seq: "1",
+    max_blob_bytes: "1048576", policy_history: [{ policy_revision: "0",
+      effective_from_seq: "1", accepted_envelope_versions: [1],
+      write_allowed_ciphers: ["none"] }],
+  };
+  const id = "550e8400-e29b-41d4-a716-446655440001";
+  let imported = false;
+  const result = await reprocessCycle(config, 100, {
+    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    requestCall: async () => capabilities,
+    driverCall: async (operation, _config, input) => {
+      if (operation === "apply") {
+        imported = true;
+        return [
+          { type: "sync_apply_result", transport_cursor: "1", corrupt_count: 0 },
+          { type: "sync_apply_outcome", id, server_seq: "1", status: "imported" },
+        ];
+      }
+      assert.equal(operation, "reprocess");
+      return [
+        { type: "sync_state", driver_generation: "generation-1", transport_cursor: "1" },
+        ...(!imported ? [{
+          type: "sync_reprocess_candidate", server_seq: "1", id,
+          server_received_at: "2026-07-22T11:00:00.000000Z",
+          envelope: { v: 1, cipher: "none", key_id: null, blob: "e30=" },
+          prior_status: "authentication_failed",
+        }] : []),
+        { type: "sync_reprocess_page", next_after: null, has_more: false },
+      ];
+    },
+    evaluateCall: async () => ({ status: "importable", projection: {
+      body: "recovered", created_at: "2026-07-22T11:00:00.000000Z",
+      from_agent: "alice", to_agent: "bob",
+    }, policy_revision: "0", local_security_revision: "0" }),
+    eventCall: async () => {},
+    logApplyCall: async () => {},
+  });
+  assert.equal(result.count, 1);
+  assert.equal(result.imported_count, 1);
+  assert.equal(result.blocking_remaining, false);
 });
 
 test("explicit reprocess rejects an unbounded walk through duplicate server sequences", async () => {

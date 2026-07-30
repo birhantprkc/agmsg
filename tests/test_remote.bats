@@ -830,20 +830,39 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   [[ "$output" == *"does not match"* ]]
   [ "$(sqlite_mem "SELECT json_type(json_extract(CAST(readfile('$(rf "$TEST_SKILL_DIR/teams/encrypted/config.json")') AS TEXT), '\$.remote_key'));")" = "" ]
 
+  local wrong_identity="$TEST_SKILL_DIR/wrong-identity.key"
+  age-keygen -o "$wrong_identity" >/dev/null 2>&1
+  run bash "$SCRIPTS/remote.sh" unlock encrypted \
+    --snapshot "$snapshot" --identity "$wrong_identity" --confirm-digest "$digest"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"does not match the authority-confirmed snapshot"* ]]
+  [ "$(sqlite_mem "SELECT json_type(json_extract(CAST(readfile('$(rf "$TEST_SKILL_DIR/teams/encrypted/config.json")') AS TEXT), '\$.remote_key'));")" = "" ]
+  [ ! -d "$TEST_SKILL_DIR/run/remote-trust" ]
+
   run bash "$SCRIPTS/remote.sh" unlock encrypted \
     --snapshot "$snapshot" --identity "$identity" --confirm-digest "$digest"
   [ "$status" -eq 0 ]
   [[ "$output" == *"imported 1 envelope(s); engine running (pid "* ]]
+  local pidfile first_pid second_pid
+  pidfile="$TEST_SKILL_DIR/run/remote-sync.encrypted.pid"
+  wait_for_file "$pidfile"
+  first_pid="$(cat "$pidfile")"
+  run bash "$SCRIPTS/remote.sh" unlock encrypted \
+    --snapshot "$snapshot" --identity "$identity" --confirm-digest "$digest"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"imported 0 envelope(s); engine running (pid "* ]]
+  second_pid="$(cat "$pidfile")"
+  [ "$second_pid" != "$first_pid" ]
+  ! kill -0 "$first_pid" 2>/dev/null
+  kill -0 "$second_pid" 2>/dev/null
+
   run bash "$SCRIPTS/history.sh" encrypted member-1
   [ "$status" -eq 0 ]
   [[ "$output" == *"handed ciphertext"* ]]
 
-  local pidfile pid before after pushed_cipher
-  pidfile="$TEST_SKILL_DIR/run/remote-sync.encrypted.pid"
-  wait_for_file "$pidfile"
-  pid="$(cat "$pidfile")"
-  kill "$pid" 2>/dev/null || true
-  wait_for_pid_exit "$pid"
+  local before after pushed_cipher
+  kill "$second_pid" 2>/dev/null || true
+  wait_for_pid_exit "$second_pid"
   rm -f "$pidfile"
   before="$(curl -sS "$ENDPOINT/v1/teams/$team_id" | jq -r '.current_seq')"
   bash "$SCRIPTS/send.sh" encrypted member-1 member-1 "encrypted outbound" >/dev/null

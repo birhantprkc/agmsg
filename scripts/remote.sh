@@ -1043,7 +1043,7 @@ cmd_unlock() {
   rm -f "$identity_tmp"
   trap - EXIT INT TERM HUP
 
-  local endpoint remote_team_id configure_out reprocess_out reprocess_result imported
+  local endpoint remote_team_id configure_out reprocess_out reprocess_result imported blocking
   endpoint="$(_remote_read_config_field "$cfg" '$.remote_binding.endpoint')"
   remote_team_id="$(_remote_read_config_field "$cfg" '$.remote_binding.remote_team_id')"
   configure_out="$(bash "$SCRIPT_DIR/remote-sync.sh" configure \
@@ -1064,8 +1064,17 @@ cmd_unlock() {
     echo "agmsg: reprocess produced no completion result" >&2
     exit 1
   }
-  imported="$(_remote_json_field "$reprocess_result" '$.count')"
+  imported="$(_remote_json_field "$reprocess_result" '$.imported_count')"
+  blocking="$(_remote_json_field "$reprocess_result" '$.blocking_remaining')"
+  if [ "$blocking" != "0" ]; then
+    echo "agmsg: encrypted envelopes remain blocked after reprocessing; no sync engine was started" >&2
+    exit 1
+  fi
 
+  _remote_sync_engine_stop "$team" || {
+    echo "agmsg: the previous sync engine did not stop; unlock cannot safely restart it" >&2
+    exit 1
+  }
   local engine_log="$CONNECTION_ROOT/run/remote-sync.$team.log" log_offset=1
   [ -f "$engine_log" ] &&
     log_offset=$(( $(wc -c < "$engine_log" | tr -d ' ') + 1 ))
@@ -1083,7 +1092,10 @@ cmd_unlock() {
     attempts=$((attempts + 1))
     sleep 0.1
   done
-  if [ "$ready" -ne 1 ]; then
+  local pidfile="$(_remote_sync_engine_pidfile "$team")" recorded_pid=""
+  [ -f "$pidfile" ] && recorded_pid="$(cat "$pidfile" 2>/dev/null || true)"
+  if [ "$ready" -ne 1 ] || [ "$recorded_pid" != "$pid" ] ||
+      ! _agmsg_pid_alive "$pid"; then
     _remote_sync_engine_stop "$team"
     echo "agmsg: encrypted sync was configured, but the sync engine did not become ready" >&2
     exit 1
@@ -1126,11 +1138,21 @@ _remote_sync_engine_start() {
 }
 
 _remote_sync_engine_stop() {
-  local team="$1" pidfile pid
+  local team="$1" pidfile pid attempts=0
   pidfile="$(_remote_sync_engine_pidfile "$team")"
   [ -f "$pidfile" ] || return 0
   pid="$(cat "$pidfile" 2>/dev/null || true)"
-  [ -n "$pid" ] && _agmsg_pid_alive "$pid" && kill "$pid" 2>/dev/null || true
+  if [ -n "$pid" ] && _agmsg_pid_alive "$pid"; then
+    kill "$pid" 2>/dev/null || true
+    while _agmsg_pid_alive "$pid" && [ "$attempts" -lt 50 ]; do
+      attempts=$((attempts + 1))
+      sleep 0.1
+    done
+    if _agmsg_pid_alive "$pid"; then
+      echo "agmsg: sync engine pid $pid did not stop" >&2
+      return 1
+    fi
+  fi
   rm -f "$pidfile"
 }
 

@@ -1968,6 +1968,7 @@ export async function reprocessCycle(config, limit, dependencies = {}) {
   let after = null;
   let stableState = null;
   let total = 0;
+  let imported = 0;
   let pageCount = 0n;
   const retentionFloor = BigInt(capabilities.min_available_seq);
   // Locally retained quarantine may cover both the server-retained suffix and
@@ -2018,6 +2019,11 @@ export async function reprocessCycle(config, limit, dependencies = {}) {
       records.push({ type: "sync_pull_cursor", next_after: state.transport_cursor });
       const applied = await driverCall("apply", config, records);
       await logApplyCall(config, records, applied);
+      const candidateIds = new Set(candidates.map((candidate) => candidate.id));
+      imported += applied.filter((record) =>
+        record.type === "sync_apply_outcome" &&
+        candidateIds.has(record.id) &&
+        ["imported", "reconciled"].includes(record.status)).length;
       total += candidates.length;
     }
     if (!page.has_more) break;
@@ -2026,8 +2032,16 @@ export async function reprocessCycle(config, limit, dependencies = {}) {
     }
     after = page.next_after;
   }
-  await eventCall("reprocess.complete", { count: total,
-    transport_cursor: stableState.transport_cursor });
+  const remaining = validateReprocessDriverPage(
+    await driverCall("reprocess", config, [], ["1"]), 1, null);
+  const result = {
+    count: total,
+    imported_count: imported,
+    blocking_remaining: remaining.candidates.length > 0,
+    transport_cursor: stableState.transport_cursor,
+  };
+  await eventCall("reprocess.complete", result);
+  return result;
 }
 
 function resultFromResyncAudit(status) {

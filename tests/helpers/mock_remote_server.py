@@ -52,10 +52,8 @@ PULL_SERVER_ID = CONNECT_SERVER_ID
 PULL_TEAM_ID = os.environ.get(
     "MOCK_PULL_TEAM_ID", "018f3f7e-2222-7000-8000-000000000002")
 PULL_MEMBERS = [
-    {"member_id": "018f3f7e-2222-7000-8000-000000000010",
-     "name": "alice", "registrations": []},
-    {"member_id": "018f3f7e-2222-7000-8000-000000000011",
-     "name": "bob", "registrations": []},
+    {"member_id": "018f3f7e-4444-7000-8000-000000000001",
+     "name": "member-1", "registrations": []},
 ]
 # cipher "none" carries the message as the base64 of its canonical JSON, which
 # is what the client decodes on import.
@@ -196,12 +194,38 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/_test/pushed":
             self._send_json(200, {"messages": PUSHED_MESSAGES})
             return
-        # The pull side: a machine that has none of this asking for a team by
-        # id. No credential, matching /v1/connect -- reaching the server is the
-        # permission.
         parts = self.path.split("?", 1)
         route = parts[0]
         query = parts[1] if len(parts) > 1 else ""
+        if route == "/v1/members":
+            self._send_json(200, {
+                "protocol_version": 1,
+                "server_instance_id": PULL_SERVER_ID,
+                "team_id": PULL_TEAM_ID,
+                "min_available_seq": "0",
+                "members_revision": "0",
+                "members": PULL_MEMBERS,
+            })
+            return
+        if route == "/v1/messages":
+            after = 0
+            for pair in query.split("&"):
+                if pair.startswith("after="):
+                    after = int(pair[len("after="):])
+            page = [m for m in PULL_MESSAGES + PUSHED_MESSAGES
+                    if int(m["server_seq"]) > after]
+            self._send_json(200, {
+                "protocol_version": 1,
+                "server_instance_id": PULL_SERVER_ID,
+                "team_id": PULL_TEAM_ID,
+                "messages": page,
+                "next_after": page[-1]["server_seq"] if page else str(after),
+                "has_more": False,
+            })
+            return
+        # The pull side: a machine that has none of this asking for a team by
+        # id. No credential, matching /v1/connect -- reaching the server is the
+        # permission.
         if route == "/v1/teams":
             # MOCK_DUPLICATE_NAME makes the lookup answer with two teams sharing
             # the requested name, which is the branch the client cannot resolve
@@ -335,13 +359,37 @@ class Handler(BaseHTTPRequestHandler):
                 return
             acks = []
             for message in messages:
-                PUSHED_MESSAGES.append(message)
+                stored = {
+                    "id": message.get("id"),
+                    "server_seq": str(len(PULL_MESSAGES) + len(PUSHED_MESSAGES) + 1),
+                    "server_received_at": "2026-01-03T00:00:00.000000Z",
+                    "envelope": message.get("envelope"),
+                }
+                PUSHED_MESSAGES.append(stored)
                 acks.append({
                     "id": message.get("id"),
-                    "server_seq": str(len(PULL_MESSAGES) + len(PUSHED_MESSAGES)),
+                    "server_seq": stored["server_seq"],
                     "disposition": "stored",
                 })
             self._send_json(200, {"acks": acks})
+            return
+
+        if self.path == "/v1/read-state/sync":
+            current = str(len(PULL_MESSAGES) + len(PUSHED_MESSAGES))
+            self._send_json(200, {
+                "protocol_version": 1,
+                "server_instance_id": PULL_SERVER_ID,
+                "team_id": PULL_TEAM_ID,
+                "min_available_seq": "0",
+                "current_seq": current,
+                "items": [
+                    {"kind": "frontier", "member_id": member["member_id"],
+                     "server_seq": "0"}
+                    for member in PULL_MEMBERS
+                ],
+                "next_page_after": None,
+                "has_more": False,
+            })
             return
 
         if self.path == "/v1/connect":
