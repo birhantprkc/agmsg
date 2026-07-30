@@ -176,7 +176,7 @@ EOF
 @test "key import --identity-stdin: establishes the first epoch for a team with no key yet" {
   skip_if_no_age
   secret=$(age-keygen 2>/dev/null | grep '^AGE-SECRET-KEY-')
-  run bash -c "printf '%s' '$secret' | bash '$SCRIPTS/key.sh' import testteam --key-id '$key_id' --identity-stdin"
+  run bash -c "printf '%s' '$secret' | bash '$SCRIPTS/key.sh' import testteam --identity-stdin"
   [ "$status" -eq 0 ]
   [[ "$output" == *"Imported key for team 'testteam'"* ]]
 }
@@ -333,7 +333,13 @@ EOF
   identity="$SCRIPTS/../run/remote-credentials/testteam/keys/$key_id.key"
   secret=$(grep '^AGE-SECRET-KEY-' "$identity")
   rm -f "$identity"
-  run bash -c "printf '%s' '$secret' | bash '$SCRIPTS/key.sh' import testteam --identity-stdin"
+  run bash -c "printf '%s' '$secret' | bash '$SCRIPTS/key.sh' import testteam --key-id wrong-announced-id --identity-stdin"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"does not match the announced rotation"* ]]
+  [ ! -f "$identity" ]
+  [ ! -f "$SCRIPTS/../run/remote-credentials/testteam/keys/wrong-announced-id.key" ]
+
+  run bash -c "printf '%s' '$secret' | bash '$SCRIPTS/key.sh' import testteam --key-id '$key_id' --identity-stdin"
   [ "$status" -eq 0 ]
   [[ "$output" == *"Imported replacement key"* ]]
   [ -f "$identity" ]
