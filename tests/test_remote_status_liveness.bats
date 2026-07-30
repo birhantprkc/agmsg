@@ -58,16 +58,19 @@ write_matching_ps_fixture() {
 }
 
 write_fake_node() {
-  local fake_node="$TEST_SKILL_DIR/fake-node"
+  local trailing_records="${1:-0}" fake_node="$TEST_SKILL_DIR/fake-node"
   printf '%s\n' '#!/usr/bin/env bash' \
     'if [ "${1:-}" = "--version" ]; then' \
     '  echo v23.0.0' \
     '  exit 0' \
     'fi' \
     'echo "{\"event\":\"capabilities\",\"startup_nonce\":\"${AGMSG_SYNC_START_NONCE:-}\"}"' \
+    "trailing_records=$trailing_records" \
+    "printf -v padding '%16384s' ''" \
+    'padding="${padding// /x}"' \
     'i=0' \
-    'while [ "$i" -lt 512 ]; do' \
-    '  echo "{\"event\":\"capabilities\",\"startup_nonce\":\"other-generation\"}"' \
+    'while [ "$i" -lt "$trailing_records" ]; do' \
+    '  echo "{\"event\":\"capabilities\",\"startup_nonce\":\"other-generation\",\"padding\":\"$padding\"}"' \
     '  i=$((i + 1))' \
     'done' \
     '[ -z "${AGMSG_TEST_CHILD_PID_FILE:-}" ] || printf '\''%s\\n'\'' "$$" > "$AGMSG_TEST_CHILD_PID_FILE"' \
@@ -261,6 +264,18 @@ remember_engine_pid() {
   remember_engine_pid
   kill -0 "$ENGINE_PID"
   rm -f "$first_out" "$second_out"
+}
+
+@test "sync start reads a complete multi-megabyte handshake log without SIGPIPE" {
+  local fake_node fake_bin
+  fake_node="$(write_fake_node 512)"
+  fake_bin="$(write_fake_node_ps_fixture "$fake_node")"
+
+  run env PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" \
+    bash "$SCRIPTS/remote.sh" sync start testteam
+  [ "$status" -eq 0 ]
+  remember_engine_pid
+  kill -0 "$ENGINE_PID"
 }
 
 @test "sync start reaps a ready-timeout child before releasing ownership" {
