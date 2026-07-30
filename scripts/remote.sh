@@ -203,7 +203,13 @@ _remote_http_post_json() {
   mkfifo "$header_fifo"
   chmod 600 "$cfg"
   trap 'rm -f "$cfg" "$header_fifo"; rmdir "$fifo_dir" 2>/dev/null || true' EXIT INT TERM
-  python3 "$SCRIPT_DIR/internal/bounded-copy.py" 65536 < "$header_fifo" > "$header_file" &
+  # Reaped on both normal paths below (waited on success, killed and waited on
+  # failure), so this is short-lived by construction -- but the EXIT trap only
+  # removes files, it does not kill the copier. A signal arriving before curl
+  # opens the fifo therefore leaves it blocked on open() with no writer ever
+  # coming, and an inherited fd 3 would then hold a bats test file open to the
+  # timeout. Closing the fds costs nothing and removes that one path.
+  python3 "$SCRIPT_DIR/internal/bounded-copy.py" 65536 < "$header_fifo" > "$header_file" 3>&- 4>&- &
   copier_pid=$!
   {
     printf 'url = "%s"\n' "$url"
@@ -248,7 +254,8 @@ _remote_http_post_bearer() {
   mkfifo "$header_fifo"
   chmod 600 "$cfg"
   trap 'rm -f "$cfg" "$header_fifo"; rmdir "$fifo_dir" 2>/dev/null || true' EXIT INT TERM
-  python3 "$SCRIPT_DIR/internal/bounded-copy.py" 65536 < "$header_fifo" > "$header_file" &
+  # Same reaping and the same trap gap as the copier above.
+  python3 "$SCRIPT_DIR/internal/bounded-copy.py" 65536 < "$header_fifo" > "$header_file" 3>&- 4>&- &
   copier_pid=$!
   {
     printf 'url = "%s"\n' "$url"
