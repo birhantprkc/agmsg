@@ -1008,7 +1008,9 @@ function runDriver({ args, label, operation, parse, input }) {
     child.on("exit", (code, signal) => {
       if (failure) { fail(failure); return; }
       if (code === 0 && !signal) return;
-      fail(new Error(`${label} ${operation} failed (${signal ?? code}): ${stderr.trim()}`));
+      const diagnostic = stderr.trim() ||
+        "driver returned a non-zero exit without diagnostics; inspect its team storage and binding";
+      fail(new Error(`${label} ${operation} failed (${signal ?? code}): ${diagnostic}`));
     });
     child.on("close", () => {
       if (failure) { settle(failure, null); return; }
