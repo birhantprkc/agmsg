@@ -8,11 +8,13 @@ import test from "node:test";
 import {
   ageSnapshotDigest,
   activateKeyRotations,
+  canonicalJson,
   consistentReadStateContext,
   configure,
   cycle,
   driver,
   isRetryable,
+  initialAgeSnapshot,
   runLoop,
   loadConfig,
   plaintextWriteEligible,
@@ -37,6 +39,7 @@ import {
   validateReadStatePage,
   validateResyncResult,
   validateResyncStatus,
+  verifyAgeSnapshot,
 } from "../scripts/internal/remote-sync.mjs";
 
 const config = {
@@ -301,6 +304,82 @@ test("connected binding is a bounded non-writable nofollow authority", async () 
   });
 });
 
+test("an age-selected binding never synthesizes a plaintext config", async () => {
+  await withConnectedCredential(async (root) => {
+    const previousStorage = process.env.AGMSG_SYNC_STORAGE_DIR;
+    process.env.AGMSG_SYNC_STORAGE_DIR = join(root, "db");
+    await writeConnectedTeam(root, { cipher_profile: "age-v1" });
+    try {
+      await assert.rejects(loadConfig("demo"),
+        /selected age-v1.*authenticated sync configuration is missing/u);
+      await mkdir(join(root, "db", "remote-sync"), { recursive: true });
+      await writeFile(join(root, "db", "remote-sync", "demo.json"),
+        `${JSON.stringify({
+          format_version: 1,
+          local_team: "demo",
+          server_url: "https://sync.example",
+          server_instance_id: config.server_instance_id,
+          remote_team_id: config.remote_team_id,
+          protocol_version: 1,
+          cipher_profile: "none",
+          local_security_history: [{
+            local_security_revision: "0",
+            effective_from_seq: "1",
+            minimum_security_mode: "plaintext-allowed",
+          }],
+        })}\n`,
+        { mode: 0o600 });
+      await assert.rejects(loadConfig("demo"),
+        /sync configuration cipher does not match.*binding/u);
+    } finally {
+      if (previousStorage === undefined) delete process.env.AGMSG_SYNC_STORAGE_DIR;
+      else process.env.AGMSG_SYNC_STORAGE_DIR = previousStorage;
+    }
+  });
+});
+
+test("unlock snapshot verification is canonical and bound to the pulled team", async () => {
+  await withConnectedCredential(async (root) => {
+    await writeConnectedTeam(root, { cipher_profile: "age-v1" });
+    const snapshot = {
+      profile: "age-v1",
+      server_instance_id: config.server_instance_id,
+      team_id: config.remote_team_id,
+      epoch_revision: "0",
+      writer_generation: "0",
+      authorized_writers: ["epoch-initial"],
+      previous_snapshot_sha256: null,
+      history: [{
+        epoch_revision: "0",
+        effective_from_seq: "1",
+        cipher: "age-v1",
+        key_id: "epoch-initial",
+        recipients: ["age1mmqjrejftea4f6xh47lhpc0jn4vw0yuhz349sw2e3sfl22k5gcjsv6xcvp"],
+      }],
+    };
+    const path = join(root, "snapshot.json");
+    await writeFile(path, canonicalJson(snapshot), { mode: 0o600 });
+    const result = await verifyAgeSnapshot({
+      team: "demo",
+      // CLI option parsing represents repeatable options as arrays even when
+      // exactly one value was supplied.
+      "age-snapshot": [path],
+    });
+    assert.equal(result.snapshot_sha256, ageSnapshotDigest(snapshot));
+    assert.equal(result.key_id, "epoch-initial");
+    assert.equal(result.recipient, snapshot.history[0].recipients[0]);
+    await writeFile(path, `${JSON.stringify(snapshot, null, 2)}\n`, { mode: 0o600 });
+    await assert.rejects(verifyAgeSnapshot({
+      team: "demo",
+      "age-snapshot": [path],
+    }), /RFC 8785 JCS/u);
+    await assert.rejects(verifyAgeSnapshot({
+      team: "demo",
+      "age-snapshot": [path, path],
+    }), /exactly one age-snapshot/u);
+  });
+});
+
 test("ack mapping rejects reversed and duplicate server sequences", () => {
   assert.throws(() => validateAckMapping(candidates, [
     { id: candidates[0].id, server_seq: "2", disposition: "stored" },
@@ -331,9 +410,17 @@ test("explicit reprocess walks past a permanent first keyset page", async () => 
   const applied = [];
   const driverCall = async (operation, _config, input, extra) => {
     if (operation === "apply") {
-      applied.push(...input.filter((record) => record.type === "sync_pull_message")
-        .map((record) => record.id));
-      return [{ type: "sync_apply_result", transport_cursor: "2", corrupt_count: 0 }];
+      const messages = input.filter((record) => record.type === "sync_pull_message");
+      applied.push(...messages.map((record) => record.id));
+      return [
+        { type: "sync_apply_result", transport_cursor: "2", corrupt_count: 0 },
+        ...messages.map((record) => ({
+          type: "sync_apply_outcome",
+          id: record.id,
+          server_seq: record.server_seq,
+          status: "authentication_failed",
+        })),
+      ];
     }
     assert.equal(operation, "reprocess");
     const pageIndex = extra.length === 1 ? 0 : 1;
@@ -350,7 +437,7 @@ test("explicit reprocess walks past a permanent first keyset page", async () => 
         has_more: pageIndex === 0 },
     ];
   };
-  await reprocessCycle(config, 1, {
+  const result = await reprocessCycle(config, 1, {
     healthCall: async () => ({ server_instance_id: config.server_instance_id }),
     requestCall: async () => capabilities,
     driverCall,
@@ -360,6 +447,55 @@ test("explicit reprocess walks past a permanent first keyset page", async () => 
     logApplyCall: async () => {},
   });
   assert.deepEqual(applied, ids);
+  assert.equal(result.imported_count, 0);
+  assert.equal(result.blocking_remaining, true);
+});
+
+test("reprocess completion counts imported outcomes and requires empty blocking quarantine", async () => {
+  const capabilities = {
+    protocol_version: 1, server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id, team_name: "demo", min_available_seq: "0",
+    current_seq: "1", next_sequence_boundary: "2", accepted_envelope_versions: [1],
+    write_allowed_ciphers: ["none"], policy_revision: "0", effective_from_seq: "1",
+    max_blob_bytes: "1048576", policy_history: [{ policy_revision: "0",
+      effective_from_seq: "1", accepted_envelope_versions: [1],
+      write_allowed_ciphers: ["none"] }],
+  };
+  const id = "550e8400-e29b-41d4-a716-446655440001";
+  let imported = false;
+  const result = await reprocessCycle(config, 100, {
+    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    requestCall: async () => capabilities,
+    driverCall: async (operation, _config, input) => {
+      if (operation === "apply") {
+        imported = true;
+        return [
+          { type: "sync_apply_result", transport_cursor: "1", corrupt_count: 0 },
+          { type: "sync_apply_outcome", id, server_seq: "1", status: "imported" },
+        ];
+      }
+      assert.equal(operation, "reprocess");
+      return [
+        { type: "sync_state", driver_generation: "generation-1", transport_cursor: "1" },
+        ...(!imported ? [{
+          type: "sync_reprocess_candidate", server_seq: "1", id,
+          server_received_at: "2026-07-22T11:00:00.000000Z",
+          envelope: { v: 1, cipher: "none", key_id: null, blob: "e30=" },
+          prior_status: "authentication_failed",
+        }] : []),
+        { type: "sync_reprocess_page", next_after: null, has_more: false },
+      ];
+    },
+    evaluateCall: async () => ({ status: "importable", projection: {
+      body: "recovered", created_at: "2026-07-22T11:00:00.000000Z",
+      from_agent: "alice", to_agent: "bob",
+    }, policy_revision: "0", local_security_revision: "0" }),
+    eventCall: async () => {},
+    logApplyCall: async () => {},
+  });
+  assert.equal(result.count, 1);
+  assert.equal(result.imported_count, 1);
+  assert.equal(result.blocking_remaining, false);
 });
 
 test("explicit reprocess rejects an unbounded walk through duplicate server sequences", async () => {
@@ -1133,6 +1269,60 @@ test("age-v1 configuration verifies the complete epoch snapshot hash chain", () 
   } }), /missing revision/u);
 });
 
+test("initial age snapshot uses the key id as its sole writer and stable JCS", () => {
+  const keyId = "epoch-initial";
+  const recipient = "age1mmqjrejftea4f6xh47lhpc0jn4vw0yuhz349sw2e3sfl22k5gcjsv6xcvp";
+  const epoch = {
+    key_id: keyId,
+    epoch_revision: 0,
+    writer_generation: 0,
+    recipient,
+    previous_snapshot_sha256: null,
+    created_at: "2026-07-30T00:00:00Z",
+  };
+  const teamConfig = {
+    name: "demo",
+    agents: {},
+    remote_key: { current: epoch, epochs: [epoch] },
+    remote_binding: {
+      endpoint: "https://sync.example.test",
+      server_instance_id: config.server_instance_id,
+      remote_team_id: config.remote_team_id,
+      remote_team_name: "demo",
+      protocol_version: 1,
+      capabilities: { write_allowed_ciphers: ["none", "age-v1"] },
+      connected_at: "2026-07-30T00:00:00Z",
+      disconnected_at: null,
+    },
+  };
+  const first = initialAgeSnapshot(teamConfig);
+  const second = initialAgeSnapshot(JSON.parse(JSON.stringify(teamConfig)));
+  assert.deepEqual(first.authorized_writers, [keyId]);
+  assert.equal(canonicalJson(first), canonicalJson(second));
+  assert.equal(ageSnapshotDigest(first), ageSnapshotDigest(second));
+  assert.match(ageSnapshotDigest(first), /^[0-9a-f]{64}$/u);
+  assert.doesNotThrow(() => validateAgeConfiguration({
+    ...config,
+    cipher_profile: "age-v1",
+    local_security_history: [{
+      local_security_revision: "0",
+      effective_from_seq: "1",
+      minimum_security_mode: "e2ee-required",
+    }],
+    age_v1: {
+      epoch_snapshot: first,
+      checkpoint: {
+        epoch_revision: "0",
+        writer_generation: "0",
+        snapshot_sha256: ageSnapshotDigest(first),
+        confirmed_at: "2026-07-30T00:00:00Z",
+      },
+      identity_files: {},
+      age_version: "v1.3.1",
+    },
+  }));
+});
+
 test("retained age checkpoint survives sync config reset and rejects same-revision conflict", async () => {
   const root = await mkdtemp(join(tmpdir(), "agmsg-age-trust-"));
   const previousTrust = process.env.AGMSG_SYNC_TRUST_DIR;
@@ -1581,9 +1771,12 @@ test("pull bootstrap dispatches a real mixed roster and message page", async () 
       to_agent: "member-2",
     },
   }));
+  messages[0].envelope = {
+    v: 1, cipher: "age-v1", key_id: "epoch-0", blob: "encrypted",
+  };
   const storageInputs = [];
   const rosterInputs = [];
-  await pullBootstrap({
+  const result = await pullBootstrap({
     team: "clone", "team-id": teamId, endpoint: "http://127.0.0.1:8787",
   }, {
     publicSnapshotCall: async () => ({
@@ -1617,6 +1810,7 @@ test("pull bootstrap dispatches a real mixed roster and message page", async () 
   assert.equal(storageInputs.length, 1);
   assert.equal(storageInputs[0].filter((record) => record.type === "sync_pull_message").length, 73);
   assert.deepEqual(storageInputs[0].at(-1), { type: "sync_pull_cursor", next_after: "80" });
+  assert.equal(result.age_v1_envelopes, 1);
 });
 
 test("pull bootstrap rejects unsupported projection kinds before either cursor advances", async () => {
