@@ -539,14 +539,17 @@ export async function verifyAgeSnapshot(args) {
   if (!args["age-snapshot"]) throw new Error("age-snapshot is required");
   const snapshotPaths = Array.isArray(args["age-snapshot"]) ?
     args["age-snapshot"] : [args["age-snapshot"]];
-  if (snapshotPaths.length !== 1 || typeof snapshotPaths[0] !== "string") {
-    throw new Error("verify-age-snapshot requires exactly one age-snapshot");
+  if (snapshotPaths.length < 1 || snapshotPaths.some((path) => typeof path !== "string"))
+    throw new Error("verify-age-snapshot requires at least one age-snapshot");
+  const snapshots = [];
+  for (const path of snapshotPaths) {
+    const snapshotText = await readFile(resolve(path), "utf8");
+    const value = parseStrictJson(snapshotText);
+    if (snapshotText.trim() !== canonicalJson(value))
+      throw new Error("age snapshot must be RFC 8785 JCS without duplicate or noncanonical fields");
+    snapshots.push(value);
   }
-  const snapshotText = await readFile(resolve(snapshotPaths[0]), "utf8");
-  const snapshot = parseStrictJson(snapshotText);
-  if (snapshotText.trim() !== canonicalJson(snapshot)) {
-    throw new Error("age snapshot must be RFC 8785 JCS without duplicate or noncanonical fields");
-  }
+  const snapshot = snapshots.at(-1);
   const binding = await readConnectedBinding(team);
   const digest = ageSnapshotDigest(snapshot);
   const config = {
@@ -563,7 +566,7 @@ export async function verifyAgeSnapshot(args) {
       minimum_security_mode: "e2ee-required",
     }],
     age_v1: {
-      epoch_snapshots: [snapshot],
+      epoch_snapshots: snapshots,
       checkpoint: {
         epoch_revision: snapshot.epoch_revision,
         snapshot_sha256: digest,

@@ -507,10 +507,19 @@ test("unlock snapshot verification is canonical and bound to the pulled team", a
       team: "demo",
       "age-snapshot": [path],
     }), /RFC 8785 JCS/u);
-    await assert.rejects(verifyAgeSnapshot({
-      team: "demo",
-      "age-snapshot": [path, path],
-    }), /exactly one age-snapshot/u);
+    await writeFile(path, canonicalJson(snapshot), { mode: 0o600 });
+    const next = { ...snapshot, epoch_revision: "1", writer_generation: "1",
+      previous_snapshot_sha256: ageSnapshotDigest(snapshot),
+      history: [...snapshot.history, { ...snapshot.history[0], epoch_revision: "1",
+        effective_from_seq: "3", key_id: "epoch-next" }] };
+    const nextPath = join(root, "snapshot-next.json");
+    await writeFile(nextPath, canonicalJson(next), { mode: 0o600 });
+    const rotated = await verifyAgeSnapshot({ team: "demo",
+      "age-snapshot": [path, nextPath] });
+    assert.equal(rotated.epoch_revision, "1");
+    assert.equal(rotated.snapshot_sha256, ageSnapshotDigest(next));
+    await assert.rejects(verifyAgeSnapshot({ team: "demo",
+      "age-snapshot": [nextPath, path] }), /missing revision/u);
   });
 });
 
