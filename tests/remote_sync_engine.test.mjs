@@ -303,6 +303,21 @@ test("connected binding is a bounded non-writable nofollow authority", async () 
   });
 });
 
+test("an age-selected binding never synthesizes a plaintext config", async () => {
+  await withConnectedCredential(async (root) => {
+    const previousStorage = process.env.AGMSG_SYNC_STORAGE_DIR;
+    process.env.AGMSG_SYNC_STORAGE_DIR = join(root, "db");
+    await writeConnectedTeam(root, { cipher_profile: "age-v1" });
+    try {
+      await assert.rejects(loadConfig("demo"),
+        /selected age-v1.*authenticated sync configuration is missing/u);
+    } finally {
+      if (previousStorage === undefined) delete process.env.AGMSG_SYNC_STORAGE_DIR;
+      else process.env.AGMSG_SYNC_STORAGE_DIR = previousStorage;
+    }
+  });
+});
+
 test("ack mapping rejects reversed and duplicate server sequences", () => {
   assert.throws(() => validateAckMapping(candidates, [
     { id: candidates[0].id, server_seq: "2", disposition: "stored" },

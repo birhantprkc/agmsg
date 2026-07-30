@@ -286,11 +286,19 @@ async function readStoredSyncConfig(team) {
 
 export async function loadConfig(team) {
   const binding = await readConnectedBinding(team);
+  const selectedCipher = binding.cipher_profile ?? "none";
+  if (!["none", "age-v1"].includes(selectedCipher)) {
+    throw new Error("connected team binding selects an unsupported cipher profile");
+  }
   let value;
   try {
     value = await readStoredSyncConfig(team);
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
+    if (selectedCipher !== "none") {
+      throw new Error(
+        `connected team selected ${selectedCipher} but its authenticated sync configuration is missing`);
+    }
     if (!binding.capabilities.write_allowed_ciphers.includes("none")) {
       throw new Error("connected team requires an authenticated age-v1 sync configuration");
     }
@@ -306,6 +314,10 @@ export async function loadConfig(team) {
         minimum_security_mode: "plaintext-allowed" }],
     };
   }
+  value.cipher_profile ??= "none";
+  if (binding.cipher_profile !== undefined && value.cipher_profile !== selectedCipher) {
+    throw new Error("sync configuration cipher does not match the connected team binding");
+  }
   if (value.server_url !== binding.endpoint ||
       value.server_instance_id !== binding.server_instance_id ||
       value.remote_team_id !== binding.remote_team_id ||
@@ -316,7 +328,6 @@ export async function loadConfig(team) {
       !UUID_V7.test(value.server_instance_id) || !UUID_V7.test(value.remote_team_id)) {
     throw new Error("sync config binding is invalid");
   }
-  value.cipher_profile ??= "none";
   validateLocalSecurityHistory(value.local_security_history);
   if (value.cipher_profile === "age-v1") {
     validateAgeConfiguration(value);
