@@ -16,6 +16,7 @@ setup() {
   MOCK_REVOKE_BAD_BODY="${MOCK_REVOKE_BAD_BODY:-}" \
   MOCK_REVOKE_LARGE_BODY="${MOCK_REVOKE_LARGE_BODY:-}" \
   MOCK_PULL_MIXED="${MOCK_PULL_MIXED:-}" \
+  MOCK_CONNECT_NO_AGE="${MOCK_CONNECT_NO_AGE:-}" \
     "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
     </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
   MOCK_SERVER_PID=$!
@@ -38,12 +39,18 @@ restart_mock_server() {
   MOCK_REVOKE_BAD_BODY="${MOCK_REVOKE_BAD_BODY:-}" \
   MOCK_REVOKE_LARGE_BODY="${MOCK_REVOKE_LARGE_BODY:-}" \
   MOCK_PULL_MIXED="${MOCK_PULL_MIXED:-}" \
+  MOCK_CONNECT_NO_AGE="${MOCK_CONNECT_NO_AGE:-}" \
     "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
       </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
   MOCK_SERVER_PID=$!
   wait_for_file_contains "$TEST_SKILL_DIR/server.port" '^[0-9][0-9]*$'
   MOCK_PORT="$(cat "$TEST_SKILL_DIR/server.port")"
   ENDPOINT="http://127.0.0.1:$MOCK_PORT"
+}
+
+skip_if_no_age() {
+  command -v age >/dev/null 2>&1 && command -v age-keygen >/dev/null 2>&1 ||
+    skip "age/age-keygen not installed"
 }
 
 # --- doctor ------------------------------------------------------------
@@ -137,6 +144,51 @@ restart_mock_server() {
   # the register model writes none and none is fetched back.
   [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$SCRIPTS/../teams/testteam/config.json') AS TEXT), '\$.remote_binding.connected_at');")" != "" ]
   [ ! -f "$SCRIPTS/../run/remote-credentials/testteam.json" ]
+}
+
+@test "connect --e2ee generates a key and establishes age-v1 before engine start" {
+  skip_if_no_age
+
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Back this up now"* ]]
+  [[ "$output" == *"key.sh show testteam --snapshot --out <file>"* ]]
+  sync_config="$TEST_SKILL_DIR/db/remote-sync/testteam.json"
+  [ -f "$sync_config" ]
+  [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$sync_config")') AS TEXT), '\$.cipher_profile');")" = "age-v1" ]
+  [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$sync_config")') AS TEXT), '\$.local_security_history[0].minimum_security_mode');")" = "e2ee-required" ]
+  [ -f "$TEST_SKILL_DIR/run/remote-sync.testteam.pid" ]
+  run bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"encryption: age-v1, key present"* ]]
+}
+
+@test "connect defaults to plain even when the team already has a key" {
+  skip_if_no_age
+  bash "$SCRIPTS/key.sh" generate testteam
+
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"plain sync was selected"* ]]
+  [[ "$output" == *"pass --e2ee"* ]]
+  [ ! -f "$TEST_SKILL_DIR/db/remote-sync/testteam.json" ]
+  [ -f "$TEST_SKILL_DIR/run/remote-sync.testteam.pid" ]
+  run bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"encryption: none (local key is not used by this binding)"* ]]
+}
+
+@test "connect: a keyed team fails closed when the remote disallows age-v1" {
+  skip_if_no_age
+  MOCK_CONNECT_NO_AGE=1
+  restart_mock_server
+
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"does not allow age-v1"* ]]
+  [[ "$output" == *"refusing to fall back to plaintext"* ]]
+  [ ! -f "$TEST_SKILL_DIR/db/remote-sync/testteam.json" ]
+  [ ! -f "$TEST_SKILL_DIR/run/remote-sync.testteam.pid" ]
 }
 
 @test "connect: moves the team into its own per-team store (Done-when 2)" {

@@ -8,11 +8,13 @@ import test from "node:test";
 import {
   ageSnapshotDigest,
   activateKeyRotations,
+  canonicalJson,
   consistentReadStateContext,
   configure,
   cycle,
   driver,
   isRetryable,
+  initialAgeSnapshot,
   runLoop,
   loadConfig,
   plaintextWriteEligible,
@@ -1131,6 +1133,60 @@ test("age-v1 configuration verifies the complete epoch snapshot hash chain", () 
     checkpoint: { ...chainedAgeConfig.age_v1.checkpoint, epoch_revision: "2",
       writer_generation: "2", snapshot_sha256: ageSnapshotDigest(revisionTwo) },
   } }), /missing revision/u);
+});
+
+test("initial age snapshot uses the key id as its sole writer and stable JCS", () => {
+  const keyId = "epoch-initial";
+  const recipient = "age1mmqjrejftea4f6xh47lhpc0jn4vw0yuhz349sw2e3sfl22k5gcjsv6xcvp";
+  const epoch = {
+    key_id: keyId,
+    epoch_revision: 0,
+    writer_generation: 0,
+    recipient,
+    previous_snapshot_sha256: null,
+    created_at: "2026-07-30T00:00:00Z",
+  };
+  const teamConfig = {
+    name: "demo",
+    agents: {},
+    remote_key: { current: epoch, epochs: [epoch] },
+    remote_binding: {
+      endpoint: "https://sync.example.test",
+      server_instance_id: config.server_instance_id,
+      remote_team_id: config.remote_team_id,
+      remote_team_name: "demo",
+      protocol_version: 1,
+      capabilities: { write_allowed_ciphers: ["none", "age-v1"] },
+      connected_at: "2026-07-30T00:00:00Z",
+      disconnected_at: null,
+    },
+  };
+  const first = initialAgeSnapshot(teamConfig);
+  const second = initialAgeSnapshot(JSON.parse(JSON.stringify(teamConfig)));
+  assert.deepEqual(first.authorized_writers, [keyId]);
+  assert.equal(canonicalJson(first), canonicalJson(second));
+  assert.equal(ageSnapshotDigest(first), ageSnapshotDigest(second));
+  assert.match(ageSnapshotDigest(first), /^[0-9a-f]{64}$/u);
+  assert.doesNotThrow(() => validateAgeConfiguration({
+    ...config,
+    cipher_profile: "age-v1",
+    local_security_history: [{
+      local_security_revision: "0",
+      effective_from_seq: "1",
+      minimum_security_mode: "e2ee-required",
+    }],
+    age_v1: {
+      epoch_snapshot: first,
+      checkpoint: {
+        epoch_revision: "0",
+        writer_generation: "0",
+        snapshot_sha256: ageSnapshotDigest(first),
+        confirmed_at: "2026-07-30T00:00:00Z",
+      },
+      identity_files: {},
+      age_version: "v1.3.1",
+    },
+  }));
 });
 
 test("retained age checkpoint survives sync config reset and rejects same-revision conflict", async () => {

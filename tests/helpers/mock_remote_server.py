@@ -34,6 +34,8 @@ REVOKE_BAD_HEADER = os.environ.get("MOCK_REVOKE_BAD_HEADER") == "1"
 REVOKE_BAD_BODY = os.environ.get("MOCK_REVOKE_BAD_BODY") == "1"
 REVOKE_LARGE_BODY = os.environ.get("MOCK_REVOKE_LARGE_BODY") == "1"
 PULL_MIXED = os.environ.get("MOCK_PULL_MIXED") == "1"
+CONNECT_CIPHERS = (["none"] if os.environ.get("MOCK_CONNECT_NO_AGE") == "1"
+                   else ["none", "age-v1"])
 ISSUED_CREDENTIAL_IDS = set()
 REVOKED_CREDENTIAL_IDS = []
 
@@ -135,6 +137,35 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if self.path == "/v1/health":
+            self._send_json(200, {
+                "status": "ok",
+                "database": "ok",
+                "server_instance_id": CONNECT_SERVER_ID,
+            })
+            return
+        if self.path == "/v1/capabilities":
+            team_id = self.headers.get("Agmsg-Team-ID", "")
+            self._send_json(200, {
+                "protocol_version": 1,
+                "server_instance_id": CONNECT_SERVER_ID,
+                "team_id": team_id,
+                "current_seq": "0",
+                "next_sequence_boundary": "1",
+                "min_available_seq": "0",
+                "accepted_envelope_versions": [1],
+                "write_allowed_ciphers": CONNECT_CIPHERS,
+                "policy_revision": "0",
+                "effective_from_seq": "1",
+                "max_blob_bytes": "1048576",
+                "policy_history": [{
+                    "policy_revision": "0",
+                    "effective_from_seq": "1",
+                    "accepted_envelope_versions": [1],
+                    "write_allowed_ciphers": CONNECT_CIPHERS,
+                }],
+            })
+            return
         if self.path == "/_test/revoked":
             self._send_json(200, {"revoked": REVOKED_CREDENTIAL_IDS})
             return
@@ -233,7 +264,7 @@ class Handler(BaseHTTPRequestHandler):
                 "current_seq": str(len(PULL_MESSAGES)),
                 "policy_revision": "0",
                 "accepted_envelope_versions": [1],
-                "write_allowed_ciphers": ["none", "age-v1"],
+                "write_allowed_ciphers": CONNECT_CIPHERS,
                 "policy_history": [{
                     "policy_revision": "0", "effective_from_seq": "1",
                     "accepted_envelope_versions": [1],
@@ -298,7 +329,7 @@ class Handler(BaseHTTPRequestHandler):
                 "policy_history": [{"policy_revision": "0",
                                     "effective_from_seq": "1",
                                     "accepted_envelope_versions": [1],
-                                    "write_allowed_ciphers": ["none", "age-v1"]}],
+                                    "write_allowed_ciphers": CONNECT_CIPHERS}],
             })
             return
 

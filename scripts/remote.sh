@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Usage:
-#   remote.sh connect --endpoint <url> <team>
+#   remote.sh connect --endpoint <url> [--e2ee] <team>
 #   remote.sh pull --endpoint <url> [--team-id <uuid>] <team>
 #   remote.sh status [<team>] [--json]
 #   remote.sh disconnect <team>
@@ -1011,27 +1011,86 @@ EOF_MINT_NAMES
   agmsg_lock_release
 }
 
+_remote_binding_allows_cipher() {
+  local cfg="$1" cipher="$2" cfg_escaped
+  cfg_escaped="$(sed "s/'/''/g" "$cfg")"
+  [ "$(agmsg_sqlite_mem \
+    "SELECT EXISTS(
+       SELECT 1
+         FROM json_each(json_extract('$cfg_escaped',
+           '\$.remote_binding.capabilities.write_allowed_ciphers'))
+        WHERE value = '$(_agmsg_sqlesc "$cipher")'
+     );")" = "1" ]
+}
+
+_remote_configure_keyed_team() {
+  local team="$1" cfg="$2" key_id endpoint remote_team_id \
+    identity_file snapshot_file snapshot_sha
+  key_id="$(_remote_read_config_field "$cfg" '$.remote_key.current.key_id')"
+  if [ -z "$key_id" ] || [ "$key_id" = "null" ]; then
+    return 0
+  fi
+
+  if ! _remote_binding_allows_cipher "$cfg" age-v1; then
+    echo "agmsg: team '$team' has an encryption key, but this remote does not allow age-v1; refusing to fall back to plaintext." >&2
+    return 1
+  fi
+
+  endpoint="$(_remote_read_config_field "$cfg" '$.remote_binding.endpoint')"
+  remote_team_id="$(_remote_read_config_field "$cfg" '$.remote_binding.remote_team_id')"
+  identity_file="$CONNECTION_ROOT/run/remote-credentials/$team/keys/$key_id.key"
+  if [ ! -f "$identity_file" ]; then
+    echo "agmsg: team '$team' has key_id=$key_id but its local identity file is missing; refusing to start plaintext sync." >&2
+    return 1
+  fi
+
+  snapshot_file="$(mktemp "${TMPDIR:-/tmp}/agmsg-age-snapshot.XXXXXX")"
+  if ! bash "$SCRIPT_DIR/remote-sync.sh" export-age-snapshot \
+      --team "$team" --out "$snapshot_file"; then
+    rm -f "$snapshot_file"
+    echo "agmsg: could not export the initial age-v1 snapshot for team '$team'; sync was not started." >&2
+    return 1
+  fi
+  snapshot_sha="$(shasum -a 256 "$snapshot_file" | awk '{print $1}')"
+  if ! bash "$SCRIPT_DIR/remote-sync.sh" configure \
+      --team "$team" \
+      --server "$endpoint" \
+      --team-id "$remote_team_id" \
+      --minimum-security e2ee-required \
+      --cipher age-v1 \
+      --age-snapshot "$snapshot_file" \
+      --age-checkpoint "0:$snapshot_sha" \
+      --age-confirmation operator-live \
+      --age-identity "$key_id=$identity_file"; then
+    rm -f "$snapshot_file"
+    echo "agmsg: age-v1 setup failed for team '$team'; refusing to start plaintext sync." >&2
+    return 1
+  fi
+  rm -f "$snapshot_file"
+}
+
 cmd_connect() {
   # Register a team you already own with a remote, then move it to its own
   # store and start syncing. No token, no credential: reaching the server is
   # the permission (docs/design/remote-sync.md). The team_id and every
   # member_id were minted locally at team creation; the server records what it
   # is sent and never originates a team.
-  local endpoint="" team="" positional=()
+  local endpoint="" team="" e2ee=0 positional=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --endpoint) endpoint="${2:?--endpoint requires a value}"; shift 2 ;;
       --endpoint=*) endpoint="${1#--endpoint=}"; shift ;;
+      --e2ee) e2ee=1; shift ;;
       *) positional+=("$1"); shift ;;
     esac
   done
-  : "${endpoint:?Usage: remote.sh connect --endpoint <url> <team>}"
+  : "${endpoint:?Usage: remote.sh connect --endpoint <url> [--e2ee] <team>}"
   _remote_validate_endpoint "$endpoint" || exit 1
   endpoint="${endpoint%/}"
   team="${positional[0]:-}"
-  [ -n "$team" ] || { echo "agmsg: connect requires a team: remote.sh connect --endpoint <url> <team>" >&2; exit 1; }
+  [ -n "$team" ] || { echo "agmsg: connect requires a team: remote.sh connect --endpoint <url> [--e2ee] <team>" >&2; exit 1; }
 
-  local cfg team_id team_name
+  local cfg team_id team_name key_id binding_cipher
   cfg="$(_remote_team_config "$team")"
   [ -f "$cfg" ] || { echo "agmsg: team '$team' is not a local team" >&2; exit 1; }
   team_id="$(_remote_read_config_field "$cfg" '$.team_id')"
@@ -1045,6 +1104,18 @@ cmd_connect() {
       team_id="$(_remote_read_config_field "$cfg" '$.team_id')"
       ;;
   esac
+  key_id="$(_remote_read_config_field "$cfg" '$.remote_key.current.key_id')"
+  if [ "$e2ee" -eq 1 ] && { [ -z "$key_id" ] || [ "$key_id" = "null" ]; }; then
+    bash "$SCRIPT_DIR/key.sh" generate "$team" || exit 1
+    key_id="$(_remote_read_config_field "$cfg" '$.remote_key.current.key_id')"
+  elif [ "$e2ee" -eq 0 ] && [ -n "$key_id" ] && [ "$key_id" != "null" ]; then
+    echo "Note: this team has a key, but plain sync was selected. The key will not be used; pass --e2ee to seal remote messages." >&2
+  fi
+  if [ "$e2ee" -eq 1 ]; then
+    binding_cipher="age-v1"
+  else
+    binding_cipher="none"
+  fi
 
   # The body: the team's id and name, plus the roster from .agents — each
   # agent's key is its name and its minted member_id comes with it.
@@ -1111,11 +1182,27 @@ cmd_connect() {
        'remote_team_id', '$(_agmsg_sqlesc "$remote_team_id")',
        'remote_team_name', '$(_agmsg_sqlesc "$remote_team_name")',
        'protocol_version', $protocol_version,
+       'cipher_profile', '$binding_cipher',
        'capabilities', json('$resp_escaped'),
        'connected_at', '$(_agmsg_sqlesc "$connected_at")',
        'disconnected_at', null
      ));")
   agmsg_write_atomic "$cfg" "$updated"
+
+  if [ "$e2ee" -eq 0 ] && ! _remote_binding_allows_cipher "$cfg" none; then
+    echo "agmsg: this remote does not allow $binding_cipher; no sync engine was started." >&2
+    exit 1
+  fi
+
+  if [ "$e2ee" -eq 1 ]; then
+    # The explicit switch, not key presence, selects E2EE. Configure before
+    # migration or engine startup so a capability/trust failure cannot fall
+    # back to plaintext.
+    if ! _remote_configure_keyed_team "$team" "$cfg"; then
+      echo "agmsg: the remote binding was recorded, but no sync engine was started." >&2
+      exit 1
+    fi
+  fi
 
   # Move the team out of the shared store into its own before the engine runs:
   # a connected team's rows carry ids, and one column cannot hold both those and
@@ -1133,12 +1220,16 @@ cmd_connect() {
   _remote_sync_engine_start "$team"
 
   echo "Connected: team '$team'${remote_team_name:+ (org '$remote_team_name')}. Sync engine running."
+  if [ "$e2ee" -eq 1 ]; then
+    echo "Export the public epoch snapshot with: key.sh show $team --snapshot --out <file>"
+    echo "Transfer that snapshot and the key out of band; the other machine must import and live-confirm them before syncing."
+  fi
 }
 
 # --- status --------------------------------------------------------------
 
 _remote_status_one() {
-  local team="$1" cfg connected_at disconnected_at write_allowed_ciphers key_id
+  local team="$1" cfg connected_at disconnected_at write_allowed_ciphers key_id binding_cipher
   cfg="$(_remote_team_config "$team")"
   connected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.connected_at')"
   disconnected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.disconnected_at')"
@@ -1152,20 +1243,19 @@ _remote_status_one() {
 
   write_allowed_ciphers="$(_remote_read_config_field "$cfg" '$.remote_binding.capabilities.write_allowed_ciphers')"
   key_id="$(_remote_read_config_field "$cfg" '$.remote_key.current.key_id')"
-
-  local needs_encryption=0
-  case "$write_allowed_ciphers" in
-    *none*) needs_encryption=0 ;;
-    '['*']') [ "$write_allowed_ciphers" != "[]" ] && needs_encryption=1 ;;
-  esac
+  binding_cipher="$(_remote_read_config_field "$cfg" '$.remote_binding.cipher_profile')"
 
   echo "$team	connected (since $connected_at)"
-  if [ "$needs_encryption" -eq 1 ]; then
-    if [ -z "$key_id" ] || [ "$key_id" = "null" ]; then
-      echo "		encryption: required, no local key — run 'key.sh generate $team' or 'key.sh import $team'"
-    else
+  if [ "$binding_cipher" = "age-v1" ]; then
+    if [ -n "$key_id" ] && [ "$key_id" != "null" ]; then
       echo "		encryption: age-v1, key present"
+    else
+      echo "		encryption: age-v1, local key missing"
     fi
+  elif [ -n "$key_id" ] && [ "$key_id" != "null" ]; then
+    echo "		encryption: none (local key is not used by this binding)"
+  elif [[ "$write_allowed_ciphers" != *none* ]]; then
+    echo "		encryption: required, no local key"
   else
     echo "		encryption: none"
   fi

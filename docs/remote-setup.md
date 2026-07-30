@@ -3,6 +3,8 @@
 This walkthrough connects an existing team on machine A to the reference
 server, then pulls it into a normal agmsg install on machine B. Your local
 agents handle the client commands. This setup uses plaintext sync.
+For encrypted sync, read
+[Extra: end-to-end encryption](#extra-end-to-end-encryption).
 
 ## Requirements
 
@@ -81,6 +83,24 @@ The history should contain:
 ```text
 <from> → <to>: hello from machine A
 ```
+
+## Extra: end-to-end encryption
+
+The remote team's encryption choice is fixed by its first connect and cannot
+be changed later. If you need an encrypted team, connect it with `--e2ee`:
+
+```sh
+bash ~/.agents/skills/agmsg/scripts/remote.sh connect \
+  --endpoint https://<server-url> \
+  --e2ee \
+  <team>
+```
+
+If the team has no key yet, connect creates one and prints the mandatory backup
+notice. It also shows how to export the compact public epoch snapshot. Transfer
+that snapshot and the private key to machine B through a separate trusted
+channel. Machine B still imports the key explicitly and live-confirms the
+displayed snapshot digest; the message server never distributes key material.
 
 ## Reference
 

@@ -145,9 +145,9 @@ If argument is "reset":
 2. Tell the user the result.
 
 If argument starts with "remote connect":
-1. Parse the required `--endpoint <url>` and `<team>`.
-2. Run: `bash ~/.agents/skills/__SKILL_NAME__/scripts/remote.sh connect --endpoint <url> <team>`
-3. Show the output to the user. No token or credential is required.
+1. Parse the required `--endpoint <url>` and `<team>`, plus optional `--e2ee`.
+2. Run: `bash ~/.agents/skills/__SKILL_NAME__/scripts/remote.sh connect --endpoint <url> [--e2ee] <team>`
+3. Show the output to the user. Plain sync is the default; pass `--e2ee` only when the user explicitly requests end-to-end encryption. The choice is fixed by the first connect.
 4. End by showing this copy-paste command for the other machine, with the actual endpoint and team substituted: `bash ~/.agents/skills/__SKILL_NAME__/scripts/remote.sh pull --endpoint <actual-url> <actual-team>`
 
 If argument starts with "remote pull":

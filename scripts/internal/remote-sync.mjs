@@ -31,6 +31,7 @@ function usage() {
     --age-checkpoint REVISION:SHA256 \\
     --age-confirmation operator-live \\
     [--age-identity KEY_ID=FILE ...]
+  remote-sync.sh export-age-snapshot --team NAME [--out FILE]
   remote-sync.sh once --team NAME [--limit N]
   remote-sync.sh run --team NAME [--limit N] [--interval SECONDS]
   remote-sync.sh reprocess --team NAME [--limit N]
@@ -357,7 +358,7 @@ function requireUnicodeScalars(value, label) {
   }
 }
 
-function canonicalJson(value) {
+export function canonicalJson(value) {
   if (value === null || typeof value === "boolean") return JSON.stringify(value);
   if (typeof value === "string") {
     requireUnicodeScalars(value, "age snapshot string");
@@ -379,6 +380,58 @@ function canonicalJson(value) {
 
 export function ageSnapshotDigest(value) {
   return createHash("sha256").update(canonicalJson(value), "utf8").digest("hex");
+}
+
+export function initialAgeSnapshot(teamConfig, team = teamConfig?.name) {
+  const binding = connectedBinding(teamConfig, team);
+  const current = teamConfig?.remote_key?.current;
+  const epochs = teamConfig?.remote_key?.epochs;
+  if (!current || !Array.isArray(epochs) || epochs.length !== 1 ||
+      (current !== epochs[0] && canonicalJson(current) !== canonicalJson(epochs[0])) ||
+      current.epoch_revision !== 0 || current.writer_generation !== 0 ||
+      typeof current.key_id !== "string" ||
+      !/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(current.key_id) ||
+      typeof current.recipient !== "string" ||
+      !/^age1[0-9a-z]{58}$/u.test(current.recipient) ||
+      current.previous_snapshot_sha256 !== null) {
+    throw new Error("team does not have one canonical initial age epoch");
+  }
+  return {
+    profile: "age-v1",
+    server_instance_id: binding.server_instance_id,
+    team_id: binding.remote_team_id,
+    epoch_revision: "0",
+    writer_generation: "0",
+    authorized_writers: [current.key_id],
+    previous_snapshot_sha256: null,
+    history: [{
+      epoch_revision: "0",
+      effective_from_seq: "1",
+      cipher: "age-v1",
+      key_id: current.key_id,
+      recipients: [current.recipient],
+    }],
+  };
+}
+
+async function exportAgeSnapshot(args) {
+  const team = requireName(args.team, "team");
+  const bytes = await readBoundedAuthorityFile(
+    teamConfigPath(team), MAX_CONNECTION_CONFIG_BYTES, false);
+  const teamConfig = parseStrictJson(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  const snapshot = initialAgeSnapshot(teamConfig, team);
+  const canonical = canonicalJson(snapshot);
+  const outputPath = args.out ? resolve(args.out) : null;
+  if (outputPath) {
+    const directory = dirname(outputPath);
+    await mkdir(directory, { recursive: true });
+    const temporary = join(directory, `.${basename(outputPath)}.${process.pid}.tmp`);
+    await writeFile(temporary, canonical, { mode: 0o600, flag: "wx" });
+    await rename(temporary, outputPath);
+  } else {
+    process.stdout.write(`${canonical}\n`);
+  }
+  process.stderr.write(`Snapshot SHA-256: ${ageSnapshotDigest(snapshot)}\n`);
 }
 
 function ageSnapshotChain(age) {
@@ -2142,11 +2195,12 @@ async function publicSnapshot(serverUrl, teamId) {
 async function main() {
   const [command, ...rest] = process.argv.slice(2);
   const args = options(rest);
-  if (!["configure", "once", "run", "reprocess", "resync", "unblock-read",
-        "pull-bootstrap", "resolve-team"].includes(command)) {
+  if (!["configure", "export-age-snapshot", "once", "run", "reprocess", "resync",
+        "unblock-read", "pull-bootstrap", "resolve-team"].includes(command)) {
     throw new Error(usage());
   }
   if (command === "configure") { await configure(args); return; }
+  if (command === "export-age-snapshot") { await exportAgeSnapshot(args); return; }
   // Before any local team exists, so neither can go through loadConfig.
   if (command === "resolve-team") { await resolveTeam(args); return; }
   if (command === "pull-bootstrap") { await pullBootstrap(args); return; }
