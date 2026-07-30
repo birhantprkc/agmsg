@@ -17,6 +17,8 @@ setup() {
   MOCK_REVOKE_LARGE_BODY="${MOCK_REVOKE_LARGE_BODY:-}" \
   MOCK_PULL_MIXED="${MOCK_PULL_MIXED:-}" \
   MOCK_PULL_AGE="${MOCK_PULL_AGE:-}" \
+  MOCK_PULL_AGE_ENVELOPE_FILE="${MOCK_PULL_AGE_ENVELOPE_FILE:-}" \
+  MOCK_PULL_TEAM_ID="${MOCK_PULL_TEAM_ID:-}" \
   MOCK_CONNECT_NO_AGE="${MOCK_CONNECT_NO_AGE:-}" \
     "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
     </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
@@ -41,6 +43,8 @@ restart_mock_server() {
   MOCK_REVOKE_LARGE_BODY="${MOCK_REVOKE_LARGE_BODY:-}" \
   MOCK_PULL_MIXED="${MOCK_PULL_MIXED:-}" \
   MOCK_PULL_AGE="${MOCK_PULL_AGE:-}" \
+  MOCK_PULL_AGE_ENVELOPE_FILE="${MOCK_PULL_AGE_ENVELOPE_FILE:-}" \
+  MOCK_PULL_TEAM_ID="${MOCK_PULL_TEAM_ID:-}" \
   MOCK_CONNECT_NO_AGE="${MOCK_CONNECT_NO_AGE:-}" \
     "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
       </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
@@ -779,6 +783,76 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   [[ "$output" == *"selected age-v1"* ]]
   after="$(curl -sS "$ENDPOINT/v1/teams/$PULL_TEAM_ID" | jq -r '.current_seq')"
   [ "$after" = "$before" ]
+}
+
+@test "remote unlock: confirms handed authority, reprocesses, and resumes age-v1 sync" {
+  skip_if_no_age
+
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam >/dev/null
+  local source_cfg snapshot key_id recipient identity team_id envelope digest
+  source_cfg="$TEST_SKILL_DIR/teams/testteam/config.json"
+  snapshot="$TEST_SKILL_DIR/handed-snapshot.json"
+  envelope="$TEST_SKILL_DIR/handed-envelope.json"
+  bash "$SCRIPTS/key.sh" show testteam --snapshot --out "$snapshot" 2>/dev/null
+  key_id="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.remote_key.current.key_id');")"
+  recipient="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.remote_key.current.recipient');")"
+  team_id="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.team_id');")"
+  identity="$TEST_SKILL_DIR/run/remote-credentials/testteam/keys/$key_id.key"
+  jq -nc \
+    --arg key_id "$key_id" \
+    --arg recipient "$recipient" \
+    --arg team_id "$team_id" \
+    '{
+      type:"sync_seal", envelope_v:1, cipher:"age-v1",
+      key_id:$key_id, recipients:[$recipient], max_blob_bytes:1048576,
+      wire_id:"20000000-0000-4000-8000-000000000001",
+      team_id:$team_id, protocol_version:1,
+      projection:{
+        body:"handed ciphertext", created_at:"2026-01-02T00:00:00.000000Z",
+        from_agent:"member-1", to_agent:"member-1"
+      }
+    }' | node "$SCRIPTS/internal/sync-cipher.mjs" seal > "$envelope"
+  bash "$SCRIPTS/remote.sh" disconnect testteam >/dev/null 2>&1 || true
+
+  MOCK_PULL_AGE=1
+  MOCK_PULL_AGE_ENVELOPE_FILE="$envelope"
+  MOCK_PULL_TEAM_ID="$team_id"
+  restart_mock_server
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$team_id" encrypted
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"local but locked"* ]]
+
+  digest="$(shasum -a 256 "$snapshot" | awk '{print $1}')"
+  run bash "$SCRIPTS/remote.sh" unlock encrypted \
+    --snapshot "$snapshot" --identity "$identity" \
+    --confirm-digest "0000000000000000000000000000000000000000000000000000000000000000"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"does not match"* ]]
+  [ "$(sqlite_mem "SELECT json_type(json_extract(CAST(readfile('$(rf "$TEST_SKILL_DIR/teams/encrypted/config.json")') AS TEXT), '\$.remote_key'));")" = "" ]
+
+  run bash "$SCRIPTS/remote.sh" unlock encrypted \
+    --snapshot "$snapshot" --identity "$identity" --confirm-digest "$digest"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"imported 1 envelope(s); engine running (pid "* ]]
+  run bash "$SCRIPTS/history.sh" encrypted member-1
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"handed ciphertext"* ]]
+
+  local pidfile pid before after pushed_cipher
+  pidfile="$TEST_SKILL_DIR/run/remote-sync.encrypted.pid"
+  wait_for_file "$pidfile"
+  pid="$(cat "$pidfile")"
+  kill "$pid" 2>/dev/null || true
+  wait_for_pid_exit "$pid"
+  rm -f "$pidfile"
+  before="$(curl -sS "$ENDPOINT/v1/teams/$team_id" | jq -r '.current_seq')"
+  bash "$SCRIPTS/send.sh" encrypted member-1 member-1 "encrypted outbound" >/dev/null
+  bash "$SCRIPTS/remote-sync.sh" once --team encrypted >/dev/null 2>&1 || true
+  after="$(curl -sS "$ENDPOINT/v1/teams/$team_id" | jq -r '.current_seq')"
+  [ "$after" -gt "$before" ]
+  pushed_cipher="$(curl -sS "$ENDPOINT/_test/pushed" |
+    jq -r '.messages[-1].envelope.cipher')"
+  [ "$pushed_cipher" = "age-v1" ]
 }
 
 @test "remote doctor: age is optional — its absence does not fail the run" {

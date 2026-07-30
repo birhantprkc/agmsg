@@ -311,15 +311,24 @@ cmd_show() {
 }
 
 cmd_import() {
-  local identity_stdin=0 positional=()
+  local identity_stdin=0 requested_key_id="" positional=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --identity-stdin) identity_stdin=1; shift ;;
+      --key-id) requested_key_id="${2:?--key-id requires a value}"; shift 2 ;;
+      --key-id=*) requested_key_id="${1#--key-id=}"; shift ;;
       *) positional+=("$1"); shift ;;
     esac
   done
   local team="${positional[0]:?Usage: key.sh import <team> [<identity>] [--identity-stdin]}"
   agmsg_validate_team_name "$team" || exit 1
+  if [ -n "$requested_key_id" ]; then
+    printf '%s\n' "$requested_key_id" |
+      grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$' || {
+      echo "agmsg: --key-id is not a valid age key id." >&2
+      exit 1
+    }
+  fi
 
   local identity
   if [ "$identity_stdin" -eq 1 ]; then
@@ -371,6 +380,11 @@ cmd_import() {
   cur_recipient="$(_key_read_config_field "$cfg" '$.remote_key.current.recipient')"
 
   if [ -n "$cur_key_id" ] && [ "$cur_key_id" != "null" ]; then
+    if [ -n "$requested_key_id" ] && [ "$requested_key_id" != "$cur_key_id" ]; then
+      agmsg_lock_release
+      echo "agmsg: imported authority key id does not match the team's current key." >&2
+      exit 1
+    fi
     if [ "$cur_recipient" != "$recipient" ]; then
       local journal journal_sql fingerprint staged_key_id
       journal="$(agmsg_roster_journal_path "$TEAMS_DIR/$team")"
@@ -415,7 +429,7 @@ cmd_import() {
   else
     # No epoch yet for this team: importing establishes the first one.
     local key_id created_at
-    key_id="$(_key_new_key_id)"
+    key_id="${requested_key_id:-$(_key_new_key_id)}"
     created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     _key_write_identity_atomic "$cred_dir/$key_id.key" "$identity"
     _key_write_epoch_locked "$cfg" "$(_key_epoch_json "$key_id" 0 0 "$recipient" null "$created_at")"

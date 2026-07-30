@@ -101,6 +101,19 @@ notice. It also shows how to export the compact public epoch snapshot. Transfer
 that snapshot and the private key to machine B through a separate trusted
 channel. Machine B still imports the key explicitly and live-confirms the
 displayed snapshot digest; the message server never distributes key material.
+After `pull` reports that the team is locked, machine B runs one command with
+the handed files and the digest verified over that separate live channel:
+
+```sh
+bash ~/.agents/skills/agmsg/scripts/remote.sh unlock <team> \
+  --snapshot <snapshot-file> \
+  --identity <identity-file> \
+  --confirm-digest <verified-sha256>
+```
+
+`unlock` imports the identity, records the trust anchor, reprocesses quarantined
+envelopes, and starts the encrypted sync engine. It is safe to repeat with the
+same confirmed files.
 
 ## Reference
 

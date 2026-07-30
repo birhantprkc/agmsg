@@ -162,6 +162,18 @@ open(p, 'w').write(json.dumps(d) + '\\n')
   [[ "$output" == *"Imported key for team 'testteam'"* ]]
 }
 
+@test "key import --key-id: preserves the authority key id and is idempotent" {
+  skip_if_no_age
+  secret=$(age-keygen 2>/dev/null | grep '^AGE-SECRET-KEY-')
+  run bash -c "printf '%s' '$secret' | bash '$SCRIPTS/key.sh' import testteam --key-id epoch-handed --identity-stdin"
+  [ "$status" -eq 0 ]
+  config="$SCRIPTS/../teams/testteam/config.json"
+  [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$config")') AS TEXT), '\$.remote_key.current.key_id');")" = "epoch-handed" ]
+  run bash -c "printf '%s' '$secret' | bash '$SCRIPTS/key.sh' import testteam --key-id epoch-handed --identity-stdin"
+  [ "$status" -eq 0 ]
+  [ "$(sqlite_mem "SELECT json_array_length(json_extract(CAST(readfile('$(rf "$config")') AS TEXT), '\$.remote_key.epochs'));")" -eq 1 ]
+}
+
 @test "key import: legacy positional identity warns on stderr; --identity-stdin does not" {
   skip_if_no_age
   secret=$(age-keygen 2>/dev/null | grep '^AGE-SECRET-KEY-')

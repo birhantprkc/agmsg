@@ -35,6 +35,7 @@ REVOKE_BAD_BODY = os.environ.get("MOCK_REVOKE_BAD_BODY") == "1"
 REVOKE_LARGE_BODY = os.environ.get("MOCK_REVOKE_LARGE_BODY") == "1"
 PULL_MIXED = os.environ.get("MOCK_PULL_MIXED") == "1"
 PULL_AGE = os.environ.get("MOCK_PULL_AGE") == "1"
+PULL_AGE_ENVELOPE_FILE = os.environ.get("MOCK_PULL_AGE_ENVELOPE_FILE", "")
 CONNECT_CIPHERS = (["none"] if os.environ.get("MOCK_CONNECT_NO_AGE") == "1"
                    else ["none", "age-v1"])
 ISSUED_CREDENTIAL_IDS = set()
@@ -48,7 +49,8 @@ REGISTERED_TEAM_IDS = set()
 
 
 PULL_SERVER_ID = CONNECT_SERVER_ID
-PULL_TEAM_ID = "018f3f7e-2222-7000-8000-000000000002"
+PULL_TEAM_ID = os.environ.get(
+    "MOCK_PULL_TEAM_ID", "018f3f7e-2222-7000-8000-000000000002")
 PULL_MEMBERS = [
     {"member_id": "018f3f7e-2222-7000-8000-000000000010",
      "name": "alice", "registrations": []},
@@ -87,6 +89,12 @@ BASE_PULL_MESSAGES = [
 ]
 
 if PULL_AGE:
+    age_envelope = (
+        json.load(open(PULL_AGE_ENVELOPE_FILE, encoding="utf-8"))
+        if PULL_AGE_ENVELOPE_FILE else
+        {"v": 1, "cipher": "age-v1", "key_id": "epoch-0",
+         "blob": "ZW5jcnlwdGVk"}
+    )
     PULL_MESSAGES = [
         {"id": "10000000-0000-4000-8000-000000000001",
          "server_seq": "1",
@@ -96,8 +104,7 @@ if PULL_AGE:
         {"id": "20000000-0000-4000-8000-000000000001",
          "server_seq": "2",
          "server_received_at": "2026-01-02T00:00:00.000000Z",
-         "envelope": {"v": 1, "cipher": "age-v1", "key_id": "epoch-0",
-                      "blob": "ZW5jcnlwdGVk"}},
+         "envelope": age_envelope},
     ]
 elif PULL_MIXED:
     PULL_MESSAGES = [
@@ -185,6 +192,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/_test/revoked":
             self._send_json(200, {"revoked": REVOKED_CREDENTIAL_IDS})
+            return
+        if self.path == "/_test/pushed":
+            self._send_json(200, {"messages": PUSHED_MESSAGES})
             return
         # The pull side: a machine that has none of this asking for a team by
         # id. No credential, matching /v1/connect -- reaching the server is the

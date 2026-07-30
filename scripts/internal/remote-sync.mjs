@@ -32,6 +32,7 @@ function usage() {
     --age-confirmation operator-live \\
     [--age-identity KEY_ID=FILE ...]
   remote-sync.sh export-age-snapshot --team NAME [--out FILE]
+  remote-sync.sh verify-age-snapshot --team NAME --age-snapshot FILE
   remote-sync.sh once --team NAME [--limit N]
   remote-sync.sh run --team NAME [--limit N] [--interval SECONDS]
   remote-sync.sh reprocess --team NAME [--limit N]
@@ -443,6 +444,57 @@ async function exportAgeSnapshot(args) {
     process.stdout.write(`${canonical}\n`);
   }
   process.stderr.write(`Snapshot SHA-256: ${ageSnapshotDigest(snapshot)}\n`);
+}
+
+export async function verifyAgeSnapshot(args) {
+  const team = requireName(args.team, "team");
+  if (!args["age-snapshot"]) throw new Error("age-snapshot is required");
+  const snapshotText = await readFile(resolve(args["age-snapshot"]), "utf8");
+  const snapshot = parseStrictJson(snapshotText);
+  if (snapshotText.trim() !== canonicalJson(snapshot)) {
+    throw new Error("age snapshot must be RFC 8785 JCS without duplicate or noncanonical fields");
+  }
+  const binding = await readConnectedBinding(team);
+  const digest = ageSnapshotDigest(snapshot);
+  const config = {
+    format_version: 1,
+    local_team: team,
+    server_url: binding.endpoint,
+    server_instance_id: binding.server_instance_id,
+    remote_team_id: binding.remote_team_id,
+    protocol_version: binding.protocol_version,
+    cipher_profile: "age-v1",
+    local_security_history: [{
+      local_security_revision: "0",
+      effective_from_seq: "1",
+      minimum_security_mode: "e2ee-required",
+    }],
+    age_v1: {
+      epoch_snapshots: [snapshot],
+      checkpoint: {
+        epoch_revision: snapshot.epoch_revision,
+        snapshot_sha256: digest,
+        writer_generation: snapshot.writer_generation,
+        confirmed_at: new Date().toISOString(),
+      },
+      identity_files: {},
+      age_version: "verification-only",
+    },
+  };
+  validateAgeConfiguration(config);
+  const epoch = snapshot.history.at(-1);
+  if (epoch.recipients.length !== 1) {
+    throw new Error("unlock requires an epoch with exactly one handed recipient");
+  }
+  const result = {
+    type: "age_snapshot_verified",
+    epoch_revision: snapshot.epoch_revision,
+    snapshot_sha256: digest,
+    key_id: epoch.key_id,
+    recipient: epoch.recipients[0],
+  };
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+  return result;
 }
 
 function ageSnapshotChain(age) {
@@ -2211,12 +2263,13 @@ async function publicSnapshot(serverUrl, teamId) {
 async function main() {
   const [command, ...rest] = process.argv.slice(2);
   const args = options(rest);
-  if (!["configure", "export-age-snapshot", "once", "run", "reprocess", "resync",
+  if (!["configure", "export-age-snapshot", "verify-age-snapshot", "once", "run", "reprocess", "resync",
         "unblock-read", "pull-bootstrap", "resolve-team"].includes(command)) {
     throw new Error(usage());
   }
   if (command === "configure") { await configure(args); return; }
   if (command === "export-age-snapshot") { await exportAgeSnapshot(args); return; }
+  if (command === "verify-age-snapshot") { await verifyAgeSnapshot(args); return; }
   // Before any local team exists, so neither can go through loadConfig.
   if (command === "resolve-team") { await resolveTeam(args); return; }
   if (command === "pull-bootstrap") { await pullBootstrap(args); return; }

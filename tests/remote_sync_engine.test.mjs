@@ -39,6 +39,7 @@ import {
   validateReadStatePage,
   validateResyncResult,
   validateResyncStatus,
+  verifyAgeSnapshot,
 } from "../scripts/internal/remote-sync.mjs";
 
 const config = {
@@ -334,6 +335,42 @@ test("an age-selected binding never synthesizes a plaintext config", async () =>
       if (previousStorage === undefined) delete process.env.AGMSG_SYNC_STORAGE_DIR;
       else process.env.AGMSG_SYNC_STORAGE_DIR = previousStorage;
     }
+  });
+});
+
+test("unlock snapshot verification is canonical and bound to the pulled team", async () => {
+  await withConnectedCredential(async (root) => {
+    await writeConnectedTeam(root, { cipher_profile: "age-v1" });
+    const snapshot = {
+      profile: "age-v1",
+      server_instance_id: config.server_instance_id,
+      team_id: config.remote_team_id,
+      epoch_revision: "0",
+      writer_generation: "0",
+      authorized_writers: ["epoch-initial"],
+      previous_snapshot_sha256: null,
+      history: [{
+        epoch_revision: "0",
+        effective_from_seq: "1",
+        cipher: "age-v1",
+        key_id: "epoch-initial",
+        recipients: ["age1mmqjrejftea4f6xh47lhpc0jn4vw0yuhz349sw2e3sfl22k5gcjsv6xcvp"],
+      }],
+    };
+    const path = join(root, "snapshot.json");
+    await writeFile(path, canonicalJson(snapshot), { mode: 0o600 });
+    const result = await verifyAgeSnapshot({
+      team: "demo",
+      "age-snapshot": path,
+    });
+    assert.equal(result.snapshot_sha256, ageSnapshotDigest(snapshot));
+    assert.equal(result.key_id, "epoch-initial");
+    assert.equal(result.recipient, snapshot.history[0].recipients[0]);
+    await writeFile(path, `${JSON.stringify(snapshot, null, 2)}\n`, { mode: 0o600 });
+    await assert.rejects(verifyAgeSnapshot({
+      team: "demo",
+      "age-snapshot": path,
+    }), /RFC 8785 JCS/u);
   });
 });
 

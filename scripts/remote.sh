@@ -4,13 +4,16 @@ set -euo pipefail
 # Usage:
 #   remote.sh connect --endpoint <url> [--e2ee] <team>
 #   remote.sh pull --endpoint <url> [--team-id <uuid>] <team>
+#   remote.sh unlock <team> --snapshot <file> (--identity <file>|--identity-stdin)
+#     [--confirm-digest <sha256>]
 #   remote.sh status [<team>] [--json]
 #   remote.sh disconnect <team>
 #
 # Team-scoped cloud/self-hosted sync connection. The OSS CLI never assumes or
 # defaults to a server, so <endpoint> is always required. `connect` registers a
 # local team directly; reaching the server is the permission. `pull` clones a
-# remote team into an empty local team. Both start the background sync engine.
+# remote team into an empty local team. An encrypted pull remains locked until
+# `unlock` confirms the handed authority and starts the background sync engine.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -948,13 +951,145 @@ cmd_pull() {
   if [ "$pulled_age_v1" -gt 0 ]; then
     echo "Pulled '$pulled_name' into local team '$team' ($imported message(s))."
     echo "This team is encrypted; its sync engine is halted until the handed key material is imported and confirmed."
-    echo "Run key.sh import, configure age-v1 with operator-live confirmation, then run remote-sync.sh reprocess."
   else
     _remote_sync_engine_start "$team"
     echo "Pulled '$pulled_name' into local team '$team' ($imported message(s)). Sync engine running."
   fi
+  if [ "$pulled_age_v1" -gt 0 ]; then
+    echo "This team is local but locked. Run remote.sh unlock with the snapshot and identity you were handed."
+  else
+    echo "This team is now local and ready for normal use."
+    echo "Open your agent and invoke its installed '$cmd_name' command, then join with a new agent name."
+  fi
+}
+
+cmd_unlock() {
+  local team="" snapshot="" identity_file="" identity_stdin=0 confirm_digest=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --snapshot) snapshot="${2:?--snapshot requires a value}"; shift 2 ;;
+      --snapshot=*) snapshot="${1#--snapshot=}"; shift ;;
+      --identity) identity_file="${2:?--identity requires a value}"; shift 2 ;;
+      --identity=*) identity_file="${1#--identity=}"; shift ;;
+      --identity-stdin) identity_stdin=1; shift ;;
+      --confirm-digest) confirm_digest="${2:?--confirm-digest requires a value}"; shift 2 ;;
+      --confirm-digest=*) confirm_digest="${1#--confirm-digest=}"; shift ;;
+      --*) echo "agmsg: unknown unlock option: $1" >&2; exit 1 ;;
+      *) [ -z "$team" ] || { echo "agmsg: unlock accepts one team" >&2; exit 1; }
+         team="$1"; shift ;;
+    esac
+  done
+  : "${team:?Usage: remote.sh unlock <team> --snapshot <file> (--identity <file>|--identity-stdin) [--confirm-digest <sha256>]}"
+  : "${snapshot:?--snapshot is required}"
+  agmsg_validate_team_name "$team" || exit 1
+  if { [ -n "$identity_file" ] && [ "$identity_stdin" -eq 1 ]; } ||
+      { [ -z "$identity_file" ] && [ "$identity_stdin" -eq 0 ]; }; then
+    echo "agmsg: unlock requires exactly one of --identity <file> or --identity-stdin" >&2
+    exit 1
+  fi
+
+  local cfg binding_cipher metadata digest epoch_revision key_id recipient
+  cfg="$(_remote_team_config "$team")"
+  [ -f "$cfg" ] || { echo "agmsg: team not found: $team" >&2; exit 1; }
+  binding_cipher="$(_remote_read_config_field "$cfg" '$.remote_binding.cipher_profile')"
+  [ "$binding_cipher" = "age-v1" ] || {
+    echo "agmsg: team '$team' is not an encrypted pulled team awaiting unlock" >&2
+    exit 1
+  }
+  metadata="$(bash "$SCRIPT_DIR/remote-sync.sh" verify-age-snapshot \
+    --team "$team" --age-snapshot "$snapshot")" || exit 1
+  metadata="$(printf '%s\n' "$metadata" | grep '"age_snapshot_verified"' | tail -1)"
+  [ -n "$metadata" ] || { echo "agmsg: snapshot verification produced no result" >&2; exit 1; }
+  digest="$(_remote_json_field "$metadata" '$.snapshot_sha256')"
+  epoch_revision="$(_remote_json_field "$metadata" '$.epoch_revision')"
+  key_id="$(_remote_json_field "$metadata" '$.key_id')"
+  recipient="$(_remote_json_field "$metadata" '$.recipient')"
+  echo "Snapshot SHA-256: $digest"
+  echo "Snapshot key_id: $key_id"
+
+  if [ -z "$confirm_digest" ]; then
+    if [ "$identity_stdin" -eq 1 ] && { [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; }; then
+      echo "agmsg: --identity-stdin without a terminal also requires --confirm-digest <sha256>" >&2
+      exit 1
+    fi
+    _remote_prompt_read confirm_digest \
+      "Type the snapshot SHA-256 you verified over a separate live channel: " || exit 1
+  fi
+  if [ "$confirm_digest" != "$digest" ]; then
+    echo "agmsg: confirmed snapshot digest does not match; refusing to import trust or key material" >&2
+    exit 1
+  fi
+
+  local identity_tmp derived_recipient identity_dest
+  identity_tmp="$(mktemp "${TMPDIR:-/tmp}/agmsg-unlock-identity.XXXXXX")"
+  chmod 600 "$identity_tmp"
+  trap 'rm -f "${identity_tmp:-}"' EXIT INT TERM HUP
+  if [ "$identity_stdin" -eq 1 ]; then
+    cat > "$identity_tmp"
+  else
+    cat "$identity_file" > "$identity_tmp"
+  fi
+  derived_recipient="$(age-keygen -y "$identity_tmp" 2>/dev/null)" || {
+    echo "agmsg: handed identity is not a valid age identity" >&2
+    exit 1
+  }
+  if [ "$derived_recipient" != "$recipient" ]; then
+    echo "agmsg: handed identity does not match the authority-confirmed snapshot" >&2
+    exit 1
+  fi
+  bash "$SCRIPT_DIR/key.sh" import "$team" --key-id "$key_id" \
+    --identity-stdin < "$identity_tmp" || exit 1
+  identity_dest="$CONNECTION_ROOT/run/remote-credentials/$team/keys/$key_id.key"
+  rm -f "$identity_tmp"
+  trap - EXIT INT TERM HUP
+
+  local endpoint remote_team_id configure_out reprocess_out reprocess_result imported
+  endpoint="$(_remote_read_config_field "$cfg" '$.remote_binding.endpoint')"
+  remote_team_id="$(_remote_read_config_field "$cfg" '$.remote_binding.remote_team_id')"
+  configure_out="$(bash "$SCRIPT_DIR/remote-sync.sh" configure \
+    --team "$team" \
+    --server "$endpoint" \
+    --team-id "$remote_team_id" \
+    --minimum-security e2ee-required \
+    --cipher age-v1 \
+    --age-snapshot "$snapshot" \
+    --age-checkpoint "$epoch_revision:$digest" \
+    --age-confirmation operator-live \
+    --age-identity "$key_id=$identity_dest")" || exit 1
+  [ -n "$configure_out" ] && printf '%s\n' "$configure_out"
+  reprocess_out="$(bash "$SCRIPT_DIR/remote-sync.sh" reprocess --team "$team")" || exit 1
+  reprocess_result="$(printf '%s\n' "$reprocess_out" |
+    grep '"event":"reprocess.complete"' | tail -1)"
+  [ -n "$reprocess_result" ] || {
+    echo "agmsg: reprocess produced no completion result" >&2
+    exit 1
+  }
+  imported="$(_remote_json_field "$reprocess_result" '$.count')"
+
+  local engine_log="$CONNECTION_ROOT/run/remote-sync.$team.log" log_offset=1
+  [ -f "$engine_log" ] &&
+    log_offset=$(( $(wc -c < "$engine_log" | tr -d ' ') + 1 ))
+  _remote_sync_engine_start "$team"
+  local pid="${REMOTE_SYNC_ENGINE_PID:-}" ready=0 attempts=0
+  while [ "$attempts" -lt 50 ]; do
+    if [ -z "$pid" ] || ! _agmsg_pid_alive "$pid"; then
+      break
+    fi
+    if tail -c "+$log_offset" "$engine_log" 2>/dev/null |
+        grep -q '"event":"capabilities"'; then
+      ready=1
+      break
+    fi
+    attempts=$((attempts + 1))
+    sleep 0.1
+  done
+  if [ "$ready" -ne 1 ]; then
+    _remote_sync_engine_stop "$team"
+    echo "agmsg: encrypted sync was configured, but the sync engine did not become ready" >&2
+    exit 1
+  fi
+  echo "Unlocked '$team': imported $imported envelope(s); engine running (pid $pid)."
   echo "This team is now local and ready for normal use."
-  echo "Open your agent and invoke its installed '$cmd_name' command, then join with a new agent name."
 }
 
 # The remote-sync engine runs as a background daemon: one per connected team,
@@ -985,7 +1120,8 @@ _remote_sync_engine_start() {
   # the last-ok-then-orphan hang this repo has met before, this time spawned by
   # production code rather than a test.
   nohup bash "$SCRIPT_DIR/remote-sync.sh" run --team "$team" >> "$logfile" 2>&1 3>&- 4>&- &
-  echo $! > "$pidfile"
+  REMOTE_SYNC_ENGINE_PID=$!
+  echo "$REMOTE_SYNC_ENGINE_PID" > "$pidfile"
   disown 2>/dev/null || true
 }
 
@@ -1451,11 +1587,12 @@ cmd_disconnect() {
 case "${1:-}" in
   connect) shift; agmsg_require_python3 "remote connect" || exit 1; cmd_connect "$@" ;;
   pull) shift; agmsg_require_python3 "remote pull" || exit 1; cmd_pull "$@" ;;
+  unlock) shift; agmsg_require_python3 "remote unlock" || exit 1; cmd_unlock "$@" ;;
   status) shift; agmsg_require_python3 "remote status" || exit 1; cmd_status "$@" ;;
   disconnect) shift; agmsg_require_python3 "remote disconnect" || exit 1; cmd_disconnect "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;
   pending) shift; agmsg_require_python3 "remote pending" || exit 1; cmd_pending "$@" ;;
   *)
-    echo "Usage: remote.sh <connect|pull|status|disconnect|doctor|pending> ..." >&2
+    echo "Usage: remote.sh <connect|pull|unlock|status|disconnect|doctor|pending> ..." >&2
     exit 1 ;;
 esac
