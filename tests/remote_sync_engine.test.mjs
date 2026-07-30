@@ -361,7 +361,9 @@ test("unlock snapshot verification is canonical and bound to the pulled team", a
     await writeFile(path, canonicalJson(snapshot), { mode: 0o600 });
     const result = await verifyAgeSnapshot({
       team: "demo",
-      "age-snapshot": path,
+      // CLI option parsing represents repeatable options as arrays even when
+      // exactly one value was supplied.
+      "age-snapshot": [path],
     });
     assert.equal(result.snapshot_sha256, ageSnapshotDigest(snapshot));
     assert.equal(result.key_id, "epoch-initial");
@@ -369,8 +371,12 @@ test("unlock snapshot verification is canonical and bound to the pulled team", a
     await writeFile(path, `${JSON.stringify(snapshot, null, 2)}\n`, { mode: 0o600 });
     await assert.rejects(verifyAgeSnapshot({
       team: "demo",
-      "age-snapshot": path,
+      "age-snapshot": [path],
     }), /RFC 8785 JCS/u);
+    await assert.rejects(verifyAgeSnapshot({
+      team: "demo",
+      "age-snapshot": [path, path],
+    }), /exactly one age-snapshot/u);
   });
 });
 

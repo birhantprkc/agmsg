@@ -449,7 +449,12 @@ async function exportAgeSnapshot(args) {
 export async function verifyAgeSnapshot(args) {
   const team = requireName(args.team, "team");
   if (!args["age-snapshot"]) throw new Error("age-snapshot is required");
-  const snapshotText = await readFile(resolve(args["age-snapshot"]), "utf8");
+  const snapshotPaths = Array.isArray(args["age-snapshot"]) ?
+    args["age-snapshot"] : [args["age-snapshot"]];
+  if (snapshotPaths.length !== 1 || typeof snapshotPaths[0] !== "string") {
+    throw new Error("verify-age-snapshot requires exactly one age-snapshot");
+  }
+  const snapshotText = await readFile(resolve(snapshotPaths[0]), "utf8");
   const snapshot = parseStrictJson(snapshotText);
   if (snapshotText.trim() !== canonicalJson(snapshot)) {
     throw new Error("age snapshot must be RFC 8785 JCS without duplicate or noncanonical fields");
