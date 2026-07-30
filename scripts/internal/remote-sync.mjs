@@ -154,7 +154,11 @@ export async function activateKeyRotations(config) {
         `key rotation epoch ${rotation.epoch} is not the next epoch ${expectedRevision}`);
     }
     const ageSnapshot = ageSnapshots[Number(expectedRevision)];
-    if (!ageSnapshot) {
+    if (!ageSnapshot && await provisionLocalAgeSnapshot(config, rotation)) {
+      ageSnapshots.push(ageSnapshotChain(config.age_v1).at(-1));
+    }
+    const confirmedAgeSnapshot = ageSnapshots[Number(expectedRevision)];
+    if (!confirmedAgeSnapshot) {
       throw new Error(
         `key rotation at server sequence ${rotation.server_seq} selected epoch ` +
         `${rotation.epoch}; import its authority-confirmed epoch snapshot before sync can continue`);
@@ -162,7 +166,7 @@ export async function activateKeyRotations(config) {
     if (BigInt(rotation.server_seq) === MAX_SEQUENCE) {
       throw new Error("key rotation cannot be activated at the final server sequence");
     }
-    const epoch = ageSnapshot.history.at(-1);
+    const epoch = confirmedAgeSnapshot.history.at(-1);
     const effectiveFrom = (BigInt(rotation.server_seq) + 1n).toString();
     if (epoch.epoch_revision !== rotation.epoch ||
         epoch.key_id !== rotation.key_id ||
@@ -332,8 +336,12 @@ export async function loadConfig(team) {
   validateLocalSecurityHistory(value.local_security_history);
   if (value.cipher_profile === "age-v1") {
     validateAgeConfiguration(value);
-    await validateRetainedAgeCheckpoint(value);
+    // A local authority advance retains its checkpoint before atomically
+    // replacing the sync config. Let that narrowly authenticated transition
+    // finish first so a crash between those writes is retryable; every other
+    // rollback still fails the retained-checkpoint comparison below.
     await activateKeyRotations(value);
+    await validateRetainedAgeCheckpoint(value);
   }
   else if (value.cipher_profile !== "none") throw new Error("sync cipher profile is unsupported");
   return value;
@@ -426,12 +434,92 @@ export function initialAgeSnapshot(teamConfig, team = teamConfig?.name) {
   };
 }
 
-async function exportAgeSnapshot(args) {
+export function nextLocalAgeSnapshot(config, teamConfig, rotation) {
+  const ageSnapshots = ageSnapshotChain(config.age_v1);
+  const previous = ageSnapshots.at(-1);
+  const localEpoch = teamConfig?.remote_key?.current;
+  const localEpochs = teamConfig?.remote_key?.epochs;
+  if (!previous || !localEpoch || !Array.isArray(localEpochs) ||
+      canonicalJson(localEpochs.at(-1)) !== canonicalJson(localEpoch) ||
+      String(localEpoch.epoch_revision) !== rotation.epoch ||
+      localEpoch.key_id !== rotation.key_id ||
+      localEpoch.recipient === undefined ||
+      createHash("sha256").update(localEpoch.recipient, "utf8").digest("hex") !==
+        rotation.fingerprint ||
+      localEpoch.previous_snapshot_sha256 !== ageSnapshotDigest(previous)) {
+    return null;
+  }
+  if (BigInt(rotation.server_seq) === MAX_SEQUENCE) {
+    throw new Error("key rotation cannot be activated at the final server sequence");
+  }
+  const revision = sequence(rotation.epoch, "local key epoch revision");
+  const writerGeneration = sequence(
+    String(localEpoch.writer_generation), "local key writer generation");
+  const snapshot = {
+    ...previous,
+    epoch_revision: revision,
+    writer_generation: writerGeneration,
+    authorized_writers: [localEpoch.key_id],
+    previous_snapshot_sha256: ageSnapshotDigest(previous),
+    history: [...previous.history, {
+      epoch_revision: revision,
+      effective_from_seq: (BigInt(rotation.server_seq) + 1n).toString(),
+      cipher: "age-v1",
+      key_id: localEpoch.key_id,
+      recipients: [localEpoch.recipient],
+    }],
+  };
+  return snapshot;
+}
+
+async function provisionLocalAgeSnapshot(config, rotation) {
+  let bytes;
+  try {
+    bytes = await readBoundedAuthorityFile(
+      teamConfigPath(config.local_team), MAX_CONNECTION_CONFIG_BYTES, false);
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  const teamConfig = parseStrictJson(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  const snapshot = nextLocalAgeSnapshot(config, teamConfig, rotation);
+  if (!snapshot) return false;
+  const identityPath = replacementIdentityPath(config.local_team, rotation.key_id);
+  const proposed = structuredClone(config);
+  delete proposed.age_v1_runtime_history;
+  proposed.age_v1.epoch_snapshots = [...ageSnapshotChain(config.age_v1), snapshot];
+  delete proposed.age_v1.epoch_snapshot;
+  proposed.age_v1.checkpoint = {
+    epoch_revision: snapshot.epoch_revision,
+    snapshot_sha256: ageSnapshotDigest(snapshot),
+    writer_generation: snapshot.writer_generation,
+    confirmed_at: new Date().toISOString(),
+  };
+  proposed.age_v1.identity_files[rotation.key_id] = identityPath;
+  validateAgeConfiguration(proposed);
+  validateConfiguredAgeIdentities(proposed);
+  const retained = await retainAgeCheckpoint(proposed, "operator-live");
+  proposed.age_v1.checkpoint.confirmed_at = retained.confirmation.confirmed_at;
+  await writeConfig(configPath(config.local_team), proposed);
+  Object.assign(config, proposed);
+  return true;
+}
+
+export async function exportAgeSnapshot(args) {
   const team = requireName(args.team, "team");
   const bytes = await readBoundedAuthorityFile(
     teamConfigPath(team), MAX_CONNECTION_CONFIG_BYTES, false);
   const teamConfig = parseStrictJson(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
-  const snapshot = initialAgeSnapshot(teamConfig, team);
+  let snapshot;
+  try {
+    const config = await readStoredSyncConfig(team);
+    if (config.cipher_profile !== "age-v1") throw new Error("team is not configured for age-v1");
+    validateAgeConfiguration(config);
+    snapshot = ageSnapshotChain(config.age_v1).at(-1);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+    snapshot = initialAgeSnapshot(teamConfig, team);
+  }
   const canonical = canonicalJson(snapshot);
   const outputPath = args.out ? resolve(args.out) : null;
   if (outputPath) {

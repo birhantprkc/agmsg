@@ -38,6 +38,25 @@ open(p, 'w').write(json.dumps(d) + '\\n')
 "
 }
 
+stub_current_age_snapshot() {
+  cat > "$SCRIPTS/remote-sync.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "$1" = "export-age-snapshot" ]
+shift
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --out) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$out" ]
+printf '%s' '{"epoch_revision":"0"}' > "$out"
+EOF
+  chmod +x "$SCRIPTS/remote-sync.sh"
+}
+
 # --- generate --------------------------------------------------------------
 
 @test "key generate: creates a first epoch and prints the backup notice" {
@@ -266,6 +285,7 @@ open(p, 'w').write(json.dumps(d) + '\\n')
 @test "key rotate: creates a replacement identity and journals only its fingerprint" {
   skip_if_no_age
   bash "$SCRIPTS/key.sh" generate testteam
+  stub_current_age_snapshot
   run bash "$SCRIPTS/key.sh" rotate testteam
   [ "$status" -eq 0 ]
   [[ "$output" == *"Generated replacement key"* ]]
@@ -277,6 +297,8 @@ open(p, 'w').write(json.dumps(d) + '\\n')
   [[ "$key_id" == epoch-* ]]
   [[ "$fingerprint" =~ ^[0-9a-f]{64}$ ]]
   [ -f "$SCRIPTS/../run/remote-credentials/testteam/keys/$key_id.key" ]
+  [ "$(python3 -c "import json; d=json.load(open('$SCRIPTS/../teams/testteam/config.json')); print(d['remote_key']['current']['key_id'])")" = "$key_id" ]
+  [ "$(python3 -c "import json; d=json.load(open('$SCRIPTS/../teams/testteam/config.json')); print(len(d['remote_key']['epochs']))")" -eq 2 ]
   ! grep -q 'AGE-SECRET-KEY\\|age1' "$journal"
   run bash "$SCRIPTS/key.sh" show testteam --key-id "$key_id"
   [ "$status" -eq 0 ]
@@ -286,6 +308,7 @@ open(p, 'w').write(json.dumps(d) + '\\n')
 @test "key rotate: an old identity cannot decrypt data for the replacement epoch" {
   skip_if_no_age
   bash "$SCRIPTS/key.sh" generate testteam
+  stub_current_age_snapshot
   old_epoch=$(python3 -c "import json; print(json.load(open('$SCRIPTS/../teams/testteam/config.json'))['remote_key']['current']['key_id'])")
   old_identity="$SCRIPTS/../run/remote-credentials/testteam/keys/$old_epoch.key"
   bash "$SCRIPTS/key.sh" rotate testteam
@@ -303,6 +326,7 @@ open(p, 'w').write(json.dumps(d) + '\\n')
 @test "key import: installs an out-of-band replacement only after its fingerprint is announced" {
   skip_if_no_age
   bash "$SCRIPTS/key.sh" generate testteam
+  stub_current_age_snapshot
   bash "$SCRIPTS/key.sh" rotate testteam
   journal="$SCRIPTS/../teams/testteam/roster.jsonl"
   key_id=$(python3 -c "import json; print([json.loads(x) for x in open('$journal') if json.loads(x).get('type') == 'key_rotated'][-1]['key_id'])")
@@ -318,6 +342,7 @@ open(p, 'w').write(json.dumps(d) + '\\n')
 @test "key rotate: advances the shared epoch only after the previous winner is synchronized" {
   skip_if_no_age
   bash "$SCRIPTS/key.sh" generate testteam
+  stub_current_age_snapshot
   config="$SCRIPTS/../teams/testteam/config.json"
   journal="$SCRIPTS/../teams/testteam/roster.jsonl"
   server_id="018f3f7e-0000-7000-8000-000000000000"

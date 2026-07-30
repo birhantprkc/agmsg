@@ -13,10 +13,12 @@ import {
   configure,
   cycle,
   driver,
+  exportAgeSnapshot,
   isRetryable,
   initialAgeSnapshot,
   runLoop,
   loadConfig,
+  nextLocalAgeSnapshot,
   plaintextWriteEligible,
   pullBootstrap,
   parseStrictJsonl,
@@ -59,6 +61,105 @@ const candidates = [
 ];
 
 const credentialId = "018f3f7e-0000-7000-8000-000000000020";
+
+test("a rotator provisions its confirmed snapshot at the server boundary", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agmsg-local-key-rotation-"));
+  const saved = {
+    connection: process.env.AGMSG_SYNC_CONNECTION_DIR,
+    storage: process.env.AGMSG_SYNC_STORAGE_DIR,
+    trust: process.env.AGMSG_SYNC_TRUST_DIR,
+  };
+  const oldKeyId = "epoch-old";
+  const newKeyId = "epoch-new";
+  const recipient = "age1ykvctct4aklx4f4mnjd8rmzqs7p2le9ufg4faydljsk5mvcy0pls27mu64";
+  const identity = "AGE-SECRET-KEY-14Z7XMNPZTPEMMM6DG2FSKEH042L7UMU79T645GAQJKU2LLJGPM2S7GWNLQ";
+  const initial = {
+    profile: "age-v1",
+    server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id,
+    epoch_revision: "0",
+    writer_generation: "0",
+    authorized_writers: [oldKeyId],
+    previous_snapshot_sha256: null,
+    history: [{ epoch_revision: "0", effective_from_seq: "1", cipher: "age-v1",
+      key_id: oldKeyId, recipients: [recipient] }],
+  };
+  const rotation = {
+    id: "018f3f7e-0000-7000-8000-000000000025",
+    epoch: "1",
+    key_id: newKeyId,
+    fingerprint: createHash("sha256").update(recipient).digest("hex"),
+    server_seq: "8",
+  };
+  const localEpoch = { key_id: newKeyId, epoch_revision: 1, writer_generation: 1,
+    recipient, previous_snapshot_sha256: ageSnapshotDigest(initial),
+    created_at: "2026-07-30T00:00:00Z" };
+  const teamConfig = { name: "demo", remote_key: { current: localEpoch,
+    epochs: [{ key_id: oldKeyId, epoch_revision: 0, writer_generation: 0,
+      recipient, previous_snapshot_sha256: null, created_at: "2026-07-29T00:00:00Z" },
+    localEpoch] } };
+  const rotationConfig = {
+    ...config,
+    server_url: "https://sync.example.test",
+    cipher_profile: "age-v1",
+    local_security_history: [{ local_security_revision: "0", effective_from_seq: "1",
+      minimum_security_mode: "e2ee-required" }],
+    age_v1: {
+      epoch_snapshots: [initial],
+      checkpoint: { epoch_revision: "0", writer_generation: "0",
+        snapshot_sha256: ageSnapshotDigest(initial), confirmed_at: "2026-07-29T00:00:00Z" },
+      identity_files: {},
+      age_version: "v1.3.1",
+    },
+  };
+  try {
+    process.env.AGMSG_SYNC_CONNECTION_DIR = root;
+    process.env.AGMSG_SYNC_STORAGE_DIR = join(root, "store");
+    process.env.AGMSG_SYNC_TRUST_DIR = join(root, "trust");
+    const teamDir = join(root, "teams", "demo");
+    const keyDir = join(root, "run", "remote-credentials", "demo", "keys");
+    await mkdir(teamDir, { recursive: true });
+    await mkdir(keyDir, { recursive: true });
+    await writeFile(join(teamDir, "config.json"), `${JSON.stringify(teamConfig)}\n`);
+    await writeFile(join(teamDir, "roster.jsonl"), [
+      JSON.stringify({ type: "key_rotated", ...rotation,
+        at: "2026-07-30T00:00:00.000000Z", server_seq: undefined }),
+      JSON.stringify({ type: "roster_synced", mutation_id: rotation.id,
+        server_seq: rotation.server_seq,
+        wire_id: "550e8400-e29b-41d4-a716-446655440006",
+        server_instance_id: config.server_instance_id,
+        remote_team_id: config.remote_team_id }), "",
+    ].join("\n"));
+    await writeFile(join(keyDir, `${newKeyId}.key`), `${identity}\n`, { mode: 0o600 });
+    const snapshot = nextLocalAgeSnapshot(rotationConfig, teamConfig, rotation);
+    assert.equal(snapshot.epoch_revision, "1");
+    assert.equal(snapshot.writer_generation, "1");
+    assert.equal(snapshot.previous_snapshot_sha256, ageSnapshotDigest(initial));
+    assert.equal(snapshot.history.at(-1).effective_from_seq, "9");
+    await activateKeyRotations(rotationConfig);
+    assert.equal(rotationConfig.age_v1_runtime_history.at(-1).key_id, newKeyId);
+    const stored = JSON.parse(await readFile(join(root, "store", "remote-sync", "demo.json"), "utf8"));
+    assert.equal(stored.age_v1.epoch_snapshots.length, 2);
+    assert.equal(stored.age_v1.epoch_snapshots.at(-1).epoch_revision, "1");
+    assert.equal(stored.age_v1.checkpoint.snapshot_sha256, ageSnapshotDigest(snapshot));
+    const exportedPath = join(root, "exported-age-snapshot.json");
+    await exportAgeSnapshot({ team: "demo", out: exportedPath });
+    const exported = JSON.parse(await readFile(exportedPath, "utf8"));
+    assert.equal(exported.epoch_revision, "1");
+    assert.equal(exported.history.length, 2);
+    assert.match(await readFile(join(root, "trust",
+      `age-v1-${config.server_instance_id}-${config.remote_team_id}-v1.json`), "utf8"),
+    new RegExp(ageSnapshotDigest(snapshot), "u"));
+  } finally {
+    if (saved.connection === undefined) delete process.env.AGMSG_SYNC_CONNECTION_DIR;
+    else process.env.AGMSG_SYNC_CONNECTION_DIR = saved.connection;
+    if (saved.storage === undefined) delete process.env.AGMSG_SYNC_STORAGE_DIR;
+    else process.env.AGMSG_SYNC_STORAGE_DIR = saved.storage;
+    if (saved.trust === undefined) delete process.env.AGMSG_SYNC_TRUST_DIR;
+    else process.env.AGMSG_SYNC_TRUST_DIR = saved.trust;
+    await rm(root, { recursive: true });
+  }
+});
 
 test("a synced rotation halts until an out-of-band identity matches its fingerprint", async () => {
   const root = await mkdtemp(join(tmpdir(), "agmsg-key-rotation-"));

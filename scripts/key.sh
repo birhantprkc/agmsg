@@ -574,7 +574,8 @@ EOF
     exit 1
   }
 
-  local key_id created_at identity_file recipient fingerprint keygen_err
+  local key_id created_at identity_file recipient fingerprint keygen_err previous_snapshot \
+    previous_snapshot_sha writer_generation original_cfg
   key_id="$(_key_new_key_id)"
   created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   identity_file="$cred_dir/$key_id.key"
@@ -589,7 +590,28 @@ EOF
   chmod 600 "$identity_file"
   recipient="$(grep '^# public key:' "$identity_file" | sed 's/^# public key: //')"
   fingerprint="$(_key_fingerprint_sha256 "$recipient")"
+  previous_snapshot="$(mktemp "${TMPDIR:-/tmp}/agmsg-age-snapshot.XXXXXX")"
+  if ! bash "$SCRIPT_DIR/remote-sync.sh" export-age-snapshot \
+      --team "$team" --out "$previous_snapshot" >/dev/null; then
+    rm -f "$previous_snapshot" "$identity_file"
+    agmsg_lock_release
+    echo "agmsg: could not read the current authority-confirmed epoch snapshot." >&2
+    exit 1
+  fi
+  previous_snapshot_sha="$(shasum -a 256 "$previous_snapshot" | awk '{print $1}')"
+  rm -f "$previous_snapshot"
+  writer_generation="$(agmsg_sqlite_mem \
+    "SELECT CAST('$(_agmsg_sqlesc "$(_key_read_config_field "$cfg" '$.remote_key.current.writer_generation')")' AS INTEGER) + 1;")"
+  original_cfg="$(cat "$cfg")"
+  if ! _key_write_epoch_locked "$cfg" \
+      "$(_key_epoch_json "$key_id" "$next_epoch" "$writer_generation" "$recipient" "$previous_snapshot_sha" "$created_at")"; then
+    rm -f "$identity_file"
+    agmsg_lock_release
+    echo "agmsg: failed to stage the replacement epoch." >&2
+    exit 1
+  fi
   if ! agmsg_roster_append_key_rotated "$team_dir" "$next_epoch" "$key_id" "$fingerprint" "$created_at"; then
+    agmsg_write_atomic "$cfg" "$original_cfg"
     rm -f "$identity_file"
     agmsg_lock_release
     echo "agmsg: failed to publish the key rotation; no replacement was announced." >&2
