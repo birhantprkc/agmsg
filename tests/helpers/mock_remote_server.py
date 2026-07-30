@@ -49,8 +49,10 @@ REGISTERED_TEAM_IDS = set()
 
 
 PULL_SERVER_ID = CONNECT_SERVER_ID
-PULL_TEAM_ID = os.environ.get(
-    "MOCK_PULL_TEAM_ID", "018f3f7e-2222-7000-8000-000000000002")
+PULL_TEAM_ID = (
+    os.environ.get("MOCK_PULL_TEAM_ID")
+    or "018f3f7e-2222-7000-8000-000000000002"
+)
 PULL_MEMBERS = [
     {"member_id": "018f3f7e-4444-7000-8000-000000000001",
      "name": "member-1", "registrations": []},
