@@ -37,15 +37,7 @@ teardown() {
     for peer_pidfile in "$PEER_SKILL_DIR"/run/remote-sync.*.pid; do
       [ -f "$peer_pidfile" ] || continue
       peer_pid="$(cat "$peer_pidfile" 2>/dev/null || true)"
-      case "$peer_pid" in
-        ''|*[!0-9]*)
-          echo "invalid peer sync engine PID in $peer_pidfile: $peer_pid" >&2
-          peer_cleanup_status=1
-          peer_root_removable=0
-          continue
-          ;;
-      esac
-      if [ "${#peer_pid}" -gt 10 ] || [ "$peer_pid" -le 0 ]; then
+      if ! [[ "$peer_pid" =~ ^[1-9][0-9]{0,9}$ ]]; then
         echo "invalid peer sync engine PID in $peer_pidfile: $peer_pid" >&2
         peer_cleanup_status=1
         peer_root_removable=0
