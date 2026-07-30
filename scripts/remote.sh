@@ -6,6 +6,7 @@ set -euo pipefail
 #   remote.sh pull --endpoint <url> [--team-id <uuid>] <team>
 #   remote.sh status [<team>] [--json]
 #   remote.sh disconnect <team>
+#   remote.sh forget [--yes] <team>
 #
 # Team-scoped cloud/self-hosted sync connection. The OSS CLI never assumes or
 # defaults to a server, so <endpoint> is always required. `connect` registers a
@@ -40,6 +41,13 @@ _agmsg_sqlesc() { printf %s "$1" | sed "s/'/''/g"; }
 
 _remote_team_config() { printf '%s' "$TEAMS_DIR/$1/config.json"; }
 _remote_cred_file() { printf '%s' "$CRED_ROOT/$1.json"; }
+_remote_sync_config_file() {
+  local encoded
+  encoded="$(python3 -c \
+    "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=\"-_.!~*'()\"))" \
+    "$1")"
+  printf '%s/remote-sync/%s.json' "$(agmsg_storage_dir)" "$encoded"
+}
 
 # <escaped> is spliced as a genuine SQL string literal below, NOT bound via
 # `.param set`: the sqlite3 shell's dot-command tokenizer does not honour SQL
@@ -159,7 +167,7 @@ cmd_doctor() {
   else
     echo "  [ ] python3 on PATH"
     echo
-    echo "'python3' is required for the remote control plane (connect/status/disconnect/pending) and was not found on this device. Install it, then retry:"
+    echo "'python3' is required for the remote control plane (connect/pull/status/disconnect/forget/pending) and was not found on this device. Install it, then retry:"
     echo "  macOS (Homebrew):      brew install python3"
     echo "  macOS (Xcode tools):   xcode-select --install"
     echo "  Debian/Ubuntu:         sudo apt install python3"
@@ -1344,14 +1352,136 @@ cmd_disconnect() {
   echo "Disconnected '$team'. Local sync state cleared; sends/reads continue locally."
 }
 
+# --- forget ---------------------------------------------------------------
+
+cmd_forget() {
+  local team="" yes=0 positional=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes) yes=1; shift ;;
+      *) positional+=("$1"); shift ;;
+    esac
+  done
+  [ "${#positional[@]}" -eq 1 ] || {
+    echo "Usage: remote.sh forget [--yes] <team>" >&2
+    exit 1
+  }
+  team="${positional[0]}"
+  agmsg_validate_team_name "$team" || exit 1
+
+  local team_dir cfg connected_at disconnected_at
+  team_dir="$TEAMS_DIR/$team"
+  cfg="$(_remote_team_config "$team")"
+  [ -f "$cfg" ] || {
+    echo "agmsg: team '$team' has no local remote binding to forget" >&2
+    exit 1
+  }
+  connected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.connected_at')"
+  disconnected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.disconnected_at')"
+  if [ -z "$connected_at" ] || [ "$connected_at" = "null" ]; then
+    echo "agmsg: team '$team' has never been connected" >&2
+    exit 1
+  fi
+  if [ -z "$disconnected_at" ] || [ "$disconnected_at" = "null" ]; then
+    echo "agmsg: team '$team' is still connected; run 'remote.sh disconnect $team' first" >&2
+    exit 1
+  fi
+
+  # A successful remote connection owns this exact directory. Never resolve
+  # through agmsg_db_path here: a malformed or interrupted layout selection
+  # must not turn a team-scoped delete into deletion of the shared store.
+  local store_dir store_path event_count=0 tables
+  store_dir="$(agmsg_storage_dir)/teams/$team"
+  store_path="$store_dir/messages.db"
+  if [ -f "$store_path" ]; then
+    tables="$(agmsg_sqlite "$store_path" \
+      "SELECT name FROM sqlite_master WHERE type='table';")" || {
+      echo "agmsg: cannot inspect team store '$store_path'; refusing to delete it" >&2
+      exit 1
+    }
+    if printf '%s\n' "$tables" | grep -qx events; then
+      event_count="$(agmsg_sqlite "$store_path" "SELECT COUNT(*) FROM events;")"
+    elif printf '%s\n' "$tables" | grep -qx messages; then
+      event_count="$(agmsg_sqlite "$store_path" "SELECT COUNT(*) FROM messages;")"
+    fi
+  fi
+
+  echo "This will forget local team '$team' from this machine."
+  echo "Store: $store_path"
+  echo "Events: $event_count"
+  echo "The server copy remains. Local roster, history, sync configuration, keys, and trust will be deleted."
+
+  if [ "$yes" -ne 1 ]; then
+    if [ ! -t 0 ]; then
+      echo "agmsg: forget requires an interactive terminal or --yes" >&2
+      exit 1
+    fi
+    local answer=""
+    IFS= read -r -p "Type '$team' to confirm: " answer
+    if [ "$answer" != "$team" ]; then
+      echo "Forget cancelled."
+      return
+    fi
+  fi
+
+  # Revalidate under the registry lock after the operator has confirmed. A
+  # reconnect racing the prompt must not have its new active binding deleted.
+  agmsg_lock_acquire "$team_dir" || exit 1
+  disconnected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.disconnected_at')"
+  if [ -z "$disconnected_at" ] || [ "$disconnected_at" = "null" ]; then
+    agmsg_lock_release
+    echo "agmsg: team '$team' became connected while forget was waiting; nothing was deleted" >&2
+    exit 1
+  fi
+
+  local sync_config trust_root trust_file server_instance_id remote_team_id \
+    protocol_version retired_dir
+  retired_dir="$TEAMS_DIR/.forget-$team.$$"
+  [ ! -e "$retired_dir" ] || {
+    agmsg_lock_release
+    echo "agmsg: temporary forget path already exists; nothing was deleted" >&2
+    exit 1
+  }
+  sync_config="$(_remote_sync_config_file "$team")"
+  trust_root="${AGMSG_SYNC_TRUST_DIR:-$CONNECTION_ROOT/run/remote-trust}"
+  server_instance_id="$(_remote_read_config_field "$cfg" '$.remote_binding.server_instance_id')"
+  remote_team_id="$(_remote_read_config_field "$cfg" '$.remote_binding.remote_team_id')"
+  protocol_version="$(_remote_read_config_field "$cfg" '$.remote_binding.protocol_version')"
+  if ! [[ "$server_instance_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
+      ! [[ "$remote_team_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
+      [ "$protocol_version" != "1" ]; then
+    agmsg_lock_release
+    echo "agmsg: team '$team' has an invalid remote binding; refusing to derive deletion paths from it" >&2
+    exit 1
+  fi
+  trust_file="$trust_root/age-v1-$server_instance_id-$remote_team_id-v$protocol_version.json"
+
+  _remote_sync_engine_stop "$team"
+  rm -f "$sync_config" "$(_remote_cred_file "$team")" \
+    "$CONNECTION_ROOT/run/remote-sync.$team.log"
+  rm -f "$trust_file"
+  [ ! -d "$CRED_ROOT/$team" ] || rm -r "$CRED_ROOT/$team"
+  [ ! -d "$store_dir" ] || rm -r "$store_dir"
+
+  # Rename is the local commit point: after it, a fresh join may safely create
+  # the same display name without racing deletion of the forgotten registry.
+  mv "$team_dir" "$retired_dir"
+  AGMSG_HELD_LOCKS=""
+  trap - EXIT INT TERM
+  rm -r "$retired_dir"
+
+  echo "Forgot '$team' on this machine. The server copy was not changed."
+}
+
 case "${1:-}" in
   connect) shift; agmsg_require_python3 "remote connect" || exit 1; cmd_connect "$@" ;;
   pull) shift; agmsg_require_python3 "remote pull" || exit 1; cmd_pull "$@" ;;
   status) shift; agmsg_require_python3 "remote status" || exit 1; cmd_status "$@" ;;
   disconnect) shift; agmsg_require_python3 "remote disconnect" || exit 1; cmd_disconnect "$@" ;;
+  forget) shift; agmsg_require_python3 "remote forget" || exit 1; cmd_forget "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;
   pending) shift; agmsg_require_python3 "remote pending" || exit 1; cmd_pending "$@" ;;
   *)
-    echo "Usage: remote.sh <connect|pull|status|disconnect|doctor|pending> ..." >&2
+    echo "Usage: remote.sh <connect|pull|status|disconnect|forget|doctor|pending> ..." >&2
     exit 1 ;;
 esac
