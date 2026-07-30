@@ -31,6 +31,8 @@ function usage() {
     --age-checkpoint REVISION:SHA256 \\
     --age-confirmation operator-live \\
     [--age-identity KEY_ID=FILE ...]
+  remote-sync.sh export-age-snapshot --team NAME [--out FILE]
+  remote-sync.sh verify-age-snapshot --team NAME --age-snapshot FILE
   remote-sync.sh once --team NAME [--limit N]
   remote-sync.sh run --team NAME [--limit N] [--interval SECONDS]
   remote-sync.sh reprocess --team NAME [--limit N]
@@ -285,11 +287,19 @@ async function readStoredSyncConfig(team) {
 
 export async function loadConfig(team) {
   const binding = await readConnectedBinding(team);
+  const selectedCipher = binding.cipher_profile ?? "none";
+  if (!["none", "age-v1"].includes(selectedCipher)) {
+    throw new Error("connected team binding selects an unsupported cipher profile");
+  }
   let value;
   try {
     value = await readStoredSyncConfig(team);
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
+    if (selectedCipher !== "none") {
+      throw new Error(
+        `connected team selected ${selectedCipher} but its authenticated sync configuration is missing`);
+    }
     if (!binding.capabilities.write_allowed_ciphers.includes("none")) {
       throw new Error("connected team requires an authenticated age-v1 sync configuration");
     }
@@ -305,6 +315,10 @@ export async function loadConfig(team) {
         minimum_security_mode: "plaintext-allowed" }],
     };
   }
+  value.cipher_profile ??= "none";
+  if (binding.cipher_profile !== undefined && value.cipher_profile !== selectedCipher) {
+    throw new Error("sync configuration cipher does not match the connected team binding");
+  }
   if (value.server_url !== binding.endpoint ||
       value.server_instance_id !== binding.server_instance_id ||
       value.remote_team_id !== binding.remote_team_id ||
@@ -315,7 +329,6 @@ export async function loadConfig(team) {
       !UUID_V7.test(value.server_instance_id) || !UUID_V7.test(value.remote_team_id)) {
     throw new Error("sync config binding is invalid");
   }
-  value.cipher_profile ??= "none";
   validateLocalSecurityHistory(value.local_security_history);
   if (value.cipher_profile === "age-v1") {
     validateAgeConfiguration(value);
@@ -357,7 +370,7 @@ function requireUnicodeScalars(value, label) {
   }
 }
 
-function canonicalJson(value) {
+export function canonicalJson(value) {
   if (value === null || typeof value === "boolean") return JSON.stringify(value);
   if (typeof value === "string") {
     requireUnicodeScalars(value, "age snapshot string");
@@ -379,6 +392,114 @@ function canonicalJson(value) {
 
 export function ageSnapshotDigest(value) {
   return createHash("sha256").update(canonicalJson(value), "utf8").digest("hex");
+}
+
+export function initialAgeSnapshot(teamConfig, team = teamConfig?.name) {
+  const binding = connectedBinding(teamConfig, team);
+  const current = teamConfig?.remote_key?.current;
+  const epochs = teamConfig?.remote_key?.epochs;
+  if (!current || !Array.isArray(epochs) || epochs.length !== 1 ||
+      (current !== epochs[0] && canonicalJson(current) !== canonicalJson(epochs[0])) ||
+      current.epoch_revision !== 0 || current.writer_generation !== 0 ||
+      typeof current.key_id !== "string" ||
+      !/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(current.key_id) ||
+      typeof current.recipient !== "string" ||
+      !/^age1[0-9a-z]{58}$/u.test(current.recipient) ||
+      current.previous_snapshot_sha256 !== null) {
+    throw new Error("team does not have one canonical initial age epoch");
+  }
+  return {
+    profile: "age-v1",
+    server_instance_id: binding.server_instance_id,
+    team_id: binding.remote_team_id,
+    epoch_revision: "0",
+    writer_generation: "0",
+    authorized_writers: [current.key_id],
+    previous_snapshot_sha256: null,
+    history: [{
+      epoch_revision: "0",
+      effective_from_seq: "1",
+      cipher: "age-v1",
+      key_id: current.key_id,
+      recipients: [current.recipient],
+    }],
+  };
+}
+
+async function exportAgeSnapshot(args) {
+  const team = requireName(args.team, "team");
+  const bytes = await readBoundedAuthorityFile(
+    teamConfigPath(team), MAX_CONNECTION_CONFIG_BYTES, false);
+  const teamConfig = parseStrictJson(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  const snapshot = initialAgeSnapshot(teamConfig, team);
+  const canonical = canonicalJson(snapshot);
+  const outputPath = args.out ? resolve(args.out) : null;
+  if (outputPath) {
+    const directory = dirname(outputPath);
+    await mkdir(directory, { recursive: true });
+    const temporary = join(directory, `.${basename(outputPath)}.${process.pid}.tmp`);
+    await writeFile(temporary, canonical, { mode: 0o600, flag: "wx" });
+    await rename(temporary, outputPath);
+  } else {
+    process.stdout.write(`${canonical}\n`);
+  }
+  process.stderr.write(`Snapshot SHA-256: ${ageSnapshotDigest(snapshot)}\n`);
+}
+
+export async function verifyAgeSnapshot(args) {
+  const team = requireName(args.team, "team");
+  if (!args["age-snapshot"]) throw new Error("age-snapshot is required");
+  const snapshotPaths = Array.isArray(args["age-snapshot"]) ?
+    args["age-snapshot"] : [args["age-snapshot"]];
+  if (snapshotPaths.length !== 1 || typeof snapshotPaths[0] !== "string") {
+    throw new Error("verify-age-snapshot requires exactly one age-snapshot");
+  }
+  const snapshotText = await readFile(resolve(snapshotPaths[0]), "utf8");
+  const snapshot = parseStrictJson(snapshotText);
+  if (snapshotText.trim() !== canonicalJson(snapshot)) {
+    throw new Error("age snapshot must be RFC 8785 JCS without duplicate or noncanonical fields");
+  }
+  const binding = await readConnectedBinding(team);
+  const digest = ageSnapshotDigest(snapshot);
+  const config = {
+    format_version: 1,
+    local_team: team,
+    server_url: binding.endpoint,
+    server_instance_id: binding.server_instance_id,
+    remote_team_id: binding.remote_team_id,
+    protocol_version: binding.protocol_version,
+    cipher_profile: "age-v1",
+    local_security_history: [{
+      local_security_revision: "0",
+      effective_from_seq: "1",
+      minimum_security_mode: "e2ee-required",
+    }],
+    age_v1: {
+      epoch_snapshots: [snapshot],
+      checkpoint: {
+        epoch_revision: snapshot.epoch_revision,
+        snapshot_sha256: digest,
+        writer_generation: snapshot.writer_generation,
+        confirmed_at: new Date().toISOString(),
+      },
+      identity_files: {},
+      age_version: "verification-only",
+    },
+  };
+  validateAgeConfiguration(config);
+  const epoch = snapshot.history.at(-1);
+  if (epoch.recipients.length !== 1) {
+    throw new Error("unlock requires an epoch with exactly one handed recipient");
+  }
+  const result = {
+    type: "age_snapshot_verified",
+    epoch_revision: snapshot.epoch_revision,
+    snapshot_sha256: digest,
+    key_id: epoch.key_id,
+    recipient: epoch.recipients[0],
+  };
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+  return result;
 }
 
 function ageSnapshotChain(age) {
@@ -1852,6 +1973,7 @@ export async function reprocessCycle(config, limit, dependencies = {}) {
   let after = null;
   let stableState = null;
   let total = 0;
+  let imported = 0;
   let pageCount = 0n;
   const retentionFloor = BigInt(capabilities.min_available_seq);
   // Locally retained quarantine may cover both the server-retained suffix and
@@ -1902,6 +2024,11 @@ export async function reprocessCycle(config, limit, dependencies = {}) {
       records.push({ type: "sync_pull_cursor", next_after: state.transport_cursor });
       const applied = await driverCall("apply", config, records);
       await logApplyCall(config, records, applied);
+      const candidateIds = new Set(candidates.map((candidate) => candidate.id));
+      imported += applied.filter((record) =>
+        record.type === "sync_apply_outcome" &&
+        candidateIds.has(record.id) &&
+        ["imported", "reconciled"].includes(record.status)).length;
       total += candidates.length;
     }
     if (!page.has_more) break;
@@ -1910,8 +2037,16 @@ export async function reprocessCycle(config, limit, dependencies = {}) {
     }
     after = page.next_after;
   }
-  await eventCall("reprocess.complete", { count: total,
-    transport_cursor: stableState.transport_cursor });
+  const remaining = validateReprocessDriverPage(
+    await driverCall("reprocess", config, [], ["1"]), 1, null);
+  const result = {
+    count: total,
+    imported_count: imported,
+    blocking_remaining: remaining.candidates.length > 0,
+    transport_cursor: stableState.transport_cursor,
+  };
+  await eventCall("reprocess.complete", result);
+  return result;
 }
 
 function resultFromResyncAudit(status) {
@@ -2024,11 +2159,13 @@ export async function pullBootstrap(args, dependencies = {}) {
 
   let cursor = String(teamSnapshot.min_available_seq ?? "0");
   let imported = 0;
+  let ageV1Envelopes = 0;
   for (;;) {
     const page = await requestPublicCall(config,
       `/v1/teams/${teamId}/messages?after=${cursor}&limit=${limit}`);
     const records = [];
     for (const message of page.messages) {
+      if (message.envelope?.cipher === "age-v1") ageV1Envelopes += 1;
       records.push({ type: "sync_pull_message", ...message,
         ...(await evaluateCall(config, teamSnapshot, message)) });
     }
@@ -2052,7 +2189,7 @@ export async function pullBootstrap(args, dependencies = {}) {
     cursor = page.next_after;
     if (!page.has_more) break;
   }
-  process.stdout.write(`${JSON.stringify({
+  const result = {
     type: "pull_bootstrap_result", team: config.local_team,
     team_id: config.remote_team_id, team_name: teamSnapshot.team_name,
     server_instance_id: config.server_instance_id,
@@ -2063,7 +2200,10 @@ export async function pullBootstrap(args, dependencies = {}) {
     protocol_version: config.protocol_version,
     capabilities: teamSnapshot,
     imported,
-  })}\n`);
+    age_v1_envelopes: ageV1Envelopes,
+  };
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+  return result;
 }
 
 // Resolve a team name to the teams carrying it. Like publicSnapshot this runs
@@ -2142,11 +2282,13 @@ async function publicSnapshot(serverUrl, teamId) {
 async function main() {
   const [command, ...rest] = process.argv.slice(2);
   const args = options(rest);
-  if (!["configure", "once", "run", "reprocess", "resync", "unblock-read",
-        "pull-bootstrap", "resolve-team"].includes(command)) {
+  if (!["configure", "export-age-snapshot", "verify-age-snapshot", "once", "run", "reprocess", "resync",
+        "unblock-read", "pull-bootstrap", "resolve-team"].includes(command)) {
     throw new Error(usage());
   }
   if (command === "configure") { await configure(args); return; }
+  if (command === "export-age-snapshot") { await exportAgeSnapshot(args); return; }
+  if (command === "verify-age-snapshot") { await verifyAgeSnapshot(args); return; }
   // Before any local team exists, so neither can go through loadConfig.
   if (command === "resolve-team") { await resolveTeam(args); return; }
   if (command === "pull-bootstrap") { await pullBootstrap(args); return; }

@@ -174,9 +174,11 @@ Do NOT manually edit config files. Always use join.sh. If the name was recently 
 Remote setup is no-auth. Do not ask for a token or create one.
 
 If argument starts with "remote connect":
-1. Parse the required `--endpoint <url>` and `<team>`.
-2. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh connect --endpoint <url> <team>`
-3. Show the output to the user.
+1. Parse the required `--endpoint <url>` and `<team>`, plus optional `--e2ee`.
+2. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh connect --endpoint <url> [--e2ee] <team>`
+3. Show the output to the user. Plain sync is the default; pass `--e2ee` only
+   when the user explicitly requests end-to-end encryption. The choice is
+   fixed by the first connect.
 4. End by showing this copy-paste command for the other machine, with the
    actual endpoint and team substituted:
    `bash ~/.agents/skills/agmsg/scripts/remote.sh pull --endpoint <actual-url> <actual-team>`
@@ -188,6 +190,18 @@ If argument starts with "remote pull":
    `--team-id <uuid>`.
 3. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh pull --endpoint <url> [--team-id <uuid>] <team>`
 4. Show the output to the user.
+
+If argument starts with "remote unlock":
+1. Parse `<team>`, required `--snapshot <file>`, exactly one of
+   `--identity <file>` or `--identity-stdin`, and optional
+   `--confirm-digest <sha256>`.
+2. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh unlock <team> --snapshot <file> (--identity <file>|--identity-stdin) [--confirm-digest <sha256>]`
+3. The snapshot digest must be compared over a separate live channel. Never
+   infer or auto-confirm it. Raw identity material is a permanent secret; when
+   `--identity-stdin` is needed, tell the user to run the command in their own
+   terminal rather than asking them to paste the identity into agent chat.
+4. Show the complete result, including the imported-envelope count and engine
+   PID.
 
 If argument starts with "remote status":
 1. Parse an optional `<team>` and `--json`.

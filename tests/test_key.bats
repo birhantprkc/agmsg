@@ -18,6 +18,26 @@ skip_if_no_age() {
   command -v age >/dev/null 2>&1 && command -v age-keygen >/dev/null 2>&1 || skip "age/age-keygen not installed"
 }
 
+bind_testteam() {
+  local config="$SCRIPTS/../teams/testteam/config.json"
+  python3 -c "
+import json
+p = '$config'
+d = json.load(open(p))
+d['remote_binding'] = {
+  'endpoint': 'https://sync.example.test',
+  'server_instance_id': '018f3f7e-0000-7000-8000-000000000000',
+  'remote_team_id': d['team_id'],
+  'remote_team_name': d['name'],
+  'protocol_version': 1,
+  'capabilities': {'write_allowed_ciphers': ['none', 'age-v1']},
+  'connected_at': '2026-07-30T00:00:00Z',
+  'disconnected_at': None,
+}
+open(p, 'w').write(json.dumps(d) + '\\n')
+"
+}
+
 # --- generate --------------------------------------------------------------
 
 @test "key generate: creates a first epoch and prints the backup notice" {
@@ -72,6 +92,16 @@ skip_if_no_age() {
   [[ "$output" == *"invalid team name"* ]]
 }
 
+@test "key generate refuses to turn a connected plaintext history into E2EE" {
+  bind_testteam
+  run bash "$SCRIPTS/key.sh" generate testteam
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"plaintext remote binding"* ]]
+  [[ "$output" == *"cannot be changed later"* ]]
+  [[ "$output" == *"Create a new team"* ]]
+  [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$SCRIPTS/../teams/testteam/config.json")') AS TEXT), '\$.remote_key.current.key_id');")" = "" ]
+}
+
 # --- show --------------------------------------------------------------
 
 @test "key show: default prints only public recipient and fingerprint" {
@@ -100,6 +130,28 @@ skip_if_no_age() {
   [[ "$output" != *"AGE-SECRET-KEY"* ]]
 }
 
+@test "key show --snapshot exports stable compact JCS and lowercase digest" {
+  skip_if_no_age
+  bash "$SCRIPTS/key.sh" generate testteam
+  config="$SCRIPTS/../teams/testteam/config.json"
+  bind_testteam
+  first="$TEST_SKILL_DIR/first-snapshot.json"
+  second="$TEST_SKILL_DIR/second-snapshot.json"
+
+  run bash "$SCRIPTS/key.sh" show testteam --snapshot --out "$first"
+  [ "$status" -eq 0 ]
+  first_output="$output"
+  [[ "$first_output" =~ Snapshot\ SHA-256:\ [0-9a-f]{64} ]]
+  run bash "$SCRIPTS/key.sh" show testteam --snapshot --out "$second"
+  [ "$status" -eq 0 ]
+  [ "$output" = "$first_output" ]
+  cmp "$first" "$second"
+  [ "$(wc -l < "$first" | tr -d ' ')" -eq 0 ]
+  [ "$(sqlite_mem "SELECT json_valid(CAST(readfile('$(rf "$first")') AS TEXT));")" = "1" ]
+  key_id="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$config")') AS TEXT), '\$.remote_key.current.key_id');")"
+  [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$first")') AS TEXT), '\$.authorized_writers[0]');")" = "$key_id" ]
+}
+
 # --- import --------------------------------------------------------------
 
 @test "key import --identity-stdin: establishes the first epoch for a team with no key yet" {
@@ -108,6 +160,18 @@ skip_if_no_age() {
   run bash -c "printf '%s' '$secret' | bash '$SCRIPTS/key.sh' import testteam --identity-stdin"
   [ "$status" -eq 0 ]
   [[ "$output" == *"Imported key for team 'testteam'"* ]]
+}
+
+@test "key import --key-id: preserves the authority key id and is idempotent" {
+  skip_if_no_age
+  secret=$(age-keygen 2>/dev/null | grep '^AGE-SECRET-KEY-')
+  run bash -c "printf '%s' '$secret' | bash '$SCRIPTS/key.sh' import testteam --key-id epoch-handed --identity-stdin"
+  [ "$status" -eq 0 ]
+  config="$SCRIPTS/../teams/testteam/config.json"
+  [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$config")') AS TEXT), '\$.remote_key.current.key_id');")" = "epoch-handed" ]
+  run bash -c "printf '%s' '$secret' | bash '$SCRIPTS/key.sh' import testteam --key-id epoch-handed --identity-stdin"
+  [ "$status" -eq 0 ]
+  [ "$(sqlite_mem "SELECT json_array_length(json_extract(CAST(readfile('$(rf "$config")') AS TEXT), '\$.remote_key.epochs'));")" -eq 1 ]
 }
 
 @test "key import: legacy positional identity warns on stderr; --identity-stdin does not" {
