@@ -4,6 +4,7 @@ set -euo pipefail
 # Usage:
 #   key.sh generate [<team>]
 #   key.sh show [<team>] [--key-id <key-id>] [--reveal-secret]
+#   key.sh show [<team>] --snapshot [--out <file>]
 #   key.sh import <team> [<identity>] [--identity-stdin]
 #   key.sh rotate [<team>]
 #
@@ -155,7 +156,6 @@ _key_write_identity_atomic() {
 cmd_generate() {
   local team="${1:?Usage: key.sh generate [<team>]}"
   agmsg_validate_team_name "$team" || exit 1
-  _key_require_age || exit 1
 
   local cfg
   cfg="$(_key_team_config "$team")"
@@ -163,6 +163,18 @@ cmd_generate() {
     echo "agmsg: team not found: $team" >&2
     exit 1
   fi
+  local connected_at disconnected_at binding_cipher
+  connected_at="$(_key_read_config_field "$cfg" '$.remote_binding.connected_at')"
+  disconnected_at="$(_key_read_config_field "$cfg" '$.remote_binding.disconnected_at')"
+  binding_cipher="$(_key_read_config_field "$cfg" '$.remote_binding.cipher_profile')"
+  if [ -n "$connected_at" ] && [ "$connected_at" != "null" ] &&
+      [ "$binding_cipher" != "age-v1" ] &&
+      { [ -z "$disconnected_at" ] || [ "$disconnected_at" = "null" ]; }; then
+    echo "agmsg: team '$team' already has a plaintext remote binding; its encryption choice cannot be changed later." >&2
+    echo "Create a new team, generate its key, then connect that new team with --e2ee." >&2
+    exit 1
+  fi
+  _key_require_age || exit 1
 
   local cred_dir
   cred_dir="$(_key_cred_dir "$team")"
@@ -216,10 +228,15 @@ cmd_generate() {
 }
 
 cmd_show() {
-  local team="" requested_key_id="" reveal=0
+  local team="" requested_key_id="" reveal=0 snapshot=0 out=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --reveal-secret) reveal=1 ;;
+      --snapshot) snapshot=1 ;;
+      --out)
+        shift
+        out="${1:?Missing value for --out}"
+        ;;
       --key-id)
         shift
         requested_key_id="${1:?Missing value for --key-id}"
@@ -228,7 +245,7 @@ cmd_show() {
     esac
     shift
   done
-  : "${team:?Usage: key.sh show [<team>] [--reveal-secret]}"
+  : "${team:?Usage: key.sh show [<team>] [--reveal-secret] | key.sh show [<team>] --snapshot [--out <file>]}"
   agmsg_validate_team_name "$team" || exit 1
 
   local cfg key_id recipient identity_file
@@ -238,6 +255,22 @@ cmd_show() {
     echo "agmsg: team '$team' has no key yet — run 'key.sh generate $team' or 'key.sh import $team'." >&2
     exit 1
   fi
+
+  if [ "$snapshot" -eq 1 ]; then
+    if [ "$reveal" -eq 1 ] || [ -n "$requested_key_id" ]; then
+      echo "agmsg: --snapshot cannot be combined with --reveal-secret or --key-id." >&2
+      exit 1
+    fi
+    if [ -n "$out" ]; then
+      exec bash "$SCRIPT_DIR/remote-sync.sh" export-age-snapshot \
+        --team "$team" --out "$out"
+    fi
+    exec bash "$SCRIPT_DIR/remote-sync.sh" export-age-snapshot --team "$team"
+  elif [ -n "$out" ]; then
+    echo "agmsg: --out requires --snapshot." >&2
+    exit 1
+  fi
+
   identity_file="$(_key_cred_dir "$team")/$key_id.key"
   if [ -n "$requested_key_id" ]; then
     _key_require_age || exit 1
@@ -278,15 +311,24 @@ cmd_show() {
 }
 
 cmd_import() {
-  local identity_stdin=0 positional=()
+  local identity_stdin=0 requested_key_id="" positional=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --identity-stdin) identity_stdin=1; shift ;;
+      --key-id) requested_key_id="${2:?--key-id requires a value}"; shift 2 ;;
+      --key-id=*) requested_key_id="${1#--key-id=}"; shift ;;
       *) positional+=("$1"); shift ;;
     esac
   done
   local team="${positional[0]:?Usage: key.sh import <team> [<identity>] [--identity-stdin]}"
   agmsg_validate_team_name "$team" || exit 1
+  if [ -n "$requested_key_id" ]; then
+    printf '%s\n' "$requested_key_id" |
+      grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$' || {
+      echo "agmsg: --key-id is not a valid age key id." >&2
+      exit 1
+    }
+  fi
 
   local identity
   if [ "$identity_stdin" -eq 1 ]; then
@@ -338,6 +380,11 @@ cmd_import() {
   cur_recipient="$(_key_read_config_field "$cfg" '$.remote_key.current.recipient')"
 
   if [ -n "$cur_key_id" ] && [ "$cur_key_id" != "null" ]; then
+    if [ -n "$requested_key_id" ] && [ "$requested_key_id" != "$cur_key_id" ]; then
+      agmsg_lock_release
+      echo "agmsg: imported authority key id does not match the team's current key." >&2
+      exit 1
+    fi
     if [ "$cur_recipient" != "$recipient" ]; then
       local journal journal_sql fingerprint staged_key_id
       journal="$(agmsg_roster_journal_path "$TEAMS_DIR/$team")"
@@ -382,7 +429,7 @@ cmd_import() {
   else
     # No epoch yet for this team: importing establishes the first one.
     local key_id created_at
-    key_id="$(_key_new_key_id)"
+    key_id="${requested_key_id:-$(_key_new_key_id)}"
     created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     _key_write_identity_atomic "$cred_dir/$key_id.key" "$identity"
     _key_write_epoch_locked "$cfg" "$(_key_epoch_json "$key_id" 0 0 "$recipient" null "$created_at")"

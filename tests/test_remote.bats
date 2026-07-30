@@ -4,6 +4,7 @@ load test_helper
 
 setup() {
   setup_test_env
+  export PEER_SKILL_DIR=""
   # Some cases deliberately remove python3 from PATH to verify the control-plane
   # gate. Resolve the fixture interpreter in each test process before that
   # system under test changes its environment.
@@ -16,6 +17,10 @@ setup() {
   MOCK_REVOKE_BAD_BODY="${MOCK_REVOKE_BAD_BODY:-}" \
   MOCK_REVOKE_LARGE_BODY="${MOCK_REVOKE_LARGE_BODY:-}" \
   MOCK_PULL_MIXED="${MOCK_PULL_MIXED:-}" \
+  MOCK_PULL_AGE="${MOCK_PULL_AGE:-}" \
+  MOCK_PULL_AGE_ENVELOPE_FILE="${MOCK_PULL_AGE_ENVELOPE_FILE:-}" \
+  MOCK_PULL_TEAM_ID="${MOCK_PULL_TEAM_ID:-}" \
+  MOCK_CONNECT_NO_AGE="${MOCK_CONNECT_NO_AGE:-}" \
     "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
     </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
   MOCK_SERVER_PID=$!
@@ -24,9 +29,49 @@ setup() {
   ENDPOINT="http://127.0.0.1:$MOCK_PORT"
 }
 
+cleanup_sync_engines() {
+  local root="$1" label="$2" cleanup_status=0 pidfile pid
+  [ -d "$root" ] || return 0
+  for pidfile in "$root"/run/remote-sync.*.pid; do
+    [ -f "$pidfile" ] || continue
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    if ! [[ "$pid" =~ ^[1-9][0-9]{0,9}$ ]]; then
+      echo "invalid $label sync engine PID in $pidfile: $pid" >&2
+      cleanup_status=1
+      continue
+    fi
+    kill "$pid" 2>/dev/null || true
+    if ! wait_for_pid_exit "$pid"; then
+      echo "$label sync engine $pid did not exit after TERM; sending KILL" >&2
+      kill -KILL "$pid" 2>/dev/null || true
+      if ! wait_for_pid_exit "$pid"; then
+        echo "$label sync engine $pid survived KILL; preserving $root" >&2
+        cleanup_status=1
+      fi
+    fi
+  done
+  return "$cleanup_status"
+}
+
 teardown() {
   kill "$MOCK_SERVER_PID" 2>/dev/null || true
-  teardown_test_env
+  wait "$MOCK_SERVER_PID" 2>/dev/null || true
+
+  local cleanup_status=0
+  if ! cleanup_sync_engines "$TEST_SKILL_DIR" "primary"; then
+    cleanup_status=1
+  fi
+  if [ -n "${PEER_SKILL_DIR:-}" ] && [ -d "$PEER_SKILL_DIR" ]; then
+    if cleanup_sync_engines "$PEER_SKILL_DIR" "peer"; then
+      rm -rf "$PEER_SKILL_DIR"
+    else
+      cleanup_status=1
+    fi
+  fi
+  if [ "$cleanup_status" -eq 0 ]; then
+    teardown_test_env
+  fi
+  return "$cleanup_status"
 }
 
 restart_mock_server() {
@@ -38,12 +83,21 @@ restart_mock_server() {
   MOCK_REVOKE_BAD_BODY="${MOCK_REVOKE_BAD_BODY:-}" \
   MOCK_REVOKE_LARGE_BODY="${MOCK_REVOKE_LARGE_BODY:-}" \
   MOCK_PULL_MIXED="${MOCK_PULL_MIXED:-}" \
+  MOCK_PULL_AGE="${MOCK_PULL_AGE:-}" \
+  MOCK_PULL_AGE_ENVELOPE_FILE="${MOCK_PULL_AGE_ENVELOPE_FILE:-}" \
+  MOCK_PULL_TEAM_ID="${MOCK_PULL_TEAM_ID:-}" \
+  MOCK_CONNECT_NO_AGE="${MOCK_CONNECT_NO_AGE:-}" \
     "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
       </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
   MOCK_SERVER_PID=$!
   wait_for_file_contains "$TEST_SKILL_DIR/server.port" '^[0-9][0-9]*$'
   MOCK_PORT="$(cat "$TEST_SKILL_DIR/server.port")"
   ENDPOINT="http://127.0.0.1:$MOCK_PORT"
+}
+
+skip_if_no_age() {
+  command -v age >/dev/null 2>&1 && command -v age-keygen >/dev/null 2>&1 ||
+    skip "age/age-keygen not installed"
 }
 
 # --- doctor ------------------------------------------------------------
@@ -132,11 +186,57 @@ restart_mock_server() {
 @test "connect: registers a client-owned team (happy path, Done-when 1)" {
   run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Connected: team 'testteam'"* ]]
+  [[ "$output" == *"Connected: team 'testteam' (org 'testteam') (plain)."* ]]
   # A binding is recorded on the team config, and it carries no credential:
   # the register model writes none and none is fetched back.
   [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$SCRIPTS/../teams/testteam/config.json') AS TEXT), '\$.remote_binding.connected_at');")" != "" ]
   [ ! -f "$SCRIPTS/../run/remote-credentials/testteam.json" ]
+}
+
+@test "connect --e2ee generates a key and establishes age-v1 before engine start" {
+  skip_if_no_age
+
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Connected: team 'testteam' (org 'testteam') (age-v1 encrypted)."* ]]
+  [[ "$output" == *"Back this up now"* ]]
+  [[ "$output" == *"key.sh show testteam --snapshot --out <file>"* ]]
+  sync_config="$TEST_SKILL_DIR/db/remote-sync/testteam.json"
+  [ -f "$sync_config" ]
+  [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$sync_config")') AS TEXT), '\$.cipher_profile');")" = "age-v1" ]
+  [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$sync_config")') AS TEXT), '\$.local_security_history[0].minimum_security_mode');")" = "e2ee-required" ]
+  [ -f "$TEST_SKILL_DIR/run/remote-sync.testteam.pid" ]
+  run bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"encryption: age-v1, key present"* ]]
+}
+
+@test "connect defaults to plain even when the team already has a key" {
+  skip_if_no_age
+  bash "$SCRIPTS/key.sh" generate testteam
+
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"plain sync was selected"* ]]
+  [[ "$output" == *"pass --e2ee"* ]]
+  [ ! -f "$TEST_SKILL_DIR/db/remote-sync/testteam.json" ]
+  [ -f "$TEST_SKILL_DIR/run/remote-sync.testteam.pid" ]
+  run bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"encryption: none (local key is not used by this binding)"* ]]
+}
+
+@test "connect: a keyed team fails closed when the remote disallows age-v1" {
+  skip_if_no_age
+  MOCK_CONNECT_NO_AGE=1
+  restart_mock_server
+
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"does not allow age-v1"* ]]
+  [[ "$output" == *"refusing to fall back to plaintext"* ]]
+  [ ! -f "$TEST_SKILL_DIR/db/remote-sync/testteam.json" ]
+  [ ! -f "$TEST_SKILL_DIR/run/remote-sync.testteam.pid" ]
 }
 
 @test "connect: moves the team into its own per-team store (Done-when 2)" {
@@ -713,6 +813,134 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   source "$SCRIPTS/lib/storage.sh"
   agmsg_storage_load
   [ "$(storage_history mixed | jq -s 'length')" -eq 73 ]
+}
+
+@test "remote pull: an observed age envelope prevents plaintext push" {
+  MOCK_PULL_AGE=1
+  restart_mock_server
+
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" encrypted
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"This team is encrypted"* ]]
+  [[ "$output" == *"Run remote.sh unlock with the snapshot and identity you were handed."* ]]
+
+  local cfg before after
+  cfg="$TEST_SKILL_DIR/teams/encrypted/config.json"
+  [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.remote_binding.cipher_profile');")" = "age-v1" ]
+  [ ! -f "$TEST_SKILL_DIR/run/remote-sync.encrypted.pid" ]
+
+  before="$(curl -sS "$ENDPOINT/v1/teams/$PULL_TEAM_ID" | jq -r '.current_seq')"
+  bash "$SCRIPTS/send.sh" encrypted member-1 member-1 "stays local" >/dev/null
+  run bash "$SCRIPTS/remote-sync.sh" once --team encrypted
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"selected age-v1"* ]]
+  after="$(curl -sS "$ENDPOINT/v1/teams/$PULL_TEAM_ID" | jq -r '.current_seq')"
+  [ "$after" = "$before" ]
+}
+
+@test "remote unlock: confirms handed authority, reprocesses, and resumes age-v1 sync" {
+  skip_if_no_age
+
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam >/dev/null
+  local source_cfg snapshot key_id recipient identity team_id envelope digest
+  source_cfg="$TEST_SKILL_DIR/teams/testteam/config.json"
+  snapshot="$TEST_SKILL_DIR/handed-snapshot.json"
+  envelope="$TEST_SKILL_DIR/handed-envelope.json"
+  bash "$SCRIPTS/key.sh" show testteam --snapshot --out "$snapshot" 2>/dev/null
+  key_id="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.remote_key.current.key_id');")"
+  recipient="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.remote_key.current.recipient');")"
+  team_id="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.team_id');")"
+  identity="$TEST_SKILL_DIR/run/remote-credentials/testteam/keys/$key_id.key"
+  jq -nc \
+    --arg key_id "$key_id" \
+    --arg recipient "$recipient" \
+    --arg team_id "$team_id" \
+    '{
+      type:"sync_seal", envelope_v:1, cipher:"age-v1",
+      key_id:$key_id, recipients:[$recipient], max_blob_bytes:1048576,
+      wire_id:"20000000-0000-4000-8000-000000000001",
+      team_id:$team_id, protocol_version:1,
+      projection:{
+        body:"handed ciphertext", created_at:"2026-01-02T00:00:00.000000Z",
+        from_agent:"member-1", to_agent:"member-1"
+      }
+    }' | node "$SCRIPTS/internal/sync-cipher.mjs" seal > "$envelope"
+  bash "$SCRIPTS/remote.sh" disconnect testteam >/dev/null 2>&1 || true
+
+  MOCK_PULL_AGE=1
+  MOCK_PULL_AGE_ENVELOPE_FILE="$envelope"
+  MOCK_PULL_TEAM_ID="$team_id"
+  restart_mock_server
+
+  # Machine B gets an independent install root. Reusing Machine A's root would
+  # reuse its retained checkpoint and would not test a first trust import.
+  PEER_SKILL_DIR="$(mktemp -d)"
+  export PEER_SKILL_DIR
+  mkdir -p "$PEER_SKILL_DIR"/{scripts,db,teams}
+  cp -R "$BATS_TEST_DIRNAME"/../scripts/. "$PEER_SKILL_DIR/scripts/"
+  chmod +x "$PEER_SKILL_DIR/scripts/"*.sh
+  chmod +x "$PEER_SKILL_DIR/scripts/"*.js 2>/dev/null || true
+  chmod +x "$PEER_SKILL_DIR/scripts/drivers/types/codex/"*.sh 2>/dev/null || true
+  bash "$PEER_SKILL_DIR/scripts/internal/init-db.sh"
+  local peer_scripts="$PEER_SKILL_DIR/scripts"
+
+  run bash "$peer_scripts/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$team_id" encrypted
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"local but locked"* ]]
+
+  digest="$(shasum -a 256 "$snapshot" | awk '{print $1}')"
+  run bash "$peer_scripts/remote.sh" unlock encrypted \
+    --snapshot "$snapshot" --identity "$identity" \
+    --confirm-digest "0000000000000000000000000000000000000000000000000000000000000000"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"does not match"* ]]
+  [ "$(sqlite_mem "SELECT json_type(json_extract(CAST(readfile('$(rf "$PEER_SKILL_DIR/teams/encrypted/config.json")') AS TEXT), '\$.remote_key'));")" = "" ]
+
+  local wrong_identity="$TEST_SKILL_DIR/wrong-identity.key"
+  age-keygen -o "$wrong_identity" >/dev/null 2>&1
+  run bash "$peer_scripts/remote.sh" unlock encrypted \
+    --snapshot "$snapshot" --identity "$wrong_identity" --confirm-digest "$digest"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"does not match the authority-confirmed snapshot"* ]]
+  [ "$(sqlite_mem "SELECT json_type(json_extract(CAST(readfile('$(rf "$PEER_SKILL_DIR/teams/encrypted/config.json")') AS TEXT), '\$.remote_key'));")" = "" ]
+  [ ! -e "$PEER_SKILL_DIR/run/remote-credentials/encrypted" ]
+  [ ! -e "$PEER_SKILL_DIR/db/remote-sync/encrypted.json" ]
+  [ ! -d "$PEER_SKILL_DIR/run/remote-trust" ]
+
+  run bash "$peer_scripts/remote.sh" unlock encrypted \
+    --snapshot "$snapshot" --identity "$identity" --confirm-digest "$digest"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"imported 1 envelope(s); engine running (pid "* ]]
+  local pidfile first_pid second_pid
+  pidfile="$PEER_SKILL_DIR/run/remote-sync.encrypted.pid"
+  wait_for_file "$pidfile"
+  first_pid="$(cat "$pidfile")"
+  [ -d "$PEER_SKILL_DIR/run/remote-trust" ]
+  run bash "$peer_scripts/remote.sh" unlock encrypted \
+    --snapshot "$snapshot" --identity "$identity" --confirm-digest "$digest"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"imported 0 envelope(s); engine running (pid "* ]]
+  second_pid="$(cat "$pidfile")"
+  [ "$second_pid" != "$first_pid" ]
+  ! kill -0 "$first_pid" 2>/dev/null
+  kill -0 "$second_pid" 2>/dev/null
+
+  run bash "$peer_scripts/history.sh" encrypted member-1
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"handed ciphertext"* ]]
+
+  local before after pushed_cipher
+  kill "$second_pid" 2>/dev/null || true
+  wait_for_pid_exit "$second_pid"
+  rm -f "$pidfile"
+  before="$(curl -sS "$ENDPOINT/v1/teams/$team_id" | jq -r '.current_seq')"
+  bash "$peer_scripts/send.sh" encrypted member-1 member-1 "encrypted outbound" >/dev/null
+  bash "$peer_scripts/remote-sync.sh" once --team encrypted >/dev/null 2>&1 || true
+  after="$(curl -sS "$ENDPOINT/v1/teams/$team_id" | jq -r '.current_seq')"
+  [ "$after" -gt "$before" ]
+  pushed_cipher="$(curl -sS "$ENDPOINT/_test/pushed" |
+    jq -r '.messages[-1].envelope.cipher')"
+  [ "$pushed_cipher" = "age-v1" ]
 }
 
 @test "remote doctor: age is optional — its absence does not fail the run" {
