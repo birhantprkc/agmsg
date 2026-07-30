@@ -136,6 +136,12 @@ test("a rotator provisions its confirmed snapshot at the server boundary", async
     assert.equal(snapshot.writer_generation, "1");
     assert.equal(snapshot.previous_snapshot_sha256, ageSnapshotDigest(initial));
     assert.equal(snapshot.history.at(-1).effective_from_seq, "9");
+    const laterEpoch = { ...localEpoch, key_id: "epoch-later", epoch_revision: 2,
+      writer_generation: 2 };
+    const replayed = nextLocalAgeSnapshot(rotationConfig, { ...teamConfig, remote_key: {
+      current: laterEpoch, epochs: [...teamConfig.remote_key.epochs, laterEpoch],
+    } }, rotation);
+    assert.equal(replayed.history.at(-1).key_id, newKeyId);
     await activateKeyRotations(rotationConfig);
     assert.equal(rotationConfig.age_v1_runtime_history.at(-1).key_id, newKeyId);
     const stored = JSON.parse(await readFile(join(root, "store", "remote-sync", "demo.json"), "utf8"));
@@ -147,6 +153,16 @@ test("a rotator provisions its confirmed snapshot at the server boundary", async
     const exported = JSON.parse(await readFile(exportedPath, "utf8"));
     assert.equal(exported.epoch_revision, "1");
     assert.equal(exported.history.length, 2);
+    const unconfirmed = { ...snapshot, epoch_revision: "2", writer_generation: "2",
+      previous_snapshot_sha256: ageSnapshotDigest(snapshot),
+      history: [...snapshot.history, { ...snapshot.history.at(-1), epoch_revision: "2",
+        effective_from_seq: "10", key_id: "epoch-unconfirmed" }] };
+    stored.age_v1.epoch_snapshots.push(unconfirmed);
+    stored.age_v1.checkpoint = { ...stored.age_v1.checkpoint, epoch_revision: "2",
+      writer_generation: "2", snapshot_sha256: ageSnapshotDigest(unconfirmed) };
+    await writeFile(join(root, "store", "remote-sync", "demo.json"), JSON.stringify(stored));
+    await assert.rejects(exportAgeSnapshot({ team: "demo", out: join(root, "unsafe.json") }),
+      /retained age checkpoint/u);
     assert.match(await readFile(join(root, "trust",
       `age-v1-${config.server_instance_id}-${config.remote_team_id}-v1.json`), "utf8"),
     new RegExp(ageSnapshotDigest(snapshot), "u"));

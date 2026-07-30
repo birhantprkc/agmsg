@@ -437,11 +437,10 @@ export function initialAgeSnapshot(teamConfig, team = teamConfig?.name) {
 export function nextLocalAgeSnapshot(config, teamConfig, rotation) {
   const ageSnapshots = ageSnapshotChain(config.age_v1);
   const previous = ageSnapshots.at(-1);
-  const localEpoch = teamConfig?.remote_key?.current;
   const localEpochs = teamConfig?.remote_key?.epochs;
-  if (!previous || !localEpoch || !Array.isArray(localEpochs) ||
-      canonicalJson(localEpochs.at(-1)) !== canonicalJson(localEpoch) ||
-      String(localEpoch.epoch_revision) !== rotation.epoch ||
+  const localEpoch = Array.isArray(localEpochs) ? localEpochs.find((epoch) =>
+    String(epoch?.epoch_revision) === rotation.epoch && epoch?.key_id === rotation.key_id) : null;
+  if (!previous || !localEpoch ||
       localEpoch.key_id !== rotation.key_id ||
       localEpoch.recipient === undefined ||
       createHash("sha256").update(localEpoch.recipient, "utf8").digest("hex") !==
@@ -515,6 +514,7 @@ export async function exportAgeSnapshot(args) {
     const config = await readStoredSyncConfig(team);
     if (config.cipher_profile !== "age-v1") throw new Error("team is not configured for age-v1");
     validateAgeConfiguration(config);
+    await validateRetainedAgeCheckpoint(config);
     snapshot = ageSnapshotChain(config.age_v1).at(-1);
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
