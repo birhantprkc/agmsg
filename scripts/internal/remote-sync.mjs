@@ -1636,8 +1636,7 @@ async function identityFiles(values) {
 
 async function existingConfig(team) {
   try {
-    await readStoredSyncConfig(team);
-    return await loadConfig(team);
+    return await readStoredSyncConfig(team);
   }
   catch (error) {
     if (error?.code === "ENOENT") return null;
@@ -1706,9 +1705,38 @@ export async function configure(args) {
     throw new Error("age options require --cipher age-v1");
   }
   const previous = await existingConfig(team);
-  if (previous && (previous.server_instance_id !== config.server_instance_id ||
-      previous.remote_team_id !== config.remote_team_id || previous.cipher_profile !== config.cipher_profile)) {
-    throw new Error("configure cannot replace an existing binding or cipher profile");
+  if (previous) {
+    previous.cipher_profile ??= "none";
+    if (previous.local_team !== team || previous.protocol_version !== 1 ||
+        !UUID_V7.test(previous.server_instance_id ?? "") ||
+        !UUID_V7.test(previous.remote_team_id ?? "")) {
+      throw new Error("existing sync config binding is invalid");
+    }
+    validateLocalSecurityHistory(previous.local_security_history);
+    if (previous.server_instance_id !== config.server_instance_id ||
+        previous.remote_team_id !== config.remote_team_id ||
+        previous.server_url !== config.server_url ||
+        previous.cipher_profile !== config.cipher_profile) {
+      throw new Error("configure cannot replace an existing binding or cipher profile");
+    }
+    if (cipherProfile === "age-v1") {
+      validateAgeConfiguration(previous);
+      await validateRetainedAgeCheckpoint(previous);
+      const previousSnapshots = ageSnapshotChain(previous.age_v1);
+      const proposedSnapshots = ageSnapshotChain(config.age_v1);
+      const prefixMatches = previousSnapshots.every((snapshot, index) =>
+        proposedSnapshots[index] !== undefined &&
+        ageSnapshotDigest(proposedSnapshots[index]) === ageSnapshotDigest(snapshot));
+      if (!prefixMatches || proposedSnapshots.length < previousSnapshots.length) {
+        throw new Error("configure cannot replace or truncate a confirmed age snapshot chain");
+      }
+      config.age_v1.identity_files = {
+        ...previous.age_v1.identity_files,
+        ...config.age_v1.identity_files,
+      };
+      validateAgeConfiguration(config);
+      validateConfiguredAgeIdentities(config);
+    }
   }
   const capabilities = await request(config, "/v1/capabilities");
   validateCapabilities(config, capabilities);

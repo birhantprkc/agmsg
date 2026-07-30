@@ -5,6 +5,7 @@ import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, unlink,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { readNativeAgeIdentity } from "../scripts/internal/sync-cipher.mjs";
 import {
   ageSnapshotDigest,
   activateKeyRotations,
@@ -1768,12 +1769,18 @@ test("age configure authenticates the connected credential before retaining trus
   });
 });
 
-test("age configure imports a complete chain without activating its future epoch", async () => {
+test("age configure extends a stored chain and activates its announced epoch", async () => {
   const previousFetch = globalThis.fetch;
   await withConnectedCredential(async (root) => {
     await writeConnectedTeam(root, { capabilities: { write_allowed_ciphers: ["age-v1"] } });
     const recipient0 = "age1mmqjrejftea4f6xh47lhpc0jn4vw0yuhz349sw2e3sfl22k5gcjsv6xcvp";
-    const recipient1 = "age1ykvctct4aklx4f4mnjd8rmzqs7p2le9ufg4faydljsk5mvcy0pls27mu64";
+    const identityDir = join(root, "run", "remote-credentials", "demo", "keys");
+    const identity1 = join(identityDir, "epoch-1.key");
+    await mkdir(identityDir, { recursive: true });
+    await writeFile(identity1,
+      "AGE-SECRET-KEY-14Z7XMNPZTPEMMM6DG2FSKEH042L7UMU79T645GAQJKU2LLJGPM2S7GWNLQ\n",
+      { mode: 0o600 });
+    const recipient1 = readNativeAgeIdentity(identity1).recipient;
     const ageSnapshot0 = {
       authorized_writers: ["writer-a"],
       epoch_revision: "0",
@@ -1809,10 +1816,8 @@ test("age configure imports a complete chain without activating its future epoch
     process.env.AGMSG_SYNC_STORAGE_DIR = join(root, "store");
     process.env.AGMSG_SYNC_TRUST_DIR = join(root, "trust");
     process.env.AGMSG_AGE_BIN = fakeAge;
-    let calls = 0;
-    globalThis.fetch = async () => {
-      calls += 1;
-      const body = calls === 1 ?
+    globalThis.fetch = async (url) => {
+      const body = String(url).endsWith("/v1/health") ?
         { status: "ok", database: "ok", server_instance_id: config.server_instance_id } :
         capsFor(["age-v1"]);
       return new Response(JSON.stringify(body), {
@@ -1822,18 +1827,34 @@ test("age configure imports a complete chain without activating its future epoch
     try {
       await configure({ team: "demo", server: "https://sync.example",
         "team-id": config.remote_team_id, "minimum-security": "e2ee-required",
+        cipher: "age-v1", "age-snapshot": [ageSnapshot0Path],
+        "age-checkpoint": `0:${ageSnapshotDigest(ageSnapshot0)}`,
+        "age-confirmation": "operator-live" });
+      const mutationId = "018f3f7e-0000-7000-8000-000000000025";
+      await writeFile(join(root, "teams", "demo", "roster.jsonl"), [
+        JSON.stringify({ type: "key_rotated", id: mutationId, epoch: "1",
+          key_id: "epoch-1", fingerprint: createHash("sha256").update(recipient1).digest("hex"),
+          at: "2026-07-30T00:00:00.000000Z" }),
+        JSON.stringify({ type: "roster_synced", mutation_id: mutationId, server_seq: "1",
+          wire_id: "550e8400-e29b-41d4-a716-446655440006",
+          server_instance_id: config.server_instance_id,
+          remote_team_id: config.remote_team_id }), "",
+      ].join("\n"));
+      await configure({ team: "demo", server: "https://sync.example",
+        "team-id": config.remote_team_id, "minimum-security": "e2ee-required",
         cipher: "age-v1", "age-snapshot": [ageSnapshot0Path, ageSnapshot1Path],
         "age-checkpoint": `1:${ageSnapshotDigest(ageSnapshot1)}`,
-        "age-confirmation": "operator-live" });
+        "age-confirmation": "operator-live", "age-identity": [`epoch-1=${identity1}`] });
       const stored = JSON.parse(await readFile(
         join(process.env.AGMSG_SYNC_STORAGE_DIR, "remote-sync", "demo.json"), "utf8"));
       assert.equal(stored.age_v1.epoch_snapshots.length, 2);
       const loaded = await loadConfig("demo");
-      assert.equal(loaded.age_v1_runtime_history.length, 0);
+      assert.equal(loaded.age_v1_runtime_history.length, 1);
+      assert.equal(loaded.age_v1_runtime_history[0].key_id, "epoch-1");
       const afterFirstSequence = {
         ...capsFor(["age-v1"]), current_seq: "1", next_sequence_boundary: "2",
       };
-      assert.equal(selectWriteProfile(loaded, afterFirstSequence).key_id, "epoch-0");
+      assert.equal(selectWriteProfile(loaded, afterFirstSequence).key_id, "epoch-1");
     } finally {
       globalThis.fetch = previousFetch;
       if (saved.storage === undefined) delete process.env.AGMSG_SYNC_STORAGE_DIR;
