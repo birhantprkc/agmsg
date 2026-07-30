@@ -1387,8 +1387,10 @@ cmd_sync_start() {
     IFS=$'\t' read -r engine_state ready_pid < <(_remote_sync_engine_status "$team")
     if [ "$engine_state" = "running" ] && [ "$ready_pid" = "$started_pid" ] &&
        tail -c "+$log_offset" "$logfile" 2>/dev/null |
-         grep '"event":"capabilities"' |
-         grep -Fq "\"startup_nonce\":\"$startup_nonce\""; then
+         awk -v nonce="\"startup_nonce\":\"$startup_nonce\"" '
+           index($0, "\"event\":\"capabilities\"") && index($0, nonce) { found = 1 }
+           END { exit(found ? 0 : 1) }
+         '; then
       ready=1
       break
     fi

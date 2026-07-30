@@ -65,6 +65,11 @@ write_fake_node() {
     '  exit 0' \
     'fi' \
     'echo "{\"event\":\"capabilities\",\"startup_nonce\":\"${AGMSG_SYNC_START_NONCE:-}\"}"' \
+    'i=0' \
+    'while [ "$i" -lt 512 ]; do' \
+    '  echo "{\"event\":\"capabilities\",\"startup_nonce\":\"other-generation\"}"' \
+    '  i=$((i + 1))' \
+    'done' \
     '[ -z "${AGMSG_TEST_CHILD_PID_FILE:-}" ] || printf '\''%s\\n'\'' "$$" > "$AGMSG_TEST_CHILD_PID_FILE"' \
     'trap "exit 0" TERM INT' \
     'while :; do sleep 1; done' > "$fake_node"
