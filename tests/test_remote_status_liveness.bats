@@ -66,13 +66,14 @@ write_fake_node() {
     'fi' \
     'echo "{\"event\":\"capabilities\",\"startup_nonce\":\"${AGMSG_SYNC_START_NONCE:-}\"}"' \
     "trailing_records=$trailing_records" \
-    "printf -v padding '%16384s' ''" \
-    'padding="${padding// /x}"' \
-    'i=0' \
-    'while [ "$i" -lt "$trailing_records" ]; do' \
-    '  echo "{\"event\":\"capabilities\",\"startup_nonce\":\"other-generation\",\"padding\":\"$padding\"}"' \
-    '  i=$((i + 1))' \
-    'done' \
+    'awk -v count="$trailing_records" '\''BEGIN {' \
+    '  padding = sprintf("%16384s", "")' \
+    '  gsub(/ /, "x", padding)' \
+    '  for (i = 0; i < count; i++) {' \
+    '    print "{\"event\":\"capabilities\",\"startup_nonce\":\"other-generation\",\"padding\":\"" padding "\"}"' \
+    '  }' \
+    '}'\''' \
+    '[ -z "${AGMSG_TEST_LOG_READY_FILE:-}" ] || : > "$AGMSG_TEST_LOG_READY_FILE"' \
     '[ -z "${AGMSG_TEST_CHILD_PID_FILE:-}" ] || printf '\''%s\\n'\'' "$$" > "$AGMSG_TEST_CHILD_PID_FILE"' \
     'trap "exit 0" TERM INT' \
     'while :; do sleep 1; done' > "$fake_node"
@@ -81,14 +82,15 @@ write_fake_node() {
 }
 
 write_fake_node_ps_fixture() {
-  local fake_node="$1" foreign_pid="${2:-}" fake_bin="$TEST_SKILL_DIR/fake-node-bin"
+  local fake_node="$1" foreign_pid="${2:-}" ready_file="${3:-}" \
+    fake_bin="$TEST_SKILL_DIR/fake-node-bin"
   mkdir -p "$fake_bin"
   printf '%s\n' '#!/usr/bin/env bash' \
     'pid=""' \
     'while [ $# -gt 0 ]; do' \
     '  if [ "$1" = "-p" ]; then pid="$2"; shift 2; else shift; fi' \
     'done' \
-    "if [ \"\$pid\" = '$foreign_pid' ]; then" \
+    "if { [ -n '$ready_file' ] && [ ! -f '$ready_file' ]; } || [ \"\$pid\" = '$foreign_pid' ]; then" \
     "  printf '%s\\n' 'sleep 30'" \
     'else' \
     "  printf '%s\\n' 'bash $SCRIPTS/internal/remote-sync.mjs run --team testteam'" \
@@ -267,13 +269,15 @@ remember_engine_pid() {
 }
 
 @test "sync start reads a complete multi-megabyte handshake log without SIGPIPE" {
-  local fake_node fake_bin
+  local fake_node fake_bin ready_file="$TEST_SKILL_DIR/handshake-log.ready"
   fake_node="$(write_fake_node 512)"
-  fake_bin="$(write_fake_node_ps_fixture "$fake_node")"
+  fake_bin="$(write_fake_node_ps_fixture "$fake_node" "" "$ready_file")"
 
   run env PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" \
+    AGMSG_TEST_LOG_READY_FILE="$ready_file" \
     bash "$SCRIPTS/remote.sh" sync start testteam
   [ "$status" -eq 0 ]
+  [ -f "$ready_file" ]
   remember_engine_pid
   kill -0 "$ENGINE_PID"
 }
