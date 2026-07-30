@@ -2092,6 +2092,13 @@ export async function reprocessCycle(config, limit, dependencies = {}) {
     const records = [];
     const storageRecords = [];
     const rotationRecords = [];
+    let pendingRosterRecords = [];
+    const flushRosterRecords = async (cursorRecord) => {
+      if (pendingRosterRecords.length === 0) return;
+      await rosterDriverCall("apply", config,
+        cursorRecord ? [...pendingRosterRecords, cursorRecord] : pendingRosterRecords);
+      pendingRosterRecords = [];
+    };
     for (const candidate of candidates) {
       const token = reprocessCandidateToken(candidate);
       if (seenTokens.has(token)) throw new Error("driver reprocess repeated a candidate");
@@ -2115,11 +2122,20 @@ export async function reprocessCycle(config, limit, dependencies = {}) {
       const record = { type: "sync_pull_message", ...message, ...evaluated };
       storageRecords.push(record);
       if (record.status === "importable" && record.projection?.kind === "key_rotated") {
+        // A rotation changes how every later sequence is interpreted. Flush
+        // earlier roster mutations before publishing and activating it; a
+        // page may interleave both kinds, and the journal is append-only.
+        await flushRosterRecords(null);
         await rosterDriverCall("apply", config, [record]);
         await activateKeyRotationsCall(config);
         rotationRecords.push(record);
       } else {
         records.push(record);
+        if (record.status === "importable" &&
+            ["member_joined", "member_left", "member_renamed"].includes(
+              record.projection?.kind)) {
+          pendingRosterRecords.push(record);
+        }
       }
     }
     if (candidates.length > 0) {
@@ -2132,9 +2148,7 @@ export async function reprocessCycle(config, limit, dependencies = {}) {
           storageRecords.length) {
         throw new Error("reprocess cannot apply this projection kind");
       }
-      if (rosterRecords.length > 0) {
-        await rosterDriverCall("apply", config, [...rosterRecords, cursorRecord]);
-      }
+      await flushRosterRecords(cursorRecord);
       const applied = await driverCall("apply", config, [...storageRecords, cursorRecord]);
       const messageIds = new Set(messageRecords.map((record) => record.id));
       await logApplyCall(config, messageRecords, applied.filter((record) =>

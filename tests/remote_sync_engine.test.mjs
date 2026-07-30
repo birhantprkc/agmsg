@@ -689,6 +689,106 @@ test("reprocess routes recovered roster mutations away from message storage", as
   assert.equal(result.blocking_remaining, false);
 });
 
+test("reprocess preserves server order across roster mutations and rotations", async () => {
+  const capabilities = {
+    ...capsFor(["age-v1"]), current_seq: "6", next_sequence_boundary: "7",
+  };
+  const ids = Array.from({ length: 6 }, (_, index) =>
+    `550e8400-e29b-41d4-a716-44665544000${index + 1}`);
+  let completed = false;
+  let activeEpoch = 0;
+  const rosterOrder = [];
+  const result = await reprocessCycle(config, 100, {
+    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    requestCall: async () => capabilities,
+    driverCall: async (operation, _config, input) => {
+      if (operation === "apply") {
+        assert.deepEqual(input.filter((record) => record.id).map((record) => record.server_seq),
+          ["1", "2", "3", "4", "5", "6"]);
+        completed = true;
+        return [{ type: "sync_apply_result", transport_cursor: "6", corrupt_count: 0 },
+          ...ids.map((id, index) => ({ type: "sync_apply_outcome", id,
+            server_seq: String(index + 1), status: "imported" }))];
+      }
+      assert.equal(operation, "reprocess");
+      return [
+        { type: "sync_state", driver_generation: "generation-ordered", transport_cursor: "6" },
+        ...(!completed ? ids.map((id, index) => ({ type: "sync_reprocess_candidate",
+          server_seq: String(index + 1), id,
+          server_received_at: "2026-07-30T20:33:33.000000Z",
+          envelope: { v: 1, cipher: "age-v1", key_id: "epoch-initial", blob: id },
+          prior_status: "pending_key" })) : []),
+        { type: "sync_reprocess_page", next_after: null, has_more: false },
+      ];
+    },
+    rosterDriverCall: async (operation, _config, input) => {
+      assert.equal(operation, "apply");
+      rosterOrder.push(...input.filter((record) => record.id).map((record) => record.server_seq));
+      return [];
+    },
+    activateKeyRotationsCall: async () => { activeEpoch += 1; },
+    evaluateCall: async (_config, _capabilities, message) => {
+      const seq = Number(message.server_seq);
+      if (seq === 2 || seq === 5) return { status: "importable", projection: {
+        kind: "key_rotated", mutation_id: `018f3f7e-0000-7000-8000-00000000002${seq}`,
+        epoch: String(seq === 2 ? 1 : 2), key_id: `epoch-${seq}`,
+        fingerprint: "a".repeat(64), occurred_at: "2026-07-30T20:33:33.000000Z",
+      }, policy_revision: "0", local_security_revision: "0" };
+      if (seq === 4) {
+        assert.equal(activeEpoch, 1);
+        return { status: "importable", projection: { body: "after rotation",
+          created_at: "2026-07-30T20:33:33.000000Z", from_agent: "a", to_agent: "b" },
+        policy_revision: "0", local_security_revision: "0" };
+      }
+      return { status: "importable", projection: { kind: "member_joined",
+        mutation_id: `018f3f7e-0000-7000-8000-00000000001${seq}`,
+        member_id: `018f3f7e-0000-7000-8000-00000000003${seq}`,
+        name: `member-${seq}`, occurred_at: "2026-07-30T20:33:33.000000Z" },
+      policy_revision: "0", local_security_revision: "0" };
+    },
+    eventCall: async () => {}, logApplyCall: async () => {},
+  });
+  assert.deepEqual(rosterOrder, ["1", "2", "3", "5", "6"]);
+  assert.equal(activeEpoch, 2);
+  assert.equal(result.imported_count, 6);
+});
+
+test("reprocess does not advance storage when an ordered roster flush fails", async () => {
+  const ids = ["550e8400-e29b-41d4-a716-446655440001",
+    "550e8400-e29b-41d4-a716-446655440002"];
+  let storageApplied = false;
+  let activated = false;
+  await assert.rejects(reprocessCycle(config, 100, {
+    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    requestCall: async () => ({ ...capsFor(["age-v1"]), current_seq: "2",
+      next_sequence_boundary: "3" }),
+    driverCall: async (operation) => {
+      if (operation === "apply") { storageApplied = true; return []; }
+      return [{ type: "sync_state", driver_generation: "generation-fail", transport_cursor: "2" },
+        ...ids.map((id, index) => ({ type: "sync_reprocess_candidate",
+          server_seq: String(index + 1), id,
+          server_received_at: "2026-07-30T20:33:33.000000Z",
+          envelope: { v: 1, cipher: "age-v1", key_id: "epoch-initial", blob: id },
+          prior_status: "pending_key" })),
+        { type: "sync_reprocess_page", next_after: null, has_more: false }];
+    },
+    rosterDriverCall: async () => { throw new Error("roster append failed"); },
+    activateKeyRotationsCall: async () => { activated = true; },
+    evaluateCall: async (_config, _capabilities, message) => ({ status: "importable",
+      projection: message.server_seq === "1" ? { kind: "member_joined",
+        mutation_id: "018f3f7e-0000-7000-8000-000000000011",
+        member_id: "018f3f7e-0000-7000-8000-000000000031", name: "member-1",
+        occurred_at: "2026-07-30T20:33:33.000000Z" } : { kind: "key_rotated",
+        mutation_id: "018f3f7e-0000-7000-8000-000000000022", epoch: "1",
+        key_id: "epoch-1", fingerprint: "a".repeat(64),
+        occurred_at: "2026-07-30T20:33:33.000000Z" },
+      policy_revision: "0", local_security_revision: "0" }),
+    eventCall: async () => {}, logApplyCall: async () => {},
+  }), /roster append failed/u);
+  assert.equal(storageApplied, false);
+  assert.equal(activated, false);
+});
+
 test("explicit reprocess rejects an unbounded walk through duplicate server sequences", async () => {
   const capabilities = {
     protocol_version: 1, server_instance_id: config.server_instance_id,
