@@ -1968,6 +1968,8 @@ export async function reprocessCycle(config, limit, dependencies = {}) {
   const evaluateCall = dependencies.evaluateCall ?? evaluatePull;
   const eventCall = dependencies.eventCall ?? event;
   const logApplyCall = dependencies.logApplyCall ?? logApplyOutcomes;
+  const rosterDriverCall = dependencies.rosterDriverCall ?? rosterDriver;
+  const activateKeyRotationsCall = dependencies.activateKeyRotationsCall ?? activateKeyRotations;
   const ready = await healthCall(config.server_url);
   if (ready.server_instance_id !== config.server_instance_id) throw new Error("health server instance changed");
   const capabilities = await requestCall(config, "/v1/capabilities");
@@ -2000,6 +2002,8 @@ export async function reprocessCycle(config, limit, dependencies = {}) {
     }
     stableState ??= state;
     const records = [];
+    const storageRecords = [];
+    const rotationRecords = [];
     for (const candidate of candidates) {
       const token = reprocessCandidateToken(candidate);
       if (seenTokens.has(token)) throw new Error("driver reprocess repeated a candidate");
@@ -2020,12 +2024,33 @@ export async function reprocessCycle(config, limit, dependencies = {}) {
       const message = { server_seq: candidate.server_seq, id: candidate.id,
         server_received_at: candidate.server_received_at, envelope: candidate.envelope };
       const evaluated = await evaluateCall(config, capabilities, message);
-      records.push({ type: "sync_pull_message", ...message, ...evaluated });
+      const record = { type: "sync_pull_message", ...message, ...evaluated };
+      storageRecords.push(record);
+      if (record.status === "importable" && record.projection?.kind === "key_rotated") {
+        await rosterDriverCall("apply", config, [record]);
+        await activateKeyRotationsCall(config);
+        rotationRecords.push(record);
+      } else {
+        records.push(record);
+      }
     }
-    if (records.length > 0) {
-      records.push({ type: "sync_pull_cursor", next_after: state.transport_cursor });
-      const applied = await driverCall("apply", config, records);
-      await logApplyCall(config, records, applied);
+    if (candidates.length > 0) {
+      const cursorRecord = { type: "sync_pull_cursor", next_after: state.transport_cursor };
+      const rosterRecords = records.filter((record) =>
+        record.status === "importable" &&
+        ["member_joined", "member_left", "member_renamed"].includes(record.projection?.kind));
+      const messageRecords = records.filter((record) => !record.projection?.kind);
+      if (rosterRecords.length + messageRecords.length + rotationRecords.length !==
+          storageRecords.length) {
+        throw new Error("reprocess cannot apply this projection kind");
+      }
+      if (rosterRecords.length > 0) {
+        await rosterDriverCall("apply", config, [...rosterRecords, cursorRecord]);
+      }
+      const applied = await driverCall("apply", config, [...storageRecords, cursorRecord]);
+      const messageIds = new Set(messageRecords.map((record) => record.id));
+      await logApplyCall(config, messageRecords, applied.filter((record) =>
+        record.type !== "sync_apply_outcome" || messageIds.has(record.id)));
       const candidateIds = new Set(candidates.map((candidate) => candidate.id));
       imported += applied.filter((record) =>
         record.type === "sync_apply_outcome" &&

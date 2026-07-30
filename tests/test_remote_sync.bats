@@ -213,6 +213,35 @@ prepare_push() {
   [ "$(agmsg_sqlite "$db" "SELECT status FROM sync_quarantine WHERE wire_id='550e8400-e29b-41d4-a716-446655440020';" | tr -d '\r')" = imported ]
 }
 
+@test "sync contract: reprocess acknowledges a roster projection without making a message" {
+  local wire blocked page reevaluated result db
+  wire=550e8400-e29b-41d4-a716-446655440021
+  blocked=$(jq -nc --arg id "$wire" '
+    {type:"sync_pull_message",server_seq:"1",id:$id,
+     server_received_at:"2026-07-30T20:33:33.000000Z",
+     envelope:{v:1,cipher:"age-v1",key_id:"epoch-1",blob:"YWdl"},
+     status:"unsupported_cipher",reason:"age-v1 is not configured",
+     policy_revision:"0",local_security_revision:"0"}')
+  page=$(printf '%s\n%s\n' "$blocked" '{"type":"sync_pull_cursor","next_after":"1"}')
+  printf '%s\n' "$page" | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
+  reevaluated=$(printf '%s\n' "$blocked" | jq -c '
+    .status="importable" | .reason="" |
+    .projection={kind:"member_joined",
+      mutation_id:"019fb4bb-7948-7520-8c16-ab64753e2012",
+      member_id:"019fb4bb-7948-7ce9-8e4f-61229dc726cf",
+      name:"dana",occurred_at:"2026-07-30T20:33:33.000000Z"}')
+  result=$(printf '%s\n%s\n' "$reevaluated" \
+    '{"type":"sync_pull_cursor","next_after":"1"}' |
+    storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1)
+  [ "$(printf '%s\n' "$result" | jq -r --arg id "$wire" \
+    'select(.type=="sync_apply_outcome" and .id==$id)|.status')" = imported ]
+  [ "$(storage_history demo | jq -s 'length')" -eq 0 ]
+  db=$(agmsg_db_path demo)
+  [ "$(agmsg_sqlite "$db" "SELECT status FROM sync_quarantine WHERE wire_id='$wire';" | tr -d '\r')" = imported ]
+  [ "$(storage_sync_reprocess demo "$SERVER_ID" "$TEAM_ID" 1 100 |
+    jq -s '[.[]|select(.type=="sync_reprocess_candidate")]|length')" -eq 0 ]
+}
+
 @test "sync contract: reprocess candidate body and trailer share one keyset page" {
   local records="" page first token second index wire
   for index in 1 2 3; do

@@ -498,6 +498,80 @@ test("reprocess completion counts imported outcomes and requires empty blocking 
   assert.equal(result.blocking_remaining, false);
 });
 
+test("reprocess routes recovered roster mutations away from message storage", async () => {
+  const capabilities = {
+    protocol_version: 1, server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id, team_name: "demo", min_available_seq: "0",
+    current_seq: "2", next_sequence_boundary: "3", accepted_envelope_versions: [1],
+    write_allowed_ciphers: ["age-v1"], policy_revision: "0", effective_from_seq: "1",
+    max_blob_bytes: "1048576", policy_history: [{ policy_revision: "0",
+      effective_from_seq: "1", accepted_envelope_versions: [1],
+      write_allowed_ciphers: ["age-v1"] }],
+  };
+  const rosterId = "80dc98aa-a3a1-4a75-becb-9397347875b0";
+  const messageId = "900f3ee4-eca6-44a1-a288-4e9c72b941ac";
+  let rosterApplied = false;
+  let messageApplied = false;
+  const result = await reprocessCycle(config, 100, {
+    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    requestCall: async () => capabilities,
+    driverCall: async (operation, _config, input) => {
+      if (operation === "apply") {
+        assert.deepEqual(input.map((record) => record.id).filter(Boolean), [rosterId, messageId]);
+        assert.deepEqual(input.at(-1), { type: "sync_pull_cursor", next_after: "2" });
+        messageApplied = true;
+        return [
+          { type: "sync_apply_result", transport_cursor: "2", corrupt_count: 0 },
+          { type: "sync_apply_outcome", id: rosterId, server_seq: "1", status: "imported" },
+          { type: "sync_apply_outcome", id: messageId, server_seq: "2", status: "imported" },
+        ];
+      }
+      assert.equal(operation, "reprocess");
+      return [
+        { type: "sync_state", driver_generation: "generation-1", transport_cursor: "2" },
+        ...(!rosterApplied || !messageApplied ? [{
+          type: "sync_reprocess_candidate", server_seq: "1", id: rosterId,
+          server_received_at: "2026-07-30T20:33:33.000000Z",
+          envelope: { v: 1, cipher: "age-v1", key_id: "epoch-initial", blob: "roster" },
+          prior_status: "unsupported_cipher",
+        }, {
+          type: "sync_reprocess_candidate", server_seq: "2", id: messageId,
+          server_received_at: "2026-07-30T20:33:43.000000Z",
+          envelope: { v: 1, cipher: "age-v1", key_id: "epoch-initial", blob: "message" },
+          prior_status: "unsupported_cipher",
+        }] : []),
+        { type: "sync_reprocess_page", next_after: null, has_more: false },
+      ];
+    },
+    rosterDriverCall: async (operation, _config, input) => {
+      assert.equal(operation, "apply");
+      assert.deepEqual(input.map((record) => record.id).filter(Boolean), [rosterId]);
+      assert.deepEqual(input.at(-1), { type: "sync_pull_cursor", next_after: "2" });
+      rosterApplied = true;
+      return [{ type: "roster_sync_apply_outcome", id: rosterId,
+        server_seq: "1", status: "imported" }];
+    },
+    evaluateCall: async (_config, _capabilities, message) => message.id === rosterId ? ({
+      status: "importable", projection: {
+        kind: "member_joined",
+        mutation_id: "019fb4bb-7948-7520-8c16-ab64753e2012",
+        member_id: "019fb4bb-7948-7ce9-8e4f-61229dc726cf",
+        name: "dana", occurred_at: "2026-07-30T20:33:33.000000Z",
+      }, policy_revision: "0", local_security_revision: "0",
+    }) : ({
+      status: "importable", projection: {
+        body: "first sealed message", created_at: "2026-07-30T20:33:43.000000Z",
+        from_agent: "dana", to_agent: "dana",
+      }, policy_revision: "0", local_security_revision: "0",
+    }),
+    eventCall: async () => {},
+    logApplyCall: async () => {},
+  });
+  assert.equal(result.count, 2);
+  assert.equal(result.imported_count, 2);
+  assert.equal(result.blocking_remaining, false);
+});
+
 test("explicit reprocess rejects an unbounded walk through duplicate server sequences", async () => {
   const capabilities = {
     protocol_version: 1, server_instance_id: config.server_instance_id,
