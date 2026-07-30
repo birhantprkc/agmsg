@@ -29,37 +29,49 @@ setup() {
   ENDPOINT="http://127.0.0.1:$MOCK_PORT"
 }
 
+cleanup_sync_engines() {
+  local root="$1" label="$2" cleanup_status=0 pidfile pid
+  [ -d "$root" ] || return 0
+  for pidfile in "$root"/run/remote-sync.*.pid; do
+    [ -f "$pidfile" ] || continue
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    if ! [[ "$pid" =~ ^[1-9][0-9]{0,9}$ ]]; then
+      echo "invalid $label sync engine PID in $pidfile: $pid" >&2
+      cleanup_status=1
+      continue
+    fi
+    kill "$pid" 2>/dev/null || true
+    if ! wait_for_pid_exit "$pid"; then
+      echo "$label sync engine $pid did not exit after TERM; sending KILL" >&2
+      kill -KILL "$pid" 2>/dev/null || true
+      if ! wait_for_pid_exit "$pid"; then
+        echo "$label sync engine $pid survived KILL; preserving $root" >&2
+        cleanup_status=1
+      fi
+    fi
+  done
+  return "$cleanup_status"
+}
+
 teardown() {
   kill "$MOCK_SERVER_PID" 2>/dev/null || true
-  local peer_cleanup_status=0 peer_root_removable=1
+  wait "$MOCK_SERVER_PID" 2>/dev/null || true
+
+  local cleanup_status=0
+  if ! cleanup_sync_engines "$TEST_SKILL_DIR" "primary"; then
+    cleanup_status=1
+  fi
   if [ -n "${PEER_SKILL_DIR:-}" ] && [ -d "$PEER_SKILL_DIR" ]; then
-    local peer_pidfile peer_pid
-    for peer_pidfile in "$PEER_SKILL_DIR"/run/remote-sync.*.pid; do
-      [ -f "$peer_pidfile" ] || continue
-      peer_pid="$(cat "$peer_pidfile" 2>/dev/null || true)"
-      if ! [[ "$peer_pid" =~ ^[1-9][0-9]{0,9}$ ]]; then
-        echo "invalid peer sync engine PID in $peer_pidfile: $peer_pid" >&2
-        peer_cleanup_status=1
-        peer_root_removable=0
-        continue
-      fi
-      kill "$peer_pid" 2>/dev/null || true
-      if ! wait_for_pid_exit "$peer_pid"; then
-        echo "peer sync engine $peer_pid did not exit after TERM; sending KILL" >&2
-        kill -KILL "$peer_pid" 2>/dev/null || true
-        if ! wait_for_pid_exit "$peer_pid"; then
-          echo "peer sync engine $peer_pid survived KILL; preserving $PEER_SKILL_DIR" >&2
-          peer_cleanup_status=1
-          peer_root_removable=0
-        fi
-      fi
-    done
-    if [ "$peer_root_removable" -eq 1 ]; then
+    if cleanup_sync_engines "$PEER_SKILL_DIR" "peer"; then
       rm -rf "$PEER_SKILL_DIR"
+    else
+      cleanup_status=1
     fi
   fi
-  teardown_test_env
-  return "$peer_cleanup_status"
+  if [ "$cleanup_status" -eq 0 ]; then
+    teardown_test_env
+  fi
+  return "$cleanup_status"
 }
 
 restart_mock_server() {
