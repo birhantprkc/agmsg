@@ -311,6 +311,25 @@ test("an age-selected binding never synthesizes a plaintext config", async () =>
     try {
       await assert.rejects(loadConfig("demo"),
         /selected age-v1.*authenticated sync configuration is missing/u);
+      await mkdir(join(root, "db", "remote-sync"), { recursive: true });
+      await writeFile(join(root, "db", "remote-sync", "demo.json"),
+        `${JSON.stringify({
+          format_version: 1,
+          local_team: "demo",
+          server_url: "https://sync.example",
+          server_instance_id: config.server_instance_id,
+          remote_team_id: config.remote_team_id,
+          protocol_version: 1,
+          cipher_profile: "none",
+          local_security_history: [{
+            local_security_revision: "0",
+            effective_from_seq: "1",
+            minimum_security_mode: "plaintext-allowed",
+          }],
+        })}\n`,
+        { mode: 0o600 });
+      await assert.rejects(loadConfig("demo"),
+        /sync configuration cipher does not match.*binding/u);
     } finally {
       if (previousStorage === undefined) delete process.env.AGMSG_SYNC_STORAGE_DIR;
       else process.env.AGMSG_SYNC_STORAGE_DIR = previousStorage;
