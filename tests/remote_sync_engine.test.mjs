@@ -153,14 +153,31 @@ test("a rotator provisions its confirmed snapshot at the server boundary", async
     const exported = JSON.parse(await readFile(exportedPath, "utf8"));
     assert.equal(exported.epoch_revision, "1");
     assert.equal(exported.history.length, 2);
+    const confirmedStored = structuredClone(stored);
+    const rolledBack = structuredClone(confirmedStored);
+    rolledBack.age_v1.epoch_snapshots = [initial];
+    rolledBack.age_v1.checkpoint = { ...rolledBack.age_v1.checkpoint,
+      epoch_revision: "0", writer_generation: "0", snapshot_sha256: ageSnapshotDigest(initial) };
+    await writeFile(join(root, "store", "remote-sync", "demo.json"), JSON.stringify(rolledBack));
+    await assert.rejects(exportAgeSnapshot({ team: "demo", out: join(root, "rollback.json") }),
+      /rollback/u);
+    const conflictingStored = structuredClone(confirmedStored);
+    const conflicting = { ...snapshot, authorized_writers: ["conflicting-writer"] };
+    conflictingStored.age_v1.epoch_snapshots[1] = conflicting;
+    conflictingStored.age_v1.checkpoint.snapshot_sha256 = ageSnapshotDigest(conflicting);
+    await writeFile(join(root, "store", "remote-sync", "demo.json"),
+      JSON.stringify(conflictingStored));
+    await assert.rejects(exportAgeSnapshot({ team: "demo", out: join(root, "conflict.json") }),
+      /same-revision conflict/u);
+    const advancedStored = structuredClone(confirmedStored);
     const unconfirmed = { ...snapshot, epoch_revision: "2", writer_generation: "2",
       previous_snapshot_sha256: ageSnapshotDigest(snapshot),
       history: [...snapshot.history, { ...snapshot.history.at(-1), epoch_revision: "2",
         effective_from_seq: "10", key_id: "epoch-unconfirmed" }] };
-    stored.age_v1.epoch_snapshots.push(unconfirmed);
-    stored.age_v1.checkpoint = { ...stored.age_v1.checkpoint, epoch_revision: "2",
+    advancedStored.age_v1.epoch_snapshots.push(unconfirmed);
+    advancedStored.age_v1.checkpoint = { ...advancedStored.age_v1.checkpoint, epoch_revision: "2",
       writer_generation: "2", snapshot_sha256: ageSnapshotDigest(unconfirmed) };
-    await writeFile(join(root, "store", "remote-sync", "demo.json"), JSON.stringify(stored));
+    await writeFile(join(root, "store", "remote-sync", "demo.json"), JSON.stringify(advancedStored));
     await assert.rejects(exportAgeSnapshot({ team: "demo", out: join(root, "unsafe.json") }),
       /retained age checkpoint/u);
     assert.match(await readFile(join(root, "trust",
