@@ -361,7 +361,10 @@ _remote_local_disconnect() {
   # <escaped> is spliced as a genuine SQL string literal, NOT bound via
   # `.param set` (same tokenizer caveat as `_remote_read_config_field` above).
   updated=$(agmsg_sqlite_mem \
-    "SELECT json_set('$escaped', '\$.remote_binding.disconnected_at', '$(_agmsg_sqlesc "$disconnected_at")');")
+    "SELECT json_set('$escaped',
+       '\$.remote_binding.disconnected_at', '$(_agmsg_sqlesc "$disconnected_at")',
+       '\$.remote_binding.binding_revision',
+         coalesce(json_extract('$escaped', '\$.remote_binding.binding_revision'), 0) + 1);")
   agmsg_write_atomic "$cfg" "$updated"
   agmsg_lock_release
 }
@@ -754,7 +757,9 @@ _remote_commit() {
        'protocol_version', $protocol_version,
        'capabilities', json('$caps_escaped'),
        'connected_at', '$(_agmsg_sqlesc "$connected_at")',
-       'disconnected_at', null
+       'disconnected_at', null,
+       'binding_revision',
+         coalesce(json_extract('$escaped', '\$.remote_binding.binding_revision'), 0) + 1
      ));")
   agmsg_write_atomic "$cfg" "$updated"
 }
@@ -935,7 +940,9 @@ cmd_pull() {
        'protocol_version', $pulled_protocol,
        'capabilities', json('$caps_escaped'),
        'connected_at', '$bind_at',
-       'disconnected_at', null));")
+       'disconnected_at', null,
+       'binding_revision',
+         coalesce(json_extract('$escaped', '\$.remote_binding.binding_revision'), 0) + 1));")
   agmsg_write_atomic "$cfg" "$updated"
   agmsg_lock_release
 
@@ -1112,6 +1119,8 @@ cmd_connect() {
   # the team_id is a value we minted ourselves.
   local connected_at updated
   connected_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  agmsg_lock_acquire "$TEAMS_DIR/$team" || exit 1
+  cfg_escaped="$(sed "s/'/''/g" "$cfg")"
   updated=$(agmsg_sqlite_mem \
     "SELECT json_set('$cfg_escaped', '\$.remote_binding', json_object(
        'endpoint', '$(_agmsg_sqlesc "$endpoint")',
@@ -1121,9 +1130,12 @@ cmd_connect() {
        'protocol_version', $protocol_version,
        'capabilities', json('$resp_escaped'),
        'connected_at', '$(_agmsg_sqlesc "$connected_at")',
-       'disconnected_at', null
+       'disconnected_at', null,
+       'binding_revision',
+         coalesce(json_extract('$cfg_escaped', '\$.remote_binding.binding_revision'), 0) + 1
      ));")
   agmsg_write_atomic "$cfg" "$updated"
+  agmsg_lock_release
 
   # Move the team out of the shared store into its own before the engine runs:
   # a connected team's rows carry ids, and one column cannot hold both those and
@@ -1369,16 +1381,27 @@ cmd_forget() {
   team="${positional[0]}"
   agmsg_validate_team_name "$team" || exit 1
 
-  local team_dir cfg connected_at disconnected_at binding_before binding_current
+  local team_dir cfg connected_at disconnected_at binding_before binding_current \
+    binding_revision_before binding_revision_current escaped updated
   team_dir="$TEAMS_DIR/$team"
   cfg="$(_remote_team_config "$team")"
   [ -f "$cfg" ] || {
     echo "agmsg: team '$team' has no local remote binding to forget" >&2
     exit 1
   }
+  agmsg_lock_acquire "$team_dir" || exit 1
   connected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.connected_at')"
   disconnected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.disconnected_at')"
+  binding_revision_before="$(_remote_read_config_field "$cfg" '$.remote_binding.binding_revision')"
+  if [ -z "$binding_revision_before" ] || [ "$binding_revision_before" = "null" ]; then
+    escaped="$(sed "s/'/''/g" "$cfg")"
+    updated="$(agmsg_sqlite_mem \
+      "SELECT json_set('$escaped', '\$.remote_binding.binding_revision', 1);")"
+    agmsg_write_atomic "$cfg" "$updated"
+    binding_revision_before=1
+  fi
   binding_before="$(_remote_read_config_field "$cfg" '$.remote_binding')"
+  agmsg_lock_release
   if [ -z "$connected_at" ] || [ "$connected_at" = "null" ]; then
     echo "agmsg: team '$team' has never been connected" >&2
     exit 1
@@ -1430,7 +1453,9 @@ cmd_forget() {
   # reconnect racing the prompt must not have its new active binding deleted.
   agmsg_lock_acquire "$team_dir" || exit 1
   binding_current="$(_remote_read_config_field "$cfg" '$.remote_binding')"
-  if [ "$binding_current" != "$binding_before" ]; then
+  binding_revision_current="$(_remote_read_config_field "$cfg" '$.remote_binding.binding_revision')"
+  if [ "$binding_revision_current" != "$binding_revision_before" ] ||
+     [ "$binding_current" != "$binding_before" ]; then
     agmsg_lock_release
     echo "agmsg: team '$team' changed while forget was waiting; nothing was deleted" >&2
     exit 1

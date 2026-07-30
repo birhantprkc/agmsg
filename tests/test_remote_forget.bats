@@ -22,7 +22,8 @@ setup() {
         'protocol_version', 1,
         'capabilities', json_object('write_allowed_ciphers', json_array('none')),
         'connected_at', '2026-07-30T00:00:00Z',
-        'disconnected_at', '2026-07-30T00:01:00Z'
+        'disconnected_at', '2026-07-30T00:01:00Z',
+        'binding_revision', 1
       ));")"
   printf '%s\n' "$updated" > "$cfg"
 
@@ -82,18 +83,57 @@ set_disconnected_at() {
 }
 
 @test "forget: rejects any binding ABA while confirmation is pending" {
-  local out="$TEST_SKILL_DIR/forget.out" cfg lock
-  lock="$TEST_SKILL_DIR/teams/testteam/.config.lock"
-  mkdir "$lock"
-  bash "$SCRIPTS/remote.sh" forget --yes testteam >"$out" 2>&1 &
-  local forget_pid=$!
-  wait_for_file_contains "$out" "Events: 3"
-  cfg="$TEST_SKILL_DIR/teams/testteam/config.json"
-  python3 -c "import json; p='$cfg'; d=json.load(open(p)); d['remote_binding']['endpoint']='https://changed.example'; open(p,'w').write(json.dumps(d)+'\\n')"
-  rmdir "$lock"
-  local status=0
-  wait "$forget_pid" || status=$?
-  [ "$status" -ne 0 ]
+  local out="$TEST_SKILL_DIR/forget.out" cfg="$TEST_SKILL_DIR/teams/testteam/config.json"
+  run python3 - "$SCRIPTS/remote.sh" "$cfg" "$out" <<'PY'
+import json, os, pty, subprocess, sys
+
+remote, cfg, out = sys.argv[1:]
+master, slave = pty.openpty()
+proc = subprocess.Popen(
+    ["bash", remote, "forget", "testteam"],
+    stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+os.close(slave)
+captured = b""
+prompt = b"Type 'testteam' to confirm:"
+while prompt not in captured:
+    chunk = os.read(master, 4096)
+    if not chunk:
+        break
+    captured += chunk
+if prompt not in captured:
+    proc.kill()
+    proc.wait()
+    sys.exit("forget confirmation prompt was not reached")
+
+with open(cfg, encoding="utf-8") as handle:
+    document = json.load(handle)
+original = dict(document["remote_binding"])
+document["remote_binding"]["endpoint"] = "https://changed.example"
+document["remote_binding"]["binding_revision"] = 2
+with open(cfg, "w", encoding="utf-8") as handle:
+    json.dump(document, handle)
+    handle.write("\n")
+document["remote_binding"] = original
+document["remote_binding"]["binding_revision"] = 3
+with open(cfg, "w", encoding="utf-8") as handle:
+    json.dump(document, handle)
+    handle.write("\n")
+
+os.write(master, b"testteam\n")
+while True:
+    try:
+        chunk = os.read(master, 4096)
+    except OSError:
+        break
+    if not chunk:
+        break
+    captured += chunk
+status = proc.wait()
+with open(out, "wb") as handle:
+    handle.write(captured)
+sys.exit(0 if status != 0 else "forget accepted an ABA binding")
+PY
+  [ "$status" -eq 0 ]
   grep -q "changed while forget was waiting" "$out"
   [ -f "$cfg" ]
   [ -d "$TEST_SKILL_DIR/db/teams/testteam" ]
