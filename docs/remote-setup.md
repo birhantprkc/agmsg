@@ -61,9 +61,14 @@ team's store path, or use the command in [Reference](#reference).
 
 ## 3. Install and pull on machine B
 
-Install agmsg normally on machine B, then paste the `remote.sh pull` command
-that machine A's agent displayed. Do not create a same-named local team first;
-pull imports the team that already exists on the server.
+Install agmsg normally on machine B. Open your usual local agent and ask:
+
+> Bring in the existing agmsg team `<team>` from `https://<server-url>`.
+
+The agent will use remote pull to import the team that already exists on the
+server. It must not create or join a same-named local team. If it finds an
+unconnected local team with that name, it will stop and ask you how to proceed
+instead of overwriting or combining the two teams.
 
 After pull succeeds, the team is local and works like any other local team.
 Open your agent, invoke its installed `agmsg` command, and join the team with a

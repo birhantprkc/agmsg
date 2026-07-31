@@ -176,10 +176,11 @@ If argument starts with "remote connect":
 4. End by showing this copy-paste command for the other machine, with the actual endpoint and team substituted: `bash ~/.agents/skills/__SKILL_NAME__/scripts/remote.sh pull --endpoint <actual-url> <actual-team>`
 
 If argument starts with "remote pull":
-1. Use this command whenever the user asks to bring in a team that already exists on a server. Never use `join.sh` for that request.
-2. Parse the required `--endpoint <url>` and `<team>`, plus optional `--team-id <uuid>`.
-3. Run: `bash ~/.agents/skills/__SKILL_NAME__/scripts/remote.sh pull --endpoint <url> [--team-id <uuid>] <team>`
-4. Show the output to the user.
+1. When the user asks to join or bring in a team that already exists on a server, NEVER use `join.sh`, create a team, or create a same-named local team. Always use remote pull.
+2. Before pulling, check for a same-named local team. If one already exists without an active remote connection, stop and ask the user how to proceed; do not overwrite, merge, connect, or rename it on your own.
+3. Parse the required `--endpoint <url>` and `<team>`, plus optional `--team-id <uuid>`.
+4. Run: `bash ~/.agents/skills/__SKILL_NAME__/scripts/remote.sh pull --endpoint <url> [--team-id <uuid>] <team>`
+5. Show the output to the user.
 
 If argument starts with "remote unlock":
 1. Parse `<team>`, one or more `--snapshot <file>` arguments in ascending revision order, exactly one of `--identity <file>` or `--identity-stdin`, and optional `--confirm-digest <sha256>`.
