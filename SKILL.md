@@ -192,10 +192,10 @@ If argument starts with "remote pull":
 4. Show the output to the user.
 
 If argument starts with "remote unlock":
-1. Parse `<team>`, required `--snapshot <file>`, exactly one of
+1. Parse `<team>`, one or more `--snapshot <file>` arguments in ascending revision order, exactly one of
    `--identity <file>` or `--identity-stdin`, and optional
    `--confirm-digest <sha256>`.
-2. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh unlock <team> --snapshot <file> (--identity <file>|--identity-stdin) [--confirm-digest <sha256>]`
+2. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh unlock <team> --snapshot <file> [--snapshot <file> ...] (--identity <file>|--identity-stdin) [--confirm-digest <sha256>]`
 3. The snapshot digest must be compared over a separate live channel. Never
    infer or auto-confirm it. Raw identity material is a permanent secret; when
    `--identity-stdin` is needed, tell the user to run the command in their own
@@ -217,6 +217,15 @@ If argument starts with "remote disconnect":
 1. Parse the required `<team>`.
 2. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh disconnect <team>`
 3. Show the output to the user.
+
+If argument starts with "remote forget":
+1. Parse the required `<team>`. This permanently deletes that team's local
+   roster, history, keys, trust, and sync state, but never changes the server.
+2. Do not add `--yes` yourself. Run:
+   `bash ~/.agents/skills/agmsg/scripts/remote.sh forget <team>`
+3. The command requires the user to confirm in their terminal. If this agent
+   has no interactive terminal, show the deletion summary and tell the user to
+   rerun the displayed command directly; never bypass confirmation for them.
 
 ### End-to-end encryption
 

@@ -373,6 +373,6 @@ while true; do
   # Run sleep in the background and `wait` for it so signal traps fire
   # immediately. Bash defers traps while a foreground builtin like `sleep`
   # is blocking, which would otherwise delay shutdown by up to $INTERVAL.
-  sleep "$INTERVAL" &
+  sleep "$INTERVAL" 3>&- 4>&- &
   wait $! 2>/dev/null
 done
