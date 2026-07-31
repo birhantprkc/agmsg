@@ -7,12 +7,6 @@ Agent messaging command. **IMPORTANT: Always use the provided scripts. NEVER dir
 
 **Shell requirement:** All agmsg scripts are Bash scripts. Always execute them via `bash`, never via PowerShell or cmd directly. If your default shell is not Bash (e.g. PowerShell on Windows), wrap every command with `bash -lc '...'`. Example: `bash -lc '~/.agents/skills/__SKILL_NAME__/scripts/send.sh myteam alice bob "hello"'`. Do NOT construct DB paths manually — the scripts handle path resolution internally. If you need to redirect storage, use `AGMSG_STORAGE_PATH` (the supported override).
 
-## Remote import precedence
-
-Before running `whoami.sh` or any first-time `join.sh` flow, inspect the user's request. If they ask to join, import, or bring in a team that already exists on a server, skip Identity setup and go directly to the `remote pull` command under Execute. This precedence also applies when `whoami.sh` would return `not_joined=true` or `suggest=true`.
-
-Before pulling, run `~/.agents/skills/__SKILL_NAME__/scripts/team-list.sh --json --scope all` and inspect the requested team name. If a same-named local team has `binding_state` `none` or `disconnected`, stop and ask the user how to proceed. Never call `join.sh` or create a local team to satisfy remote-import intent. After pull succeeds, resume the normal Identity setup so the user can register a new local agent in the team that pull just created.
-
 ## Identity
 
 If you already know your AGENT and TEAMS from a previous `$__SKILL_NAME__` call in this session, skip to **Execute** below.
@@ -32,6 +26,8 @@ Four possible outputs:
 **C) Not in a team:**
 `not_joined=true available_teams=<t1,t2,...>` (or `available_teams=none`)
 → Show the user the available teams from the output, then:
+
+  Before first-time setup, inspect the user's request. If they ask to join, import, or bring in a team that already exists on a server, do not call `join.sh`. Go directly to `remote pull` under Execute. First run `~/.agents/skills/__SKILL_NAME__/scripts/team-list.sh --json --scope all`; if a same-named local team has `binding_state` `none` or `disconnected`, stop and ask the user how to proceed. After pull succeeds, return to Identity setup so the user can register a new local agent in the pulled team.
 
   > **First-time setup required.**
   > Joining a team so this agent can send and receive messages.

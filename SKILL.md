@@ -32,21 +32,6 @@ fi
 
 After this runs once, `~/.agents/skills/agmsg/` is populated and you can skip Step 0 on future invocations.
 
-### Remote import takes precedence over first-time identity setup
-
-Before running `whoami.sh` or any first-time `join.sh` flow, inspect the user's
-request. If they ask to join, import, or bring in a team that already exists on
-a server, skip Step 1 and Step 2a and go directly to the `remote pull` command
-under Step 2b. This precedence also applies when the current installation has
-no agmsg identity yet.
-
-Before pulling, run `team-list.sh --json --scope all` and inspect the requested
-team name. If a same-named local team has `binding_state` `none` or
-`disconnected`, stop and ask the user how to proceed. Never call `join.sh` or
-create a local team to satisfy remote-import intent. After pull succeeds, resume
-the normal identity setup so the user can register a new local agent in the
-team that pull just created.
-
 ### Step 1: Check identity
 
 ```bash
@@ -56,6 +41,14 @@ team that pull just created.
 ```
 
 ### Step 2a: If not in a team — join one
+
+Before first-time setup, inspect the user's request. If they ask to join,
+import, or bring in a team that already exists on a server, do not run
+`join.sh`. Go directly to the `remote pull` command under Step 2b. Before
+pulling, run `team-list.sh --json --scope all`; if a same-named local team has
+`binding_state` `none` or `disconnected`, stop and ask the user how to proceed.
+After pull succeeds, return here so the user can register a new local agent in
+the team that pull just created.
 
 Ask the user for a team name. If it's an existing team, run `team.sh <team>` first to see the current roster and note the names already in use. Look for a naming convention already in play (e.g. a shared base name with role/number suffixes like `aggie-cc1`/`aggie-cc2`, or names derived from the team name) and, when one exists, propose 2-3 unused names that extend it; otherwise propose 2-3 short, distinctive identity names (not a bare tool-type label like `codex`/`cc`). Either way, names must not collide with the roster. For a brand-new team, skip the roster check and just ask. Then run:
 
