@@ -32,6 +32,21 @@ fi
 
 After this runs once, `~/.agents/skills/agmsg/` is populated and you can skip Step 0 on future invocations.
 
+### Remote import takes precedence over first-time identity setup
+
+Before running `whoami.sh` or any first-time `join.sh` flow, inspect the user's
+request. If they ask to join, import, or bring in a team that already exists on
+a server, skip Step 1 and Step 2a and go directly to the `remote pull` command
+under Step 2b. This precedence also applies when the current installation has
+no agmsg identity yet.
+
+Before pulling, run `team-list.sh --json --scope all` and inspect the requested
+team name. If a same-named local team has `binding_state` `none` or
+`disconnected`, stop and ask the user how to proceed. Never call `join.sh` or
+create a local team to satisfy remote-import intent. After pull succeeds, resume
+the normal identity setup so the user can register a new local agent in the
+team that pull just created.
+
 ### Step 1: Check identity
 
 ```bash

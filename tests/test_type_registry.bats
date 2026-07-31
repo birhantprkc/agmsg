@@ -64,6 +64,29 @@ write_node_launcher_fixtures() {
   [ "$status" -ne 0 ]
 }
 
+@test "agent templates route remote-import intent before not_joined identity setup" {
+  local template precedence identity
+  for template in "$BATS_TEST_DIRNAME"/../scripts/drivers/types/*/template.md; do
+    [ -f "$template" ] || continue
+    grep -q '^## Identity$' "$template" || continue
+    precedence="$(grep -n '^## Remote import precedence$' "$template" | cut -d: -f1)"
+    identity="$(grep -n '^## Identity$' "$template" | cut -d: -f1)"
+    [ -n "$precedence" ]
+    [ "$precedence" -lt "$identity" ]
+    sed -n "${precedence},$((identity - 1))p" "$template" |
+      grep -q 'not_joined=true'
+    sed -n "${precedence},$((identity - 1))p" "$template" |
+      grep -q 'go directly to the `remote pull` command'
+    sed -n "${precedence},$((identity - 1))p" "$template" |
+      grep -q 'Never call `join.sh`'
+  done
+
+  precedence="$(grep -n '^### Remote import takes precedence' "$BATS_TEST_DIRNAME/../SKILL.md" | cut -d: -f1)"
+  identity="$(grep -n '^### Step 1: Check identity$' "$BATS_TEST_DIRNAME/../SKILL.md" | cut -d: -f1)"
+  [ -n "$precedence" ]
+  [ "$precedence" -lt "$identity" ]
+}
+
 @test "type-registry: spawnable set is exactly eight of the ten built-ins (#277, #279)" {
   # hermes deliberately stays out (#279): no known CLI mode starts it
   # interactive with a seeded initial prompt. agmsg-app also stays out: it's
