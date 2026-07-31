@@ -728,7 +728,7 @@ storage_sync_apply_pull() {
   _sqlite_sync_valid_binding "$server" "$remote" "$protocol" || return 13
   _sqlite_sync_schema "$team" || return $?
   local generation db tl sql_file line type final_cursor="" corrupt=0 outcome_ids=""
-  local seq wire received v cipher key_id blob status policy local_rev reason
+  local seq wire received v cipher key_id blob status policy local_rev reason kind
   local from to body at local_id q
   generation=$(_sqlite_sync_generation "$team"); db="$(_sqlite_db "$team")"; tl="$(_sqlite_lit "$team")"
   _sqlite_sync_ensure_binding "$team" "$server" "$remote" "$protocol" "$generation" || return 13
@@ -761,6 +761,7 @@ storage_sync_apply_pull() {
     policy=$(printf '%s\n' "$line" | jq -r '.policy_revision // empty')
     local_rev=$(printf '%s\n' "$line" | jq -r '.local_security_revision // empty')
     reason=$(printf '%s\n' "$line" | jq -r '.reason // empty')
+    kind=$(printf '%s\n' "$line" | jq -r '.projection.kind // empty')
     case "$seq:$v" in *[!0-9:]*) rm -f "$sql_file"; return 13 ;; esac
     case "$status" in importable|unsupported_cipher|pending_key|authentication_failed|malformed|policy_violation) ;; *) rm -f "$sql_file"; return 13 ;; esac
     q="'$(_sqlite_lit "$key_id")'"; [ -n "$key_id" ] || q=NULL
@@ -859,11 +860,31 @@ storage_sync_apply_pull() {
             AND m.protocol_version=$protocol AND m.wire_id='$wire' AND m.server_seq='$seq');" >> "$sql_file"
 
     if [ "$status" = importable ]; then
+      if [ -n "$kind" ]; then
+        case "$kind" in
+          member_joined|member_left|member_renamed|key_rotated) ;;
+          *)
+            echo "agmsg: storage sync apply cannot acknowledge projection kind '$kind'" >&2
+            rm -f "$sql_file"; trap - EXIT INT TERM HUP; return 13 ;;
+        esac
+        # The roster driver has already durably applied this mutation. Storage
+        # owns the quarantine and transport cursor, so it records the matching
+        # terminal outcome without projecting a roster event into messages.
+        printf "%s\n" "
+          UPDATE sync_quarantine SET status='imported'
+           WHERE server_instance_id='$server' AND remote_team_id='$remote'
+             AND protocol_version=$protocol AND wire_id='$wire'
+             AND server_seq='$seq' AND status='importable';" >> "$sql_file"
+        continue
+      fi
       from=$(printf '%s\n' "$line" | jq -r '.projection.from_agent // empty')
       to=$(printf '%s\n' "$line" | jq -r '.projection.to_agent // empty')
       body=$(printf '%s\n' "$line" | jq -r '.projection.body // empty')
       at=$(printf '%s\n' "$line" | jq -r '.projection.created_at // empty')
-      [ -n "$from" ] && [ -n "$to" ] && [ -n "$body" ] && [ -n "$at" ] || { rm -f "$sql_file"; return 13; }
+      [ -n "$from" ] && [ -n "$to" ] && [ -n "$body" ] && [ -n "$at" ] || {
+        echo "agmsg: storage sync apply received an importable message without its projection" >&2
+        rm -f "$sql_file"; trap - EXIT INT TERM HUP; return 13;
+      }
       local_id=$(compat_uuid7) || { rm -f "$sql_file"; return 13; }
       printf "%s\n" "
         INSERT INTO events(type,id,team,from_agent,to_agent,body,at)

@@ -182,8 +182,8 @@ If argument starts with "remote pull":
 4. Show the output to the user.
 
 If argument starts with "remote unlock":
-1. Parse `<team>`, required `--snapshot <file>`, exactly one of `--identity <file>` or `--identity-stdin`, and optional `--confirm-digest <sha256>`.
-2. Run: `bash ~/.agents/skills/__SKILL_NAME__/scripts/remote.sh unlock <team> --snapshot <file> (--identity <file>|--identity-stdin) [--confirm-digest <sha256>]`
+1. Parse `<team>`, one or more `--snapshot <file>` arguments in ascending revision order, exactly one of `--identity <file>` or `--identity-stdin`, and optional `--confirm-digest <sha256>`.
+2. Run: `bash ~/.agents/skills/__SKILL_NAME__/scripts/remote.sh unlock <team> --snapshot <file> [--snapshot <file> ...] (--identity <file>|--identity-stdin) [--confirm-digest <sha256>]`
 3. The snapshot digest must be compared over a separate live channel. Never infer or auto-confirm it. Raw identity material is a permanent secret; when `--identity-stdin` is needed, tell the user to run the command in their own terminal rather than asking them to paste the identity into agent chat.
 4. Show the complete result, including the imported-envelope count and engine PID.
 

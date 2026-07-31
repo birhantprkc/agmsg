@@ -154,7 +154,11 @@ export async function activateKeyRotations(config) {
         `key rotation epoch ${rotation.epoch} is not the next epoch ${expectedRevision}`);
     }
     const ageSnapshot = ageSnapshots[Number(expectedRevision)];
-    if (!ageSnapshot) {
+    if (!ageSnapshot && await provisionLocalAgeSnapshot(config, rotation)) {
+      ageSnapshots.push(ageSnapshotChain(config.age_v1).at(-1));
+    }
+    const confirmedAgeSnapshot = ageSnapshots[Number(expectedRevision)];
+    if (!confirmedAgeSnapshot) {
       throw new Error(
         `key rotation at server sequence ${rotation.server_seq} selected epoch ` +
         `${rotation.epoch}; import its authority-confirmed epoch snapshot before sync can continue`);
@@ -162,7 +166,7 @@ export async function activateKeyRotations(config) {
     if (BigInt(rotation.server_seq) === MAX_SEQUENCE) {
       throw new Error("key rotation cannot be activated at the final server sequence");
     }
-    const epoch = ageSnapshot.history.at(-1);
+    const epoch = confirmedAgeSnapshot.history.at(-1);
     const effectiveFrom = (BigInt(rotation.server_seq) + 1n).toString();
     if (epoch.epoch_revision !== rotation.epoch ||
         epoch.key_id !== rotation.key_id ||
@@ -332,8 +336,12 @@ export async function loadConfig(team) {
   validateLocalSecurityHistory(value.local_security_history);
   if (value.cipher_profile === "age-v1") {
     validateAgeConfiguration(value);
-    await validateRetainedAgeCheckpoint(value);
+    // A local authority advance retains its checkpoint before atomically
+    // replacing the sync config. Let that narrowly authenticated transition
+    // finish first so a crash between those writes is retryable; every other
+    // rollback still fails the retained-checkpoint comparison below.
     await activateKeyRotations(value);
+    await validateRetainedAgeCheckpoint(value);
   }
   else if (value.cipher_profile !== "none") throw new Error("sync cipher profile is unsupported");
   return value;
@@ -426,12 +434,92 @@ export function initialAgeSnapshot(teamConfig, team = teamConfig?.name) {
   };
 }
 
-async function exportAgeSnapshot(args) {
+export function nextLocalAgeSnapshot(config, teamConfig, rotation) {
+  const ageSnapshots = ageSnapshotChain(config.age_v1);
+  const previous = ageSnapshots.at(-1);
+  const localEpochs = teamConfig?.remote_key?.epochs;
+  const localEpoch = Array.isArray(localEpochs) ? localEpochs.find((epoch) =>
+    String(epoch?.epoch_revision) === rotation.epoch && epoch?.key_id === rotation.key_id) : null;
+  if (!previous || !localEpoch ||
+      localEpoch.key_id !== rotation.key_id ||
+      localEpoch.recipient === undefined ||
+      createHash("sha256").update(localEpoch.recipient, "utf8").digest("hex") !==
+        rotation.fingerprint ||
+      localEpoch.previous_snapshot_sha256 !== ageSnapshotDigest(previous)) {
+    return null;
+  }
+  if (BigInt(rotation.server_seq) === MAX_SEQUENCE) {
+    throw new Error("key rotation cannot be activated at the final server sequence");
+  }
+  const revision = sequence(rotation.epoch, "local key epoch revision");
+  const writerGeneration = sequence(
+    String(localEpoch.writer_generation), "local key writer generation");
+  const snapshot = {
+    ...previous,
+    epoch_revision: revision,
+    writer_generation: writerGeneration,
+    authorized_writers: [localEpoch.key_id],
+    previous_snapshot_sha256: ageSnapshotDigest(previous),
+    history: [...previous.history, {
+      epoch_revision: revision,
+      effective_from_seq: (BigInt(rotation.server_seq) + 1n).toString(),
+      cipher: "age-v1",
+      key_id: localEpoch.key_id,
+      recipients: [localEpoch.recipient],
+    }],
+  };
+  return snapshot;
+}
+
+async function provisionLocalAgeSnapshot(config, rotation) {
+  let bytes;
+  try {
+    bytes = await readBoundedAuthorityFile(
+      teamConfigPath(config.local_team), MAX_CONNECTION_CONFIG_BYTES, false);
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  const teamConfig = parseStrictJson(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  const snapshot = nextLocalAgeSnapshot(config, teamConfig, rotation);
+  if (!snapshot) return false;
+  const identityPath = replacementIdentityPath(config.local_team, rotation.key_id);
+  const proposed = structuredClone(config);
+  delete proposed.age_v1_runtime_history;
+  proposed.age_v1.epoch_snapshots = [...ageSnapshotChain(config.age_v1), snapshot];
+  delete proposed.age_v1.epoch_snapshot;
+  proposed.age_v1.checkpoint = {
+    epoch_revision: snapshot.epoch_revision,
+    snapshot_sha256: ageSnapshotDigest(snapshot),
+    writer_generation: snapshot.writer_generation,
+    confirmed_at: new Date().toISOString(),
+  };
+  proposed.age_v1.identity_files[rotation.key_id] = identityPath;
+  validateAgeConfiguration(proposed);
+  validateConfiguredAgeIdentities(proposed);
+  const retained = await retainAgeCheckpoint(proposed, "operator-live");
+  proposed.age_v1.checkpoint.confirmed_at = retained.confirmation.confirmed_at;
+  await writeConfig(configPath(config.local_team), proposed);
+  Object.assign(config, proposed);
+  return true;
+}
+
+export async function exportAgeSnapshot(args) {
   const team = requireName(args.team, "team");
   const bytes = await readBoundedAuthorityFile(
     teamConfigPath(team), MAX_CONNECTION_CONFIG_BYTES, false);
   const teamConfig = parseStrictJson(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
-  const snapshot = initialAgeSnapshot(teamConfig, team);
+  let snapshot;
+  try {
+    const config = await readStoredSyncConfig(team);
+    if (config.cipher_profile !== "age-v1") throw new Error("team is not configured for age-v1");
+    validateAgeConfiguration(config);
+    await validateRetainedAgeCheckpoint(config);
+    snapshot = ageSnapshotChain(config.age_v1).at(-1);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+    snapshot = initialAgeSnapshot(teamConfig, team);
+  }
   const canonical = canonicalJson(snapshot);
   const outputPath = args.out ? resolve(args.out) : null;
   if (outputPath) {
@@ -451,14 +539,17 @@ export async function verifyAgeSnapshot(args) {
   if (!args["age-snapshot"]) throw new Error("age-snapshot is required");
   const snapshotPaths = Array.isArray(args["age-snapshot"]) ?
     args["age-snapshot"] : [args["age-snapshot"]];
-  if (snapshotPaths.length !== 1 || typeof snapshotPaths[0] !== "string") {
-    throw new Error("verify-age-snapshot requires exactly one age-snapshot");
+  if (snapshotPaths.length < 1 || snapshotPaths.some((path) => typeof path !== "string"))
+    throw new Error("verify-age-snapshot requires at least one age-snapshot");
+  const snapshots = [];
+  for (const path of snapshotPaths) {
+    const snapshotText = await readFile(resolve(path), "utf8");
+    const value = parseStrictJson(snapshotText);
+    if (snapshotText.trim() !== canonicalJson(value))
+      throw new Error("age snapshot must be RFC 8785 JCS without duplicate or noncanonical fields");
+    snapshots.push(value);
   }
-  const snapshotText = await readFile(resolve(snapshotPaths[0]), "utf8");
-  const snapshot = parseStrictJson(snapshotText);
-  if (snapshotText.trim() !== canonicalJson(snapshot)) {
-    throw new Error("age snapshot must be RFC 8785 JCS without duplicate or noncanonical fields");
-  }
+  const snapshot = snapshots.at(-1);
   const binding = await readConnectedBinding(team);
   const digest = ageSnapshotDigest(snapshot);
   const config = {
@@ -475,7 +566,7 @@ export async function verifyAgeSnapshot(args) {
       minimum_security_mode: "e2ee-required",
     }],
     age_v1: {
-      epoch_snapshots: [snapshot],
+      epoch_snapshots: snapshots,
       checkpoint: {
         epoch_revision: snapshot.epoch_revision,
         snapshot_sha256: digest,
@@ -1008,7 +1099,9 @@ function runDriver({ args, label, operation, parse, input }) {
     child.on("exit", (code, signal) => {
       if (failure) { fail(failure); return; }
       if (code === 0 && !signal) return;
-      fail(new Error(`${label} ${operation} failed (${signal ?? code}): ${stderr.trim()}`));
+      const diagnostic = stderr.trim() ||
+        "driver returned a non-zero exit without diagnostics; inspect its team storage and binding";
+      fail(new Error(`${label} ${operation} failed (${signal ?? code}): ${diagnostic}`));
     });
     child.on("close", () => {
       if (failure) { settle(failure, null); return; }
@@ -1543,8 +1636,7 @@ async function identityFiles(values) {
 
 async function existingConfig(team) {
   try {
-    await readStoredSyncConfig(team);
-    return await loadConfig(team);
+    return await readStoredSyncConfig(team);
   }
   catch (error) {
     if (error?.code === "ENOENT") return null;
@@ -1613,9 +1705,38 @@ export async function configure(args) {
     throw new Error("age options require --cipher age-v1");
   }
   const previous = await existingConfig(team);
-  if (previous && (previous.server_instance_id !== config.server_instance_id ||
-      previous.remote_team_id !== config.remote_team_id || previous.cipher_profile !== config.cipher_profile)) {
-    throw new Error("configure cannot replace an existing binding or cipher profile");
+  if (previous) {
+    previous.cipher_profile ??= "none";
+    if (previous.local_team !== team || previous.protocol_version !== 1 ||
+        !UUID_V7.test(previous.server_instance_id ?? "") ||
+        !UUID_V7.test(previous.remote_team_id ?? "")) {
+      throw new Error("existing sync config binding is invalid");
+    }
+    validateLocalSecurityHistory(previous.local_security_history);
+    if (previous.server_instance_id !== config.server_instance_id ||
+        previous.remote_team_id !== config.remote_team_id ||
+        previous.server_url !== config.server_url ||
+        previous.cipher_profile !== config.cipher_profile) {
+      throw new Error("configure cannot replace an existing binding or cipher profile");
+    }
+    if (cipherProfile === "age-v1") {
+      validateAgeConfiguration(previous);
+      await validateRetainedAgeCheckpoint(previous);
+      const previousSnapshots = ageSnapshotChain(previous.age_v1);
+      const proposedSnapshots = ageSnapshotChain(config.age_v1);
+      const prefixMatches = previousSnapshots.every((snapshot, index) =>
+        proposedSnapshots[index] !== undefined &&
+        ageSnapshotDigest(proposedSnapshots[index]) === ageSnapshotDigest(snapshot));
+      if (!prefixMatches || proposedSnapshots.length < previousSnapshots.length) {
+        throw new Error("configure cannot replace or truncate a confirmed age snapshot chain");
+      }
+      config.age_v1.identity_files = {
+        ...previous.age_v1.identity_files,
+        ...config.age_v1.identity_files,
+      };
+      validateAgeConfiguration(config);
+      validateConfiguredAgeIdentities(config);
+    }
   }
   const capabilities = await request(config, "/v1/capabilities");
   validateCapabilities(config, capabilities);
@@ -1966,6 +2087,8 @@ export async function reprocessCycle(config, limit, dependencies = {}) {
   const evaluateCall = dependencies.evaluateCall ?? evaluatePull;
   const eventCall = dependencies.eventCall ?? event;
   const logApplyCall = dependencies.logApplyCall ?? logApplyOutcomes;
+  const rosterDriverCall = dependencies.rosterDriverCall ?? rosterDriver;
+  const activateKeyRotationsCall = dependencies.activateKeyRotationsCall ?? activateKeyRotations;
   const ready = await healthCall(config.server_url);
   if (ready.server_instance_id !== config.server_instance_id) throw new Error("health server instance changed");
   const capabilities = await requestCall(config, "/v1/capabilities");
@@ -1998,6 +2121,15 @@ export async function reprocessCycle(config, limit, dependencies = {}) {
     }
     stableState ??= state;
     const records = [];
+    const storageRecords = [];
+    const rotationRecords = [];
+    let pendingRosterRecords = [];
+    const flushRosterRecords = async (cursorRecord) => {
+      if (pendingRosterRecords.length === 0) return;
+      await rosterDriverCall("apply", config,
+        cursorRecord ? [...pendingRosterRecords, cursorRecord] : pendingRosterRecords);
+      pendingRosterRecords = [];
+    };
     for (const candidate of candidates) {
       const token = reprocessCandidateToken(candidate);
       if (seenTokens.has(token)) throw new Error("driver reprocess repeated a candidate");
@@ -2018,12 +2150,40 @@ export async function reprocessCycle(config, limit, dependencies = {}) {
       const message = { server_seq: candidate.server_seq, id: candidate.id,
         server_received_at: candidate.server_received_at, envelope: candidate.envelope };
       const evaluated = await evaluateCall(config, capabilities, message);
-      records.push({ type: "sync_pull_message", ...message, ...evaluated });
+      const record = { type: "sync_pull_message", ...message, ...evaluated };
+      storageRecords.push(record);
+      if (record.status === "importable" && record.projection?.kind === "key_rotated") {
+        // A rotation changes how every later sequence is interpreted. Flush
+        // earlier roster mutations before publishing and activating it; a
+        // page may interleave both kinds, and the journal is append-only.
+        await flushRosterRecords(null);
+        await rosterDriverCall("apply", config, [record]);
+        await activateKeyRotationsCall(config);
+        rotationRecords.push(record);
+      } else {
+        records.push(record);
+        if (record.status === "importable" &&
+            ["member_joined", "member_left", "member_renamed"].includes(
+              record.projection?.kind)) {
+          pendingRosterRecords.push(record);
+        }
+      }
     }
-    if (records.length > 0) {
-      records.push({ type: "sync_pull_cursor", next_after: state.transport_cursor });
-      const applied = await driverCall("apply", config, records);
-      await logApplyCall(config, records, applied);
+    if (candidates.length > 0) {
+      const cursorRecord = { type: "sync_pull_cursor", next_after: state.transport_cursor };
+      const rosterRecords = records.filter((record) =>
+        record.status === "importable" &&
+        ["member_joined", "member_left", "member_renamed"].includes(record.projection?.kind));
+      const messageRecords = records.filter((record) => !record.projection?.kind);
+      if (rosterRecords.length + messageRecords.length + rotationRecords.length !==
+          storageRecords.length) {
+        throw new Error("reprocess cannot apply this projection kind");
+      }
+      await flushRosterRecords(cursorRecord);
+      const applied = await driverCall("apply", config, [...storageRecords, cursorRecord]);
+      const messageIds = new Set(messageRecords.map((record) => record.id));
+      await logApplyCall(config, messageRecords, applied.filter((record) =>
+        record.type !== "sync_apply_outcome" || messageIds.has(record.id)));
       const candidateIds = new Set(candidates.map((candidate) => candidate.id));
       imported += applied.filter((record) =>
         record.type === "sync_apply_outcome" &&

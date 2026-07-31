@@ -965,11 +965,11 @@ cmd_pull() {
 }
 
 cmd_unlock() {
-  local team="" snapshot="" identity_file="" identity_stdin=0 confirm_digest=""
+  local team="" identity_file="" identity_stdin=0 confirm_digest="" snapshots=()
   while [ $# -gt 0 ]; do
     case "$1" in
-      --snapshot) snapshot="${2:?--snapshot requires a value}"; shift 2 ;;
-      --snapshot=*) snapshot="${1#--snapshot=}"; shift ;;
+      --snapshot) snapshots+=("${2:?--snapshot requires a value}"); shift 2 ;;
+      --snapshot=*) snapshots+=("${1#--snapshot=}"); shift ;;
       --identity) identity_file="${2:?--identity requires a value}"; shift 2 ;;
       --identity=*) identity_file="${1#--identity=}"; shift ;;
       --identity-stdin) identity_stdin=1; shift ;;
@@ -981,7 +981,7 @@ cmd_unlock() {
     esac
   done
   : "${team:?Usage: remote.sh unlock <team> --snapshot <file> (--identity <file>|--identity-stdin) [--confirm-digest <sha256>]}"
-  : "${snapshot:?--snapshot is required}"
+  [ "${#snapshots[@]}" -gt 0 ] || { echo "agmsg: --snapshot is required" >&2; exit 1; }
   agmsg_validate_team_name "$team" || exit 1
   if { [ -n "$identity_file" ] && [ "$identity_stdin" -eq 1 ]; } ||
       { [ -z "$identity_file" ] && [ "$identity_stdin" -eq 0 ]; }; then
@@ -997,8 +997,10 @@ cmd_unlock() {
     echo "agmsg: team '$team' is not an encrypted pulled team awaiting unlock" >&2
     exit 1
   }
+  local snapshot_args=() snapshot
+  for snapshot in "${snapshots[@]}"; do snapshot_args+=(--age-snapshot "$snapshot"); done
   metadata="$(bash "$SCRIPT_DIR/remote-sync.sh" verify-age-snapshot \
-    --team "$team" --age-snapshot "$snapshot")" || exit 1
+    --team "$team" "${snapshot_args[@]}")" || exit 1
   metadata="$(printf '%s\n' "$metadata" | grep '"age_snapshot_verified"' | tail -1)"
   [ -n "$metadata" ] || { echo "agmsg: snapshot verification produced no result" >&2; exit 1; }
   digest="$(_remote_json_field "$metadata" '$.snapshot_sha256')"
@@ -1058,7 +1060,7 @@ cmd_unlock() {
     --team-id "$remote_team_id" \
     --minimum-security e2ee-required \
     --cipher age-v1 \
-    --age-snapshot "$snapshot" \
+    "${snapshot_args[@]}" \
     --age-checkpoint "$epoch_revision:$digest" \
     --age-confirmation operator-live \
     --age-identity "$key_id=$identity_dest")" || exit 1

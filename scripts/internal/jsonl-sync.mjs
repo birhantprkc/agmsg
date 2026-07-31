@@ -468,12 +468,15 @@ function validatePull(records) {
     sequence(message.server_seq, "pull server_seq");
     if (BigInt(message.server_seq) <= previous) fail("pull messages are not ordered");
     previous = BigInt(message.server_seq);
-    if (message.status === "importable" && (!message.projection ||
-        typeof message.projection.body !== "string" ||
-        typeof message.projection.from_agent !== "string" ||
-        typeof message.projection.to_agent !== "string" ||
-        typeof message.projection.created_at !== "string")) {
-      fail("importable pull message has no projection");
+    if (message.status === "importable") {
+      const rosterKind = ["member_joined", "member_left", "member_renamed", "key_rotated"]
+        .includes(message.projection?.kind);
+      const chatProjection = message.projection && message.projection.kind === undefined &&
+        typeof message.projection.body === "string" &&
+        typeof message.projection.from_agent === "string" &&
+        typeof message.projection.to_agent === "string" &&
+        typeof message.projection.created_at === "string";
+      if (!rosterKind && !chatProjection) fail("importable pull message has no supported projection");
     }
   }
   return { messages, cursor: cursor.next_after };
@@ -525,9 +528,11 @@ function apply(path, target, inputText) {
     } else if (reservation && status === "importable") {
       status = "reconciled";
     } else if (!reservation && status === "importable") {
-      localEvent = prior?.local_event ?? { type: "message_sent", id: uuid7(), team: target.local_team,
-        from: source.projection.from_agent, to: source.projection.to_agent,
-        body: source.projection.body, at: source.projection.created_at };
+      if (source.projection.kind === undefined) {
+        localEvent = prior?.local_event ?? { type: "message_sent", id: uuid7(), team: target.local_team,
+          from: source.projection.from_agent, to: source.projection.to_agent,
+          body: source.projection.body, at: source.projection.created_at };
+      }
       status = "imported";
     }
     const storedLocalEvent = prior?.local_event ? null : localEvent;

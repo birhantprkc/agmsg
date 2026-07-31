@@ -106,7 +106,7 @@ the handed files and the digest verified over that separate live channel:
 
 ```sh
 bash ~/.agents/skills/agmsg/scripts/remote.sh unlock <team> \
-  --snapshot <snapshot-file> \
+  --snapshot <snapshot-file> [--snapshot <next-snapshot-file> ...] \
   --identity <identity-file> \
   --confirm-digest <verified-sha256>
 ```

@@ -5,6 +5,7 @@ import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, unlink,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { readNativeAgeIdentity } from "../scripts/internal/sync-cipher.mjs";
 import {
   ageSnapshotDigest,
   activateKeyRotations,
@@ -13,10 +14,12 @@ import {
   configure,
   cycle,
   driver,
+  exportAgeSnapshot,
   isRetryable,
   initialAgeSnapshot,
   runLoop,
   loadConfig,
+  nextLocalAgeSnapshot,
   plaintextWriteEligible,
   pullBootstrap,
   parseStrictJsonl,
@@ -59,6 +62,138 @@ const candidates = [
 ];
 
 const credentialId = "018f3f7e-0000-7000-8000-000000000020";
+
+test("a rotator provisions its confirmed snapshot at the server boundary", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agmsg-local-key-rotation-"));
+  const saved = {
+    connection: process.env.AGMSG_SYNC_CONNECTION_DIR,
+    storage: process.env.AGMSG_SYNC_STORAGE_DIR,
+    trust: process.env.AGMSG_SYNC_TRUST_DIR,
+  };
+  const oldKeyId = "epoch-old";
+  const newKeyId = "epoch-new";
+  const recipient = "age1ykvctct4aklx4f4mnjd8rmzqs7p2le9ufg4faydljsk5mvcy0pls27mu64";
+  const identity = "AGE-SECRET-KEY-14Z7XMNPZTPEMMM6DG2FSKEH042L7UMU79T645GAQJKU2LLJGPM2S7GWNLQ";
+  const initial = {
+    profile: "age-v1",
+    server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id,
+    epoch_revision: "0",
+    writer_generation: "0",
+    authorized_writers: [oldKeyId],
+    previous_snapshot_sha256: null,
+    history: [{ epoch_revision: "0", effective_from_seq: "1", cipher: "age-v1",
+      key_id: oldKeyId, recipients: [recipient] }],
+  };
+  const rotation = {
+    id: "018f3f7e-0000-7000-8000-000000000025",
+    epoch: "1",
+    key_id: newKeyId,
+    fingerprint: createHash("sha256").update(recipient).digest("hex"),
+    server_seq: "8",
+  };
+  const localEpoch = { key_id: newKeyId, epoch_revision: 1, writer_generation: 1,
+    recipient, previous_snapshot_sha256: ageSnapshotDigest(initial),
+    created_at: "2026-07-30T00:00:00Z" };
+  const teamConfig = { name: "demo", remote_key: { current: localEpoch,
+    epochs: [{ key_id: oldKeyId, epoch_revision: 0, writer_generation: 0,
+      recipient, previous_snapshot_sha256: null, created_at: "2026-07-29T00:00:00Z" },
+    localEpoch] } };
+  const rotationConfig = {
+    ...config,
+    server_url: "https://sync.example.test",
+    cipher_profile: "age-v1",
+    local_security_history: [{ local_security_revision: "0", effective_from_seq: "1",
+      minimum_security_mode: "e2ee-required" }],
+    age_v1: {
+      epoch_snapshots: [initial],
+      checkpoint: { epoch_revision: "0", writer_generation: "0",
+        snapshot_sha256: ageSnapshotDigest(initial), confirmed_at: "2026-07-29T00:00:00Z" },
+      identity_files: {},
+      age_version: "v1.3.1",
+    },
+  };
+  try {
+    process.env.AGMSG_SYNC_CONNECTION_DIR = root;
+    process.env.AGMSG_SYNC_STORAGE_DIR = join(root, "store");
+    process.env.AGMSG_SYNC_TRUST_DIR = join(root, "trust");
+    const teamDir = join(root, "teams", "demo");
+    const keyDir = join(root, "run", "remote-credentials", "demo", "keys");
+    await mkdir(teamDir, { recursive: true });
+    await mkdir(keyDir, { recursive: true });
+    await writeFile(join(teamDir, "config.json"), `${JSON.stringify(teamConfig)}\n`);
+    await writeFile(join(teamDir, "roster.jsonl"), [
+      JSON.stringify({ type: "key_rotated", ...rotation,
+        at: "2026-07-30T00:00:00.000000Z", server_seq: undefined }),
+      JSON.stringify({ type: "roster_synced", mutation_id: rotation.id,
+        server_seq: rotation.server_seq,
+        wire_id: "550e8400-e29b-41d4-a716-446655440006",
+        server_instance_id: config.server_instance_id,
+        remote_team_id: config.remote_team_id }), "",
+    ].join("\n"));
+    await writeFile(join(keyDir, `${newKeyId}.key`), `${identity}\n`, { mode: 0o600 });
+    const snapshot = nextLocalAgeSnapshot(rotationConfig, teamConfig, rotation);
+    assert.equal(snapshot.epoch_revision, "1");
+    assert.equal(snapshot.writer_generation, "1");
+    assert.equal(snapshot.previous_snapshot_sha256, ageSnapshotDigest(initial));
+    assert.equal(snapshot.history.at(-1).effective_from_seq, "9");
+    const laterEpoch = { ...localEpoch, key_id: "epoch-later", epoch_revision: 2,
+      writer_generation: 2 };
+    const replayed = nextLocalAgeSnapshot(rotationConfig, { ...teamConfig, remote_key: {
+      current: laterEpoch, epochs: [...teamConfig.remote_key.epochs, laterEpoch],
+    } }, rotation);
+    assert.equal(replayed.history.at(-1).key_id, newKeyId);
+    await activateKeyRotations(rotationConfig);
+    assert.equal(rotationConfig.age_v1_runtime_history.at(-1).key_id, newKeyId);
+    const stored = JSON.parse(await readFile(join(root, "store", "remote-sync", "demo.json"), "utf8"));
+    assert.equal(stored.age_v1.epoch_snapshots.length, 2);
+    assert.equal(stored.age_v1.epoch_snapshots.at(-1).epoch_revision, "1");
+    assert.equal(stored.age_v1.checkpoint.snapshot_sha256, ageSnapshotDigest(snapshot));
+    const exportedPath = join(root, "exported-age-snapshot.json");
+    await exportAgeSnapshot({ team: "demo", out: exportedPath });
+    const exported = JSON.parse(await readFile(exportedPath, "utf8"));
+    assert.equal(exported.epoch_revision, "1");
+    assert.equal(exported.history.length, 2);
+    const confirmedStored = structuredClone(stored);
+    const rolledBack = structuredClone(confirmedStored);
+    rolledBack.age_v1.epoch_snapshots = [initial];
+    rolledBack.age_v1.checkpoint = { ...rolledBack.age_v1.checkpoint,
+      epoch_revision: "0", writer_generation: "0", snapshot_sha256: ageSnapshotDigest(initial) };
+    await writeFile(join(root, "store", "remote-sync", "demo.json"), JSON.stringify(rolledBack));
+    await assert.rejects(exportAgeSnapshot({ team: "demo", out: join(root, "rollback.json") }),
+      /rollback/u);
+    const conflictingStored = structuredClone(confirmedStored);
+    const conflicting = { ...snapshot, authorized_writers: ["conflicting-writer"] };
+    conflictingStored.age_v1.epoch_snapshots[1] = conflicting;
+    conflictingStored.age_v1.checkpoint.snapshot_sha256 = ageSnapshotDigest(conflicting);
+    await writeFile(join(root, "store", "remote-sync", "demo.json"),
+      JSON.stringify(conflictingStored));
+    await assert.rejects(exportAgeSnapshot({ team: "demo", out: join(root, "conflict.json") }),
+      /same-revision conflict/u);
+    const advancedStored = structuredClone(confirmedStored);
+    const unconfirmed = { ...snapshot, epoch_revision: "2", writer_generation: "2",
+      previous_snapshot_sha256: ageSnapshotDigest(snapshot),
+      history: [...snapshot.history, { ...snapshot.history.at(-1), epoch_revision: "2",
+        effective_from_seq: "10", key_id: "epoch-unconfirmed" }] };
+    advancedStored.age_v1.epoch_snapshots.push(unconfirmed);
+    advancedStored.age_v1.checkpoint = { ...advancedStored.age_v1.checkpoint, epoch_revision: "2",
+      writer_generation: "2", snapshot_sha256: ageSnapshotDigest(unconfirmed) };
+    await writeFile(join(root, "store", "remote-sync", "demo.json"), JSON.stringify(advancedStored));
+    await assert.rejects(exportAgeSnapshot({ team: "demo", out: join(root, "unsafe.json") }),
+      /retained age checkpoint/u);
+    assert.match(await readFile(join(root, "trust",
+      `age-v1-${config.server_instance_id}-${config.remote_team_id}-v1.json`), "utf8"),
+    new RegExp(ageSnapshotDigest(snapshot), "u"));
+  } finally {
+    if (saved.connection === undefined) delete process.env.AGMSG_SYNC_CONNECTION_DIR;
+    else process.env.AGMSG_SYNC_CONNECTION_DIR = saved.connection;
+    if (saved.storage === undefined) delete process.env.AGMSG_SYNC_STORAGE_DIR;
+    else process.env.AGMSG_SYNC_STORAGE_DIR = saved.storage;
+    if (saved.trust === undefined) delete process.env.AGMSG_SYNC_TRUST_DIR;
+    else process.env.AGMSG_SYNC_TRUST_DIR = saved.trust;
+    await rm(root, { recursive: true });
+  }
+});
 
 test("a synced rotation halts until an out-of-band identity matches its fingerprint", async () => {
   const root = await mkdtemp(join(tmpdir(), "agmsg-key-rotation-"));
@@ -373,10 +508,19 @@ test("unlock snapshot verification is canonical and bound to the pulled team", a
       team: "demo",
       "age-snapshot": [path],
     }), /RFC 8785 JCS/u);
-    await assert.rejects(verifyAgeSnapshot({
-      team: "demo",
-      "age-snapshot": [path, path],
-    }), /exactly one age-snapshot/u);
+    await writeFile(path, canonicalJson(snapshot), { mode: 0o600 });
+    const next = { ...snapshot, epoch_revision: "1", writer_generation: "1",
+      previous_snapshot_sha256: ageSnapshotDigest(snapshot),
+      history: [...snapshot.history, { ...snapshot.history[0], epoch_revision: "1",
+        effective_from_seq: "3", key_id: "epoch-next" }] };
+    const nextPath = join(root, "snapshot-next.json");
+    await writeFile(nextPath, canonicalJson(next), { mode: 0o600 });
+    const rotated = await verifyAgeSnapshot({ team: "demo",
+      "age-snapshot": [path, nextPath] });
+    assert.equal(rotated.epoch_revision, "1");
+    assert.equal(rotated.snapshot_sha256, ageSnapshotDigest(next));
+    await assert.rejects(verifyAgeSnapshot({ team: "demo",
+      "age-snapshot": [nextPath, path] }), /missing revision/u);
   });
 });
 
@@ -496,6 +640,180 @@ test("reprocess completion counts imported outcomes and requires empty blocking 
   assert.equal(result.count, 1);
   assert.equal(result.imported_count, 1);
   assert.equal(result.blocking_remaining, false);
+});
+
+test("reprocess routes recovered roster mutations away from message storage", async () => {
+  const capabilities = {
+    protocol_version: 1, server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id, team_name: "demo", min_available_seq: "0",
+    current_seq: "2", next_sequence_boundary: "3", accepted_envelope_versions: [1],
+    write_allowed_ciphers: ["age-v1"], policy_revision: "0", effective_from_seq: "1",
+    max_blob_bytes: "1048576", policy_history: [{ policy_revision: "0",
+      effective_from_seq: "1", accepted_envelope_versions: [1],
+      write_allowed_ciphers: ["age-v1"] }],
+  };
+  const rosterId = "80dc98aa-a3a1-4a75-becb-9397347875b0";
+  const messageId = "900f3ee4-eca6-44a1-a288-4e9c72b941ac";
+  let rosterApplied = false;
+  let messageApplied = false;
+  const result = await reprocessCycle(config, 100, {
+    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    requestCall: async () => capabilities,
+    driverCall: async (operation, _config, input) => {
+      if (operation === "apply") {
+        assert.deepEqual(input.map((record) => record.id).filter(Boolean), [rosterId, messageId]);
+        assert.deepEqual(input.at(-1), { type: "sync_pull_cursor", next_after: "2" });
+        messageApplied = true;
+        return [
+          { type: "sync_apply_result", transport_cursor: "2", corrupt_count: 0 },
+          { type: "sync_apply_outcome", id: rosterId, server_seq: "1", status: "imported" },
+          { type: "sync_apply_outcome", id: messageId, server_seq: "2", status: "imported" },
+        ];
+      }
+      assert.equal(operation, "reprocess");
+      return [
+        { type: "sync_state", driver_generation: "generation-1", transport_cursor: "2" },
+        ...(!rosterApplied || !messageApplied ? [{
+          type: "sync_reprocess_candidate", server_seq: "1", id: rosterId,
+          server_received_at: "2026-07-30T20:33:33.000000Z",
+          envelope: { v: 1, cipher: "age-v1", key_id: "epoch-initial", blob: "roster" },
+          prior_status: "unsupported_cipher",
+        }, {
+          type: "sync_reprocess_candidate", server_seq: "2", id: messageId,
+          server_received_at: "2026-07-30T20:33:43.000000Z",
+          envelope: { v: 1, cipher: "age-v1", key_id: "epoch-initial", blob: "message" },
+          prior_status: "unsupported_cipher",
+        }] : []),
+        { type: "sync_reprocess_page", next_after: null, has_more: false },
+      ];
+    },
+    rosterDriverCall: async (operation, _config, input) => {
+      assert.equal(operation, "apply");
+      assert.deepEqual(input.map((record) => record.id).filter(Boolean), [rosterId]);
+      assert.deepEqual(input.at(-1), { type: "sync_pull_cursor", next_after: "2" });
+      rosterApplied = true;
+      return [{ type: "roster_sync_apply_outcome", id: rosterId,
+        server_seq: "1", status: "imported" }];
+    },
+    evaluateCall: async (_config, _capabilities, message) => message.id === rosterId ? ({
+      status: "importable", projection: {
+        kind: "member_joined",
+        mutation_id: "019fb4bb-7948-7520-8c16-ab64753e2012",
+        member_id: "019fb4bb-7948-7ce9-8e4f-61229dc726cf",
+        name: "dana", occurred_at: "2026-07-30T20:33:33.000000Z",
+      }, policy_revision: "0", local_security_revision: "0",
+    }) : ({
+      status: "importable", projection: {
+        body: "first sealed message", created_at: "2026-07-30T20:33:43.000000Z",
+        from_agent: "dana", to_agent: "dana",
+      }, policy_revision: "0", local_security_revision: "0",
+    }),
+    eventCall: async () => {},
+    logApplyCall: async () => {},
+  });
+  assert.equal(result.count, 2);
+  assert.equal(result.imported_count, 2);
+  assert.equal(result.blocking_remaining, false);
+});
+
+test("reprocess preserves server order across roster mutations and rotations", async () => {
+  const capabilities = {
+    ...capsFor(["age-v1"]), current_seq: "6", next_sequence_boundary: "7",
+  };
+  const ids = Array.from({ length: 6 }, (_, index) =>
+    `550e8400-e29b-41d4-a716-44665544000${index + 1}`);
+  let completed = false;
+  let activeEpoch = 0;
+  const rosterOrder = [];
+  const result = await reprocessCycle(config, 100, {
+    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    requestCall: async () => capabilities,
+    driverCall: async (operation, _config, input) => {
+      if (operation === "apply") {
+        assert.deepEqual(input.filter((record) => record.id).map((record) => record.server_seq),
+          ["1", "2", "3", "4", "5", "6"]);
+        completed = true;
+        return [{ type: "sync_apply_result", transport_cursor: "6", corrupt_count: 0 },
+          ...ids.map((id, index) => ({ type: "sync_apply_outcome", id,
+            server_seq: String(index + 1), status: "imported" }))];
+      }
+      assert.equal(operation, "reprocess");
+      return [
+        { type: "sync_state", driver_generation: "generation-ordered", transport_cursor: "6" },
+        ...(!completed ? ids.map((id, index) => ({ type: "sync_reprocess_candidate",
+          server_seq: String(index + 1), id,
+          server_received_at: "2026-07-30T20:33:33.000000Z",
+          envelope: { v: 1, cipher: "age-v1", key_id: "epoch-initial", blob: id },
+          prior_status: "pending_key" })) : []),
+        { type: "sync_reprocess_page", next_after: null, has_more: false },
+      ];
+    },
+    rosterDriverCall: async (operation, _config, input) => {
+      assert.equal(operation, "apply");
+      rosterOrder.push(...input.filter((record) => record.id).map((record) => record.server_seq));
+      return [];
+    },
+    activateKeyRotationsCall: async () => { activeEpoch += 1; },
+    evaluateCall: async (_config, _capabilities, message) => {
+      const seq = Number(message.server_seq);
+      if (seq === 2 || seq === 5) return { status: "importable", projection: {
+        kind: "key_rotated", mutation_id: `018f3f7e-0000-7000-8000-00000000002${seq}`,
+        epoch: String(seq === 2 ? 1 : 2), key_id: `epoch-${seq}`,
+        fingerprint: "a".repeat(64), occurred_at: "2026-07-30T20:33:33.000000Z",
+      }, policy_revision: "0", local_security_revision: "0" };
+      if (seq === 4) {
+        assert.equal(activeEpoch, 1);
+        return { status: "importable", projection: { body: "after rotation",
+          created_at: "2026-07-30T20:33:33.000000Z", from_agent: "a", to_agent: "b" },
+        policy_revision: "0", local_security_revision: "0" };
+      }
+      return { status: "importable", projection: { kind: "member_joined",
+        mutation_id: `018f3f7e-0000-7000-8000-00000000001${seq}`,
+        member_id: `018f3f7e-0000-7000-8000-00000000003${seq}`,
+        name: `member-${seq}`, occurred_at: "2026-07-30T20:33:33.000000Z" },
+      policy_revision: "0", local_security_revision: "0" };
+    },
+    eventCall: async () => {}, logApplyCall: async () => {},
+  });
+  assert.deepEqual(rosterOrder, ["1", "2", "3", "5", "6"]);
+  assert.equal(activeEpoch, 2);
+  assert.equal(result.imported_count, 6);
+});
+
+test("reprocess does not advance storage when an ordered roster flush fails", async () => {
+  const ids = ["550e8400-e29b-41d4-a716-446655440001",
+    "550e8400-e29b-41d4-a716-446655440002"];
+  let storageApplied = false;
+  let activated = false;
+  await assert.rejects(reprocessCycle(config, 100, {
+    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    requestCall: async () => ({ ...capsFor(["age-v1"]), current_seq: "2",
+      next_sequence_boundary: "3" }),
+    driverCall: async (operation) => {
+      if (operation === "apply") { storageApplied = true; return []; }
+      return [{ type: "sync_state", driver_generation: "generation-fail", transport_cursor: "2" },
+        ...ids.map((id, index) => ({ type: "sync_reprocess_candidate",
+          server_seq: String(index + 1), id,
+          server_received_at: "2026-07-30T20:33:33.000000Z",
+          envelope: { v: 1, cipher: "age-v1", key_id: "epoch-initial", blob: id },
+          prior_status: "pending_key" })),
+        { type: "sync_reprocess_page", next_after: null, has_more: false }];
+    },
+    rosterDriverCall: async () => { throw new Error("roster append failed"); },
+    activateKeyRotationsCall: async () => { activated = true; },
+    evaluateCall: async (_config, _capabilities, message) => ({ status: "importable",
+      projection: message.server_seq === "1" ? { kind: "member_joined",
+        mutation_id: "018f3f7e-0000-7000-8000-000000000011",
+        member_id: "018f3f7e-0000-7000-8000-000000000031", name: "member-1",
+        occurred_at: "2026-07-30T20:33:33.000000Z" } : { kind: "key_rotated",
+        mutation_id: "018f3f7e-0000-7000-8000-000000000022", epoch: "1",
+        key_id: "epoch-1", fingerprint: "a".repeat(64),
+        occurred_at: "2026-07-30T20:33:33.000000Z" },
+      policy_revision: "0", local_security_revision: "0" }),
+    eventCall: async () => {}, logApplyCall: async () => {},
+  }), /roster append failed/u);
+  assert.equal(storageApplied, false);
+  assert.equal(activated, false);
 });
 
 test("explicit reprocess rejects an unbounded walk through duplicate server sequences", async () => {
@@ -1451,12 +1769,18 @@ test("age configure authenticates the connected credential before retaining trus
   });
 });
 
-test("age configure imports a complete chain without activating its future epoch", async () => {
+test("age configure extends a stored chain and activates its announced epoch", async () => {
   const previousFetch = globalThis.fetch;
   await withConnectedCredential(async (root) => {
     await writeConnectedTeam(root, { capabilities: { write_allowed_ciphers: ["age-v1"] } });
-    const recipient0 = "age1mmqjrejftea4f6xh47lhpc0jn4vw0yuhz349sw2e3sfl22k5gcjsv6xcvp";
-    const recipient1 = "age1ykvctct4aklx4f4mnjd8rmzqs7p2le9ufg4faydljsk5mvcy0pls27mu64";
+    const identityDir = join(root, "run", "remote-credentials", "demo", "keys");
+    const identity1 = join(identityDir, "epoch-1.key");
+    await mkdir(identityDir, { recursive: true });
+    await writeFile(identity1,
+      "AGE-SECRET-KEY-14Z7XMNPZTPEMMM6DG2FSKEH042L7UMU79T645GAQJKU2LLJGPM2S7GWNLQ\n",
+      { mode: 0o600 });
+    const recipient1 = readNativeAgeIdentity(identity1).recipient;
+    const recipient0 = recipient1;
     const ageSnapshot0 = {
       authorized_writers: ["writer-a"],
       epoch_revision: "0",
@@ -1492,10 +1816,8 @@ test("age configure imports a complete chain without activating its future epoch
     process.env.AGMSG_SYNC_STORAGE_DIR = join(root, "store");
     process.env.AGMSG_SYNC_TRUST_DIR = join(root, "trust");
     process.env.AGMSG_AGE_BIN = fakeAge;
-    let calls = 0;
-    globalThis.fetch = async () => {
-      calls += 1;
-      const body = calls === 1 ?
+    globalThis.fetch = async (url) => {
+      const body = String(url).endsWith("/v1/health") ?
         { status: "ok", database: "ok", server_instance_id: config.server_instance_id } :
         capsFor(["age-v1"]);
       return new Response(JSON.stringify(body), {
@@ -1505,18 +1827,36 @@ test("age configure imports a complete chain without activating its future epoch
     try {
       await configure({ team: "demo", server: "https://sync.example",
         "team-id": config.remote_team_id, "minimum-security": "e2ee-required",
+        cipher: "age-v1", "age-snapshot": [ageSnapshot0Path],
+        "age-checkpoint": `0:${ageSnapshotDigest(ageSnapshot0)}`,
+        "age-confirmation": "operator-live", "age-identity": [`epoch-0=${identity1}`] });
+      const mutationId = "018f3f7e-0000-7000-8000-000000000025";
+      await writeFile(join(root, "teams", "demo", "roster.jsonl"), [
+        JSON.stringify({ type: "key_rotated", id: mutationId, epoch: "1",
+          key_id: "epoch-1", fingerprint: createHash("sha256").update(recipient1).digest("hex"),
+          at: "2026-07-30T00:00:00.000000Z" }),
+        JSON.stringify({ type: "roster_synced", mutation_id: mutationId, server_seq: "1",
+          wire_id: "550e8400-e29b-41d4-a716-446655440006",
+          server_instance_id: config.server_instance_id,
+          remote_team_id: config.remote_team_id }), "",
+      ].join("\n"));
+      await configure({ team: "demo", server: "https://sync.example",
+        "team-id": config.remote_team_id, "minimum-security": "e2ee-required",
         cipher: "age-v1", "age-snapshot": [ageSnapshot0Path, ageSnapshot1Path],
         "age-checkpoint": `1:${ageSnapshotDigest(ageSnapshot1)}`,
-        "age-confirmation": "operator-live" });
+        "age-confirmation": "operator-live", "age-identity": [`epoch-1=${identity1}`] });
       const stored = JSON.parse(await readFile(
         join(process.env.AGMSG_SYNC_STORAGE_DIR, "remote-sync", "demo.json"), "utf8"));
       assert.equal(stored.age_v1.epoch_snapshots.length, 2);
+      assert.equal(stored.age_v1.identity_files["epoch-0"], identity1);
+      assert.equal(stored.age_v1.identity_files["epoch-1"], identity1);
       const loaded = await loadConfig("demo");
-      assert.equal(loaded.age_v1_runtime_history.length, 0);
+      assert.equal(loaded.age_v1_runtime_history.length, 1);
+      assert.equal(loaded.age_v1_runtime_history[0].key_id, "epoch-1");
       const afterFirstSequence = {
         ...capsFor(["age-v1"]), current_seq: "1", next_sequence_boundary: "2",
       };
-      assert.equal(selectWriteProfile(loaded, afterFirstSequence).key_id, "epoch-0");
+      assert.equal(selectWriteProfile(loaded, afterFirstSequence).key_id, "epoch-1");
     } finally {
       globalThis.fetch = previousFetch;
       if (saved.storage === undefined) delete process.env.AGMSG_SYNC_STORAGE_DIR;
