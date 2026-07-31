@@ -208,6 +208,11 @@ If argument starts with "remote status":
 2. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh status [<team>] [--json]`
 3. Show the output to the user.
 
+If argument starts with "remote sync start":
+1. Parse the required `<team>`.
+2. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh sync start <team>`
+3. Show the output to the user.
+
 If argument starts with "remote disconnect":
 1. Parse the required `<team>`.
 2. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh disconnect <team>`

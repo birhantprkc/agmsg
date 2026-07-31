@@ -345,6 +345,8 @@ skip_if_no_age() {
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.local_team');")" = "testteam" ]
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.endpoint');")" = "$ENDPOINT" ]
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.state');")" = "active" ]
+  [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.engine_state');")" = "running" ]
+  [ "$(sqlite_mem "SELECT json_type('$(echo "$output" | sed "s/'/''/g")', '\$.engine_pid');")" = "integer" ]
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.server_instance_id');")" != "" ]
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.remote_team_id');")" != "" ]
   # The register binding carries no credential; the field is still emitted for
@@ -358,6 +360,8 @@ skip_if_no_age() {
   run bash "$SCRIPTS/remote.sh" status testteam --json
   [ "$status" -eq 0 ]
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.state');")" = "disconnected" ]
+  [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.engine_state');")" = "stopped" ]
+  [ "$(sqlite_mem "SELECT json_type('$(echo "$output" | sed "s/'/''/g")', '\$.engine_pid');")" = "null" ]
 }
 
 @test "status --json: errors for a team that has never been connected" {
