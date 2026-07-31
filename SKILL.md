@@ -213,6 +213,15 @@ If argument starts with "remote disconnect":
 2. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh disconnect <team>`
 3. Show the output to the user.
 
+If argument starts with "remote forget":
+1. Parse the required `<team>`. This permanently deletes that team's local
+   roster, history, keys, trust, and sync state, but never changes the server.
+2. Do not add `--yes` yourself. Run:
+   `bash ~/.agents/skills/agmsg/scripts/remote.sh forget <team>`
+3. The command requires the user to confirm in their terminal. If this agent
+   has no interactive terminal, show the deletion summary and tell the user to
+   rerun the displayed command directly; never bypass confirmation for them.
+
 ### End-to-end encryption
 
 If argument starts with "key generate" followed by an optional team name:
