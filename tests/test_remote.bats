@@ -11,11 +11,7 @@ setup() {
   MOCK_PYTHON3="$(command -v python3)"
   bash "$SCRIPTS/join.sh" testteam alice claude-code /tmp/project-a
 
-  # Start the mock pairing-exchange/revoke server on an OS-assigned port.
-  MOCK_REVOKE_FAIL="${MOCK_REVOKE_FAIL:-}" \
-  MOCK_REVOKE_BAD_HEADER="${MOCK_REVOKE_BAD_HEADER:-}" \
-  MOCK_REVOKE_BAD_BODY="${MOCK_REVOKE_BAD_BODY:-}" \
-  MOCK_REVOKE_LARGE_BODY="${MOCK_REVOKE_LARGE_BODY:-}" \
+  # Start the mock remote server on an OS-assigned port.
   MOCK_PULL_MIXED="${MOCK_PULL_MIXED:-}" \
   MOCK_PULL_AGE="${MOCK_PULL_AGE:-}" \
   MOCK_PULL_AGE_ENVELOPE_FILE="${MOCK_PULL_AGE_ENVELOPE_FILE:-}" \
@@ -78,10 +74,6 @@ restart_mock_server() {
   kill "$MOCK_SERVER_PID" 2>/dev/null || true
   wait "$MOCK_SERVER_PID" 2>/dev/null || true
   : > "$TEST_SKILL_DIR/server.port"
-  MOCK_REVOKE_FAIL="${MOCK_REVOKE_FAIL:-}" \
-  MOCK_REVOKE_BAD_HEADER="${MOCK_REVOKE_BAD_HEADER:-}" \
-  MOCK_REVOKE_BAD_BODY="${MOCK_REVOKE_BAD_BODY:-}" \
-  MOCK_REVOKE_LARGE_BODY="${MOCK_REVOKE_LARGE_BODY:-}" \
   MOCK_PULL_MIXED="${MOCK_PULL_MIXED:-}" \
   MOCK_PULL_AGE="${MOCK_PULL_AGE:-}" \
   MOCK_PULL_AGE_ENVELOPE_FILE="${MOCK_PULL_AGE_ENVELOPE_FILE:-}" \
@@ -329,6 +321,123 @@ skip_if_no_age() {
   [[ "$output" != *"revoke it from the console"* ]]
 }
 
+@test "disconnect: refuses when the binding was replaced after it chose one" {
+  # The generation guard, on a binding with no credential -- which is every
+  # binding now. disconnect decides what to unbind from one snapshot, then stops
+  # the engine, then writes. A reconnect landing in that gap installs a NEWER
+  # binding, and marking THAT disconnected would tear down a connection this
+  # call never touched.
+  #
+  # Ordered by a synchronisation primitive, not by a delay. The stand-in engine
+  # traps TERM and reports it: receiving TERM proves disconnect has already
+  # taken its snapshot and is inside the engine stop, which is exactly the gap.
+  # The replacement lands there, and only then is the engine let go.
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  local cfg="$SCRIPTS/../teams/testteam/config.json"
+  local pidfile="$SCRIPTS/../run/remote-sync.testteam.pid"
+  local termed="$TEST_SKILL_DIR/engine-termed"
+  local release="$TEST_SKILL_DIR/engine-release"
+
+  # Replace the real engine with one that stops when we say so. Its argv has to
+  # end the way the status check expects, or the stop declines to reap it.
+  local real_pid; real_pid="$(cat "$pidfile" 2>/dev/null || true)"
+  [ -n "$real_pid" ] && kill "$real_pid" 2>/dev/null
+  TERMED="$termed" RELEASE="$release" bash -c '
+    trap "touch \"$TERMED\"" TERM
+    while [ ! -f "$RELEASE" ]; do sleep 0.02; done
+  ' "$SCRIPTS/internal/remote-sync.mjs" run --team testteam &
+  local fake=$!
+  echo "$fake" > "$pidfile"
+
+  bash "$SCRIPTS/remote.sh" disconnect testteam > "$TEST_SKILL_DIR/dc.out" 2>&1 &
+  local dc=$!
+
+  # Wait for the seam itself, not for a duration.
+  local i
+  for i in $(seq 1 300); do
+    [ -f "$termed" ] && break
+    sleep 0.02
+  done
+  [ -f "$termed" ] || { echo "disconnect never reached the engine stop"; false; }
+
+  # A concurrent reconnect: same team, newer generation.
+  python3 - "$cfg" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    document = json.load(handle)
+binding = document["remote_binding"]
+binding["binding_revision"] = int(binding.get("binding_revision") or 0) + 1
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(document, handle)
+    handle.write("\n")
+PY
+
+  touch "$release"
+  local dc_status=0
+  wait "$dc" || dc_status=$?
+  wait "$fake" 2>/dev/null || true
+  local out; out="$(cat "$TEST_SKILL_DIR/dc.out")"
+  echo "disconnect exited $dc_status; output: $out"
+
+  [ "$dc_status" -ne 0 ] || { echo "disconnect succeeded against a replaced binding"; false; }
+  [[ "$out" == *"binding changed to something else during disconnect"* ]]
+  # ...and the newer binding is still active.
+  [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$cfg') AS TEXT), '\$.remote_binding.disconnected_at');")" = "" ]
+}
+
+@test "disconnect: no replacement can land while the engine it chose is being stopped" {
+  # The half the generation check cannot cover. connect writes its binding under
+  # the team lock and starts the engine after releasing it, so a reconnect
+  # landing between disconnect's snapshot and an unlocked stop would have ITS
+  # engine killed by a call that then refuses to write. The stop therefore
+  # happens inside the same hold as the snapshot.
+  #
+  # Observed by exclusion rather than by racing: while disconnect is inside the
+  # stop, a separate process asks for the same lock with a short retry budget
+  # and must be refused. Nothing here depends on who wins a lock -- being shut
+  # out IS the invariant.
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  local pidfile="$SCRIPTS/../run/remote-sync.testteam.pid"
+  local termed="$TEST_SKILL_DIR/engine-termed"
+  local release="$TEST_SKILL_DIR/engine-release"
+
+  local real_pid; real_pid="$(cat "$pidfile" 2>/dev/null || true)"
+  [ -n "$real_pid" ] && kill "$real_pid" 2>/dev/null
+  # argv has to end the way _remote_sync_engine_status expects, or the stop
+  # declines to reap it and the seam is never reached.
+  TERMED="$termed" RELEASE="$release" bash -c '
+    trap "touch \"$TERMED\"" TERM
+    while [ ! -f "$RELEASE" ]; do sleep 0.02; done
+  ' "$SCRIPTS/internal/remote-sync.mjs" run --team testteam &
+  local engine=$!
+  echo "$engine" > "$pidfile"
+
+  bash "$SCRIPTS/remote.sh" disconnect testteam > "$TEST_SKILL_DIR/dc.out" 2>&1 &
+  local dc=$!
+
+  local i
+  for i in $(seq 1 300); do [ -f "$termed" ] && break; sleep 0.02; done
+  [ -f "$termed" ] || { echo "disconnect never reached the engine stop"; false; }
+
+  # A would-be replacement writer, while the stop is in progress.
+  run env AGMSG_LOCK_TRIES=5 SCRIPTS="$SCRIPTS" bash -c '
+    . "$SCRIPTS/lib/registry-lock.sh"
+    agmsg_lock_acquire "$SCRIPTS/../teams/testteam"
+  '
+  [ "$status" -ne 0 ] || {
+    echo "the lock was available during the engine stop: a reconnect could have landed"
+    false
+  }
+  [[ "$output" == *"timed out acquiring registry lock"* ]]
+
+  touch "$release"
+  local dc_status=0
+  wait "$dc" || dc_status=$?
+  wait "$engine" 2>/dev/null || true
+  # Nothing was contending, so the disconnect itself completes normally.
+  [ "$dc_status" -eq 0 ] || { echo "disconnect failed: $(cat "$TEST_SKILL_DIR/dc.out")"; false; }
+}
+
 @test "disconnect: fails for a team that isn't connected" {
   run bash "$SCRIPTS/remote.sh" disconnect testteam
   [ "$status" -ne 0 ]
@@ -408,182 +517,16 @@ skip_if_no_age() {
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.local_team');")" = "$team" ]
 }
 
-# --- pending list / abort (ADR 0007 addendum) -------------------------------
 
-_valid_pending_response_json() {
-  # A fully-valid exchange response body, matching the shape
-  # test_remote.bats's own "resumes from a hand-crafted pending record"
-  # test already establishes as this branch's strict-validator baseline.
-  local credential_id="$1" server_instance_id="$2" remote_team_id="$3" remote_team_name="$4"
-  python3 -c "
-import json
-response = {
-    'credential': 'orphan-test-credential-value',
-    'credential_id': '$credential_id',
-    'server_instance_id': '$server_instance_id',
-    'remote_team_id': '$remote_team_id',
-    'remote_team_name': '$remote_team_name',
-    'protocol_version': 1,
-    'capabilities': {
-        'protocol_version': 1,
-        'server_instance_id': '$server_instance_id',
-        'team_id': '$remote_team_id',
-        'team_name': '$remote_team_name',
-        'accepted_envelope_versions': [1],
-        'write_allowed_ciphers': ['none'],
-        'policy_revision': '0', 'effective_from_seq': '1',
-        'current_seq': '0', 'next_sequence_boundary': '1',
-        'min_available_seq': '0', 'max_blob_bytes': '1048576',
-        'policy_history': [{
-            'policy_revision': '0', 'effective_from_seq': '1',
-            'accepted_envelope_versions': [1],
-            'write_allowed_ciphers': ['none'],
-        }],
-    },
-}
-print(json.dumps(response))
-"
-}
 
-_write_pending_record() {
-  local key="$1" endpoint="$2" raw_response_text="$3" pending_dir="$4"
-  mkdir -p "$pending_dir"
-  python3 -c "
-import json, sys
-raw = sys.stdin.read()
-json.dump({'endpoint': '$endpoint', 'protocol_header_verified': True, 'raw_response_text': raw},
-          open('$pending_dir/$key.json', 'w'))
-" <<< "$raw_response_text"
-}
 
-@test "pending list: reports nothing when there are no pending records" {
-  run bash "$SCRIPTS/remote.sh" pending list
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"No pending connect records"* ]]
-  run bash "$SCRIPTS/remote.sh" pending list --json
-  [ "$status" -eq 0 ]
-  [ -z "$output" ]
-}
 
-@test "pending list --json: reports a valid orphaned record with its metadata, no credential" {
-  local token="orphan-test-token"
-  local key
-  key=$(python3 -c "import hashlib; print(hashlib.sha256('$ENDPOINT'.encode()+b'\x00'+'$token'.encode()).hexdigest())")
-  local pending_dir="$SCRIPTS/../run/remote-connect-pending"
-  local resp
-  resp=$(_valid_pending_response_json \
-    "018f3f7e-6666-7000-8000-000000000006" \
-    "018f3f7e-3333-7000-8000-000000000003" \
-    "018f3f7e-4444-7000-8000-000000000004" \
-    "orphanteam")
-  _write_pending_record "$key" "$ENDPOINT" "$resp" "$pending_dir"
 
-  run bash "$SCRIPTS/remote.sh" pending list --json
-  [ "$status" -eq 0 ]
-  [ "$(echo "$output" | wc -l | tr -d ' ')" -eq 1 ]
-  local escaped; escaped="$(echo "$output" | sed "s/'/''/g")"
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.pending_id');")" = "$key" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.endpoint');")" = "$ENDPOINT" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.credential_id');")" = "018f3f7e-6666-7000-8000-000000000006" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.valid');")" = "1" ]
-  # The raw credential must never appear anywhere in the listing output.
-  [[ "$output" != *"orphan-test-credential-value"* ]]
-}
 
-@test "pending list --json: reports valid:false and null metadata for a record whose content fails validation" {
-  local pending_dir="$SCRIPTS/../run/remote-connect-pending"
-  local key; key="$(printf 'a%.0s' $(seq 1 64))"
-  _write_pending_record "$key" "$ENDPOINT" '{not valid json' "$pending_dir"
 
-  run bash "$SCRIPTS/remote.sh" pending list --json
-  [ "$status" -eq 0 ]
-  local escaped; escaped="$(echo "$output" | sed "s/'/''/g")"
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.pending_id');")" = "$key" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.endpoint');")" = "$ENDPOINT" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.valid');")" = "0" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.credential_id');")" = "" ]
-}
 
-@test "pending list --json: still reports pending_id even when the envelope itself is corrupt" {
-  local pending_dir="$SCRIPTS/../run/remote-connect-pending"
-  mkdir -p "$pending_dir"
-  local key; key="$(printf 'b%.0s' $(seq 1 64))"
-  printf 'not even json' > "$pending_dir/$key.json"
 
-  run bash "$SCRIPTS/remote.sh" pending list --json
-  [ "$status" -eq 0 ]
-  local escaped; escaped="$(echo "$output" | sed "s/'/''/g")"
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.pending_id');")" = "$key" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.endpoint');")" = "" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.valid');")" = "0" ]
-}
 
-@test "pending list --json: does not enumerate a quarantined record (only normal <id>.json files)" {
-  local token="quarantine-visibility-token"
-  local key
-  key=$(python3 -c "import hashlib; print(hashlib.sha256('$ENDPOINT'.encode()+b'\x00'+'$token'.encode()).hexdigest())")
-  local pending_dir="$SCRIPTS/../run/remote-connect-pending"
-  # Legacy 2-key envelope (no protocol_header_verified) — triggers
-  # cmd_connect's own quarantine path on resume, exercised here directly by
-  # hand-crafting the pre-quarantine legacy file and quarantining it the
-  # same way cmd_connect would.
-  mkdir -p "$pending_dir"
-  python3 -c "
-import json
-json.dump({'endpoint': '$ENDPOINT', 'raw_response_text': '{}'}, open('$pending_dir/$key.json', 'w'))
-"
-  mv "$pending_dir/$key.json" "$pending_dir/$key.json.unverified.20260101T000000Z.1"
-
-  run bash "$SCRIPTS/remote.sh" pending list --json
-  [ "$status" -eq 0 ]
-  [ -z "$output" ]
-  run bash "$SCRIPTS/remote.sh" pending list
-  [[ "$output" == *"No pending connect records"* ]]
-}
-
-@test "pending abort: rejects a malformed pending_id" {
-  run bash "$SCRIPTS/remote.sh" pending abort "not-a-valid-id"
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"invalid pending_id"* ]]
-  run bash "$SCRIPTS/remote.sh" pending abort "../../escape"
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"invalid pending_id"* ]]
-}
-
-@test "pending abort: removes a valid pending record" {
-  local token="abort-test-token"
-  local key
-  key=$(python3 -c "import hashlib; print(hashlib.sha256('$ENDPOINT'.encode()+b'\x00'+'$token'.encode()).hexdigest())")
-  local pending_dir="$SCRIPTS/../run/remote-connect-pending"
-  _write_pending_record "$key" "$ENDPOINT" '{}' "$pending_dir"
-
-  run bash "$SCRIPTS/remote.sh" pending abort "$key"
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"Aborted pending connect record $key"* ]]
-  [ ! -f "$pending_dir/$key.json" ]
-}
-
-@test "pending abort: fails clearly for an unknown pending_id" {
-  local key; key="$(printf 'c%.0s' $(seq 1 64))"
-  run bash "$SCRIPTS/remote.sh" pending abort "$key"
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"no pending connect record"* ]]
-}
-
-@test "pending abort: aborting the same pending_id twice is not silently treated as success" {
-  local token="double-abort-token"
-  local key
-  key=$(python3 -c "import hashlib; print(hashlib.sha256('$ENDPOINT'.encode()+b'\x00'+'$token'.encode()).hexdigest())")
-  local pending_dir="$SCRIPTS/../run/remote-connect-pending"
-  _write_pending_record "$key" "$ENDPOINT" '{}' "$pending_dir"
-
-  bash "$SCRIPTS/remote.sh" pending abort "$key"
-  run bash "$SCRIPTS/remote.sh" pending abort "$key"
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"no pending connect record"* ]]
-}
-
-# --- pending/connect lock barrier (co1 delta review) ------------------------
 #
 # Deterministic, single-threaded simulation of the race co1 flagged (see
 # feat/remote-connect-onboarding's PR #479): rather than actually racing two
@@ -605,43 +548,8 @@ VALUES ('remote-pending.$key', $owner_pid, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 "
 }
 
-@test "pending abort: blocks (not deletes) when a concurrent connect resume already holds this pending_id's lock (barrier test)" {
-  local token="lock-barrier-abort-token"
-  local key
-  key=$(python3 -c "import hashlib; print(hashlib.sha256('$ENDPOINT'.encode()+b'\x00'+'$token'.encode()).hexdigest())")
-  local pending_dir="$SCRIPTS/../run/remote-connect-pending"
-  _write_pending_record "$key" "$ENDPOINT" '{}' "$pending_dir"
-  _insert_pending_lock_row "$key" "$$"
 
-  AGMSG_PENDING_LOCK_TRIES=3 run bash "$SCRIPTS/remote.sh" pending abort "$key"
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"timed out acquiring pending lock"* ]]
-  [ -f "$pending_dir/$key.json" ]
-}
 
-@test "pending abort: reclaims a stale lock left by a dead owner instead of blocking forever (barrier test)" {
-  local token="lock-barrier-stale-token"
-  local key
-  key=$(python3 -c "import hashlib; print(hashlib.sha256('$ENDPOINT'.encode()+b'\x00'+'$token'.encode()).hexdigest())")
-  local pending_dir="$SCRIPTS/../run/remote-connect-pending"
-  _write_pending_record "$key" "$ENDPOINT" '{}' "$pending_dir"
-
-  ( : ) &
-  local dead_pid=$!
-  wait "$dead_pid" 2>/dev/null || true
-  _insert_pending_lock_row "$key" "$dead_pid"
-
-  AGMSG_PENDING_LOCK_TRIES=20 run bash "$SCRIPTS/remote.sh" pending abort "$key"
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"Aborted pending connect record $key"* ]]
-  [ ! -f "$pending_dir/$key.json" ]
-}
-
-@test "remote.sh: unknown pending subcommand prints usage and exits non-zero" {
-  run bash "$SCRIPTS/remote.sh" pending bogus
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"Usage:"* ]]
-}
 
 # --- dispatch --------------------------------------------------------------
 
@@ -676,12 +584,6 @@ VALUES ('remote-pending.$key', $owner_pid, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
   [[ "$output" == *"requires python3"* ]]
 }
 
-@test "remote pending: fails fast with an install message when python3 is absent" {
-  local no_py3; no_py3="$(path_without_python3)"
-  run env PATH="$no_py3" bash "$SCRIPTS/remote.sh" pending list
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"requires python3"* ]]
-}
 
 @test "remote doctor: still runs without python3, and reports it as a failed check (not a crash)" {
   local no_py3; no_py3="$(path_without_python3)"
