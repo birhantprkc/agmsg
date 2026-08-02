@@ -975,6 +975,54 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   wait_for_pid_exit "$pid"
 }
 
+@test "remote unlock --authenticated-bundle-stdin: the captured bundle is 0600 whatever the umask" {
+  # The capture holds a team's key history in the clear until the trap fires, so
+  # its mode must not depend on how the caller's shell happened to be configured.
+  # Observed at the real boundary: remote.sh hands the path to remote-sync.sh, so
+  # a stand-in there reports the mode of the actual file remote.sh created. A
+  # structural "is there a chmod" grep would pass on code that chmods the wrong
+  # path, or too late.
+  local peer; peer="$(mktemp -d)"
+  mkdir -p "$peer"/{scripts,db,teams}
+  cp -R "$BATS_TEST_DIRNAME"/../scripts/. "$peer/scripts/"
+  chmod +x "$peer/scripts/"*.sh
+  bash "$peer/scripts/internal/init-db.sh"
+
+  # A team the unlock will accept as an encrypted pulled team, so it reaches the
+  # capture. Nothing beyond the capture needs to succeed.
+  bash "$peer/scripts/join.sh" locked alice claude-code "$peer" >/dev/null 2>&1
+  local cfg="$peer/teams/locked/config.json"
+  python3 - "$cfg" <<'PY'
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p))
+cfg["remote_binding"] = {"cipher_profile": "age-v1", "connected_at": "2026-01-01T00:00:00Z"}
+json.dump(cfg, open(p, "w"))
+PY
+
+  local seen="$peer/observed-mode"
+  cat > "$peer/scripts/remote-sync.sh" <<PY
+#!/usr/bin/env bash
+# Stand-in: report the mode of the file remote.sh captured, then stop the unlock.
+for a in "\$@"; do
+  if [ "\$prev" = "--bundle" ]; then
+    if stat -f '%Lp' "\$a" >/dev/null 2>&1; then stat -f '%Lp' "\$a" > "$seen"
+    else stat -c '%a' "\$a" > "$seen"; fi
+  fi
+  prev="\$a"
+done
+exit 1
+PY
+  chmod +x "$peer/scripts/remote-sync.sh"
+
+  # A deliberately permissive umask: without the fix the capture inherits it.
+  run bash -c "umask 000; printf 'BUNDLE BYTES' | bash '$peer/scripts/remote.sh' unlock locked --authenticated-bundle-stdin"
+  [ "$status" -ne 0 ]          # the stand-in refuses; only the capture matters here
+  [ -f "$seen" ]               # and it must actually have been reached
+  [ "$(cat "$seen")" = "600" ]
+  rm -rf "$peer"
+}
+
 @test "remote unlock: --bundle still requires a matching --confirm-digest" {
   # The ordinary gate is unchanged by the new mode. Asserted on its own so that a
   # regression here cannot hide inside the larger handed-authority test.

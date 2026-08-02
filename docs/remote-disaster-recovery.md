@@ -53,13 +53,15 @@ same bytes, read once.
 It would be easy to read the section above as "so nothing plaintext is written."
 That is false, and the difference matters when the secret is a team's key history.
 
-While the unlock runs, `remote.sh` creates a private directory with `mktemp -d`,
-`chmod 700`, and writes inside it, each file mode `0600`:
+While the unlock runs, `remote.sh` creates a private directory with `mktemp -d`
+and `chmod 700`, and writes inside it:
 
-- the bundle bytes taken from stdin, and
+- the bundle bytes taken from stdin — created under `umask 077`, so `0600`
+  regardless of the caller's umask, and never briefly wider (a `chmod` after the
+  write would leave exactly that window), and
 - **the age secret keys extracted from it** — `verify-age-handoff` requires an
-  output directory and writes one `identity-<key_id>.key` per epoch, because the
-  import step reads them from there.
+  output directory and writes one `identity-<key_id>.key` per epoch at mode
+  `0600`, because the import step reads them from there.
 
 So the plaintext that matters is on the filesystem for the duration either way.
 Handing the bundle in on stdin does not change that, and could not: the files are

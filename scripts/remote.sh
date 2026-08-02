@@ -611,7 +611,11 @@ cmd_unlock() {
     # caller authenticated a specific sequence of bytes, and re-opening a path it
     # named would let anything with write access substitute different bytes
     # between that authentication and this import. A filename is not the bytes.
-    cat > "$bundle"
+    # umask rather than a chmod afterwards: `cat >` creates the file with the
+    # caller's umask, and a chmod on the next line leaves a window where the
+    # secret is already on disk at whatever mode that was. Setting it in a
+    # subshell around the redirection means the file is never briefly wider.
+    ( umask 077; cat > "$bundle" )
     [ -s "$bundle" ] || {
       echo "agmsg: --authenticated-bundle-stdin received no bundle bytes on stdin" >&2
       exit 1
