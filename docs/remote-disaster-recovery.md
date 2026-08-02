@@ -69,12 +69,28 @@ the verifier's output, not the transport. Passing it as a stream is about
 something else — that the bytes imported are the bytes the caller authenticated,
 with no window in between for a path to be re-pointed.
 
-**Cleanup limit.** The directory is removed by a `trap` on `EXIT INT TERM HUP`.
-That covers a normal finish and the usual interruptions. It does **not** cover
-`SIGKILL`, a crash, or power loss — after any of those the directory can survive
-a reboot under the system temp directory with the key material still in it. If an
-unlock dies that way, treat `${TMPDIR:-/tmp}/agmsg-handoff.*` as material to find
-and remove deliberately; "there is a trap" is not the same as "nothing is left".
+### What protects it, and what does not
+
+**Protecting:**
+
+- the parent directory at `0700` — this is what actually keeps other users out;
+  they cannot traverse it whatever the files inside are set to;
+- the file modes at `0600` — a second layer, not the load-bearing one. It matters
+  because the first layer should not be the only one: if the directory's mode is
+  ever loosened, or the files are copied somewhere flatter, the modes are what is
+  left.
+
+**Not protecting:**
+
+- **other processes running as you.** Same-UID access is not restricted by any of
+  this. Anything you run while an unlock is in flight can read the directory.
+- **anything after `SIGKILL`, a crash, or power loss.** The directory is removed
+  by a `trap` on `EXIT INT TERM HUP` — a normal finish and the usual
+  interruptions. None of those three run it. Afterwards the directory can survive
+  a reboot under the system temp directory with the key material still in it.
+  Treat `${TMPDIR:-/tmp}/agmsg-handoff.*` as something to find and remove
+  deliberately after an unlock dies that way; "there is a trap" is not the same
+  as "nothing is left".
 
 ## Contract
 
