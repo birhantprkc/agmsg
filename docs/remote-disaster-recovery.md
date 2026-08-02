@@ -48,8 +48,31 @@ between the authentication and the import. Passing the exact buffer through the
 pipe closes that window — what was authenticated and what is imported are the
 same bytes, read once.
 
-A side effect worth having: the decrypted bundle never has to exist as a
-plaintext file on disk.
+## What it does NOT give you: plaintext still reaches the disk
+
+It would be easy to read the section above as "so nothing plaintext is written."
+That is false, and the difference matters when the secret is a team's key history.
+
+While the unlock runs, `remote.sh` creates a private directory with `mktemp -d`,
+`chmod 700`, and writes inside it, each file mode `0600`:
+
+- the bundle bytes taken from stdin, and
+- **the age secret keys extracted from it** — `verify-age-handoff` requires an
+  output directory and writes one `identity-<key_id>.key` per epoch, because the
+  import step reads them from there.
+
+So the plaintext that matters is on the filesystem for the duration either way.
+Handing the bundle in on stdin does not change that, and could not: the files are
+the verifier's output, not the transport. Passing it as a stream is about
+something else — that the bytes imported are the bytes the caller authenticated,
+with no window in between for a path to be re-pointed.
+
+**Cleanup limit.** The directory is removed by a `trap` on `EXIT INT TERM HUP`.
+That covers a normal finish and the usual interruptions. It does **not** cover
+`SIGKILL`, a crash, or power loss — after any of those the directory can survive
+a reboot under the system temp directory with the key material still in it. If an
+unlock dies that way, treat `${TMPDIR:-/tmp}/agmsg-handoff.*` as material to find
+and remove deliberately; "there is a trap" is not the same as "nothing is left".
 
 ## Contract
 
