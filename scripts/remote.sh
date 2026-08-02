@@ -7,6 +7,19 @@ set -euo pipefail
 #   remote.sh unlock <team> --bundle <file> --confirm-digest <sha256>
 #   remote.sh unlock <team> --snapshot <file> (--identity <file>|--identity-stdin)
 #     [--confirm-digest <sha256>]
+#   remote.sh unlock <team> --authenticated-bundle-stdin
+#     Read the exact bundle bytes from stdin after the invoking program has
+#     authenticated them end to end. remote.sh does not authenticate this input.
+#     Use only with an authenticator that verifies integrity and binds the
+#     expected team/context. This mode replaces, and must not be combined with,
+#     --bundle or --confirm-digest.
+#
+#     This is not a bypass of the digest check: it switches the authentication
+#     authority from a live human digest comparison to an upstream AEAD verifier.
+#     remote.sh cannot prove that verifier ran, and does not pretend to — that
+#     limit is the caller's contract, not a hidden assumption. Reserved for the
+#     disaster-recovery route (see docs/remote-disaster-recovery.md); ordinary
+#     onboarding and the courier `fetch` path use --bundle/--confirm-digest.
 #   remote.sh status [<team>] [--json]
 #   remote.sh sync start <team>
 #   remote.sh disconnect <team>
@@ -531,13 +544,15 @@ cmd_pull() {
 }
 
 cmd_unlock() {
-  local team="" identity_file="" identity_stdin=0 confirm_digest="" bundle="" snapshots=()
+  local team="" identity_file="" identity_stdin=0 confirm_digest="" bundle="" \
+    authenticated_stdin=0 snapshots=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --snapshot) snapshots+=("${2:?--snapshot requires a value}"); shift 2 ;;
       --snapshot=*) snapshots+=("${1#--snapshot=}"); shift ;;
       --bundle) bundle="${2:?--bundle requires a value}"; shift 2 ;;
       --bundle=*) bundle="${1#--bundle=}"; shift ;;
+      --authenticated-bundle-stdin) authenticated_stdin=1; shift ;;
       --identity) identity_file="${2:?--identity requires a value}"; shift 2 ;;
       --identity=*) identity_file="${1#--identity=}"; shift ;;
       --identity-stdin) identity_stdin=1; shift ;;
@@ -548,9 +563,18 @@ cmd_unlock() {
          team="$1"; shift ;;
     esac
   done
-  : "${team:?Usage: remote.sh unlock <team> (--bundle <file> | --snapshot <file> (--identity <file>|--identity-stdin)) [--confirm-digest <sha256>]}"
+  : "${team:?Usage: remote.sh unlock <team> (--bundle <file> --confirm-digest <sha256> | --authenticated-bundle-stdin | --snapshot <file> (--identity <file>|--identity-stdin)) }"
   agmsg_validate_team_name "$team" || exit 1
-  if [ -n "$bundle" ]; then
+  if [ "$authenticated_stdin" -eq 1 ]; then
+    # This mode REPLACES the digest gate rather than relaxing it, so it cannot
+    # sit alongside another input mode: two authorities disagreeing about which
+    # bytes were authenticated is worse than either alone. Fail closed.
+    if [ -n "$bundle" ] || [ -n "$confirm_digest" ] || [ "${#snapshots[@]}" -gt 0 ] ||
+        [ -n "$identity_file" ] || [ "$identity_stdin" -eq 1 ]; then
+      echo "agmsg: --authenticated-bundle-stdin replaces --bundle/--confirm-digest and cannot be combined with them, --snapshot, or --identity" >&2
+      exit 1
+    fi
+  elif [ -n "$bundle" ]; then
     if [ "${#snapshots[@]}" -gt 0 ] || [ -n "$identity_file" ] || [ "$identity_stdin" -eq 1 ]; then
       echo "agmsg: --bundle cannot be combined with --snapshot or --identity" >&2
       exit 1
@@ -577,10 +601,32 @@ cmd_unlock() {
     exit 1
   }
   local snapshot_args=() identity_args=() snapshot handoff_tmp="" handoff_metadata=""
-  if [ -n "$bundle" ]; then
+  if [ "$authenticated_stdin" -eq 1 ]; then
     handoff_tmp="$(mktemp -d "${TMPDIR:-/tmp}/agmsg-handoff.XXXXXX")"
     chmod 700 "$handoff_tmp"
     trap 'rm -r "${handoff_tmp:-}" 2>/dev/null || true' EXIT INT TERM HUP
+    bundle="$handoff_tmp/authenticated.bundle"
+    # Capture the caller's bytes ONCE, into a directory only this process can
+    # reach. That is the whole reason this mode takes stdin and not a path: the
+    # caller authenticated a specific sequence of bytes, and re-opening a path it
+    # named would let anything with write access substitute different bytes
+    # between that authentication and this import. A filename is not the bytes.
+    # umask rather than a chmod afterwards: `cat >` creates the file with the
+    # caller's umask, and a chmod on the next line leaves a window where the
+    # secret is already on disk at whatever mode that was. Setting it in a
+    # subshell around the redirection means the file is never briefly wider.
+    ( umask 077; cat > "$bundle" )
+    [ -s "$bundle" ] || {
+      echo "agmsg: --authenticated-bundle-stdin received no bundle bytes on stdin" >&2
+      exit 1
+    }
+  fi
+  if [ -n "$bundle" ]; then
+    if [ -z "$handoff_tmp" ]; then
+      handoff_tmp="$(mktemp -d "${TMPDIR:-/tmp}/agmsg-handoff.XXXXXX")"
+      chmod 700 "$handoff_tmp"
+      trap 'rm -r "${handoff_tmp:-}" 2>/dev/null || true' EXIT INT TERM HUP
+    fi
     handoff_metadata="$(bash "$SCRIPT_DIR/remote-sync.sh" verify-age-handoff \
       --team "$team" --bundle "$bundle" --out-dir "$handoff_tmp")" || exit 1
     local snapshot_count identity_count index mapped_key mapped_path
@@ -620,17 +666,25 @@ cmd_unlock() {
     }
   fi
 
-  if [ -z "$confirm_digest" ]; then
-    if [ "$identity_stdin" -eq 1 ] && { [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; }; then
-      echo "agmsg: --identity-stdin without a terminal also requires --confirm-digest <sha256>" >&2
+  # The live-channel comparison is the ordinary authority over "are these the
+  # bytes the other side sent". --authenticated-bundle-stdin substitutes a
+  # different authority for it — an authenticator the invoking program already
+  # verified over exactly these bytes — so the two are alternatives, never a
+  # sequence where one can be skipped. Every other path still goes through the
+  # gate unchanged.
+  if [ "$authenticated_stdin" -ne 1 ]; then
+    if [ -z "$confirm_digest" ]; then
+      if [ "$identity_stdin" -eq 1 ] && { [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; }; then
+        echo "agmsg: --identity-stdin without a terminal also requires --confirm-digest <sha256>" >&2
+        exit 1
+      fi
+      _remote_prompt_read confirm_digest \
+        "Type the snapshot SHA-256 you verified over a separate live channel: " || exit 1
+    fi
+    if [ "$confirm_digest" != "$digest" ]; then
+      echo "agmsg: confirmed snapshot digest does not match; refusing to import trust or key material" >&2
       exit 1
     fi
-    _remote_prompt_read confirm_digest \
-      "Type the snapshot SHA-256 you verified over a separate live channel: " || exit 1
-  fi
-  if [ "$confirm_digest" != "$digest" ]; then
-    echo "agmsg: confirmed snapshot digest does not match; refusing to import trust or key material" >&2
-    exit 1
   fi
 
   local identity_tmp="" derived_recipient identity_dest mapping mapping_key mapping_path

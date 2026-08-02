@@ -862,6 +862,175 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   [ "$pushed_cipher" = "age-v1" ]
 }
 
+@test "remote unlock --authenticated-bundle-stdin: takes exact bytes, refuses everything else" {
+  skip_if_no_age
+
+  # Same handed-authority setup as the --bundle test above, kept separate rather
+  # than factored out: a shared fixture would let a change made for one mode
+  # quietly redefine what the other one is asserting.
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam >/dev/null
+  local source_cfg bundle key_id recipient team_id envelope
+  source_cfg="$TEST_SKILL_DIR/teams/testteam/config.json"
+  bundle="$TEST_SKILL_DIR/auth-bundle.json"
+  envelope="$TEST_SKILL_DIR/auth-envelope.json"
+  # Export the snapshot first: the handoff bundle carries the *confirmed* chain,
+  # and the epoch is only confirmed once a snapshot has been exported. Skipping
+  # this hands over a bundle that cannot open what the envelope was sealed to.
+  bash "$SCRIPTS/key.sh" show testteam --snapshot --out "$TEST_SKILL_DIR/auth-snapshot.json" 2>/dev/null
+  bash "$SCRIPTS/key.sh" handoff testteam --out "$bundle" >/dev/null 2>&1
+  key_id="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.remote_key.current.key_id');")"
+  recipient="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.remote_key.current.recipient');")"
+  team_id="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.team_id');")"
+  # wire_id must be exactly this: tests/helpers/mock_remote_server.py:83 serves a
+  # row with that id, and an envelope carrying any other one is pulled but never
+  # matched — which surfaces as "envelopes remain blocked after reprocessing",
+  # i.e. as an unlock failure rather than as a fixture mismatch.
+  jq -nc \
+    --arg key_id "$key_id" \
+    --arg recipient "$recipient" \
+    --arg team_id "$team_id" \
+    '{
+      type:"sync_seal", envelope_v:1, cipher:"age-v1",
+      key_id:$key_id, recipients:[$recipient], max_blob_bytes:1048576,
+      wire_id:"20000000-0000-4000-8000-000000000001",
+      team_id:$team_id, protocol_version:1,
+      projection:{
+        body:"authenticated ciphertext", created_at:"2026-01-02T00:00:00.000000Z",
+        from_agent:"member-1", to_agent:"member-1"
+      }
+    }' | node "$SCRIPTS/internal/sync-cipher.mjs" seal > "$envelope"
+  bash "$SCRIPTS/remote.sh" disconnect testteam >/dev/null 2>&1 || true
+
+  MOCK_PULL_AGE=1
+  MOCK_PULL_AGE_ENVELOPE_FILE="$envelope"
+  MOCK_PULL_TEAM_ID="$team_id"
+  restart_mock_server
+
+  PEER_SKILL_DIR="$(mktemp -d)"
+  export PEER_SKILL_DIR
+  mkdir -p "$PEER_SKILL_DIR"/{scripts,db,teams}
+  cp -R "$BATS_TEST_DIRNAME"/../scripts/. "$PEER_SKILL_DIR/scripts/"
+  chmod +x "$PEER_SKILL_DIR/scripts/"*.sh
+  chmod +x "$PEER_SKILL_DIR/scripts/"*.js 2>/dev/null || true
+  chmod +x "$PEER_SKILL_DIR/scripts/drivers/types/codex/"*.sh 2>/dev/null || true
+  bash "$PEER_SKILL_DIR/scripts/internal/init-db.sh"
+  local peer_scripts="$PEER_SKILL_DIR/scripts"
+
+  run bash "$peer_scripts/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$team_id" encrypted
+  [ "$status" -eq 0 ]
+
+  # Combining the new mode with any other input mode is an error, not a
+  # precedence rule: two authorities disagreeing about which bytes were
+  # authenticated must not resolve silently in either direction.
+  local digest; digest="$(shasum -a 256 "$bundle" | awk '{print $1}')"
+  run bash -c "bash '$peer_scripts/remote.sh' unlock encrypted --authenticated-bundle-stdin --confirm-digest '$digest' < '$bundle'"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"cannot be combined"* ]]
+  run bash -c "bash '$peer_scripts/remote.sh' unlock encrypted --authenticated-bundle-stdin --bundle '$bundle' < '$bundle'"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"cannot be combined"* ]]
+
+  # Empty stdin must fail closed rather than fall through to some other mode.
+  run bash -c "bash '$peer_scripts/remote.sh' unlock encrypted --authenticated-bundle-stdin < /dev/null"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"no bundle bytes on stdin"* ]]
+
+  # Truncated and trailing-garbage input must fail too: "we did not authenticate
+  # this" has to lose, and a partial read that merely looked like a bundle is
+  # exactly what a fail-open would accept.
+  head -c 64 "$bundle" > "$TEST_SKILL_DIR/partial.json"
+  run bash -c "bash '$peer_scripts/remote.sh' unlock encrypted --authenticated-bundle-stdin < '$TEST_SKILL_DIR/partial.json'"
+  [ "$status" -ne 0 ]
+  cat "$bundle" > "$TEST_SKILL_DIR/trailing.json"
+  printf 'garbage\n' >> "$TEST_SKILL_DIR/trailing.json"
+  run bash -c "bash '$peer_scripts/remote.sh' unlock encrypted --authenticated-bundle-stdin < '$TEST_SKILL_DIR/trailing.json'"
+  [ "$status" -ne 0 ]
+
+  # None of the failures above may have imported trust or key material.
+  [ "$(sqlite_mem "SELECT json_type(json_extract(CAST(readfile('$(rf "$PEER_SKILL_DIR/teams/encrypted/config.json")') AS TEXT), '\$.remote_key'));")" = "" ]
+  [ ! -e "$PEER_SKILL_DIR/run/remote-credentials/encrypted" ]
+
+  # The success path, fed through a PIPE rather than a redirect. A pipe has no
+  # pathname, so this also proves the bytes are taken from the stream and not
+  # re-opened by name — which is the entire reason this mode is stdin-only.
+  run bash -c "cat '$bundle' | bash '$peer_scripts/remote.sh' unlock encrypted --authenticated-bundle-stdin"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"imported 1 envelope(s); engine running (pid "* ]]
+  # It must NOT have asked for, or accepted, a digest along the way.
+  [[ "$output" != *"separate live channel"* ]]
+  wait_for_file "$PEER_SKILL_DIR/run/remote-sync.encrypted.pid"
+  [ -d "$PEER_SKILL_DIR/run/remote-trust" ]
+
+  run bash "$peer_scripts/history.sh" encrypted member-1
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"authenticated ciphertext"* ]]
+
+  # The decrypted bundle must not survive as a plaintext file: taking it on stdin
+  # is pointless if we then leave a copy behind.
+  run bash -c "ls -d \${TMPDIR:-/tmp}/agmsg-handoff.* 2>/dev/null | wc -l"
+  [ "$(echo "$output" | tr -d '[:space:]')" = "0" ]
+
+  local pid; pid="$(cat "$PEER_SKILL_DIR/run/remote-sync.encrypted.pid")"
+  kill "$pid" 2>/dev/null || true
+  wait_for_pid_exit "$pid"
+}
+
+@test "remote unlock --authenticated-bundle-stdin: the captured bundle is 0600 whatever the umask" {
+  # The capture holds a team's key history in the clear until the trap fires, so
+  # its mode must not depend on how the caller's shell happened to be configured.
+  # Observed at the real boundary: remote.sh hands the path to remote-sync.sh, so
+  # a stand-in there reports the mode of the actual file remote.sh created. A
+  # structural "is there a chmod" grep would pass on code that chmods the wrong
+  # path, or too late.
+  local peer; peer="$(mktemp -d)"
+  mkdir -p "$peer"/{scripts,db,teams}
+  cp -R "$BATS_TEST_DIRNAME"/../scripts/. "$peer/scripts/"
+  chmod +x "$peer/scripts/"*.sh
+  bash "$peer/scripts/internal/init-db.sh"
+
+  # A team the unlock will accept as an encrypted pulled team, so it reaches the
+  # capture. Nothing beyond the capture needs to succeed.
+  bash "$peer/scripts/join.sh" locked alice claude-code "$peer" >/dev/null 2>&1
+  local cfg="$peer/teams/locked/config.json"
+  python3 - "$cfg" <<'PY'
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p))
+cfg["remote_binding"] = {"cipher_profile": "age-v1", "connected_at": "2026-01-01T00:00:00Z"}
+json.dump(cfg, open(p, "w"))
+PY
+
+  local seen="$peer/observed-mode"
+  cat > "$peer/scripts/remote-sync.sh" <<PY
+#!/usr/bin/env bash
+# Stand-in: report the mode of the file remote.sh captured, then stop the unlock.
+for a in "\$@"; do
+  if [ "\$prev" = "--bundle" ]; then
+    if stat -f '%Lp' "\$a" >/dev/null 2>&1; then stat -f '%Lp' "\$a" > "$seen"
+    else stat -c '%a' "\$a" > "$seen"; fi
+  fi
+  prev="\$a"
+done
+exit 1
+PY
+  chmod +x "$peer/scripts/remote-sync.sh"
+
+  # A deliberately permissive umask: without the fix the capture inherits it.
+  run bash -c "umask 000; printf 'BUNDLE BYTES' | bash '$peer/scripts/remote.sh' unlock locked --authenticated-bundle-stdin"
+  [ "$status" -ne 0 ]          # the stand-in refuses; only the capture matters here
+  [ -f "$seen" ]               # and it must actually have been reached
+  [ "$(cat "$seen")" = "600" ]
+  rm -rf "$peer"
+}
+
+@test "remote unlock: --bundle still requires a matching --confirm-digest" {
+  # The ordinary gate is unchanged by the new mode. Asserted on its own so that a
+  # regression here cannot hide inside the larger handed-authority test.
+  run bash "$SCRIPTS/remote.sh" unlock testteam --bundle /dev/null
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"requires --confirm-digest"* ]]
+}
+
 @test "remote doctor: age is optional — its absence does not fail the run" {
   # cipher "none" is the base and e2ee is available rather than required, so a
   # new user running doctor must not be told they are missing something they
