@@ -2641,13 +2641,26 @@ test("push stops at one message rather than splitting forever, and names it", as
     cycle(config, { pushLimit: 100, pullLimit: 1000 }, harness),
     (error) => {
       assert.match(error.message, /cannot be pushed by splitting/u);
+      // The message a human reads has to carry the local coordinate too.
+      assert.ok(error.message.includes(candidates[0].local_id),
+        `error must name local_id, got: ${error.message}`);
+      assert.equal(error.local_id, candidates[0].local_id);
+      assert.equal(error.local_position, candidates[0].local_position);
       assert.equal(error.wire_id, candidates[0].id);
       return true;
     });
   assert.equal(attempts, 1, "a single message must not be split again");
   const oversized = events.find(([name]) => name === "push.oversized");
   assert.ok(oversized, "no push.oversized event was emitted");
-  assert.equal(oversized[1].wire_id, candidates[0].id);
+  // local_id is the coordinate in THIS machine's store — the row an operator can
+  // look at or delete. The wire id is a reservation this push minted and points
+  // at nothing locally, so reporting only that would say "sync is stuck" without
+  // saying on what. The fixture keeps them different on purpose.
+  assert.notEqual(candidates[0].local_id, candidates[0].id);
+  assert.equal(oversized[1].local_id, candidates[0].local_id);
+  assert.equal(oversized[1].local_position, candidates[0].local_position);
+  assert.equal(oversized[1].sync_axis, "messages");
+  assert.equal(oversized[1].wire_id, candidates[0].id); // still there, for correlation
   assert.ok(oversized[1].bytes > 4096, "the reported size must be the real wire size");
 });
 

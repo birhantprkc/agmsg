@@ -2049,21 +2049,35 @@ async function postGroup(config, group, requestCall, eventCall) {
   } catch (error) {
     if (error?.status !== 413) throw error;
     if (group.length === 1) {
-      // The end of the line, and it must be said plainly: this message cannot
-      // be synced by any batching this client can do, and every later cycle
-      // will pick it up and fail here again. Naming the id and the size is
-      // what makes it actionable — without them the operator sees a sync that
-      // stops making progress and nothing that says which message or how big.
+      // The end of the line, and it must be said plainly: this row cannot be
+      // synced by any batching this client can do, and every later cycle will
+      // pick it up and fail here again.
+      //
+      // Named by `local_id`, which is the id of the row in this machine's own
+      // store — that is the thing an operator can look at or remove. `id` is the
+      // wire reservation this push minted; it identifies nothing locally, so a
+      // failure that quoted only that would say "sync is stuck" without saying
+      // on what. The wire id is still reported, for correlating with the
+      // server's logs, and the axis because a candidate can be a message or a
+      // roster mutation and the two live in different places.
       const candidate = group[0];
       const bytes = wireBytes(candidate) - 1;
-      await eventCall("push.oversized", { wire_id: candidate.id, bytes,
+      const where = {
+        local_id: candidate.local_id ?? null,
+        local_position: candidate.local_position ?? null,
+        sync_axis: candidate.sync_axis ?? null,
+        wire_id: candidate.id,
+      };
+      await eventCall("push.oversized", { ...where, bytes,
         detail: error?.body?.error?.code ?? null });
       const stuck = new Error(
-        `message ${candidate.id} is ${bytes} bytes and the server refuses it on its own ` +
-        "(413); it cannot be pushed by splitting and will block this team's sync until " +
-        "it is removed or the server's limit is raised");
+        `${where.sync_axis ?? "message"} ${where.local_id ?? candidate.id} ` +
+        `(local_position ${where.local_position ?? "unknown"}, wire ${candidate.id}) ` +
+        `is ${bytes} bytes and the server refuses it on its own (413); it cannot be ` +
+        "pushed by splitting and will block this team's sync until it is removed or " +
+        "the server's limit is raised");
       stuck.status = 413;
-      stuck.wire_id = candidate.id;
+      Object.assign(stuck, where);
       throw stuck;
     }
     const middle = Math.ceil(group.length / 2);
