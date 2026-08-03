@@ -1059,14 +1059,24 @@ async function send(config, path, init, authHeaders) {
 // Checking presence instead is also the stronger rule: an error that DOES carry
 // a binding is verified whatever its status, where the allowlist would have
 // skipped a mismatched 400.
-// The error code, from either shape a server in this position may send.
+// The error code.
 //
-// The reference server nests it — `{ error: { code } }` — and the hosted edge
-// sends `{ error: "payload_too_large" }`, a bare string. Reading only the nested
-// form turned every hosted error into `unknown-error`: a 413 arrived saying
-// nothing about being too large, so an operator watching the log saw sync stop
-// with no reason attached. Found by someone walking a real 9,784-message
-// migration, not by a test.
+// THE PROTOCOL SHAPE IS THE NESTED ONE: `{ error: { code, message, details } }`,
+// built by `errorBody()` in the reference server (server/src/errors.ts) — which
+// is the definition, since server/spec/v1.md is marked SUPERSEDED. That is what
+// a new implementation should emit and what a reader here should take as the
+// contract.
+//
+// The bare-string branch is a BRIDGE, not a second valid shape. The hosted edge
+// currently answers `{ error: "payload_too_large" }`, and reading only the
+// nested form turned every one of its errors into `unknown-error` — a 413 that
+// said nothing about being too large, which is how a real 9,784-message
+// migration ended with a stopped sync and no reason in the log.
+//
+// Accepting both keeps that legible today; it does not make both correct. When
+// the edge emits the nested shape, DELETE the string branch — leaving it is how
+// "two shapes" quietly becomes the contract and a third implementation picks
+// whichever it likes.
 export function errorCode(body) {
   const error = body?.error;
   if (typeof error === "string" && error.length > 0) return error;
