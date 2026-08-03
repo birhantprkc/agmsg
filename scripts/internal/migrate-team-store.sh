@@ -62,11 +62,84 @@ src_tables="$(agmsg_sqlite "$SHARED" \
   "SELECT name FROM sqlite_master WHERE type='table';" 2>/dev/null || true)"
 has_table() { printf '%s\n' "$src_tables" | grep -qx "$1"; }
 
+# Every row of this team that the shared store holds, compared by VALUE.
+#
+# Not a count: equal totals can be different rows. Not a key either: the same
+# seq or id can name different content once a destination has been recreated.
+# What has to be proven before deleting anything is that each shared row exists
+# in the destination as the same row.
+_missing_from_dest() {
+  local lit; lit="$(agmsg_sqlesc "$TEAM")"
+  local dest_lit; dest_lit="$(agmsg_sql_readfile_path "$DEST")"
+  local t sql out
+  for t in events messages read_cursors; do
+    printf '%s\n' "$src_tables" | grep -qx "$t" || continue
+    # Every column the copy carries, not just the key.
+    #
+    # A key alone proves too little here. After the destination is removed the
+    # config still says per-team, so the next write creates a NEW database at
+    # that path, AUTOINCREMENT restarts, and its first event takes seq 1 — the
+    # same seq a different shared event already has. Measured: two stores, both
+    # holding seq 1, entirely different bodies, and a key-only comparison
+    # reports nothing missing.
+    #
+    # The copy uses INSERT OR IGNORE, so a key collision leaves the existing row
+    # untouched rather than replacing it. Whatever is under that key in the
+    # destination may be someone else's row, and deleting the shared original on
+    # the strength of a matching number would lose it.
+    case "$t" in
+      events)   sql="SELECT seq,type,id,team,from_agent,to_agent,body,msg_id,agent,at
+                       FROM $t WHERE team='$lit'
+                     EXCEPT
+                     SELECT seq,type,id,team,from_agent,to_agent,body,msg_id,agent,at
+                       FROM dst.$t WHERE team='$lit';" ;;
+      messages) sql="SELECT id,team,from_agent,to_agent,body,created_at,read_at
+                       FROM $t WHERE team='$lit'
+                     EXCEPT
+                     SELECT id,team,from_agent,to_agent,body,created_at,read_at
+                       FROM dst.$t WHERE team='$lit';" ;;
+      *)        sql="SELECT team,agent,local_position FROM $t WHERE team='$lit'
+                     EXCEPT
+                     SELECT team,agent,local_position FROM dst.$t WHERE team='$lit';" ;;
+    esac
+    # A destination that cannot be read, or lacks the table, makes the query
+    # fail — which is reported as "not proven complete", never as "nothing is
+    # missing". Being unable to check is not the same as having checked.
+    out="$(printf '%s\n' "ATTACH DATABASE '$dest_lit' AS dst; $sql" \
+      | agmsg_sqlite "$SHARED" 2>/dev/null)" || { echo "$t"; return 0; }
+    [ -z "$out" ] || { echo "$t"; return 0; }
+  done
+  return 0
+}
+
 if [ "$(agmsg_driver_for_team partition "$TEAM" shared)" = per-team ]; then
   # Already moved. Finish the job if a previous run died between recording the
   # partition and clearing the shared copy — otherwise external readers keep seeing
   # this team's history frozen at the moment it moved, which looks like nothing
   # is wrong.
+  #
+  # But only after proving the destination HAS what is about to be deleted.
+  # Reaching this branch means the config says "moved"; it does not mean the
+  # store still exists. Deleting on the strength of a flag is how a destination
+  # removed by hand takes the shared history with it — the flag survives, the
+  # data does not, and the run reports success.
+  #
+  # Note the direction: the destination legitimately holds MORE than the shared
+  # store, because new arrivals land there from the moment the config flips.
+  # What has to hold is containment, not equality.
+  if [ ! -e "$DEST" ]; then
+    echo "team store: '$TEAM' is recorded as moved, but $DEST does not exist." >&2
+    echo "team store: the shared store still holds its history and has NOT been touched." >&2
+    echo "team store: restore $DEST from a backup, or move the team back before retrying." >&2
+    exit 1
+  fi
+  incomplete="$(_missing_from_dest)"
+  if [ -n "$incomplete" ]; then
+    echo "team store: '$TEAM' is recorded as moved, but $DEST is missing rows ($incomplete)." >&2
+    echo "team store: the shared store still holds its history and has NOT been touched." >&2
+    echo "team store: restore or remove $DEST and re-run, rather than leaving both partial." >&2
+    exit 1
+  fi
   _drop_from_shared
   echo "team store: '$TEAM' already has its own store; shared copy cleared"
   exit 0
@@ -77,6 +150,16 @@ if [ -e "$DEST" ]; then
   # seq/id values, and copying the shared ones on top would either collide or be
   # silently ignored — losing history in the case that looks like success.
   echo "team store: a store already exists at $DEST; refusing to merge" >&2
+  # The same situation as the verification failure below, which does say what to
+  # do about it. Saying it in one place and not the other leaves the reader to
+  # guess in the case that reached them first.
+  #
+  # Safe here because this branch runs BEFORE the partition is recorded: the
+  # team still resolves to the shared store, so removing the destination throws
+  # away only the failed attempt. Once a team is recorded as moved, the same
+  # advice would destroy the live store — hence the caveat, which is not padding.
+  echo "team store: remove $DEST before retrying — but only while '$TEAM' is NOT yet" >&2
+  echo "team store: recorded as moved; after that, $DEST holds its live history." >&2
   exit 1
 fi
 
