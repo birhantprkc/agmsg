@@ -120,7 +120,7 @@ describeDatabase("remote storage HTTP API v1", () => {
     // still bound to the team I think I am" comes from a configured client,
     // which always has one; that answer is what makes the client's check
     // possible at all.
-    const teamId = "018f3f7e-0000-7000-8000-0000000000c1";
+    // The provisioned team, so the answer comes from a row that exists.
     const withTeam = await app.inject({
       method: "GET",
       url: "/v1/health",
@@ -128,6 +128,21 @@ describeDatabase("remote storage HTTP API v1", () => {
     });
     expect(withTeam.statusCode).toBe(200);
     expect(withTeam.json()).toMatchObject({ status: "ok", team_id: teamId });
+
+    // The case that separates a real answer from an echo: a well-formed id this
+    // server does not have. Still 200 — health is a liveness answer, and an edge
+    // routing by team cannot always turn "no such team" into a status code — but
+    // with no team_id. Echoing the header would make this indistinguishable from
+    // the provisioned case, and the client would compare its own value with
+    // itself and call it agreement.
+    const unknown = await app.inject({
+      method: "GET",
+      url: "/v1/health",
+      headers: { "Agmsg-Team-ID": "018f3f7e-0000-7000-8000-0000000000c1" },
+    });
+    expect(unknown.statusCode).toBe(200);
+    expect(unknown.json()).toMatchObject({ status: "ok" });
+    expect(unknown.json()).not.toHaveProperty("team_id");
 
     // Without the header: still 200, and no team_id invented. A client that
     // sends the header and gets nothing back treats that as disagreement, so

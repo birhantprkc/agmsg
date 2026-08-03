@@ -938,20 +938,38 @@ export async function getMembers(
   );
 }
 
-export async function health(pool: Pool): Promise<{
+// `teamId` asks a second question: does this server actually have that team?
+//
+// The answer comes from the database, never from the request. Echoing the header
+// back would let a client compare its own value with itself and call that
+// agreement — true even for a team this server has never heard of, which is the
+// case the check exists for.
+//
+// An unknown team is a 200 without `team_id`, not a 404. Health stays a liveness
+// answer: an edge in front of this may route by team and cannot always turn "no
+// such team" into a status code, and a 404 here would be indistinguishable from
+// "no such route" to a client checking whether the server is up at all. Absence
+// carries the disagreement instead, and the client — which knows which team it
+// expects — is where that is judged.
+export async function health(pool: Pool, teamId?: string): Promise<{
   status: "ok";
   server_instance_id: string;
   protocol: { supported_versions: number[] };
   database: "ok";
+  team_id?: string;
 }> {
   const client = await pool.connect();
   try {
-    return {
-      status: "ok",
-      server_instance_id: await serverInstanceId(client),
+    const serverId = await serverInstanceId(client);
+    const base = {
+      status: "ok" as const,
+      server_instance_id: serverId,
       protocol: { supported_versions: [1] },
-      database: "ok",
+      database: "ok" as const,
     };
+    if (teamId === undefined) return base;
+    const team = await teamRow(client, teamId);
+    return team ? { ...base, team_id: team.team_id } : base;
   } finally {
     client.release();
   }

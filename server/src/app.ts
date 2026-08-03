@@ -204,8 +204,11 @@ async function dataPlaneRoutes(
       // not. A client that sends the header and gets no team_id treats that as a
       // disagreement rather than as consent, which is what makes the optional
       // side safe — the check lives on the side that knows what it expects.
-      const body = await health(pool);
-      return teamId === undefined ? body : { ...body, team_id: teamId };
+      // The team comes back from the DB, never from the header we were handed.
+      // Returning the caller's own value would let it compare its value with
+      // itself and read that as agreement — true even for a team this server has
+      // never had. health() reads the row and 404s when there is none.
+      return await health(pool, teamId);
     } catch {
       return reply.status(503).send({
         status: "unavailable",
