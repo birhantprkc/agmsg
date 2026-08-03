@@ -183,9 +183,29 @@ async function dataPlaneRoutes(
     void reply.status(500).send(errorBody(protocolError));
   });
 
-  app.get("/v1/health", async (_request, reply) => {
+  app.get("/v1/health", async (request, reply) => {
+    // Parsed OUTSIDE the try: the catch below turns anything thrown into 503
+    // "database unavailable", so a malformed header validated in there would be
+    // reported as a dead server. Same substitution this branch is fixing on the
+    // client, one layer down.
+    const teamId = request.headers["agmsg-team-id"] === undefined
+      ? undefined
+      : requestedTeamId(request);
     try {
-      return await health(pool);
+      // The team header is OPTIONAL here, and only here.
+      //
+      // /v1/health answers two different questions. "Is this server up" is asked
+      // before any team exists — by an operator checking an endpoint, by a
+      // probe, by a client that has not connected yet — and requiring a team
+      // would make that unanswerable. "Am I still bound to the team I think I
+      // am" is asked by a configured client, which always has one to send.
+      //
+      // So: echo the team back when asked about one, and stay answerable when
+      // not. A client that sends the header and gets no team_id treats that as a
+      // disagreement rather than as consent, which is what makes the optional
+      // side safe — the check lives on the side that knows what it expects.
+      const body = await health(pool);
+      return teamId === undefined ? body : { ...body, team_id: teamId };
     } catch {
       return reply.status(503).send({
         status: "unavailable",

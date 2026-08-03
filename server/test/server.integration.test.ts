@@ -113,6 +113,41 @@ describeDatabase("remote storage HTTP API v1", () => {
     });
   });
 
+  it("echoes the team on health when asked about one, and stays answerable when not", async () => {
+    // Two questions share this route. "Is the server up" is asked before any
+    // team exists — by an operator, a probe, a client that has not connected —
+    // so the header is optional and its absence must not be an error. "Am I
+    // still bound to the team I think I am" comes from a configured client,
+    // which always has one; that answer is what makes the client's check
+    // possible at all.
+    const teamId = "018f3f7e-0000-7000-8000-0000000000c1";
+    const withTeam = await app.inject({
+      method: "GET",
+      url: "/v1/health",
+      headers: { "Agmsg-Team-ID": teamId },
+    });
+    expect(withTeam.statusCode).toBe(200);
+    expect(withTeam.json()).toMatchObject({ status: "ok", team_id: teamId });
+
+    // Without the header: still 200, and no team_id invented. A client that
+    // sends the header and gets nothing back treats that as disagreement, so
+    // answering with someone else's team would be worse than answering with
+    // none.
+    const withoutTeam = await app.inject({ method: "GET", url: "/v1/health" });
+    expect(withoutTeam.statusCode).toBe(200);
+    expect(withoutTeam.json()).not.toHaveProperty("team_id");
+
+    // A malformed header is a bad request, not a dead database. The 503 handler
+    // wraps everything thrown inside the route, so validating in there would
+    // report "database unavailable" for a client's typo.
+    const malformed = await app.inject({
+      method: "GET",
+      url: "/v1/health",
+      headers: { "Agmsg-Team-ID": "not-a-uuid" },
+    });
+    expect(malformed.statusCode).toBe(400);
+  });
+
   it("answers a name lookup, and refuses more names than it can disambiguate", async () => {
     const lookupName = "lookup-by-name";
     const ids = Array.from({ length: 17 }, (_, index) =>
