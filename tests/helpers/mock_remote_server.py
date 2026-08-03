@@ -24,6 +24,10 @@ CONNECT_CIPHERS = (["none"] if os.environ.get("MOCK_CONNECT_NO_AGE") == "1"
 # or returned — reaching the server is the permission. A team_id already
 # registered is refused 409 (a uniqueness conflict, like a non-fast-forward).
 CONNECT_SERVER_ID = "018f3f7e-3333-7000-8000-000000000001"
+# What /v1/health reports as the team. Empty means "echo the requested one",
+# which is what a per-team edge does; a test sets it via /_test/health-team= to
+# make the server disagree with the client's binding.
+HEALTH_TEAM_ID = os.environ.get("MOCK_HEALTH_TEAM_ID", "")
 REGISTERED_TEAM_IDS = set()
 
 
@@ -138,11 +142,20 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        # Declared for the whole method: /_test/health-team assigns it, and
+        # Python requires the declaration to precede the first mention anywhere
+        # in the function — including the read in the /v1/health branch below.
+        global HEALTH_TEAM_ID
         if self.path == "/v1/health":
+            # Echo the team the caller asked about, the way a real per-team edge
+            # answers. MOCK_HEALTH_TEAM_ID overrides it so a test can make the
+            # server disagree with the local binding.
+            team_id = HEALTH_TEAM_ID or self.headers.get("Agmsg-Team-ID", "")
             self._send_json(200, {
                 "status": "ok",
                 "database": "ok",
                 "server_instance_id": CONNECT_SERVER_ID,
+                "team_id": team_id,
             })
             return
         if self.path == "/v1/capabilities":
@@ -171,6 +184,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/_test/pushed":
             self._send_json(200, {"messages": PUSHED_MESSAGES})
+            return
+        # Change what /v1/health claims the team is, without restarting — a
+        # restart moves the port, and a client that already recorded the old one
+        # then fails to connect for a reason unrelated to what is under test.
+        if self.path.startswith("/_test/health-team"):
+            from urllib.parse import unquote
+            _, _, override = self.path.partition("=")
+            HEALTH_TEAM_ID = unquote(override)
+            self._send_json(200, {"health_team_id": HEALTH_TEAM_ID})
             return
         parts = self.path.split("?", 1)
         route = parts[0]

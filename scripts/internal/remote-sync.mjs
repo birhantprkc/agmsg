@@ -1046,16 +1046,33 @@ async function send(config, path, init, authHeaders) {
   return body;
 }
 
+// Check the binding when the body actually carries one — not when the status
+// code happens to be outside a list.
+//
+// The list was {400,401,426}, so every other error ran through validateBinding,
+// which compares `body.team_id` to the configured one. An error body without a
+// binding has `undefined` there, so it failed the comparison and every 403, 404,
+// 409 and 500 arrived as "server/team binding mismatch". The one message that
+// means "you are talking to the wrong team" was what a caller saw for a
+// forbidden request, a missing team, a conflict, and a server crash alike.
+//
+// Checking presence instead is also the stronger rule: an error that DOES carry
+// a binding is verified whatever its status, where the allowlist would have
+// skipped a mismatched 400.
 export function validateErrorBinding(config, status, body) {
-  const preResolution = status === 400 || status === 401 || status === 426;
   const carriesBinding = body?.server_instance_id !== undefined || body?.team_id !== undefined;
-  if (!preResolution || carriesBinding) validateBinding(config, body);
+  if (carriesBinding) validateBinding(config, body);
 }
 
-async function health(serverUrl) {
+// `teamId` is required, not optional: a health check that does not say which
+// team it is asking about cannot be answered per-team, and an edge that routes
+// by team would have to guess. Same header name as send() — one name for one
+// fact, so a gateway does not have to know two.
+async function health(serverUrl, teamId) {
   let response;
   try {
     response = await fetch(endpoint(serverUrl, "/v1/health"), {
+      headers: { "Agmsg-Team-ID": teamId },
       redirect: "error", signal: AbortSignal.timeout(15_000),
     });
   } catch (error) {
@@ -1773,9 +1790,26 @@ export async function configure(args) {
   if (serverUrl !== binding.endpoint || args["team-id"] !== binding.remote_team_id) {
     throw new Error("configure binding does not match remote.sh connect");
   }
-  const ready = await health(serverUrl);
+  const ready = await health(serverUrl, binding.remote_team_id);
   if (ready.server_instance_id !== binding.server_instance_id) {
     throw new Error("health server instance does not match remote.sh connect");
+  }
+  // Read back what the server says the team is, and refuse if it disagrees.
+  //
+  // Sending the header alone would change nothing observable here — it would be
+  // a field that exists and that nobody consults, which this file already has
+  // one of (the handoff bundle's format_version is checked for `!== 1` and never
+  // used to negotiate). The check is the reason the header is worth adding.
+  //
+  // Until now `remote_team_id` was whatever was passed in on the command line,
+  // stored without ever being compared to the server. A mismatch stayed
+  // invisible until the first push failed, far from the step that caused it.
+  // Strict equality, with no exemption for a server that omits the field. An
+  // `!== undefined` guard would let exactly the case this is meant to catch pass
+  // silently — an endpoint that does not answer per-team looks identical to one
+  // that agrees with us. Absent is not agreement.
+  if (ready.team_id !== binding.remote_team_id) {
+    throw new Error("health team does not match remote.sh connect");
   }
   const config = {
     format_version: 1, local_team: team, server_url: serverUrl,
@@ -1970,8 +2004,13 @@ export async function cycle(config, { pushLimit, pullLimit }, dependencies = {})
   const readStateCycleCall = dependencies.readStateCycleCall ?? readStateCycle;
   const activateKeyRotationsCall = dependencies.activateKeyRotationsCall ?? activateKeyRotations;
 
-  const ready = await healthCall(config.server_url);
+  const ready = await healthCall(config.server_url, config.remote_team_id);
   if (ready.server_instance_id !== config.server_instance_id) throw new Error("health server instance changed");
+  // Read back the team as well. Sending the header without checking the answer
+  // would leave a field that exists and that nobody consults; the check is what
+  // makes a server that has been re-pointed at another team fail here rather
+  // than at the first push.
+  if (ready.team_id !== config.remote_team_id) throw new Error("health team changed");
   const capabilities = await requestCall(config, "/v1/capabilities");
   validateCapabilities(config, capabilities);
   await eventCall("capabilities", { team: config.local_team, current_seq: capabilities.current_seq,
@@ -2204,8 +2243,13 @@ export async function reprocessCycle(config, limit, dependencies = {}) {
   const logApplyCall = dependencies.logApplyCall ?? logApplyOutcomes;
   const rosterDriverCall = dependencies.rosterDriverCall ?? rosterDriver;
   const activateKeyRotationsCall = dependencies.activateKeyRotationsCall ?? activateKeyRotations;
-  const ready = await healthCall(config.server_url);
+  const ready = await healthCall(config.server_url, config.remote_team_id);
   if (ready.server_instance_id !== config.server_instance_id) throw new Error("health server instance changed");
+  // Read back the team as well. Sending the header without checking the answer
+  // would leave a field that exists and that nobody consults; the check is what
+  // makes a server that has been re-pointed at another team fail here rather
+  // than at the first push.
+  if (ready.team_id !== config.remote_team_id) throw new Error("health team changed");
   const capabilities = await requestCall(config, "/v1/capabilities");
   validateCapabilities(config, capabilities);
   let after = null;

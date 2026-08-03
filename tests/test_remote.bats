@@ -16,6 +16,7 @@ setup() {
   MOCK_PULL_AGE="${MOCK_PULL_AGE:-}" \
   MOCK_PULL_AGE_ENVELOPE_FILE="${MOCK_PULL_AGE_ENVELOPE_FILE:-}" \
   MOCK_PULL_TEAM_ID="${MOCK_PULL_TEAM_ID:-}" \
+  MOCK_HEALTH_TEAM_ID="${MOCK_HEALTH_TEAM_ID:-}" \
   MOCK_CONNECT_NO_AGE="${MOCK_CONNECT_NO_AGE:-}" \
     "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
     </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
@@ -78,6 +79,7 @@ restart_mock_server() {
   MOCK_PULL_AGE="${MOCK_PULL_AGE:-}" \
   MOCK_PULL_AGE_ENVELOPE_FILE="${MOCK_PULL_AGE_ENVELOPE_FILE:-}" \
   MOCK_PULL_TEAM_ID="${MOCK_PULL_TEAM_ID:-}" \
+  MOCK_HEALTH_TEAM_ID="${MOCK_HEALTH_TEAM_ID:-}" \
   MOCK_CONNECT_NO_AGE="${MOCK_CONNECT_NO_AGE:-}" \
     "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
       </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
@@ -1021,6 +1023,75 @@ PY
   [ -f "$seen" ]               # and it must actually have been reached
   [ "$(cat "$seen")" = "600" ]
   rm -rf "$peer"
+}
+
+@test "remote unlock: a health response naming another team stops the configure" {
+  skip_if_no_age
+
+  # `configure` is the only caller of health(), and `cmd_unlock` is the only
+  # caller of configure — so this is the path where reading the answer back can
+  # be observed at all. Before this check, remote_team_id was whatever was passed
+  # in and was never compared against the server, so a disagreement stayed
+  # invisible until the first push failed, far from the step that caused it.
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam >/dev/null
+  local source_cfg bundle key_id recipient team_id envelope snapshot digest
+  source_cfg="$TEST_SKILL_DIR/teams/testteam/config.json"
+  bundle="$TEST_SKILL_DIR/hm-bundle.json"
+  snapshot="$TEST_SKILL_DIR/hm-snapshot.json"
+  envelope="$TEST_SKILL_DIR/hm-envelope.json"
+  bash "$SCRIPTS/key.sh" show testteam --snapshot --out "$snapshot" 2>/dev/null
+  bash "$SCRIPTS/key.sh" handoff testteam --out "$bundle" >/dev/null 2>&1
+  key_id="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.remote_key.current.key_id');")"
+  recipient="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.remote_key.current.recipient');")"
+  team_id="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.team_id');")"
+  jq -nc --arg key_id "$key_id" --arg recipient "$recipient" --arg team_id "$team_id" \
+    '{ type:"sync_seal", envelope_v:1, cipher:"age-v1",
+       key_id:$key_id, recipients:[$recipient], max_blob_bytes:1048576,
+       wire_id:"20000000-0000-4000-8000-000000000001",
+       team_id:$team_id, protocol_version:1,
+       projection:{ body:"hm ciphertext", created_at:"2026-01-02T00:00:00.000000Z",
+         from_agent:"member-1", to_agent:"member-1" } }' |
+    node "$SCRIPTS/internal/sync-cipher.mjs" seal > "$envelope"
+  bash "$SCRIPTS/remote.sh" disconnect testteam >/dev/null 2>&1 || true
+
+  MOCK_PULL_AGE=1
+  MOCK_PULL_AGE_ENVELOPE_FILE="$envelope"
+  MOCK_PULL_TEAM_ID="$team_id"
+  # The server answers /v1/health with a DIFFERENT team than the one this
+  # machine is bound to.
+  MOCK_HEALTH_TEAM_ID="018f3f7e-9999-7999-8999-999999999999"
+  restart_mock_server
+
+  PEER_SKILL_DIR="$(mktemp -d)"
+  export PEER_SKILL_DIR
+  mkdir -p "$PEER_SKILL_DIR"/{scripts,db,teams}
+  cp -R "$BATS_TEST_DIRNAME"/../scripts/. "$PEER_SKILL_DIR/scripts/"
+  chmod +x "$PEER_SKILL_DIR/scripts/"*.sh
+  bash "$PEER_SKILL_DIR/scripts/internal/init-db.sh"
+  local peer_scripts="$PEER_SKILL_DIR/scripts"
+
+  run bash "$peer_scripts/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$team_id" encrypted
+  [ "$status" -eq 0 ]
+
+  digest="$(shasum -a 256 "$snapshot" | awk '{print $1}')"
+  run bash "$peer_scripts/remote.sh" unlock encrypted --bundle "$bundle" --confirm-digest "$digest"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"health team does not match"* ]]
+
+  # Fail closed: no sync state and no engine for a binding the server disowns.
+  [ ! -e "$PEER_SKILL_DIR/db/remote-sync/encrypted.json" ]
+  [ ! -e "$PEER_SKILL_DIR/run/remote-sync.encrypted.pid" ]
+
+  # The same unlock succeeds once the server agrees, so the failure above is the
+  # mismatch and not something else in this setup. Switched in place rather than
+  # by restarting: a restart moves the port, and the peer would then fail to
+  # reach the endpoint it recorded at pull time — a green-looking pass for the
+  # wrong reason, or a red one.
+  curl -sS "$ENDPOINT/_test/health-team=" >/dev/null
+  run bash "$peer_scripts/remote.sh" unlock encrypted --bundle "$bundle" --confirm-digest "$digest"
+  [ "$status" -eq 0 ]
+  local pid; pid="$(cat "$PEER_SKILL_DIR/run/remote-sync.encrypted.pid" 2>/dev/null || true)"
+  [ -n "$pid" ] && { kill "$pid" 2>/dev/null || true; wait_for_pid_exit "$pid"; }
 }
 
 @test "remote unlock: --bundle still requires a matching --confirm-digest" {

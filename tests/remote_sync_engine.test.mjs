@@ -604,7 +604,7 @@ test("explicit reprocess walks past a permanent first keyset page", async () => 
     ];
   };
   const result = await reprocessCycle(config, 1, {
-    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
     requestCall: async () => capabilities,
     driverCall,
     evaluateCall: async () => ({ status: "authentication_failed", reason: "still blocked",
@@ -630,7 +630,7 @@ test("reprocess completion counts imported outcomes and requires empty blocking 
   const id = "550e8400-e29b-41d4-a716-446655440001";
   let imported = false;
   const result = await reprocessCycle(config, 100, {
-    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
     requestCall: async () => capabilities,
     driverCall: async (operation, _config, input) => {
       if (operation === "apply") {
@@ -679,7 +679,7 @@ test("reprocess routes recovered roster mutations away from message storage", as
   let rosterApplied = false;
   let messageApplied = false;
   const result = await reprocessCycle(config, 100, {
-    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
     requestCall: async () => capabilities,
     driverCall: async (operation, _config, input) => {
       if (operation === "apply") {
@@ -748,7 +748,7 @@ test("reprocess preserves server order across roster mutations and rotations", a
   let activeEpoch = 0;
   const rosterOrder = [];
   const result = await reprocessCycle(config, 100, {
-    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
     requestCall: async () => capabilities,
     driverCall: async (operation, _config, input) => {
       if (operation === "apply") {
@@ -808,7 +808,7 @@ test("reprocess does not advance storage when an ordered roster flush fails", as
   let storageApplied = false;
   let activated = false;
   await assert.rejects(reprocessCycle(config, 100, {
-    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
     requestCall: async () => ({ ...capsFor(["age-v1"]), current_seq: "2",
       next_sequence_boundary: "3" }),
     driverCall: async (operation) => {
@@ -852,7 +852,7 @@ test("explicit reprocess rejects an unbounded walk through duplicate server sequ
     "550e8400-e29b-41d4-a716-446655440002"];
   let pageIndex = 0;
   await assert.rejects(() => reprocessCycle(config, 1, {
-    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
     requestCall: async () => capabilities,
     driverCall: async (operation) => {
       if (operation === "apply") {
@@ -1150,6 +1150,46 @@ test("resolved protocol errors enforce the immutable binding", () => {
   assert.doesNotThrow(() => validateErrorBinding(config, 401, {
     protocol_version: 1, error: { code: "unauthenticated" },
   }));
+});
+
+test("an error that carries no binding is reported as itself, not as a mismatch", () => {
+  // The allowlist was {400,401,426}, so everything else went through
+  // validateBinding — which compares body.team_id, `undefined` in an ordinary
+  // error body. Every 403, 404, 409 and 500 therefore arrived as "server/team
+  // binding mismatch": the one message meaning "you are talking to the wrong
+  // team" stood in for forbidden, missing, conflicting, and crashed alike.
+  //
+  // Whether a body carries a binding is the real question, so that is what is
+  // asked. Statuses listed explicitly rather than looped from a range: each one
+  // is a diagnosis a caller acts on differently.
+  for (const status of [403, 404, 409, 500]) {
+    assert.doesNotThrow(
+      () => validateErrorBinding(config, status, { error: { code: "some-server-error" } }),
+      `status ${status} must not be reported as a binding mismatch`,
+    );
+  }
+  // Presence is the trigger, so a mismatched binding on a status the old
+  // allowlist skipped is now caught rather than waved through.
+  assert.throws(() => validateErrorBinding(config, 400, {
+    protocol_version: 1,
+    server_instance_id: "018f3f7e-0000-7000-8000-000000000099",
+    team_id: config.remote_team_id,
+    error: { code: "bad-request" },
+  }), /binding mismatch/u);
+});
+
+test("a masked 500 becomes retryable again", () => {
+  // Not a side effect — the point. While validateBinding swallowed it, the
+  // caller never built the Error that carries `status`, and isRetryable saw
+  // `undefined`: a 500 was treated as permanent even though it is in the
+  // retryable set. Passing the body through restores that.
+  assert.doesNotThrow(() =>
+    validateErrorBinding(config, 500, { error: { code: "internal" } }));
+  const escalated = Object.assign(new Error("HTTP 500 internal"), { status: 500 });
+  assert.equal(isRetryable(escalated), true);
+  // And the mismatch itself stays permanent: retrying a wrong-team binding
+  // would just repeat it.
+  assert.equal(isRetryable(new Error("server/team binding mismatch")), false);
 });
 
 test("run retry classification excludes permanent HTTP and validation failures", () => {
@@ -1760,8 +1800,12 @@ test("age configure authenticates the connected credential before retaining trus
     globalThis.fetch = async () => {
       calls += 1;
       if (calls === 1) {
+        // The health reply has to name the team, or configure refuses here and
+        // the credential check below is never reached — this test would then
+        // pass on the wrong rejection.
         return new Response(JSON.stringify({ status: "ok", database: "ok",
-          server_instance_id: config.server_instance_id }), {
+          server_instance_id: config.server_instance_id,
+          team_id: config.remote_team_id }), {
           status: 200, headers: { "Agmsg-Protocol-Version": "1" },
         });
       }
@@ -1840,7 +1884,11 @@ test("age configure extends a stored chain and activates its announced epoch", a
     process.env.AGMSG_AGE_BIN = fakeAge;
     globalThis.fetch = async (url) => {
       const body = String(url).endsWith("/v1/health") ?
-        { status: "ok", database: "ok", server_instance_id: config.server_instance_id } :
+        // team_id too: configure now reads it back and refuses a server that
+        // names a different team, so a stub that omits it is a server which
+        // does not answer per-team.
+        { status: "ok", database: "ok", server_instance_id: config.server_instance_id,
+          team_id: config.remote_team_id } :
         capsFor(["age-v1"]);
       return new Response(JSON.stringify(body), {
         status: 200, headers: { "Agmsg-Protocol-Version": "1" },
@@ -1994,7 +2042,7 @@ test("cycle: a large pull page (backlog present) is requested and accepted at pu
   }));
   let pullPath = null;
   const result = await cycle(config, { pushLimit: 100, pullLimit: 1000 }, {
-    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
     requestCall: async (_config, path) => {
       if (path === "/v1/capabilities") return capabilities;
       if (path.startsWith("/v1/messages?after=")) { pullPath = path; return { messages, next_after: "500", has_more: false }; }
@@ -2037,7 +2085,7 @@ test("cycle routes roster payloads through the existing message transport", asyn
   });
   const rosterOperations = [];
   await cycle(config, { pushLimit: 100, pullLimit: 1000 }, {
-    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
     requestCall: async (_config, path, init) => {
       if (path === "/v1/capabilities") return capability();
       if (path === "/v1/messages" && init?.method === "POST") {
@@ -2226,7 +2274,7 @@ test("cycle pushes a key rotation alone and waits for ordered pull before activa
   };
   let activated = 0;
   await cycle(config, { pushLimit: 100, pullLimit: 1000 }, {
-    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
     requestCall: async (_config, path, init) => {
       if (path === "/v1/capabilities") return capsFor(["none"]);
       if (path === "/v1/messages" && init?.method === "POST") {
@@ -2282,7 +2330,7 @@ test("cycle records a pulled key rotation before halting for a missing replaceme
   let recorded = false;
   let storageApplied = false;
   await assert.rejects(cycle(config, { pushLimit: 100, pullLimit: 1000 }, {
-    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
     requestCall: async (_config, path) => {
       if (path === "/v1/capabilities") return {
         ...capsFor(["none"]), current_seq: "1", next_sequence_boundary: "2",
@@ -2355,7 +2403,7 @@ async function runCycleWithPush({ writeCiphers, candidateCount, pushLimit }) {
   let posted = false;
   let reconcileCalled = false;
   const result = await cycle(config, { pushLimit, pullLimit: 1000 }, {
-    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
     requestCall: async (_config, path, init) => {
       if (path === "/v1/capabilities") return capabilities;
       if (path === "/v1/messages" && init?.method === "POST") {
@@ -2407,7 +2455,7 @@ test("cycle: a batch that fails after prepare re-sends the same candidates and c
   let reconcileAcks = null;
   const postedIdsPerAttempt = [];
   const deps = {
-    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
     requestCall: async (_config, path, init) => {
       if (path === "/v1/capabilities") return capabilities;
       if (path === "/v1/messages" && init?.method === "POST") {
