@@ -1996,6 +1996,103 @@ export async function readStateCycle(config, limit, dependencies = {}) {
   }
 }
 
+// How many bytes of message JSON to put in one POST before splitting.
+//
+// Deliberately well under the server's 2 MiB body limit, because the client
+// cannot know that limit: a proxy, a gateway, or a self-hosted deployment may
+// impose a smaller one, and the only number we control is our own. Counting
+// bytes rather than messages is the point — a thousand small messages and a
+// thousand large ones were the same batch before this, and only the second kind
+// was ever refused.
+const PUSH_BYTE_BUDGET = 512 * 1024;
+
+// The wire size of one message, measured the way the body is built rather than
+// estimated from the blob. `+1` covers the comma that joins it to the next.
+function wireBytes(candidate) {
+  return Buffer.byteLength(
+    JSON.stringify({ id: candidate.id, envelope: candidate.envelope }), "utf8") + 1;
+}
+
+// Split on the byte budget, never returning an empty group: a single message
+// over the budget goes out alone and the server decides. Refusing to send it
+// here would be this client inventing a limit the server never stated.
+function byBudget(candidates, budget) {
+  const groups = [];
+  let current = [];
+  let size = 0;
+  for (const candidate of candidates) {
+    const bytes = wireBytes(candidate);
+    if (current.length > 0 && size + bytes > budget) {
+      groups.push(current);
+      current = [];
+      size = 0;
+    }
+    current.push(candidate);
+    size += bytes;
+  }
+  if (current.length > 0) groups.push(current);
+  return groups;
+}
+
+// POST one group, halving on 413 until the server accepts it or one message is
+// left. Overlap is safe: a resent id is a no-op server-side and still returns an
+// ack (`disposition: "duplicate"`) carrying its stored position, so a retry that
+// repeats already-stored messages neither duplicates rows nor loses acks.
+//
+// Bounded by construction: each retry halves a group of at least two, so the
+// recursion depth is log2(group size) and a single message never splits again.
+async function postGroup(config, group, requestCall, eventCall) {
+  try {
+    return await requestCall(config, "/v1/messages", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages: group.map(({ id, envelope }) => ({ id, envelope })) }) });
+  } catch (error) {
+    if (error?.status !== 413) throw error;
+    if (group.length === 1) {
+      // The end of the line, and it must be said plainly: this message cannot
+      // be synced by any batching this client can do, and every later cycle
+      // will pick it up and fail here again. Naming the id and the size is
+      // what makes it actionable — without them the operator sees a sync that
+      // stops making progress and nothing that says which message or how big.
+      const candidate = group[0];
+      const bytes = wireBytes(candidate) - 1;
+      await eventCall("push.oversized", { wire_id: candidate.id, bytes,
+        detail: error?.body?.error?.code ?? null });
+      const stuck = new Error(
+        `message ${candidate.id} is ${bytes} bytes and the server refuses it on its own ` +
+        "(413); it cannot be pushed by splitting and will block this team's sync until " +
+        "it is removed or the server's limit is raised");
+      stuck.status = 413;
+      stuck.wire_id = candidate.id;
+      throw stuck;
+    }
+    const middle = Math.ceil(group.length / 2);
+    await eventCall("push.split", { count: group.length, halves: [middle, group.length - middle] });
+    const first = await postGroup(config, group.slice(0, middle), requestCall, eventCall);
+    const second = await postGroup(config, group.slice(middle), requestCall, eventCall);
+    // Concatenated in send order, so the combined acks line up with the
+    // candidates the caller passed in — validateAckMapping compares positionally.
+    return { ...second, acks: [...first.acks, ...second.acks] };
+  }
+}
+
+// Send every candidate, in order, as one or more POSTs.
+async function postCandidates(config, candidates, requestCall, eventCall) {
+  const groups = byBudget(candidates, PUSH_BYTE_BUDGET);
+  if (groups.length > 1) {
+    await eventCall("push.batched", { count: candidates.length, batches: groups.length });
+  }
+  let last;
+  const acks = [];
+  for (const group of groups) {
+    last = await postGroup(config, group, requestCall, eventCall);
+    acks.push(...last.acks);
+  }
+  // The last response carries the freshest server state (current_seq, floor);
+  // the acks are every group's, in the order they were sent.
+  return { ...last, acks };
+}
+
 // A single sync cycle: push one page (up to pushLimit) + drain the pull side
 // to exhaustion. pushLimit and pullLimit are decoupled — the pull page is
 // sized generously so a large pull backlog drains in few round-trips, while
@@ -2060,9 +2157,7 @@ export async function cycle(config, { pushLimit, pullLimit }, dependencies = {})
   if (!writeProfile.eligible) {
     await eventCall("push.blocked", { reason: writeProfile.reason });
   } else if (candidates.length > 0) {
-    const posted = await requestCall(config, "/v1/messages", { method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messages: candidates.map(({ id, envelope }) => ({ id, envelope })) }) });
+    const posted = await postCandidates(config, candidates, requestCall, eventCall);
     const ackRecords = validateAckMapping(candidates, posted.acks);
     await eventCall("push.ack", { acks: ackRecords.map(({ id, server_seq, disposition }) => ({ id, server_seq, disposition })) });
     const messageAcks = ackRecords.filter((_, index) => candidates[index].sync_axis === "messages");
