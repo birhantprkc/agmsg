@@ -1037,7 +1037,7 @@ async function send(config, path, init, authHeaders) {
   }
   if (!response.ok) {
     validateErrorBinding(config, response.status, body);
-    const code = body?.error?.code ?? "unknown-error";
+    const code = errorCode(body);
     const error = new Error(`HTTP ${response.status} ${code}`);
     error.status = response.status; error.code = code; error.body = body;
     throw error;
@@ -1059,6 +1059,21 @@ async function send(config, path, init, authHeaders) {
 // Checking presence instead is also the stronger rule: an error that DOES carry
 // a binding is verified whatever its status, where the allowlist would have
 // skipped a mismatched 400.
+// The error code, from either shape a server in this position may send.
+//
+// The reference server nests it — `{ error: { code } }` — and the hosted edge
+// sends `{ error: "payload_too_large" }`, a bare string. Reading only the nested
+// form turned every hosted error into `unknown-error`: a 413 arrived saying
+// nothing about being too large, so an operator watching the log saw sync stop
+// with no reason attached. Found by someone walking a real 9,784-message
+// migration, not by a test.
+export function errorCode(body) {
+  const error = body?.error;
+  if (typeof error === "string" && error.length > 0) return error;
+  if (typeof error?.code === "string" && error.code.length > 0) return error.code;
+  return "unknown-error";
+}
+
 export function validateErrorBinding(config, status, body) {
   // An identity claim is server_instance_id or team_id. Those name WHICH server
   // and WHICH team, so a reply carrying either is asserting the binding and gets
@@ -2704,7 +2719,7 @@ async function publicGet(serverUrl, path) {
   }
   const body = await response.json();
   if (!response.ok) {
-    const error = new Error(`HTTP ${response.status} ${body?.error?.code ?? "unknown-error"}`);
+    const error = new Error(`HTTP ${response.status} ${errorCode(body)}`);
     error.status = response.status;
     throw error;
   }

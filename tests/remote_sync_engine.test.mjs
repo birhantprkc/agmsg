@@ -39,6 +39,7 @@ import {
   validateConfiguredAgeIdentities,
   validateCapabilities,
   validateErrorBinding,
+  errorCode,
   validateMembers,
   validateReadStatePage,
   validateResyncResult,
@@ -2684,4 +2685,18 @@ test("an overlapping resend acks every message SENT, duplicates included", async
     }));
   assert.equal(seen.length, 4);
   assert.equal(seen.filter((ack) => ack.disposition === "duplicate").length, 2);
+});
+
+test("an error code is read from either shape a server sends it in", () => {
+  // The reference server nests it; the hosted edge sends a bare string. Reading
+  // only the nested form turned every hosted error into "unknown-error" — a 413
+  // that said nothing about being too large, which is how a real 9,784-message
+  // migration ended up with a stopped sync and no reason in the log.
+  assert.equal(errorCode({ error: { code: "request-too-large" } }), "request-too-large");
+  assert.equal(errorCode({ error: "payload_too_large" }), "payload_too_large");
+  // Neither shape present, or present but empty: say so rather than inventing one.
+  assert.equal(errorCode({ error: {} }), "unknown-error");
+  assert.equal(errorCode({ error: "" }), "unknown-error");
+  assert.equal(errorCode({}), "unknown-error");
+  assert.equal(errorCode(undefined), "unknown-error");
 });
