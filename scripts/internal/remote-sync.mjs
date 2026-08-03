@@ -2093,8 +2093,13 @@ async function postGroup(config, group, requestCall, eventCall) {
         sync_axis: candidate.sync_axis ?? null,
         wire_id: candidate.id,
       };
+      // Through errorCode(), like every other reader: the caller may already
+      // have parsed it (error.code), and if not, the body still has to be read
+      // in both shapes. Reading `body.error.code` directly here would leave the
+      // one event this change exists for saying `detail: null` against the
+      // hosted edge — the case the whole bridge was added for.
       await eventCall("push.oversized", { ...where, bytes,
-        detail: error?.body?.error?.code ?? null });
+        detail: error?.code ?? errorCode(error?.body) });
       const stuck = new Error(
         `${where.sync_axis ?? "message"} ${where.local_id ?? candidate.id} ` +
         `(local_position ${where.local_position ?? "unknown"}, wire ${candidate.id}) ` +

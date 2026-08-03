@@ -2633,8 +2633,11 @@ test("push stops at one message rather than splitting forever, and names it", as
     attempts += 1;
     const error = new Error("HTTP 413 request-too-large");
     error.status = 413;
+    // The HOSTED shape on purpose: a bare string, which is what the edge sends.
+    // If this event read body.error.code directly it would report detail:null
+    // for exactly the deployment the bridge was added for.
     error.body = { protocol_version: 1, server_instance_id: config.server_instance_id,
-      team_id: config.remote_team_id, error: { code: "request-too-large" } };
+      team_id: config.remote_team_id, error: "payload_too_large" };
     throw error;
   });
   harness.eventCall = async (name, payload) => { events.push([name, payload]); };
@@ -2663,6 +2666,7 @@ test("push stops at one message rather than splitting forever, and names it", as
   assert.equal(oversized[1].sync_axis, "messages");
   assert.equal(oversized[1].wire_id, candidates[0].id); // still there, for correlation
   assert.ok(oversized[1].bytes > 4096, "the reported size must be the real wire size");
+  assert.equal(oversized[1].detail, "payload_too_large");
 });
 
 test("an overlapping resend acks every message SENT, duplicates included", async () => {
