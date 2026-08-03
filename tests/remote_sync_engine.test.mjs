@@ -1168,6 +1168,24 @@ test("an error that carries no binding is reported as itself, not as a mismatch"
       `status ${status} must not be reported as a binding mismatch`,
     );
   }
+  // A PARTIAL binding is still a binding claim, and the partial one is what
+  // matters: a body with only protocol_version reached validateBinding under the
+  // allowlist and was refused for the missing pair. Triggering on two of the
+  // three fields would have let it through — the inversion loosening a path
+  // instead of tightening it. The value being the correct 1 is the sharp case:
+  // it is right, and the rest is still missing.
+  for (const status of [403, 500]) {
+    assert.throws(() => validateErrorBinding(config, status, {
+      protocol_version: 1, error: { code: "partial-binding" },
+    }), /binding mismatch/u, `status ${status} with only protocol_version must be refused`);
+  }
+  // But protocol_version is not itself an identity claim — every well-formed
+  // reply carries one, including an ordinary 401. Treating it as one everywhere
+  // would turn "your credential was rejected" back into "binding mismatch",
+  // which is the bug this whole change exists to remove.
+  assert.doesNotThrow(() => validateErrorBinding(config, 401, {
+    protocol_version: 1, error: { code: "unauthenticated" },
+  }));
   // Presence is the trigger, so a mismatched binding on a status the old
   // allowlist skipped is now caught rather than waved through.
   assert.throws(() => validateErrorBinding(config, 400, {

@@ -1060,8 +1060,20 @@ async function send(config, path, init, authHeaders) {
 // a binding is verified whatever its status, where the allowlist would have
 // skipped a mismatched 400.
 export function validateErrorBinding(config, status, body) {
-  const carriesBinding = body?.server_instance_id !== undefined || body?.team_id !== undefined;
-  if (carriesBinding) validateBinding(config, body);
+  // An identity claim is server_instance_id or team_id. Those name WHICH server
+  // and WHICH team, so a reply carrying either is asserting the binding and gets
+  // checked at any status.
+  const claimsIdentity = body?.server_instance_id !== undefined || body?.team_id !== undefined;
+  // `protocol_version` alone is not an identity claim — every well-formed reply
+  // in this protocol has one, including a plain 401. But once the server has
+  // resolved the request far enough to answer 403/404/409/500, a body that
+  // carries the protocol envelope and omits the identity is malformed for that
+  // stage, and the old code refused it. Keeping that refusal is why this is not
+  // simply "check when identity is present": the inversion must not loosen a
+  // path (co1 review).
+  const preResolution = status === 400 || status === 401 || status === 426;
+  const claimsProtocol = body?.protocol_version !== undefined;
+  if (claimsIdentity || (!preResolution && claimsProtocol)) validateBinding(config, body);
 }
 
 // `teamId` is required, not optional: a health check that does not say which
