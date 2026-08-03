@@ -207,7 +207,9 @@ async function dataPlaneRoutes(
       // The team comes back from the DB, never from the header we were handed.
       // Returning the caller's own value would let it compare its value with
       // itself and read that as agreement — true even for a team this server has
-      // never had. health() reads the row and 404s when there is none.
+      // never had. health() reads the row and omits team_id when there is none,
+      // staying 200 — this route is also how "is the server up" is asked, and a
+      // 404 would be indistinguishable from "no such route".
       return await health(pool, teamId);
     } catch {
       return reply.status(503).send({
