@@ -183,9 +183,34 @@ async function dataPlaneRoutes(
     void reply.status(500).send(errorBody(protocolError));
   });
 
-  app.get("/v1/health", async (_request, reply) => {
+  app.get("/v1/health", async (request, reply) => {
+    // Parsed OUTSIDE the try: the catch below turns anything thrown into 503
+    // "database unavailable", so a malformed header validated in there would be
+    // reported as a dead server. Same substitution this branch is fixing on the
+    // client, one layer down.
+    const teamId = request.headers["agmsg-team-id"] === undefined
+      ? undefined
+      : requestedTeamId(request);
     try {
-      return await health(pool);
+      // The team header is OPTIONAL here, and only here.
+      //
+      // /v1/health answers two different questions. "Is this server up" is asked
+      // before any team exists — by an operator checking an endpoint, by a
+      // probe, by a client that has not connected yet — and requiring a team
+      // would make that unanswerable. "Am I still bound to the team I think I
+      // am" is asked by a configured client, which always has one to send.
+      //
+      // So: echo the team back when asked about one, and stay answerable when
+      // not. A client that sends the header and gets no team_id treats that as a
+      // disagreement rather than as consent, which is what makes the optional
+      // side safe — the check lives on the side that knows what it expects.
+      // The team comes back from the DB, never from the header we were handed.
+      // Returning the caller's own value would let it compare its value with
+      // itself and read that as agreement — true even for a team this server has
+      // never had. health() reads the row and omits team_id when there is none,
+      // staying 200 — this route is also how "is the server up" is asked, and a
+      // 404 would be indistinguishable from "no such route".
+      return await health(pool, teamId);
     } catch {
       return reply.status(503).send({
         status: "unavailable",
