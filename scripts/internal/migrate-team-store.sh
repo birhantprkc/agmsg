@@ -109,10 +109,28 @@ _missing_from_dest() {
       # while is close to always. What has to be refused is a cursor that has
       # gone BACKWARDS, or one that is absent: either would resume that agent
       # earlier than they had already read.
+      # A position that is not stored as an integer counts as MISSING, not as
+      # a position to compare. sqlite orders integers before text, so
+      # `'abc' < 5` is false: a text cursor in the destination would answer
+      # "not behind" to the very comparison meant to catch being behind, this
+      # check would report nothing, and the shared cursor — the agent's real
+      # read position — would be deleted on the strength of it.
+      #
+      # Both sides are checked. The contract here is that the destination is
+      # deleted only once containment has been PROVEN, and a comparison whose
+      # operands are not numbers has proven nothing, whichever side is wrong.
+      #
+      # Not CAST. `CAST('abc' AS INTEGER)` is 0, which reads as a position at
+      # the very beginning and would be quietly accepted as "behind" — a
+      # damaged value painted over as a normal comparison. Refusing keeps the
+      # data and asks a person to look.
       *)        sql="SELECT s.agent FROM $t s
                        LEFT JOIN dst.$t d ON d.team = s.team AND d.agent = s.agent
                       WHERE s.team='$lit'
-                        AND (d.agent IS NULL OR d.local_position < s.local_position);" ;;
+                        AND (d.agent IS NULL
+                             OR typeof(d.local_position) <> 'integer'
+                             OR typeof(s.local_position) <> 'integer'
+                             OR d.local_position < s.local_position);" ;;
     esac
     # A destination that cannot be read, or lacks the table, makes the query
     # fail — which is reported as "not proven complete", never as "nothing is
