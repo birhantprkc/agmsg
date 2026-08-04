@@ -31,6 +31,43 @@ shared_rows() {
     "SELECT COUNT(*) FROM events WHERE type='message_sent' AND team='$1';" | tr -d '\r'
 }
 
+declared_type() {
+  sqlite3 "$1" \
+    "SELECT type FROM pragma_table_info('$2') WHERE name='$3';" | tr -d '\r'
+}
+
+# The migration decides what to copy by COMPARING ordering columns across two
+# databases — a cursor is missing if the destination is behind, not merely
+# different. Every one of those comparisons assumes the values order
+# numerically, and in sqlite that assumption lives in the column's declared
+# type.
+#
+# What this catches that the behavioural tests do not, measured rather than
+# assumed:
+#
+#   TEXT     both this and the 1005/999 re-entry test go red — text ordering
+#            puts '1005' before '999', so the advance reads as a retreat
+#   NUMERIC  ONLY this goes red. NUMERIC still orders numerically, so every
+#            behavioural test passes while the declared type has changed
+#
+# That second row is the reason this test exists: the premise can drift
+# without any value comparison noticing. It also names the fault directly —
+# "the column type changed" rather than "re-entry was refused".
+#
+# In BOTH databases, because the comparison spans them: a shared store and a
+# destination store that disagreed on the type would compare a number against
+# a string. seq is here because it decides copy order and re-entry.
+@test "migrate: the columns the comparisons order by are declared INTEGER" {
+  bash "$SCRIPTS/send.sh" alpha ann bob "one" >/dev/null
+  migrate alpha
+  local dest; dest="$(store_of alpha)"
+
+  for db in "$SHARED" "$dest"; do
+    [ "$(declared_type "$db" read_cursors local_position)" = "INTEGER" ]
+    [ "$(declared_type "$db" events seq)" = "INTEGER" ]
+  done
+}
+
 @test "migrate: only the named team moves" {
   bash "$SCRIPTS/send.sh" alpha ann bob "alpha-one" >/dev/null
   bash "$SCRIPTS/send.sh" beta  ann bob "beta-one"  >/dev/null
@@ -301,6 +338,12 @@ shared_rows() {
   migrate alpha
   local dest; dest="$(store_of alpha)"
 
+  # 1005 and 999 are chosen: as text, '1005' sorts BEFORE '999', so a
+  # comparison that became textual reads this advance as a retreat and
+  # refuses. Confirmed by mutation — declaring local_position TEXT turns this
+  # test red. It does NOT cover every way the premise can move: a NUMERIC
+  # column still orders numerically and leaves this green, which is what the
+  # pragma test at the top of this file is for.
   sqlite3 "$dest"   "INSERT OR REPLACE INTO read_cursors(team,agent,local_position)
     VALUES('alpha','ann',1005);"
   sqlite3 "$SHARED" "INSERT OR REPLACE INTO read_cursors(team,agent,local_position)
