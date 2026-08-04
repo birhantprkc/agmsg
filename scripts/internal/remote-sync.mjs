@@ -2156,10 +2156,43 @@ async function postGroup(config, group, requestCall, eventCall) {
     const middle = Math.ceil(group.length / 2);
     await eventCall("push.split", { count: group.length, halves: [middle, group.length - middle] });
     const first = await postGroup(config, group.slice(0, middle), requestCall, eventCall);
-    const second = await postGroup(config, group.slice(middle), requestCall, eventCall);
+    const second = await carryAcks(first.acks, () =>
+      postGroup(config, group.slice(middle), requestCall, eventCall));
     // Concatenated in send order, so the combined acks line up with the
     // candidates the caller passed in — validateAckMapping compares positionally.
     return { ...second, acks: [...first.acks, ...second.acks] };
+  }
+}
+
+// One POST is atomic; several are not. When a later POST dies — 4xx, 5xx, a
+// dropped socket — the rows the earlier ones stored are already committed on
+// the server, and the acks proving it are in hand. Throwing them away leaves
+// the client with no record of messages the server holds, which is the state
+// this whole path exists to avoid. So the error carries them: every layer that
+// concatenates acks concatenates them onto the failure too, and the top of the
+// push sees one prefix no matter how deep the split recursed.
+// Emit a diagnostic on a path that is already failing. Every other eventCall in
+// this file is awaited bare, and should be: on the success path an unwritable
+// event log is a real fault and failing the cycle is right. Here it is not —
+// the cycle has already failed, an error is already on its way up, and letting
+// the sink throw would replace that error with one about logging. Nothing is
+// swallowed silently: the caller still throws what actually went wrong.
+async function note(eventCall, name, payload) {
+  try {
+    await eventCall(name, payload);
+  } catch {
+    // Deliberately ignored; see above.
+  }
+}
+
+async function carryAcks(earned, attempt) {
+  try {
+    return await attempt();
+  } catch (error) {
+    if (earned.length > 0 && error && typeof error === "object") {
+      error.acks = [...earned, ...(error.acks ?? [])];
+    }
+    throw error;
   }
 }
 
@@ -2172,7 +2205,7 @@ async function postCandidates(config, candidates, requestCall, eventCall) {
   let last;
   const acks = [];
   for (const group of groups) {
-    last = await postGroup(config, group, requestCall, eventCall);
+    last = await carryAcks(acks, () => postGroup(config, group, requestCall, eventCall));
     acks.push(...last.acks);
   }
   // The last response carries the freshest server state (current_seq, floor);
@@ -2244,19 +2277,76 @@ export async function cycle(config, { pushLimit, pullLimit }, dependencies = {})
   if (!writeProfile.eligible) {
     await eventCall("push.blocked", { reason: writeProfile.reason });
   } else if (candidates.length > 0) {
-    const posted = await postCandidates(config, candidates, requestCall, eventCall);
-    const ackRecords = validateAckMapping(candidates, posted.acks);
-    await eventCall("push.ack", { acks: ackRecords.map(({ id, server_seq, disposition }) => ({ id, server_seq, disposition })) });
-    const messageAcks = ackRecords.filter((_, index) => candidates[index].sync_axis === "messages");
-    const rosterAcks = ackRecords.filter((_, index) => candidates[index].sync_axis === "roster");
-    const [reconciled, rosterReconciled] = await Promise.all([
-      messageAcks.length > 0 ? driverCall("reconcile", config, messageAcks) : [],
-      rosterAcks.length > 0 ? rosterDriverCall("reconcile", config, rosterAcks) : [],
-    ]);
-    await eventCall("push.reconciled", {
-      result: reconciled[0] ?? null,
-      roster_result: rosterReconciled[0] ?? null,
-    });
+    // Record whatever the server acknowledged, then let the failure through.
+    // Both have to reach the caller: the cycle failed, and some of it durably
+    // succeeded. Reconciling first means a retry resends only what is actually
+    // missing — and the acks arrive as `duplicate` for anything it does resend,
+    // which the mapping already accepts.
+    // Recording and reporting are separate calls on purpose. Folded together,
+    // the caller cannot tell "the prefix was never written" from "the prefix
+    // was written and the log was not" — and the failing path acts on exactly
+    // that distinction.
+    const recordAcks = async (acks) => {
+      // Only a front prefix can be reconciled: the acks are in send order, so
+      // acks[i] belongs to candidates[i]. Slicing to the acks' own length is
+      // what makes the mapping's positional id check an assertion that this
+      // really is an unbroken prefix — a gap shows up as an id mismatch.
+      const ackRecords = validateAckMapping(candidates.slice(0, acks.length), acks);
+      const messageAcks = ackRecords.filter((_, index) => candidates[index].sync_axis === "messages");
+      const rosterAcks = ackRecords.filter((_, index) => candidates[index].sync_axis === "roster");
+      const [reconciled, rosterReconciled] = await Promise.all([
+        messageAcks.length > 0 ? driverCall("reconcile", config, messageAcks) : [],
+        rosterAcks.length > 0 ? rosterDriverCall("reconcile", config, rosterAcks) : [],
+      ]);
+      return { ackRecords, reconciled, rosterReconciled };
+    };
+    // `emit` is the bare eventCall on the success path and note() on the failing
+    // one. Nothing here runs before the write above.
+    const reportAcks = async (emit, { ackRecords, reconciled, rosterReconciled }) => {
+      await emit("push.ack", { acks: ackRecords.map(({ id, server_seq, disposition }) => ({ id, server_seq, disposition })) });
+      await emit("push.reconciled", {
+        result: reconciled[0] ?? null,
+        roster_result: rosterReconciled[0] ?? null,
+      });
+    };
+    let posted;
+    try {
+      posted = await postCandidates(config, candidates, requestCall, eventCall);
+    } catch (error) {
+      const earned = Array.isArray(error?.acks) ? error.acks : [];
+      if (earned.length > 0) {
+        // The try covers the durable write and nothing else. Widen it by one
+        // event and a log failure starts arriving here as a write failure —
+        // `push.partial-unrecorded` for a prefix that is on disk, and the next
+        // reader resends what must not be resent. The boundary is the write,
+        // not the function.
+        let written = null;
+        let writeFailure = null;
+        try {
+          written = await recordAcks(earned);
+        } catch (failure) {
+          writeFailure = failure;
+          // Neither the rows nor a note of them. Report it, but keep it under
+          // the transport error rather than in front of it — that error is the
+          // reason any of this happened.
+          if (error && typeof error === "object" && error.cause === undefined) {
+            error.cause = failure;
+          }
+        }
+        // Everything below is reporting, on a path that has already failed, so
+        // none of it may throw: an unwritable log must not replace the
+        // transport error on its way up.
+        const emit = (name, payload) => note(eventCall, name, payload);
+        await emit("push.partial", { acked: earned.length, of: candidates.length });
+        if (written) {
+          await reportAcks(emit, written);
+        } else {
+          await emit("push.partial-unrecorded", { reason: writeFailure.message });
+        }
+      }
+      throw error;
+    }
+    await reportAcks(eventCall, await recordAcks(posted.acks));
   }
   // A full push page (and eligible) means at least a full page was available,
   // so the loop treats it as "more remains" and stays in catch-up. An exactly-

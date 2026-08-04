@@ -2750,6 +2750,150 @@ test("push halves on 413 and every message still lands, in order", async () => {
   assert.deepEqual(accepted, candidates.map((c) => c.id)); // all of them, in send order
 });
 
+test("a POST that fails after earlier ones succeeded still records their acks", async () => {
+  // Several POSTs cannot be atomic the way one was: when a later one dies, the
+  // rows the earlier ones stored are committed and their acks are in hand.
+  // Dropping them leaves the client with no record of messages the server holds
+  // — the exact state the split has to keep from happening. Both the failure and
+  // the prefix have to reach the caller.
+  const candidates = Array.from({ length: 8 }, (_unused, index) =>
+    bulkyCandidate(index, 256 * 1024));
+  const committed = [];
+  const reconciled = [];
+  const events = [];
+  let posts = 0;
+  const ack = ackAllFrom({ value: 0 });
+  const harness = pushHarness(candidates, (messages) => {
+    posts += 1;
+    if (posts === 2) {
+      const error = new Error("HTTP 409 conflict");
+      error.status = 409;
+      throw error;
+    }
+    committed.push(...messages.map((message) => message.id));
+    return ack(messages);
+  });
+  const dependencies = {
+    ...harness,
+    eventCall: async (name, payload) => { events.push([name, payload]); },
+    driverCall: async (operation, driverConfig, input) => {
+      if (operation === "reconcile") {
+        reconciled.push(...input.map((record) => record.id));
+        return [{ type: "sync_reconcile_result", count: input.length }];
+      }
+      return harness.driverCall(operation, driverConfig, input);
+    },
+  };
+  await assert.rejects(cycle(config, { pushLimit: 100, pullLimit: 1000 }, dependencies),
+    (error) => error.status === 409);
+  assert.ok(posts > 1, `expected the page to split, got ${posts} POST(s)`);
+  assert.ok(committed.length > 0, "the first POST stored nothing, so nothing was at risk");
+  // What the server kept is exactly what the client wrote down — no more (it
+  // must not claim rows the failed POST never stored) and no less.
+  assert.deepEqual(reconciled, committed);
+  assert.deepEqual(events.filter(([name]) => name === "push.partial")
+    .map(([, payload]) => payload), [{ acked: committed.length, of: candidates.length }]);
+});
+
+test("a half that fails after its sibling succeeded still records the sibling's acks", async () => {
+  // The same loss, one level down: the 413 halving is recursive, so a failure in
+  // the second half discards the first half's acks unless every layer carries
+  // them. Small messages, so the byte budget makes one group and the only split
+  // is the recursive one — this reaches code the batch-level test does not.
+  const candidates = Array.from({ length: 4 }, (_unused, index) => bulkyCandidate(index, 64));
+  const committed = [];
+  const reconciled = [];
+  let refused = false;
+  const ack = ackAllFrom({ value: 0 });
+  const harness = pushHarness(candidates, (messages) => {
+    if (messages.length > 2) { // refuse the whole group once, forcing the halving
+      refused = true;
+      const error = new Error("HTTP 413 request-too-large");
+      error.status = 413;
+      error.body = { protocol_version: 1, server_instance_id: config.server_instance_id,
+        team_id: config.remote_team_id, error: { code: "request-too-large" } };
+      throw error;
+    }
+    if (committed.length > 0) { // the second half, after the first one stored
+      const error = new Error("HTTP 503 unavailable");
+      error.status = 503;
+      throw error;
+    }
+    committed.push(...messages.map((message) => message.id));
+    return ack(messages);
+  });
+  await assert.rejects(cycle(config, { pushLimit: 100, pullLimit: 1000 }, {
+    ...harness,
+    driverCall: async (operation, driverConfig, input) => {
+      if (operation === "reconcile") {
+        reconciled.push(...input.map((record) => record.id));
+        return [{ type: "sync_reconcile_result", count: input.length }];
+      }
+      return harness.driverCall(operation, driverConfig, input);
+    },
+  }), (error) => error.status === 503);
+  assert.ok(refused, "the server never refused, so the recursive halving never ran");
+  assert.deepEqual(reconciled, committed);
+  assert.equal(committed.length, 2);
+});
+
+test("an event sink that fails costs neither the prefix nor the transport error", async () => {
+  // The recovery must not depend on the reporting. An event log that cannot be
+  // written is a reason to say so, never a reason to skip the durable write the
+  // acks exist for, or to surface itself as the cycle's error in place of the
+  // transport failure that caused it.
+  const candidates = Array.from({ length: 8 }, (_unused, index) =>
+    bulkyCandidate(index, 256 * 1024));
+  const committed = [];
+  const reconciled = [];
+  let posts = 0;
+  const ack = ackAllFrom({ value: 0 });
+  const harness = pushHarness(candidates, (messages) => {
+    posts += 1;
+    if (posts === 2) {
+      const error = new Error("HTTP 409 conflict");
+      error.status = 409;
+      throw error;
+    }
+    committed.push(...messages.map((message) => message.id));
+    return ack(messages);
+  });
+  const attempted = [];
+  const failed = await cycle(config, { pushLimit: 100, pullLimit: 1000 }, {
+    ...harness,
+    // Every event reachable once the push has failed throws — the two this
+    // change added, and the two that report the reconcile. None of them may sit
+    // between the acks and the durable write.
+    eventCall: async (name) => {
+      if (["push.partial", "push.partial-unrecorded", "push.ack", "push.reconciled"]
+        .includes(name)) {
+        attempted.push(name);
+        throw new Error("event log is unwritable");
+      }
+    },
+    driverCall: async (operation, driverConfig, input) => {
+      if (operation === "reconcile") {
+        reconciled.push(...input.map((record) => record.id));
+        return [{ type: "sync_reconcile_result", count: input.length }];
+      }
+      return harness.driverCall(operation, driverConfig, input);
+    },
+  }).then(() => null, (error) => error);
+  assert.ok(failed, "the cycle resolved, so the transport failure was swallowed");
+  assert.equal(failed.status, 409);
+  assert.match(failed.message, /409 conflict/u);
+  assert.ok(committed.length > 0, "the first POST stored nothing, so nothing was at risk");
+  assert.deepEqual(reconciled, committed);
+  // The write succeeded and only the log failed. Saying "unrecorded" here would
+  // send the next reader to resend a prefix that is already durable, so the
+  // classification is the assertion — a log failure is not a write failure.
+  assert.ok(!attempted.includes("push.partial-unrecorded"),
+    "a durable prefix was reported as unrecorded");
+  assert.equal(failed.cause, undefined, "an event failure took the cause slot");
+  // Reporting was still attempted, in order, after the write.
+  assert.deepEqual(attempted, ["push.partial", "push.ack", "push.reconciled"]);
+});
+
 test("push stops at one message rather than splitting forever, and names it", async () => {
   // A single message the server refuses is a permanent dead end: no batching
   // this client can do will get it across, and every later cycle retries it.
