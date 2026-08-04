@@ -31,40 +31,72 @@ shared_rows() {
     "SELECT COUNT(*) FROM events WHERE type='message_sent' AND team='$1';" | tr -d '\r'
 }
 
-declared_type() {
-  sqlite3 "$1" \
-    "SELECT type FROM pragma_table_info('$2') WHERE name='$3';" | tr -d '\r'
+row_count() { sqlite3 "$1" "SELECT COUNT(*) FROM $2;" | tr -d '\r'; }
+
+# Storage classes actually present in a column, one per line, deduplicated.
+stored_types() {
+  sqlite3 "$1" "SELECT DISTINCT typeof($3) FROM $2;" | tr -d '\r'
 }
 
 # The migration decides what to copy by COMPARING ordering columns across two
-# databases — a cursor is missing if the destination is behind, not merely
-# different. Every one of those comparisons assumes the values order
-# numerically, and in sqlite that assumption lives in the column's declared
-# type.
+# databases — a cursor is missing if the destination is BEHIND, not merely
+# different. Every one of those comparisons rests on the values comparing
+# numerically.
 #
-# What this catches that the behavioural tests do not, measured rather than
-# assumed:
+# That premise is about the VALUES, not the column's declaration, and the two
+# come apart in both directions (co1, tl ruling):
 #
-#   TEXT     both this and the 1005/999 re-entry test go red — text ordering
-#            puts '1005' before '999', so the advance reads as a retreat
-#   NUMERIC  ONLY this goes red. NUMERIC still orders numerically, so every
-#            behavioural test passes while the declared type has changed
+#   too loose   sqlite's INTEGER affinity does not reject text it cannot
+#               convert, so a column still declared INTEGER can hold a string
+#               and the premise is broken with the declaration intact
+#   too strict  a NUMERIC column still compares 1005 > 999, so the premise
+#               holds while a declared-type check calls it a fault
 #
-# That second row is the reason this test exists: the premise can drift
-# without any value comparison noticing. It also names the fault directly —
-# "the column type changed" rather than "re-entry was refused".
+# So the check is on the storage class of what is actually stored. Text
+# appears here and it goes red; a NUMERIC declaration does not, because
+# nothing the migration relies on has moved.
+#
+# DETECTION, not enforcement: this observes the rows that exist, it does not
+# stop a bad one being written. Enforcing it needs a schema change — a STRICT
+# table, or CHECK(typeof(local_position)='integer') — and a migration to go
+# with it. Whoever wants that starts here.
 #
 # In BOTH databases, because the comparison spans them: a shared store and a
-# destination store that disagreed on the type would compare a number against
-# a string. seq is here because it decides copy order and re-entry.
-@test "migrate: the columns the comparisons order by are declared INTEGER" {
+# destination store that disagreed would compare a number against a string.
+# seq is here because it decides copy order and re-entry.
+@test "migrate: the values the comparisons order by are stored as integers" {
+  # Asserted at the moment each value is actually READ, not all at one moment.
+  # A migration empties the shared store of the team that left, so a single
+  # loop over both stores at the end checks an empty table on one side and
+  # passes vacuously — which is what the first version of this test did, and
+  # what the row counts below now refuse.
   bash "$SCRIPTS/send.sh" alpha ann bob "one" >/dev/null
+
+  # Before the move: the shared store holds the events the copy orders by.
+  [ "$(row_count "$SHARED" events)" -ge 1 ]
+  [ "$(stored_types "$SHARED" events seq)" = "integer" ]
+
   migrate alpha
   local dest; dest="$(store_of alpha)"
 
+  # After it: the destination holds them, and re-entry orders by these.
+  [ "$(row_count "$dest" events)" -ge 1 ]
+  [ "$(stored_types "$dest" events seq)" = "integer" ]
+
+  # The re-entry state for cursors, set up the way the sibling cursor tests
+  # do: the same agent on BOTH sides at different positions. That is the
+  # comparison this exists for — "behind" versus "missing" — and it is the one
+  # moment both stores hold a value for it. Written through the same INSERT
+  # the product uses, so a column that took a text affinity would store '5'
+  # and '7' as text and typeof would say so.
+  sqlite3 "$dest"   "INSERT OR REPLACE INTO read_cursors(team,agent,local_position)
+    VALUES('alpha','ann',7);"
+  sqlite3 "$SHARED" "INSERT OR REPLACE INTO read_cursors(team,agent,local_position)
+    VALUES('alpha','ann',5);"
+
   for db in "$SHARED" "$dest"; do
-    [ "$(declared_type "$db" read_cursors local_position)" = "INTEGER" ]
-    [ "$(declared_type "$db" events seq)" = "INTEGER" ]
+    [ "$(row_count "$db" read_cursors)" -ge 1 ]
+    [ "$(stored_types "$db" read_cursors local_position)" = "integer" ]
   done
 }
 
@@ -341,9 +373,9 @@ declared_type() {
   # 1005 and 999 are chosen: as text, '1005' sorts BEFORE '999', so a
   # comparison that became textual reads this advance as a retreat and
   # refuses. Confirmed by mutation — declaring local_position TEXT turns this
-  # test red. It does NOT cover every way the premise can move: a NUMERIC
-  # column still orders numerically and leaves this green, which is what the
-  # pragma test at the top of this file is for.
+  # test red. What it cannot see is a text value in a column still declared
+  # INTEGER, which sqlite permits; the typeof() test at the top of this file
+  # is what looks at the stored values themselves.
   sqlite3 "$dest"   "INSERT OR REPLACE INTO read_cursors(team,agent,local_position)
     VALUES('alpha','ann',1005);"
   sqlite3 "$SHARED" "INSERT OR REPLACE INTO read_cursors(team,agent,local_position)
