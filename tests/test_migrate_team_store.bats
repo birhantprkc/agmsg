@@ -31,6 +31,52 @@ shared_rows() {
     "SELECT COUNT(*) FROM events WHERE type='message_sent' AND team='$1';" | tr -d '\r'
 }
 
+row_count() { sqlite3 "$1" "SELECT COUNT(*) FROM $2;" | tr -d '\r'; }
+
+# Storage classes actually present in a column, one per line, deduplicated.
+stored_types() {
+  sqlite3 "$1" "SELECT DISTINCT typeof($3) FROM $2;" | tr -d '\r'
+}
+
+# What this test alone protects: the storage class of events.seq.
+#
+# The containment check compares events with all-column EXCEPT. That catches a
+# row whose seq differs — but not a seq that stopped being a number, because
+# if the column took a text affinity BOTH stores store text and the two sides
+# match. A green EXCEPT then means "identical", not "correct", and the shared
+# rows are deleted on the strength of it.
+#
+# The values here come from send.sh, so this is a statement about the
+# product's own write path, not about a literal this test inserted. That
+# distinction is the whole point (tl ruling): a typeof() check on a value the
+# test wrote proves the test can write an integer.
+#
+# read_cursors is NOT here. A text AFFINITY on that column turns the 1005/999
+# re-entry test below red, so checking for that would be a second copy of an
+# existing catch. Its storage class is looked at by no test in this
+# repository — see the note on that test for why the gap is worse than
+# undetected.
+#
+# DETECTION, not enforcement: this observes the rows that exist, it does not
+# stop a bad one being written. Enforcing needs a schema change — a STRICT
+# table, or CHECK(typeof(seq)='integer') — and a migration with it.
+@test "migrate: the seq the containment check compares is stored as an integer" {
+  # Asserted where each value actually lives, not all at one moment: a
+  # migration empties the shared store of the team that left, so checking both
+  # stores at the end reads an empty table on one side and passes vacuously.
+  # That is what the first version of this test did; the row counts refuse it.
+  bash "$SCRIPTS/send.sh" alpha ann bob "one" >/dev/null
+
+  [ "$(row_count "$SHARED" events)" -ge 1 ]
+  [ "$(stored_types "$SHARED" events seq)" = "integer" ]
+
+  migrate alpha
+  local dest; dest="$(store_of alpha)"
+
+  [ "$(row_count "$dest" events)" -ge 1 ]
+  [ "$(stored_types "$dest" events seq)" = "integer" ]
+}
+
 @test "migrate: only the named team moves" {
   bash "$SCRIPTS/send.sh" alpha ann bob "alpha-one" >/dev/null
   bash "$SCRIPTS/send.sh" beta  ann bob "beta-one"  >/dev/null
@@ -301,6 +347,22 @@ shared_rows() {
   migrate alpha
   local dest; dest="$(store_of alpha)"
 
+  # 1005 and 999 are chosen: as text, '1005' sorts BEFORE '999', so a
+  # comparison that became textual reads this advance as a retreat and
+  # refuses. Confirmed by mutation — declaring local_position TEXT turns this
+  # test red.
+  #
+  # What this test guards is that the ORDER is compared numerically. It does
+  # not look at the storage class of local_position, and NO TEST IN THIS
+  # REPOSITORY does — stated plainly because the alternative is a reader
+  # assuming some other test has it.
+  #
+  # The gap is worse than undetected. A text VALUE in a column still declared
+  # INTEGER is something sqlite permits, and it inverts the guard: `'abc' < 5`
+  # is false, so a text cursor in the destination reads as "not behind", the
+  # row is called present, and the shared cursor is deleted. Closing it means
+  # checking the values inside the guard itself — a change to
+  # migrate-team-store.sh, not to this file.
   sqlite3 "$dest"   "INSERT OR REPLACE INTO read_cursors(team,agent,local_position)
     VALUES('alpha','ann',1005);"
   sqlite3 "$SHARED" "INSERT OR REPLACE INTO read_cursors(team,agent,local_position)
