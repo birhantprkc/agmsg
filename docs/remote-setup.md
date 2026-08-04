@@ -180,8 +180,9 @@ second machine with `AGMSG_SYNC_CONNECTION_DIR`, `AGMSG_STORAGE_PATH` and
 friends, pointed at one install. That separates less than it looks like it
 does, and the part it misses fails quietly:
 
-- `remote.sh`, `remote-sync.sh`, `key.sh` and `internal/migrate-team-store.sh`
-  read `AGMSG_SYNC_CONNECTION_DIR`. Connection state does move.
+- Five files under `scripts/` read `AGMSG_SYNC_CONNECTION_DIR`: `remote.sh`,
+  `remote-sync.sh`, `key.sh`, `internal/migrate-team-store.sh` and
+  `internal/remote-sync.mjs`. Connection state does move.
 - `send.sh`, `history.sh`, `team.sh` and `inbox.sh` do not. They resolve the
   team config from the install directory — `team.sh` reads
   `$SCRIPT_DIR/../teams/$TEAM/config.json` — so both "machines" share it.
