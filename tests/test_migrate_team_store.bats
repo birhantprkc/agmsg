@@ -38,66 +38,41 @@ stored_types() {
   sqlite3 "$1" "SELECT DISTINCT typeof($3) FROM $2;" | tr -d '\r'
 }
 
-# The migration decides what to copy by COMPARING ordering columns across two
-# databases — a cursor is missing if the destination is BEHIND, not merely
-# different. Every one of those comparisons rests on the values comparing
-# numerically.
+# What this test alone protects: the storage class of events.seq.
 #
-# That premise is about the VALUES, not the column's declaration, and the two
-# come apart in both directions (co1, tl ruling):
+# The containment check compares events with all-column EXCEPT. That catches a
+# row whose seq differs — but not a seq that stopped being a number, because
+# if the column took a text affinity BOTH stores store text and the two sides
+# match. A green EXCEPT then means "identical", not "correct", and the shared
+# rows are deleted on the strength of it.
 #
-#   too loose   sqlite's INTEGER affinity does not reject text it cannot
-#               convert, so a column still declared INTEGER can hold a string
-#               and the premise is broken with the declaration intact
-#   too strict  a NUMERIC column still compares 1005 > 999, so the premise
-#               holds while a declared-type check calls it a fault
+# The values here come from send.sh, so this is a statement about the
+# product's own write path, not about a literal this test inserted. That
+# distinction is the whole point (tl ruling): a typeof() check on a value the
+# test wrote proves the test can write an integer.
 #
-# So the check is on the storage class of what is actually stored. Text
-# appears here and it goes red; a NUMERIC declaration does not, because
-# nothing the migration relies on has moved.
+# read_cursors is NOT here. Its ordering premise is already held by the
+# 1005/999 re-entry test below — a text affinity there turns that test red,
+# so a check on this side would be a second copy of the same catch.
 #
 # DETECTION, not enforcement: this observes the rows that exist, it does not
-# stop a bad one being written. Enforcing it needs a schema change — a STRICT
-# table, or CHECK(typeof(local_position)='integer') — and a migration to go
-# with it. Whoever wants that starts here.
-#
-# In BOTH databases, because the comparison spans them: a shared store and a
-# destination store that disagreed would compare a number against a string.
-# seq is here because it decides copy order and re-entry.
-@test "migrate: the values the comparisons order by are stored as integers" {
-  # Asserted at the moment each value is actually READ, not all at one moment.
-  # A migration empties the shared store of the team that left, so a single
-  # loop over both stores at the end checks an empty table on one side and
-  # passes vacuously — which is what the first version of this test did, and
-  # what the row counts below now refuse.
+# stop a bad one being written. Enforcing needs a schema change — a STRICT
+# table, or CHECK(typeof(seq)='integer') — and a migration with it.
+@test "migrate: the seq the containment check compares is stored as an integer" {
+  # Asserted where each value actually lives, not all at one moment: a
+  # migration empties the shared store of the team that left, so checking both
+  # stores at the end reads an empty table on one side and passes vacuously.
+  # That is what the first version of this test did; the row counts refuse it.
   bash "$SCRIPTS/send.sh" alpha ann bob "one" >/dev/null
 
-  # Before the move: the shared store holds the events the copy orders by.
   [ "$(row_count "$SHARED" events)" -ge 1 ]
   [ "$(stored_types "$SHARED" events seq)" = "integer" ]
 
   migrate alpha
   local dest; dest="$(store_of alpha)"
 
-  # After it: the destination holds them, and re-entry orders by these.
   [ "$(row_count "$dest" events)" -ge 1 ]
   [ "$(stored_types "$dest" events seq)" = "integer" ]
-
-  # The re-entry state for cursors, set up the way the sibling cursor tests
-  # do: the same agent on BOTH sides at different positions. That is the
-  # comparison this exists for — "behind" versus "missing" — and it is the one
-  # moment both stores hold a value for it. Written through the same INSERT
-  # the product uses, so a column that took a text affinity would store '5'
-  # and '7' as text and typeof would say so.
-  sqlite3 "$dest"   "INSERT OR REPLACE INTO read_cursors(team,agent,local_position)
-    VALUES('alpha','ann',7);"
-  sqlite3 "$SHARED" "INSERT OR REPLACE INTO read_cursors(team,agent,local_position)
-    VALUES('alpha','ann',5);"
-
-  for db in "$SHARED" "$dest"; do
-    [ "$(row_count "$db" read_cursors)" -ge 1 ]
-    [ "$(stored_types "$db" read_cursors local_position)" = "integer" ]
-  done
 }
 
 @test "migrate: only the named team moves" {
