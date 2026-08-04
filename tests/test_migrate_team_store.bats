@@ -51,9 +51,11 @@ stored_types() {
 # distinction is the whole point (tl ruling): a typeof() check on a value the
 # test wrote proves the test can write an integer.
 #
-# read_cursors is NOT here. Its ordering premise is already held by the
-# 1005/999 re-entry test below — a text affinity there turns that test red,
-# so a check on this side would be a second copy of the same catch.
+# read_cursors is NOT here. A text AFFINITY on that column turns the 1005/999
+# re-entry test below red, so checking for that would be a second copy of an
+# existing catch. Its storage class is looked at by no test in this
+# repository — see the note on that test for why the gap is worse than
+# undetected.
 #
 # DETECTION, not enforcement: this observes the rows that exist, it does not
 # stop a bad one being written. Enforcing needs a schema change — a STRICT
@@ -348,9 +350,19 @@ stored_types() {
   # 1005 and 999 are chosen: as text, '1005' sorts BEFORE '999', so a
   # comparison that became textual reads this advance as a retreat and
   # refuses. Confirmed by mutation — declaring local_position TEXT turns this
-  # test red. What it cannot see is a text value in a column still declared
-  # INTEGER, which sqlite permits; the typeof() test at the top of this file
-  # is what looks at the stored values themselves.
+  # test red.
+  #
+  # What this test guards is that the ORDER is compared numerically. It does
+  # not look at the storage class of local_position, and NO TEST IN THIS
+  # REPOSITORY does — stated plainly because the alternative is a reader
+  # assuming some other test has it.
+  #
+  # The gap is worse than undetected. A text VALUE in a column still declared
+  # INTEGER is something sqlite permits, and it inverts the guard: `'abc' < 5`
+  # is false, so a text cursor in the destination reads as "not behind", the
+  # row is called present, and the shared cursor is deleted. Closing it means
+  # checking the values inside the guard itself — a change to
+  # migrate-team-store.sh, not to this file.
   sqlite3 "$dest"   "INSERT OR REPLACE INTO read_cursors(team,agent,local_position)
     VALUES('alpha','ann',1005);"
   sqlite3 "$SHARED" "INSERT OR REPLACE INTO read_cursors(team,agent,local_position)
