@@ -338,6 +338,49 @@ shared_rows() {
       "SELECT local_position FROM read_cursors WHERE team='alpha' AND agent='ann';")" -eq 42 ]
 }
 
+# A cursor that is not a number cannot be compared, so it is not proof.
+#
+# This is the case the ordering guard is blind to on its own: sqlite orders
+# integers before text, so `'abc' < 5` is FALSE. A text cursor in the
+# destination answers "not behind" to the very comparison meant to catch being
+# behind — the check reports nothing missing, and the shared cursor is deleted
+# with the rest of the team's rows. The agent resumes from wherever the
+# damaged value puts them, and their real read position is gone.
+#
+# Written as "the shared cursor survives", because survival is the point. A
+# guard that refused but deleted anyway would pass a message-only assertion.
+#
+# How a non-integer gets into the column is NOT established. sqlite permits it
+# in a column declared INTEGER, and this is a defence against an entry point
+# that has not been found, not a fix for a reproduced one.
+@test "migrate: a cursor that is not an integer is refused, and the shared copy survives" {
+  bash "$SCRIPTS/send.sh" alpha ann bob "one" >/dev/null
+  migrate alpha
+  local dest; dest="$(store_of alpha)"
+
+  # The destination is genuinely AHEAD in every honest reading — 'abc' is not
+  # a position at all. Under the old comparison this row answered "not
+  # behind", so nothing was reported and the shared row was deleted.
+  sqlite3 "$dest"   "INSERT OR REPLACE INTO read_cursors(team,agent,local_position)
+    VALUES('alpha','ann','abc');"
+  sqlite3 "$SHARED" "INSERT OR REPLACE INTO read_cursors(team,agent,local_position)
+    VALUES('alpha','ann',42);"
+  # The premise this test rests on, measured rather than assumed: the column
+  # is declared INTEGER and sqlite stored text in it anyway.
+  [ "$(sqlite3 "$dest" "SELECT typeof(local_position) FROM read_cursors
+        WHERE team='alpha' AND agent='ann';")" = "text" ]
+
+  # Nothing else is short, so a refusal here is about the cursor.
+  [ "$(shared_rows alpha)" -eq 0 ]
+
+  run migrate alpha
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "missing rows" ]]
+  # The whole point: the position the agent had actually reached is still here.
+  [ "$(sqlite3 "$SHARED" \
+      "SELECT local_position FROM read_cursors WHERE team='alpha' AND agent='ann';")" -eq 42 ]
+}
+
 # The normal re-entry this guard must NOT break. After the config flips, new
 # messages land in the destination, so it legitimately holds MORE than the
 # shared store. A guard written as "the counts match" would refuse exactly the
