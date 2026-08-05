@@ -46,6 +46,23 @@ CONNECT_SERVER_ID = "018f3f7e-3333-7000-8000-000000000001"
 # make the server disagree with the client's binding.
 HEALTH_TEAM_ID = os.environ.get("MOCK_HEALTH_TEAM_ID", "")
 REGISTERED_TEAM_IDS = set()
+# team_id -> {"team_name": str, "members": [...]}, what /v1/connect was sent.
+REGISTERED_TEAMS = {}
+# Armed by GET /_test/drop-next-connect, consumed by the next /v1/connect:
+# commit the registration, answer nothing. Armed through a route rather than an
+# env var because the registration has to SURVIVE into the retry, and a restart
+# to change the env would take it with it.
+DROP_NEXT_CONNECT = False
+# Armed by GET /_test/fail-next?route=<capabilities|members>: every request to
+# that route answers 500 until the server is restarted. Lets a test drive the
+# client's "could not read it" branches, which a fixture that always succeeds
+# cannot reach.
+#
+# Sticky, not one-shot: a connected team has a sync engine polling in the
+# background, and it would consume a single armed failure before the command
+# under test ever issued its request. The test then saw a success it had asked
+# to fail. Each test starts its own server, so nothing has to clear this.
+FAIL_NEXT = set()
 
 
 PULL_SERVER_ID = CONNECT_SERVER_ID
@@ -158,11 +175,27 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _strip_capability_prefix(self):
+        """Serve the API beneath a `/t/<token>` prefix, like a hosted endpoint.
+
+        A hosted endpoint is `https://host/t/<token>` and the routes live under
+        it. Without this the fixture can only be reached at the bare root, so a
+        test cannot drive a real flow through a capability-bearing URL -- and
+        the thing worth asserting about such a URL is that the token never
+        reaches the terminal. The token is not checked: this server issues and
+        verifies no credential, exactly like the real one.
+        """
+        if self.path.startswith("/t/"):
+            rest = self.path[len("/t/"):]
+            cut = rest.find("/")
+            self.path = rest[cut:] if cut != -1 else "/"
+
     def do_GET(self):
+        self._strip_capability_prefix()
         # Declared for the whole method: /_test/health-team assigns it, and
         # Python requires the declaration to precede the first mention anywhere
         # in the function — including the read in the /v1/health branch below.
-        global HEALTH_TEAM_ID
+        global HEALTH_TEAM_ID, CONNECT_SERVER_ID, DROP_NEXT_CONNECT, FAIL_NEXT
         if self.path == "/v1/health":
             # Echo the team the caller asked about, the way a real per-team edge
             # answers. MOCK_HEALTH_TEAM_ID overrides it so a test can make the
@@ -175,6 +208,19 @@ class Handler(BaseHTTPRequestHandler):
                 "team_id": team_id,
             })
             return
+        if self.path == "/_test/drop-next-connect":
+            DROP_NEXT_CONNECT = True
+            self._send_json(200, {"armed": True})
+            return
+        if self.path == "/_test/rotate-server-id":
+            # Same address, different server. Registrations stay, so a client
+            # can only tell by comparing the instance id it recorded.
+            CONNECT_SERVER_ID = "018f3f7e-2222-7000-8000-0000000000ff"
+            self._send_json(200, {"server_instance_id": CONNECT_SERVER_ID})
+            return
+        if self.path == "/v1/capabilities" and "capabilities" in FAIL_NEXT:
+            self._send_json(500, {"error": {"code": "server-error"}})
+            return
         if self.path == "/v1/capabilities":
             team_id = self.headers.get("Agmsg-Team-ID", "")
             current_seq = (len(PULL_MESSAGES) + len(PUSHED_MESSAGES)
@@ -183,10 +229,19 @@ class Handler(BaseHTTPRequestHandler):
                 "protocol_version": 1,
                 "server_instance_id": CONNECT_SERVER_ID,
                 "team_id": team_id,
+                # The real snapshot carries the name the server holds, and a
+                # client rebuilding a lost binding compares against it.
+                "team_name": REGISTERED_TEAMS.get(team_id, {}).get(
+                    "team_name", CONNECT_TEAM_NAME or ""),
+                # And the declaration it holds, which for a registered team is
+                # what that team was registered with -- not the env default.
+                "cipher_profile": (
+                    REGISTERED_TEAMS[team_id]["cipher_profile"]
+                    if team_id in REGISTERED_TEAMS
+                    else (TEAM_CIPHER_PROFILE or None)),
                 "current_seq": str(current_seq),
                 "next_sequence_boundary": str(current_seq + 1),
                 "min_available_seq": "0",
-                "cipher_profile": TEAM_CIPHER_PROFILE or None,
                 "accepted_envelope_versions": [1],
                 "write_allowed_ciphers": CONNECT_CIPHERS,
                 "policy_revision": "0",
@@ -215,7 +270,78 @@ class Handler(BaseHTTPRequestHandler):
         parts = self.path.split("?", 1)
         route = parts[0]
         query = parts[1] if len(parts) > 1 else ""
+        if route == "/_test/fail-next":
+            for pair in query.split("&"):
+                if pair.startswith("route="):
+                    FAIL_NEXT.add(pair[len("route="):])
+            self._send_json(200, {"armed": sorted(FAIL_NEXT)})
+            return
+        if route == "/_test/rename-team":
+            # Make the server hold a different name for a registered team, so
+            # the client's name-mismatch branch can be reached.
+            from urllib.parse import unquote_plus as _uqp
+            was, now = "", ""
+            for pair in query.split("&"):
+                if pair.startswith("from="):
+                    was = _uqp(pair[len("from="):])
+                elif pair.startswith("to="):
+                    now = _uqp(pair[len("to="):])
+            hit = [tid for tid, rec in REGISTERED_TEAMS.items()
+                   if rec["team_name"] == was]
+            if hit:
+                REGISTERED_TEAMS[hit[0]]["team_name"] = now
+                self._send_json(200, {"team_name": now})
+            else:
+                self._send_json(404, {"error": {"code": "not-registered"}})
+            return
+        if route == "/v1/members" and "members" in FAIL_NEXT:
+            self._send_json(500, {"error": {"code": "server-error"}})
+            return
+        if route == "/_test/declare-cipher":
+            # Set the declaration a registered team carries, without the client
+            # having to be able to MAKE that declaration. Declaring age-v1 for
+            # real needs a key and so the age binary; the client behaviour
+            # under test is only "the server says X and this run asked for Y",
+            # so the two are separable and the test stays runnable where age
+            # is absent -- which is where CI runs it.
+            # Addressed by NAME, so the caller does not have to dig the minted
+            # team_id back out of local config -- which for a team whose name
+            # contains a quote is its own quoting problem, in the test rather
+            # than in the thing under test.
+            # Imported here like the other branches that need it: the existing
+            # local imports make `unquote` a local name for this whole method,
+            # so a module-level one would not be visible.
+            # unquote_PLUS: this arrives form-urlencoded, where a space may be
+            # '+'. Plain unquote would leave it and the name would not match.
+            from urllib.parse import unquote_plus
+            want_name, want_profile = "", ""
+            for pair in query.split("&"):
+                if pair.startswith("team_name="):
+                    want_name = unquote_plus(pair[len("team_name="):])
+                elif pair.startswith("profile="):
+                    want_profile = unquote_plus(pair[len("profile="):])
+            hit = [tid for tid, rec in REGISTERED_TEAMS.items()
+                   if rec["team_name"] == want_name]
+            if hit:
+                REGISTERED_TEAMS[hit[0]]["cipher_profile"] = want_profile
+                self._send_json(200, {"team_id": hit[0],
+                                      "cipher_profile": want_profile})
+            else:
+                self._send_json(404, {"error": {"code": "not-registered"}})
+            return
         if route == "/v1/members":
+            team_id = self.headers.get("Agmsg-Team-ID", "")
+            if team_id in REGISTERED_TEAMS:
+                self._send_json(200, {
+                    "protocol_version": 1,
+                    "server_instance_id": CONNECT_SERVER_ID,
+                    "team_id": team_id,
+                    "min_available_seq": "0",
+                    "cipher_profile": TEAM_CIPHER_PROFILE or None,
+                    "members_revision": "0",
+                    "members": REGISTERED_TEAMS[team_id]["members"],
+                })
+                return
             self._send_json(200, {
                 "protocol_version": 1,
                 "server_instance_id": PULL_SERVER_ID,
@@ -369,6 +495,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
+        self._strip_capability_prefix()
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b""
 
@@ -434,6 +561,35 @@ class Handler(BaseHTTPRequestHandler):
                                       "error": {"code": "team-already-exists"}})
                 return
             REGISTERED_TEAM_IDS.add(team_id)
+            # What the server now holds for this team. The real one stores the
+            # name and roster it was sent and answers /v1/capabilities and
+            # /v1/members from that; reading them back is how a client that
+            # lost this response rebuilds its binding, so the mock has to hold
+            # them too or that path cannot be tested honestly.
+            REGISTERED_TEAMS[team_id] = {
+                "team_name": CONNECT_TEAM_NAME or data.get("team_name", ""),
+                # The DECLARATION, kept as sent. A repeat connect must not be
+                # able to restate it, so reads answer from here, not from
+                # whatever the later caller asked for.
+                "cipher_profile": data.get("cipher_profile"),
+                "members": [{"member_id": m.get("member_id", ""),
+                             "name": m.get("name", ""),
+                             "registrations": []}
+                            for m in data.get("members", [])],
+            }
+            global DROP_NEXT_CONNECT
+            if DROP_NEXT_CONNECT:
+                # The registration is committed and the client is told nothing.
+                # This is the POST that succeeded on the server and whose
+                # response never arrived -- the one case where a retry finds a
+                # team it owns and holds no binding for it.
+                DROP_NEXT_CONNECT = False
+                self.close_connection = True
+                try:
+                    self.connection.close()
+                except Exception:
+                    pass
+                return
             # The capability snapshot the client reads back into its binding.
             self._send_json(200, {
                 "protocol_version": 1,

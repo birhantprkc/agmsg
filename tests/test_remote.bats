@@ -34,6 +34,7 @@ setup() {
   wait_for_file_contains "$TEST_SKILL_DIR/server.port" '^[0-9][0-9]*$'
   MOCK_PORT="$(cat "$TEST_SKILL_DIR/server.port")"
   ENDPOINT="http://127.0.0.1:$MOCK_PORT"
+  CAPABILITY_SECRET="agsy_do_not_print_this_token"
 }
 
 cleanup_sync_engines() {
@@ -142,6 +143,265 @@ skip_if_no_age() {
   # real local team. testteam was minted with a team_id in setup().
   run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
   [ "$status" -eq 0 ]
+}
+
+# --- #143: a connect that already registered must not dead-end -------------
+#
+# Registration commits on the server in one transaction, and the binding is
+# written locally only after a 200. So the only thing a failed connect can
+# leave behind is local, derived state -- and the way back in is to skip the
+# step that is already done, never to undo it.
+
+_binding_field() {  # $1 = team, $2 = json path under remote_binding
+  local cfg="$TEST_SKILL_DIR/teams/$1/config.json" resolved escaped
+  resolved="$(rf "$cfg")"
+  # Double the quotes: a team name may contain one, and the path goes inside a
+  # SQL string literal. The unescaped form ends the literal on such a team --
+  # the same class of bug this test exists to catch, one layer up.
+  escaped="$(printf '%s' "$resolved" | sed "s/'/''/g")"
+  sqlite_mem "SELECT coalesce(json_extract(CAST(readfile('$escaped') AS TEXT), '\$.remote_binding.$2'), '');"
+}
+
+@test "connect: a POST that committed but lost its response recovers on retry (#143)" {
+  # Arm the cut: the next /v1/connect registers the team and answers nothing.
+  run curl -sS "$ENDPOINT/_test/drop-next-connect"
+  [ "$status" -eq 0 ]
+
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -ne 0 ]
+  # Nothing recorded: the binding is only ever written after a 200. This is
+  # exactly the state a lost response leaves -- registered there, unknown here.
+  [ "$(_binding_field testteam server_instance_id)" = "" ]
+
+  # Before #143 this retry was a 409 dead end with no way out but recreating
+  # the team (and losing its local history).
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"adopting that registration"* ]]
+  [ -n "$(_binding_field testteam server_instance_id)" ]
+  [ "$(_binding_field testteam remote_team_name)" = "testteam" ]
+}
+
+@test "connect: refuses to re-anchor a binding to a different server instance (#143)" {
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -eq 0 ]
+  local anchored
+  anchored="$(_binding_field testteam server_instance_id)"
+  [ -n "$anchored" ]
+
+  # Same address, different server. The registration is still there and the
+  # team_id, name and roster all still match -- the recorded instance id is
+  # the only thing that can tell these apart, which is why requiring it to
+  # merely EXIST is not the same as checking it.
+  run curl -sS "$ENDPOINT/_test/rotate-server-id"
+  [ "$status" -eq 0 ]
+
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Refusing to re-anchor"* ]]
+  # The binding still points at the server it was made against.
+  [ "$(_binding_field testteam server_instance_id)" = "$anchored" ]
+
+  # And the way out the refusal names has to WORK. disconnect drops the claim
+  # on the old anchor; the connect after it must get through, not land back on
+  # the same refusal. A refusal with no reachable next state is the defect this
+  # whole change exists to remove.
+  run bash "$SCRIPTS/remote.sh" disconnect testteam
+  [ "$status" -eq 0 ]
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"Refusing to re-anchor"* ]]
+  [ "$(_binding_field testteam server_instance_id)" != "$anchored" ]
+}
+
+@test "connect: a repeat run cannot restate the registered cipher profile (#143)" {
+  # Declaring age-v1 means minting a key, so this one needs age. The refusal
+  # itself does not -- the quoting it prints is covered without age in
+  # test_shquote.bats, at the function that owns it.
+  skip_if_no_age
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam
+  [ "$status" -eq 0 ]
+  [ "$(_binding_field testteam cipher_profile)" = "age-v1" ]
+
+  # Plain re-run of an age-v1 registration. Recording 'none' here would be a
+  # downgrade written by a retry, against a server that still says age-v1.
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"registered on"*"as 'age-v1'"* ]]
+  [ "$(_binding_field testteam cipher_profile)" = "age-v1" ]
+
+  # The refusal must name a change this CLI accepts, and then that change must
+  # actually work. It names the flag rather than a whole command because the
+  # endpoint can carry a capability and this line is read off a terminal --
+  # so the test performs the named change instead of pasting a printed string.
+  [[ "$output" != *"Re-run connect for"* ]]
+  [[ "$output" == *"re-run the same connect for"* ]]
+  [[ "$output" == *"with --e2ee added"* ]]
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam
+  [ "$status" -eq 0 ]
+  [ "$(_binding_field testteam cipher_profile)" = "age-v1" ]
+}
+
+@test "connect: the printed recovery command is shell-safe for a hostile team name (#143)" {
+  # This asserts the CALL SITE, not the helper. tests/test_shquote.bats pins
+  # what agmsg_shq does; nothing there stops remote.sh from going back to a
+  # bare '$team', and the case that would catch it needs age and so never runs
+  # in CI. This one needs nothing installed: the server's declaration is set
+  # directly, so the client is never asked to MAKE an age-v1 declaration.
+  local team="it's a team"
+  run bash "$SCRIPTS/join.sh" "$team" alice claude-code /tmp/project-quote
+  [ "$status" -eq 0 ]
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" "$team"
+  [ "$status" -eq 0 ]
+
+  run curl -sS --get --data-urlencode "team_name=$team" --data-urlencode "profile=age-v1" \
+    "$ENDPOINT/_test/declare-cipher"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"age-v1"* ]]
+
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" "$team"
+  [ "$status" -ne 0 ]
+  # Hold the refusal itself: $output is about to be the eval's result, and
+  # asserting the endpoint's absence against THAT would be true of anything.
+  local msg="$output" printed
+  printed="$(printf '%s\n' "$msg" \
+    | sed -n "s/.*re-run the same connect for \(.*\) with --e2ee added\..*/\1/p")"
+  [ -n "$printed" ]
+
+  # The real assertion: a shell parsing that fragment gets the team back as ONE
+  # argument, byte for byte. With a bare '$team' the quote closes early and
+  # this either fails to parse or splits into several arguments.
+  run eval "set -- $printed; printf '%s|%s' \"\$#\" \"\$1\""
+  [ "$status" -eq 0 ]
+  [ "$output" = "1|$team" ]
+
+  # And the endpoint is not reproduced in the refusal: it can carry a
+  # capability, and this line is meant to be read off a terminal.
+}
+
+# --- #143: nothing this path prints may carry the capability ---------------
+#
+# A hosted endpoint is `https://host/t/<token>` and that token IS the
+# permission. These assert on the BYTES OF A RUN, not on the source. An
+# earlier version of this guard read remote.sh looking for output statements
+# and was wrong three times running: it saw only a literal `$endpoint` on the
+# same physical line as `echo`, then only `echo|printf` -- while `${endpoint}`,
+# line continuations, `cat` with a here-doc, `tee` and a redirected block are
+# all ordinary ways to write the same leak. Enumerating how a program can
+# print something loses by one, every time. What the user sees does not depend
+# on which primitive produced it, so that is what is checked.
+#
+# Every branch of _remote_adopt_registration that prints the endpoint is driven
+# below. A new branch belongs here too.
+
+# Fails if the capability appears in anything the command wrote. The expected
+# substring is required as well: "the token is absent" is trivially true of no
+# output, and would keep passing if the message were deleted or renamed.
+assert_no_capability() {  # $1 = expected substring, rest = command
+  local expect="$1"; shift
+  run "$@"
+  [[ "$output" == *"$expect"* ]] || {
+    echo "expected to see: $expect"; echo "actual output: $output"; return 1; }
+  [[ "$output" != *"$CAPABILITY_SECRET"* ]] || {
+    echo "TOKEN LEAKED in: $output"; return 1; }
+  [[ "$output" != *"/t/"* ]] || {
+    echo "capability PATH leaked in: $output"; return 1; }
+}
+
+# NOT a command substitution: that runs in a subshell, so an assignment inside
+# it is thrown away and the secret would be the empty string -- which every
+# output contains, making the leak check pass on anything. CAPABILITY_SECRET is
+# set in setup() instead.
+_capability_endpoint() {
+  printf '%s' "$ENDPOINT/t/$CAPABILITY_SECRET"
+}
+
+@test "redaction: adoption success does not print the capability (#143)" {
+  local cap; cap="$(_capability_endpoint)"
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+  assert_no_capability "adopting that registration" \
+    bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+}
+
+@test "redaction: an unreadable capabilities response does not print it (#143)" {
+  local cap; cap="$(_capability_endpoint)"
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+  curl -sS "$ENDPOINT/_test/fail-next?route=capabilities" >/dev/null
+  assert_no_capability "capabilities could not be read" \
+    bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+}
+
+@test "redaction: an unreadable roster response does not print it (#143)" {
+  local cap; cap="$(_capability_endpoint)"
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+  curl -sS "$ENDPOINT/_test/fail-next?route=members" >/dev/null
+  assert_no_capability "roster could not be read" \
+    bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+}
+
+@test "redaction: a server-instance mismatch does not print it (#143)" {
+  local cap; cap="$(_capability_endpoint)"
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+  curl -sS "$ENDPOINT/_test/rotate-server-id" >/dev/null
+  assert_no_capability "Refusing to re-anchor" \
+    bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+}
+
+@test "redaction: a team-name mismatch does not print it (#143)" {
+  local cap; cap="$(_capability_endpoint)"
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+  curl -sS --get --data-urlencode "from=testteam" --data-urlencode "to=someone-elses" \
+    "$ENDPOINT/_test/rename-team" >/dev/null
+  assert_no_capability "not this team's" \
+    bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+}
+
+@test "redaction: a roster mismatch does not print it (#143)" {
+  local cap; cap="$(_capability_endpoint)"
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+  local cfg="$TEST_SKILL_DIR/teams/testteam/config.json" updated
+  updated="$(sqlite_mem "SELECT json_set(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.agents.intruder', json_object('member_id', '018f3f7e-9999-7000-8000-00000000cafe'));")"
+  printf '%s' "$updated" > "$cfg"
+  assert_no_capability "roster is not this team's" \
+    bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+}
+
+@test "redaction: a cipher-profile mismatch does not print it (#143)" {
+  local cap; cap="$(_capability_endpoint)"
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+  curl -sS --get --data-urlencode "team_name=testteam" --data-urlencode "profile=age-v1" \
+    "$ENDPOINT/_test/declare-cipher" >/dev/null
+  assert_no_capability "Refusing to record a profile" \
+    bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+}
+
+@test "redaction: the helper drops path, query, fragment and userinfo (#143)" {
+  # The one source-level claim kept: it is about the helper's own behaviour,
+  # not about who remembers to call it.
+  eval "$(sed -n '/^_remote_endpoint_display() {/,/^}/p' "$SCRIPTS/remote.sh")"
+  [ "$(_remote_endpoint_display 'https://host/t/secret')" = "https://host" ]
+  [ "$(_remote_endpoint_display 'https://user:tok@host/t/secret')" = "https://host" ]
+  [ "$(_remote_endpoint_display 'https://host/t/secret?q=1#frag')" = "https://host" ]
+  [ "$(_remote_endpoint_display 'http://127.0.0.1:8080')" = "http://127.0.0.1:8080" ]
+  [ "$(_remote_endpoint_display 'https://host/a@b/c')" = "https://host" ]
+}
+
+@test "connect: refuses to adopt a registration whose roster is not this team's (#143)" {
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -eq 0 ]
+
+  # Give the local team a member the server's registration does not have. The
+  # team_id still matches, so only the roster check can tell these apart --
+  # and adopting on a name match alone would be the bug.
+  local cfg="$TEST_SKILL_DIR/teams/testteam/config.json"
+  local updated
+  updated="$(sqlite_mem "SELECT json_set(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.agents.intruder', json_object('member_id', '018f3f7e-9999-7000-8000-00000000dead'));")"
+  printf '%s' "$updated" > "$cfg"
+
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"roster is not this team's"* ]]
+  [[ "$output" == *"real conflict"* ]]
 }
 
 @test "connect: the capability path never reaches the terminal" {
@@ -366,12 +626,25 @@ skip_if_no_age() {
   [ -n "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.agents.bob.member_id');")" ]
 }
 
-@test "connect: refuses a second connect for the same team_id with 409 (Done-when 5)" {
+@test "connect: a second connect does not re-register, it resumes (Done-when 5, #143)" {
+  # This test used to assert the opposite -- that a repeat connect FAILED with
+  # "already registered". That assertion was the dead end #143 reports: the
+  # same team, with the same roster, could never finish a connect whose later
+  # steps had failed. The server's rule is unchanged and still right (a team_id
+  # registers once, refused like a non-fast-forward push); what changed is that
+  # the client no longer sends a registration it can see is already done.
   bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
-  # The mock keeps the registered team_id; a repeat is a uniqueness conflict.
+  local first_revision
+  first_revision="$(_binding_field testteam binding_revision)"
+
   run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"already registered"* ]]
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"adopting that registration"* ]]
+  # No POST was attempted: the announcement that precedes it is absent, and a
+  # POST here would have been refused 409.
+  [[ "$output" != *"Connecting team"* ]]
+  [[ "$output" != *"already registered on this remote"* ]]
+  [ "$(_binding_field testteam binding_revision)" -gt "$first_revision" ]
 }
 
 # --- status --------------------------------------------------------------
