@@ -1,6 +1,6 @@
 # Adaptive sync catch-up (design draft)
 
-Status: DRAFT for review (mentor-cc). OSS-side; destination `integration/remote`.
+Status: DRAFT for review. OSS-side; destination `integration/remote`.
 No wire-contract or schema change → no ADR (see adr-discipline); a design doc
 suffices. If the design later needs to touch `server/spec/v1.md`, that part
 gets its own ADR judgement.
@@ -81,7 +81,7 @@ Pull doesn't wait, but its **page size** still matters: 90k of pull backlog at
 100/page is ~900 round-trips (~68 s at 50–100 ms each) vs ~90 at 1000/page
 (~7 s). This bites exactly when push-saturation would *not* fire — a read-only
 machine that was closed for a month has a large pull backlog and nothing to
-push (mentor-cc's case, and a common one).
+push (an actually observed case, and a common one).
 
 Two ways to get the bigger pull page there:
 - **(proposal)** a second signal — raise the pull page when `current_seq −
@@ -97,8 +97,8 @@ Two ways to get the bigger pull page there:
   the same `limit`); to confirm contract-safe at implementation (the server
   caps at its own max; page validation uses the pull limit).
 
-**Decided: unconditional large pull page** (mentor-cc concurred — simpler than a
-second signal, and harmless in steady state). Two implementation traps found in
+**Decided: unconditional large pull page** — simpler than a second signal, and
+harmless in steady state. Two implementation traps found in
 the real code, both mandatory:
 
 - **Trap 1 — validation also reads `limit`.** The pull request
@@ -191,7 +191,7 @@ instead of spinning.
   nothing to do**. During catch-up every cycle moves real messages, so that
   purpose doesn't apply. So catch-up removes the inter-cycle wait **regardless
   of whether `--interval` is default or explicit**; the interval governs only
-  the steady cadence. Three reasons this is right (mentor-cc, revised):
+  the steady cadence. Three reasons this is right (revised on review):
   1. the interval's reason-for-being (don't hammer on empty polls) is absent
      while real data flows every cycle;
   2. treating an explicit value as "intent" breaks here — systemd units and
@@ -205,7 +205,7 @@ instead of spinning.
 - **Failure backoff is independent of all of this** (previous section): after a
   retryable failure the loop always waits, in either cadence.
 
-## The other four points (mapping accepted by mentor-cc)
+## The other four points (mapping accepted on review)
 
 - **Server range sequence allocation** — already the contract shape: `POST
   /v1/messages` locks the team row once and allocates a sequence *range* for the

@@ -1230,7 +1230,7 @@ the same fixtures and strict schemas.
 
 The implementation is split by contract, not by file convenience.
 
-### Server/sync track (aggie-co2)
+### Server/sync track
 
 - HTTP/spec changes for onboarding exchange/finalize and roster mutation;
 - `onboarding_sessions`, provisional-to-active credential transition, mutation
@@ -1242,7 +1242,7 @@ The implementation is split by contract, not by file convenience.
 - protocol/integration tests for crash, response loss, concurrency, identity
   conflicts, and full backfill.
 
-### Local CLI track (aggie-cc2)
+### Local CLI track
 
 - local config v2 and atomic UUID migration;
 - `join`/`team` member catalog versus local registration behavior;
