@@ -148,8 +148,13 @@ skip_if_no_age() {
 # step that is already done, never to undo it.
 
 _binding_field() {  # $1 = team, $2 = json path under remote_binding
-  local cfg="$TEST_SKILL_DIR/teams/$1/config.json"
-  sqlite_mem "SELECT coalesce(json_extract(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.remote_binding.$2'), '');"
+  local cfg="$TEST_SKILL_DIR/teams/$1/config.json" resolved escaped
+  resolved="$(rf "$cfg")"
+  # Double the quotes: a team name may contain one, and the path goes inside a
+  # SQL string literal. The unescaped form ends the literal on such a team --
+  # the same class of bug this test exists to catch, one layer up.
+  escaped="$(printf '%s' "$resolved" | sed "s/'/''/g")"
+  sqlite_mem "SELECT coalesce(json_extract(CAST(readfile('$escaped') AS TEXT), '\$.remote_binding.$2'), '');"
 }
 
 @test "connect: a POST that committed but lost its response recovers on retry (#143)" {
@@ -233,6 +238,37 @@ _binding_field() {  # $1 = team, $2 = json path under remote_binding
   run eval "bash \"\$SCRIPTS/remote.sh\" ${printed#remote.sh }"
   [ "$status" -eq 0 ]
   [ "$(_binding_field testteam cipher_profile)" = "age-v1" ]
+}
+
+@test "connect: the printed recovery command is shell-safe for a hostile team name (#143)" {
+  # This asserts the CALL SITE, not the helper. tests/test_shquote.bats pins
+  # what agmsg_shq does; nothing there stops remote.sh from going back to a
+  # bare '$team', and the case that would catch it needs age and so never runs
+  # in CI. This one needs nothing installed: the server's declaration is set
+  # directly, so the client is never asked to MAKE an age-v1 declaration.
+  local team="it's a team"
+  run bash "$SCRIPTS/join.sh" "$team" alice claude-code /tmp/project-quote
+  [ "$status" -eq 0 ]
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" "$team"
+  [ "$status" -eq 0 ]
+
+  run curl -sS --get --data-urlencode "team_name=$team" --data-urlencode "profile=age-v1" \
+    "$ENDPOINT/_test/declare-cipher"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"age-v1"* ]]
+
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" "$team"
+  [ "$status" -ne 0 ]
+  local printed
+  printed="$(printf '%s\n' "$output" | sed -n "s/.*Connect the way it is registered: //p")"
+  [ -n "$printed" ]
+
+  # The real assertion: a shell parsing that line gets the team back as ONE
+  # argument, byte for byte. With a bare '$team' the quote closes early and
+  # this either fails to parse or splits into several arguments.
+  run eval "set -- $printed; printf '%s|%s' \"\$#\" \"\${!#}\""
+  [ "$status" -eq 0 ]
+  [ "$output" = "6|$team" ]
 }
 
 @test "connect: refuses to adopt a registration whose roster is not this team's (#143)" {

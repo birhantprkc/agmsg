@@ -234,6 +234,38 @@ class Handler(BaseHTTPRequestHandler):
         parts = self.path.split("?", 1)
         route = parts[0]
         query = parts[1] if len(parts) > 1 else ""
+        if route == "/_test/declare-cipher":
+            # Set the declaration a registered team carries, without the client
+            # having to be able to MAKE that declaration. Declaring age-v1 for
+            # real needs a key and so the age binary; the client behaviour
+            # under test is only "the server says X and this run asked for Y",
+            # so the two are separable and the test stays runnable where age
+            # is absent -- which is where CI runs it.
+            # Addressed by NAME, so the caller does not have to dig the minted
+            # team_id back out of local config -- which for a team whose name
+            # contains a quote is its own quoting problem, in the test rather
+            # than in the thing under test.
+            # Imported here like the other branches that need it: the existing
+            # local imports make `unquote` a local name for this whole method,
+            # so a module-level one would not be visible.
+            # unquote_PLUS: this arrives form-urlencoded, where a space may be
+            # '+'. Plain unquote would leave it and the name would not match.
+            from urllib.parse import unquote_plus
+            want_name, want_profile = "", ""
+            for pair in query.split("&"):
+                if pair.startswith("team_name="):
+                    want_name = unquote_plus(pair[len("team_name="):])
+                elif pair.startswith("profile="):
+                    want_profile = unquote_plus(pair[len("profile="):])
+            hit = [tid for tid, rec in REGISTERED_TEAMS.items()
+                   if rec["team_name"] == want_name]
+            if hit:
+                REGISTERED_TEAMS[hit[0]]["cipher_profile"] = want_profile
+                self._send_json(200, {"team_id": hit[0],
+                                      "cipher_profile": want_profile})
+            else:
+                self._send_json(404, {"error": {"code": "not-registered"}})
+            return
         if route == "/v1/members":
             team_id = self.headers.get("Agmsg-Team-ID", "")
             if team_id in REGISTERED_TEAMS:
