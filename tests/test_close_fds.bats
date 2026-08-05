@@ -78,16 +78,19 @@ setup() {
 # left behind is exactly how the bridge came to hang a shard while the engine
 # was already fixed.
 #
-# NOT listed, deliberately: scripts/drivers/types/codex/_session-start.sh. It
-# spawns a long-lived child the same way, but it is SOURCED into
-# session-start.sh's global context, so calling this there would close the
-# descriptors of the shell that sourced it rather than of a process about to
-# exec. It needs a different treatment and has not had one.
+# _session-start.sh is on this list even though it is SOURCED rather than run.
+# It was left off at first, on the reasoning that calling the helper there would
+# close the sourcing shell's descriptors — true, and not a reason to leave the
+# leak: wrapping only the spawn in a subshell closes the child's copies and
+# leaves the parent's alone (review P1, co1). "This one is different" is where
+# an exclusion list goes wrong, so the list is now every path, with no
+# exceptions to audit.
 @test "close-fds: every long-lived spawn path calls it" {
   for f in \
     "$BATS_TEST_DIRNAME/../scripts/remote-sync.sh" \
     "$BATS_TEST_DIRNAME/../scripts/drivers/types/codex/codex-bridge-launcher.sh" \
-    "$BATS_TEST_DIRNAME/../scripts/drivers/types/codex/codex-monitor.sh"
+    "$BATS_TEST_DIRNAME/../scripts/drivers/types/codex/codex-monitor.sh" \
+    "$BATS_TEST_DIRNAME/../scripts/drivers/types/codex/_session-start.sh"
   do
     grep -q 'agmsg_close_inherited_fds' "$f" || {
       echo "no fd close in $f"
