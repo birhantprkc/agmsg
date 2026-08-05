@@ -4,6 +4,11 @@ load test_helper
 
 setup() {
   setup_test_env
+  # Reset here, not at the end of the case that changes it: bats runs every
+  # test in this same shell, so a knob left set would quietly reconfigure the
+  # server for each later test — and a case that fails early never gets to
+  # put it back.
+  MOCK_TEAM_CIPHER_PROFILE=age-v1
   export PEER_SKILL_DIR=""
   # Some cases deliberately remove python3 from PATH to verify the control-plane
   # gate. Resolve the fixture interpreter in each test process before that
@@ -19,6 +24,7 @@ setup() {
   MOCK_HEALTH_TEAM_ID="${MOCK_HEALTH_TEAM_ID:-}" \
   MOCK_CONNECT_NO_AGE="${MOCK_CONNECT_NO_AGE:-}" \
   MOCK_CONNECT_TEAM_NAME="${MOCK_CONNECT_TEAM_NAME:-}" \
+  MOCK_TEAM_CIPHER_PROFILE="${MOCK_TEAM_CIPHER_PROFILE-age-v1}" \
     "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
     </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
   MOCK_SERVER_PID=$!
@@ -83,6 +89,7 @@ restart_mock_server() {
   MOCK_HEALTH_TEAM_ID="${MOCK_HEALTH_TEAM_ID:-}" \
   MOCK_CONNECT_NO_AGE="${MOCK_CONNECT_NO_AGE:-}" \
   MOCK_CONNECT_TEAM_NAME="${MOCK_CONNECT_TEAM_NAME:-}" \
+  MOCK_TEAM_CIPHER_PROFILE="${MOCK_TEAM_CIPHER_PROFILE-age-v1}" \
     "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
       </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
   MOCK_SERVER_PID=$!
@@ -759,8 +766,52 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   [ "$(storage_history mixed | jq -s 'length')" -eq 73 ]
 }
 
+@test "remote pull: an encrypted team with NO messages is still recorded as encrypted" {
+  # The case the old inference got wrong. It set the profile from the number of
+  # age-v1 envelopes this pull carried, so a team that had sent nothing yet was
+  # recorded 'none' — and `unlock` then refused a team that really was sealed.
+  # Here the server declares age-v1 and the pull carries zero envelopes.
+  MOCK_PULL_AGE=0
+  MOCK_TEAM_CIPHER_PROFILE=age-v1
+  restart_mock_server
+
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" encrypted
+  [ "$status" -eq 0 ]
+
+  local cfg
+  cfg="$TEST_SKILL_DIR/teams/encrypted/config.json"
+  [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.remote_binding.cipher_profile');")" = "age-v1" ]
+}
+
+@test "remote pull: no declaration is recorded as unknown, and unlock names the fix" {
+  # A team connected before the declaration was carried. The server answers
+  # null. Writing 'none' here is what made the binding unfixable, so it is
+  # written as unknown instead, and the refusal says who can settle it.
+  MOCK_TEAM_CIPHER_PROFILE=""
+  restart_mock_server
+
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" undeclared
+  [ "$status" -eq 0 ]
+
+  local cfg
+  cfg="$TEST_SKILL_DIR/teams/undeclared/config.json"
+  [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.remote_binding.cipher_profile');")" = "unknown" ]
+
+  # Well-formed on purpose: an incomplete invocation would be refused by an
+  # argument check ahead of this one, and the test would pass without ever
+  # reaching the refusal it names.
+  run bash "$SCRIPTS/remote.sh" unlock --bundle /dev/null \
+    --confirm-digest 0000000000000000000000000000000000000000000000000000000000000000 undeclared
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"is not known to the server"* ]]
+  # Stopping is right; stopping without a next move is not.
+  [[ "$output" == *"remote.sh connect"* ]]
+  [[ "$output" != *"not an encrypted pulled team awaiting unlock"* ]]
+}
+
 @test "remote pull: an observed age envelope prevents plaintext push" {
   MOCK_PULL_AGE=1
+  MOCK_TEAM_CIPHER_PROFILE=age-v1
   restart_mock_server
 
   run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" encrypted

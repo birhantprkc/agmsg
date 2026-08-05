@@ -20,6 +20,8 @@ type TeamRow = {
   write_allowed_ciphers: string[];
   max_blob_bytes: number;
   members_revision: string;
+  // Null until a machine declares it. Not the same as 'none'.
+  cipher_profile: string | null;
 };
 
 type LiveMessageRow = {
@@ -69,7 +71,8 @@ async function teamRow(
   const result = await client.query<TeamRow>(
     `SELECT team_id::text, team_name, current_seq::text, min_available_seq::text,
             policy_revision::text, accepted_envelope_versions,
-            write_allowed_ciphers, max_blob_bytes, members_revision::text
+            write_allowed_ciphers, max_blob_bytes, members_revision::text,
+            cipher_profile
        FROM teams WHERE team_id = $1${lock ? " FOR UPDATE" : ""}`,
     [id],
   );
@@ -83,6 +86,10 @@ function common(serverId: string, team: TeamRow): Record<string, unknown> {
     team_id: team.team_id,
     team_name: team.team_name,
     min_available_seq: team.min_available_seq,
+    // The DECLARED profile, distinct from write_allowed_ciphers, which says
+    // only what the server would accept. `null` is a real answer here — "no
+    // machine has declared it yet" — and a client must not read it as 'none'.
+    cipher_profile: team.cipher_profile ?? null,
   };
 }
 
@@ -775,10 +782,13 @@ export async function connectTeam(
     const inserted = await client.query(
       `INSERT INTO teams
          (team_id, team_name, members_revision,
-          accepted_envelope_versions, write_allowed_ciphers)
-       VALUES ($1, $2, 0, ARRAY[1], ARRAY['none', 'age-v1']::TEXT[])
+          accepted_envelope_versions, write_allowed_ciphers, cipher_profile)
+       VALUES ($1, $2, 0, ARRAY[1], ARRAY['none', 'age-v1']::TEXT[], $3)
        ON CONFLICT (team_id) DO NOTHING`,
-      [input.team_id, input.team_name],
+      // A client that sends no declaration leaves NULL. Nothing stands in for
+      // it: an absent declaration and a declared 'none' are different facts,
+      // and only one of them is safe to act on.
+      [input.team_id, input.team_name, input.cipher_profile ?? null],
     );
     // Refused as a uniqueness conflict, the same reason git refuses a
     // non-fast-forward push — not an authorization decision.

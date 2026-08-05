@@ -187,6 +187,14 @@ export const connectSchema = z
     team_id: uuidV7Schema,
     team_name: teamNameSchema,
     members: z.array(connectMemberSchema).max(1000),
+    // What this team uses — the connecting machine's own declaration, not a
+    // guess. Optional so a client that predates it still connects; the team is
+    // then recorded with no declaration rather than a wrong one.
+    //
+    // Not a secret: naming a cipher profile reveals nothing about the plaintext,
+    // and the server already sees the per-envelope `cipher` on every message it
+    // stores. What it could not see is a team that has sent none yet.
+    cipher_profile: z.enum(["none", "age-v1"]).optional(),
   })
   .strict()
   .superRefine((value, context) => {
