@@ -60,15 +60,12 @@ RUN_DIR="$SKILL_DIR/run"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/lib/delivery-rulefile.sh"
 
-# Single-quote-escape $1 for splicing into a hook command string as its own
-# shell argument: replace each embedded ' with '\'' (close the quote, emit an
-# escaped literal quote, reopen the quote), matching the standard POSIX
-# technique. Unlike `'$var'`, this round-trips correctly through the shell
-# that later executes the resulting "command" value even when $var itself
-# contains a single quote.
-_agmsg_shq() {
-  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
-}
+# Splices a value into a hook command string as its own shell argument. The
+# implementation is shared with every other place that prints a runnable
+# command; see lib/shquote.sh for why naive `'$var'` is not enough.
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/shquote.sh"
+_agmsg_shq() { agmsg_shq "$1"; }
 
 # The per-project delivery hooks file is the type's manifest `hooks_file=`
 # (project-relative), not a hardcoded per-type case. The hook FORMAT written into

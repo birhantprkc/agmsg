@@ -205,6 +205,10 @@ _binding_field() {  # $1 = team, $2 = json path under remote_binding
 }
 
 @test "connect: a repeat run cannot restate the registered cipher profile (#143)" {
+  # Declaring age-v1 means minting a key, so this one needs age. The refusal
+  # itself does not -- the quoting it prints is covered without age in
+  # test_shquote.bats, at the function that owns it.
+  skip_if_no_age
   run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam
   [ "$status" -eq 0 ]
   [ "$(_binding_field testteam cipher_profile)" = "age-v1" ]
@@ -216,12 +220,17 @@ _binding_field() {  # $1 = team, $2 = json path under remote_binding
   [[ "$output" == *"registered on"*"as 'age-v1'"* ]]
   [ "$(_binding_field testteam cipher_profile)" = "age-v1" ]
 
-  # The refusal must name a command this CLI accepts. connect takes no profile
-  # argument, so "re-run for age-v1" would be an instruction with nothing
-  # behind it -- assert the flag, and then prove the named invocation runs.
-  [[ "$output" == *"--e2ee"* ]]
+  # The refusal must name a command this CLI accepts. Take the printed string
+  # and RUN it -- checking that a flag appears in the text would pass just as
+  # well for an instruction with nothing behind it, which is what this
+  # replaced. Only the program path is substituted; the arguments are executed
+  # exactly as printed.
   [[ "$output" != *"Re-run connect for"* ]]
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam
+  local printed
+  printed="$(printf '%s\n' "$output" | sed -n 's/.*Connect the way it is registered: //p')"
+  [ -n "$printed" ]
+  [[ "$printed" == remote.sh\ connect\ * ]]
+  run eval "bash \"\$SCRIPTS/remote.sh\" ${printed#remote.sh }"
   [ "$status" -eq 0 ]
   [ "$(_binding_field testteam cipher_profile)" = "age-v1" ]
 }

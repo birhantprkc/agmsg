@@ -40,6 +40,8 @@ source "$SCRIPT_DIR/lib/storage.sh"
 source "$SCRIPT_DIR/lib/registry-lock.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/validate.sh"
+# shellcheck source=lib/shquote.sh
+source "$SCRIPT_DIR/lib/shquote.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/require-python3.sh"
 # shellcheck disable=SC1091
@@ -447,10 +449,15 @@ _remote_adopt_registration() {
       # "re-run for age-v1" would be an instruction with no command behind it.
       local recovery
       case "$declared_cipher" in
-        # Quoted, not `--`: this parser has no end-of-options marker and would
-        # take one as the team name.
-        age-v1) recovery="remote.sh connect --endpoint '$endpoint' --e2ee '$team'" ;;
-        none)   recovery="remote.sh connect --endpoint '$endpoint' '$team'" ;;
+        # agmsg_shq, not bare '...': a team name may legally contain a single
+        # quote (lib/validate.sh rejects only empty / . / .. / slashes / a
+        # leading dash / control characters), and one would close the quote
+        # early and leave the rest of the line as syntax for whatever shell
+        # this gets pasted into. Quoted rather than passed after `--`, too:
+        # this parser has no end-of-options marker and would take one as the
+        # team name.
+        age-v1) recovery="remote.sh connect --endpoint $(agmsg_shq "$endpoint") --e2ee $(agmsg_shq "$team")" ;;
+        none)   recovery="remote.sh connect --endpoint $(agmsg_shq "$endpoint") $(agmsg_shq "$team")" ;;
         *)      recovery="" ;;
       esac
       if [ -n "$recovery" ]; then
