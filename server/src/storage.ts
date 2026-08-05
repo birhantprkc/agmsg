@@ -290,6 +290,26 @@ export async function postMessages(
         "UPDATE teams SET current_seq = $2 WHERE team_id = $1",
         [teamId, next.toString()],
       );
+      // A team registered before declarations were carried has cipher_profile
+      // NULL, and connect cannot fill it: that route takes no credential, so a
+      // write there would let anyone who knows a team_id fix the profile ahead
+      // of the machine that owns the team. This is the other half of the same
+      // rule — a team is settled by what it actually stores.
+      //
+      // It belongs here and nowhere else because this route already writes to
+      // an existing team (current_seq, one line above), so filling a NULL adds
+      // no capability that storing the message did not already require. The
+      // value is the cipher of the envelope being stored, which the policy
+      // check above has already accepted.
+      //
+      // `IS NULL` only: a declaration, once made, is never rewritten by later
+      // traffic — a team that switches profile changes it by declaring, not by
+      // sending.
+      await client.query(
+        `UPDATE teams SET cipher_profile = $2
+          WHERE team_id = $1 AND cipher_profile IS NULL`,
+        [teamId, fresh[0]!.envelope.cipher],
+      );
     }
 
     const seen = new Set<string>();
@@ -812,12 +832,7 @@ export async function connectTeam(
   pool: Pool,
   input: ConnectInput,
 ): Promise<Record<string, unknown>> {
-  // Set when a repeat connect carries a declaration for a team that has none.
-  // The transaction below throws on that path, so the write cannot live inside
-  // it; it is applied after, on its own.
-  let backfillDeclaration: string | undefined;
-  try {
-    return await inTransaction(pool, async (client) => {
+  return inTransaction(pool, async (client) => {
       const serverId = await serverInstanceId(client);
       // The team and its opening policy row.
       // team_policy_history is required: capabilitySnapshot (and so
@@ -841,23 +856,14 @@ export async function connectTeam(
         // and only one of them is safe to act on.
         [input.team_id, input.team_name, input.cipher_profile ?? null],
       );
-      // A team registered before declarations were carried has cipher_profile
-      // NULL, and nothing else can ever fill it: the server never stored the
-      // answer and no other request supplies one. So a repeat connect that brings
-      // a declaration leaves the missing one behind, and the "reconnect the
-      // machine that already has the team" that `unlock` prints becomes advice
-      // that works.
+      // A repeat connect writes NOTHING, including no declaration. This route
+      // carries no credential, and its safety rests on exactly that: knowing a
+      // team_id is not permission to change an existing team. One write here —
+      // even one narrowed to `IS NULL` — would let anyone holding a team_id
+      // fix the profile before the machine that owns the team, and 'none' fixed
+      // first is the dangerous direction. A team already registered is settled
+      // by a message it stores, below, not by being named again.
       //
-      // Recorded OUTSIDE this transaction, because the next statement throws and
-      // would roll it back with everything else — the first version of this did
-      // exactly that and left the column NULL while appearing to fill it.
-      //
-      // Deliberately narrow: it writes only where the column IS NULL, so it can
-      // never overwrite an existing declaration, and it does not soften the
-      // refusal — registering a team twice is still 409.
-      if (inserted.rowCount === 0 && input.cipher_profile !== undefined) {
-        backfillDeclaration = input.cipher_profile;
-      }
       // Refused as a uniqueness conflict, the same reason git refuses a
       // non-fast-forward push — not an authorization decision.
       if (inserted.rowCount === 0) {
@@ -890,22 +896,8 @@ export async function connectTeam(
           [input.team_id, member.member_id, member.name],
         );
       }
-      return capabilitySnapshot(client, input.team_id);
-    });
-  } finally {
-    // Runs on both exits, but only ever set on the 409 path. Its own statement,
-    // so the rollback that carries the refusal cannot take it too. `IS NULL`
-    // keeps it to filling a gap: an existing declaration is never rewritten,
-    // and two machines racing to fill the same gap agree on whichever lands
-    // first rather than flipping the team back and forth.
-    if (backfillDeclaration !== undefined) {
-      await pool.query(
-        `UPDATE teams SET cipher_profile = $2
-          WHERE team_id = $1 AND cipher_profile IS NULL`,
-        [input.team_id, backfillDeclaration],
-      );
-    }
-  }
+    return capabilitySnapshot(client, input.team_id);
+  });
 }
 
 async function roster(

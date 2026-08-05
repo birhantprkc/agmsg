@@ -879,4 +879,52 @@ describeDatabase("remote storage HTTP API v1", () => {
     );
     expect(rows.rows[0]?.count).toBe("0");
   });
+
+  // Last on purpose: the cases above assert exact sequence numbers against a
+  // team they share, so a message stored here would move every one of them.
+  // Placing these first is what broke nine of them.
+  it("settles an undeclared team's cipher from the first message it stores", async () => {
+    // Teams registered before declarations were carried have cipher_profile
+    // NULL, and `connect` must not fill it — that route takes no credential, so
+    // a write there would let anyone holding a team_id fix the profile ahead of
+    // the machine that owns the team. This is where it is settled instead: a
+    // route that already writes to the existing team (current_seq), reached by
+    // a caller whose message got past the policy check.
+    await pool.query("UPDATE teams SET cipher_profile = NULL WHERE team_id = $1", [teamId]);
+
+    const settling = message("750e8400-e29b-41d4-a716-4466554400a1", "settles it");
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers,
+      payload: { messages: [settling] },
+    });
+    expect(response.statusCode).toBe(200);
+
+    const after = await pool.query<{ cipher_profile: string | null }>(
+      "SELECT cipher_profile FROM teams WHERE team_id = $1",
+      [teamId],
+    );
+    expect(after.rows[0]?.cipher_profile).toBe("none");
+  });
+
+  it("never rewrites a declaration a team already has", async () => {
+    // Once declared, later traffic does not reclassify the team: a team that
+    // changes profile does so by declaring, not by what it happens to send.
+    await pool.query("UPDATE teams SET cipher_profile = 'age-v1' WHERE team_id = $1", [teamId]);
+
+    const later = message("750e8400-e29b-41d4-a716-4466554400a2", "plaintext");
+    await app.inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers,
+      payload: { messages: [later] },
+    });
+
+    const after = await pool.query<{ cipher_profile: string | null }>(
+      "SELECT cipher_profile FROM teams WHERE team_id = $1",
+      [teamId],
+    );
+    expect(after.rows[0]?.cipher_profile).toBe("age-v1");
+  });
 });
