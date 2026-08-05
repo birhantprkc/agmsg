@@ -191,6 +191,17 @@ _binding_field() {  # $1 = team, $2 = json path under remote_binding
   [[ "$output" == *"Refusing to re-anchor"* ]]
   # The binding still points at the server it was made against.
   [ "$(_binding_field testteam server_instance_id)" = "$anchored" ]
+
+  # And the way out the refusal names has to WORK. disconnect drops the claim
+  # on the old anchor; the connect after it must get through, not land back on
+  # the same refusal. A refusal with no reachable next state is the defect this
+  # whole change exists to remove.
+  run bash "$SCRIPTS/remote.sh" disconnect testteam
+  [ "$status" -eq 0 ]
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"Refusing to re-anchor"* ]]
+  [ "$(_binding_field testteam server_instance_id)" != "$anchored" ]
 }
 
 @test "connect: a repeat run cannot restate the registered cipher profile (#143)" {
@@ -203,6 +214,15 @@ _binding_field() {  # $1 = team, $2 = json path under remote_binding
   run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
   [ "$status" -ne 0 ]
   [[ "$output" == *"registered on"*"as 'age-v1'"* ]]
+  [ "$(_binding_field testteam cipher_profile)" = "age-v1" ]
+
+  # The refusal must name a command this CLI accepts. connect takes no profile
+  # argument, so "re-run for age-v1" would be an instruction with nothing
+  # behind it -- assert the flag, and then prove the named invocation runs.
+  [[ "$output" == *"--e2ee"* ]]
+  [[ "$output" != *"Re-run connect for"* ]]
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam
+  [ "$status" -eq 0 ]
   [ "$(_binding_field testteam cipher_profile)" = "age-v1" ]
 }
 

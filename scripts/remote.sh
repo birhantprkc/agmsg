@@ -442,7 +442,22 @@ _remote_adopt_registration() {
     ''|null) ;;
     "$binding_cipher") ;;
     *)
-      echo "agmsg: team '$team' is registered on $endpoint as '$declared_cipher', but this connect asked for '$binding_cipher'. Refusing to record a profile the registration does not have. Re-run connect for '$declared_cipher'." >&2
+      # Name the invocation that would work, not the profile. connect takes no
+      # profile argument -- age-v1 is --e2ee and none is its absence -- so
+      # "re-run for age-v1" would be an instruction with no command behind it.
+      local recovery
+      case "$declared_cipher" in
+        # Quoted, not `--`: this parser has no end-of-options marker and would
+        # take one as the team name.
+        age-v1) recovery="remote.sh connect --endpoint '$endpoint' --e2ee '$team'" ;;
+        none)   recovery="remote.sh connect --endpoint '$endpoint' '$team'" ;;
+        *)      recovery="" ;;
+      esac
+      if [ -n "$recovery" ]; then
+        echo "agmsg: team '$team' is registered on $endpoint as '$declared_cipher', but this connect asked for '$binding_cipher'. Refusing to record a profile the registration does not have. Connect the way it is registered: $recovery" >&2
+      else
+        echo "agmsg: team '$team' is registered on $endpoint as '$declared_cipher', which this version does not know how to connect as (it understands 'none' and 'age-v1'). Refusing to record a profile the registration does not have." >&2
+      fi
       rm -f "$caps_file" "$members_file"; trap - EXIT INT TERM
       return 1
       ;;
@@ -1276,13 +1291,24 @@ cmd_connect() {
   # registration to adopt. The recorded id is not just required to EXIST -- it
   # is handed to the adopt path, which refuses unless the server answering now
   # is the same one. Existence is a precondition; the identity check is there.
-  local existing_endpoint existing_remote_team_id existing_server_instance
+  #
+  # A DISCONNECTED binding is not a live anchor. disconnect leaves the fields
+  # in place and records disconnected_at, and that record is the operator
+  # saying they no longer claim this anchor -- so connect must stop holding
+  # them to it. Without this, the refusal below would tell them to disconnect
+  # and connect again, and the retry would re-enter with the same stale
+  # expected id and refuse identically, forever. A refusal has to leave a move
+  # that actually works.
+  local existing_endpoint existing_remote_team_id existing_server_instance \
+    existing_disconnected_at
   existing_endpoint="$(_remote_read_config_field "$cfg" '$.remote_binding.endpoint')"
   existing_remote_team_id="$(_remote_read_config_field "$cfg" '$.remote_binding.remote_team_id')"
   existing_server_instance="$(_remote_read_config_field "$cfg" '$.remote_binding.server_instance_id')"
+  existing_disconnected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.disconnected_at')"
   if [ "$existing_endpoint" = "$endpoint" ] \
     && [ "$existing_remote_team_id" = "$team_id" ] \
-    && [ -n "$existing_server_instance" ] && [ "$existing_server_instance" != "null" ]; then
+    && [ -n "$existing_server_instance" ] && [ "$existing_server_instance" != "null" ] \
+    && { [ -z "$existing_disconnected_at" ] || [ "$existing_disconnected_at" = "null" ]; }; then
     _remote_adopt_registration "$team" "$cfg" "$endpoint" "$team_id" \
       "$binding_cipher" "$existing_server_instance" || exit 1
   else
