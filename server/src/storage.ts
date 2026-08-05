@@ -248,6 +248,48 @@ export async function postMessages(
       }
     }
 
+    // The team's single cipher, enforced before anything is stored.
+    //
+    // `write_allowed_ciphers` above is a different question — what the server
+    // will ACCEPT — and it permits both. `cipher_profile` is what this team
+    // chose, and a client reads it to decide whether plaintext may be pushed at
+    // all. A value that traffic is free to contradict is not a fact about the
+    // team, and a safety decision resting on it would be worse than none: it
+    // reads as dependable precisely because writes went through.
+    //
+    // So a batch that disagrees with the team, or with itself while the team is
+    // undeclared, is refused whole. Fail-closed and before the writes: a
+    // partial store would leave the team holding messages under a cipher it
+    // does not use, which is the state this column exists to make impossible.
+    if (fresh.length > 0) {
+      const ciphers = new Set(fresh.map((message) => message.envelope.cipher));
+      const expected = team.cipher_profile ?? (ciphers.size === 1 ? [...ciphers][0]! : null);
+      if (expected === null || ciphers.size !== 1 || !ciphers.has(expected)) {
+        // The refusal carries its own way out. One path here is reachable by a
+        // machine that has done nothing wrong: the team declared age-v1 after
+        // this machine last looked, so it is still sending plaintext. Blocking
+        // that write is right — it would be readable by the server — but the
+        // sender cannot act on "mismatch" alone. `remedy` names what makes it
+        // send the right thing, and `cipher_profile` says what to send.
+        throw new ProtocolError(
+          409,
+          "cipher-profile-mismatch",
+          team.cipher_profile === null
+            ? "an undeclared team cannot be settled by a batch that mixes ciphers"
+            : "message cipher does not match the team's declared cipher profile",
+          {
+            cipher_profile: team.cipher_profile,
+            batch_ciphers: [...ciphers].sort(),
+            remedy:
+              team.cipher_profile === null
+                ? "send one batch whose messages all use the same cipher; that settles the team"
+                : "re-read this team (remote.sh pull, or unlock if you hold the key) and send under its declared cipher",
+          },
+          binding,
+        );
+      }
+    }
+
     let next = BigInt(team.current_seq);
     if (BigInt(fresh.length) > MAX_SEQUENCE - next) {
       throw new ProtocolError(
@@ -293,33 +335,20 @@ export async function postMessages(
       // A team registered before declarations were carried has cipher_profile
       // NULL, and connect cannot fill it: that route takes no credential, so a
       // write there would let anyone who knows a team_id fix the profile ahead
-      // of the machine that owns the team. This is the other half of the same
-      // rule — a team is settled by what it actually stores.
+      // of the machine that owns the team. It is settled here instead — by what
+      // the team actually stores — on a route that already writes to this same
+      // row (current_seq, one line above) and has already run every check.
       //
-      // It belongs here and nowhere else because this route already writes to
-      // an existing team (current_seq, one line above), so filling a NULL adds
-      // no capability that storing the message did not already require. The
-      // value is the cipher of the envelope being stored, which the policy
-      // check above has already accepted.
+      // The batch is known to agree with itself by now: the guard above refused
+      // it otherwise, so this cannot be decided by which message came first.
       //
-      // `IS NULL` only: a declaration, once made, is never rewritten by later
-      // traffic — a team that switches profile changes it by declaring, not by
-      // sending.
-      //
-      // And only when this batch AGREES with itself. The policy allows both
-      // ciphers, so a single batch may legitimately carry a mix; taking the
-      // first message would let the order of an array decide a permanent fact
-      // about the team, and the same two messages sent the other way round
-      // would declare the opposite. A mixed batch stores normally and settles
-      // nothing — the team stays NULL until something says one thing.
-      const ciphers = new Set(fresh.map((message) => message.envelope.cipher));
-      if (ciphers.size === 1) {
-        await client.query(
-          `UPDATE teams SET cipher_profile = $2
-            WHERE team_id = $1 AND cipher_profile IS NULL`,
-          [teamId, fresh[0]!.envelope.cipher],
-        );
-      }
+      // `IS NULL` only. Once declared, a team is not reclassified by later
+      // traffic — and traffic that disagrees never reaches this point at all.
+      await client.query(
+        `UPDATE teams SET cipher_profile = $2
+          WHERE team_id = $1 AND cipher_profile IS NULL`,
+        [teamId, fresh[0]!.envelope.cipher],
+      );
     }
 
     const seen = new Set<string>();
