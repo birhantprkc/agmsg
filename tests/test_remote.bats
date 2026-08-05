@@ -140,6 +140,56 @@ skip_if_no_age() {
   [ "$status" -eq 0 ]
 }
 
+# --- #143: a connect that already registered must not dead-end -------------
+#
+# Registration commits on the server in one transaction, and the binding is
+# written locally only after a 200. So the only thing a failed connect can
+# leave behind is local, derived state -- and the way back in is to skip the
+# step that is already done, never to undo it.
+
+_binding_field() {  # $1 = team, $2 = json path under remote_binding
+  local cfg="$TEST_SKILL_DIR/teams/$1/config.json"
+  sqlite_mem "SELECT coalesce(json_extract(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.remote_binding.$2'), '');"
+}
+
+@test "connect: a POST that committed but lost its response recovers on retry (#143)" {
+  # Arm the cut: the next /v1/connect registers the team and answers nothing.
+  run curl -sS "$ENDPOINT/_test/drop-next-connect"
+  [ "$status" -eq 0 ]
+
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -ne 0 ]
+  # Nothing recorded: the binding is only ever written after a 200. This is
+  # exactly the state a lost response leaves -- registered there, unknown here.
+  [ "$(_binding_field testteam server_instance_id)" = "" ]
+
+  # Before #143 this retry was a 409 dead end with no way out but recreating
+  # the team (and losing its local history).
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"adopting that registration"* ]]
+  [ -n "$(_binding_field testteam server_instance_id)" ]
+  [ "$(_binding_field testteam remote_team_name)" = "testteam" ]
+}
+
+@test "connect: refuses to adopt a registration whose roster is not this team's (#143)" {
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -eq 0 ]
+
+  # Give the local team a member the server's registration does not have. The
+  # team_id still matches, so only the roster check can tell these apart --
+  # and adopting on a name match alone would be the bug.
+  local cfg="$TEST_SKILL_DIR/teams/testteam/config.json"
+  local updated
+  updated="$(sqlite_mem "SELECT json_set(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.agents.intruder', json_object('member_id', '018f3f7e-9999-7000-8000-00000000dead'));")"
+  printf '%s' "$updated" > "$cfg"
+
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"roster is not this team's"* ]]
+  [[ "$output" == *"real conflict"* ]]
+}
+
 @test "connect: requires the response protocol header" {
   run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" missing-protocol-header-token myteam
   [ "$status" -ne 0 ]
@@ -300,12 +350,25 @@ skip_if_no_age() {
   [ -n "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.agents.bob.member_id');")" ]
 }
 
-@test "connect: refuses a second connect for the same team_id with 409 (Done-when 5)" {
+@test "connect: a second connect does not re-register, it resumes (Done-when 5, #143)" {
+  # This test used to assert the opposite -- that a repeat connect FAILED with
+  # "already registered". That assertion was the dead end #143 reports: the
+  # same team, with the same roster, could never finish a connect whose later
+  # steps had failed. The server's rule is unchanged and still right (a team_id
+  # registers once, refused like a non-fast-forward push); what changed is that
+  # the client no longer sends a registration it can see is already done.
   bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
-  # The mock keeps the registered team_id; a repeat is a uniqueness conflict.
+  local first_revision
+  first_revision="$(_binding_field testteam binding_revision)"
+
   run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"already registered"* ]]
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"adopting that registration"* ]]
+  # No POST was attempted: the announcement that precedes it is absent, and a
+  # POST here would have been refused 409.
+  [[ "$output" != *"Connecting team"* ]]
+  [[ "$output" != *"already registered on this remote"* ]]
+  [ "$(_binding_field testteam binding_revision)" -gt "$first_revision" ]
 }
 
 # --- status --------------------------------------------------------------

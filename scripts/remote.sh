@@ -266,6 +266,158 @@ _remote_http_post_json() {
   printf '%s' "$http_code"
 }
 
+# _remote_http_get_json <url> <team_id> <out_body_file> -> prints http_code
+# The team-scoped read routes take their team from the Agmsg-Team-ID header.
+# Nothing else is sent, because there is nothing else to send: this protocol
+# carries no credential at all (see cmd_connect).
+_remote_http_get_json() {
+  local url="$1" team_id="$2" out_file="$3" cfg curl_output curl_status=0
+  cfg="$(mktemp "${TMPDIR:-/tmp}/agmsg-curl-cfg.XXXXXX")"
+  chmod 600 "$cfg"
+  trap 'rm -f "$cfg"' EXIT INT TERM
+  {
+    printf 'url = "%s"\n' "$url"
+    printf 'request = "GET"\n'
+    printf 'header = "Agmsg-Protocol-Version: 1"\n'
+    printf 'header = "Agmsg-Team-ID: %s"\n' "$team_id"
+    printf 'connect-timeout = "10"\n'
+    printf 'max-time = "15"\n'
+    printf 'max-filesize = "2097152"\n'
+  } > "$cfg"
+  if curl_output=$(curl -sS -o "$out_file" -w '%{http_code}' -K "$cfg" 2>/dev/null); then
+    :
+  else
+    curl_status=$?
+  fi
+  [ "$curl_status" -eq 0 ] || curl_output="000"
+  rm -f "$cfg"
+  trap - EXIT INT TERM
+  printf '%s' "$curl_output"
+}
+
+# _remote_write_binding <cfg> <endpoint> <binding_cipher> <resp_file>
+# Records the binding on the team config from a capability snapshot. No
+# credential is stored: the snapshot holds nothing that cannot be fetched
+# again, and the team_id is a value we minted ourselves.
+#
+# ONE writer for both the first connect and the adopt path below. Two copies of
+# this object would drift, and the second copy is the one nobody re-reads.
+_remote_write_binding() {
+  local cfg="$1" endpoint="$2" binding_cipher="$3" resp_file="$4"
+  local resp_escaped cfg_escaped connected_at updated \
+    server_instance_id remote_team_id remote_team_name protocol_version
+  resp_escaped="$(sed "s/'/''/g" "$resp_file")"
+  {
+    IFS= read -r server_instance_id
+    IFS= read -r remote_team_id
+    IFS= read -r remote_team_name
+    IFS= read -r protocol_version
+  } < <(agmsg_sqlite_mem \
+      "SELECT json_extract('$resp_escaped', '\$.server_instance_id');
+       SELECT json_extract('$resp_escaped', '\$.team_id');
+       SELECT json_extract('$resp_escaped', '\$.team_name');
+       SELECT json_extract('$resp_escaped', '\$.protocol_version');")
+  connected_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  agmsg_lock_acquire "$(dirname "$cfg")" || return 1
+  cfg_escaped="$(sed "s/'/''/g" "$cfg")"
+  updated=$(agmsg_sqlite_mem \
+    "SELECT json_set('$cfg_escaped', '\$.remote_binding', json_object(
+       'endpoint', '$(_agmsg_sqlesc "$endpoint")',
+       'server_instance_id', '$(_agmsg_sqlesc "$server_instance_id")',
+       'remote_team_id', '$(_agmsg_sqlesc "$remote_team_id")',
+       'remote_team_name', '$(_agmsg_sqlesc "$remote_team_name")',
+       'protocol_version', $protocol_version,
+       'cipher_profile', '$binding_cipher',
+       'capabilities', json('$resp_escaped'),
+       'connected_at', '$(_agmsg_sqlesc "$connected_at")',
+       'disconnected_at', null,
+       'binding_revision',
+         coalesce(json_extract('$cfg_escaped', '\$.remote_binding.binding_revision'), 0) + 1
+     ));")
+  agmsg_write_atomic "$cfg" "$updated"
+  agmsg_lock_release
+}
+
+# _remote_adopt_registration <team> <cfg> <endpoint> <team_id> <binding_cipher>
+#
+# Takes over a registration this server already holds for <team_id> and writes
+# the binding for it, so connect continues from the step that still has work
+# instead of stopping. Two callers, one situation: a retry that already holds a
+# binding, and a first attempt whose POST committed but whose response never
+# arrived. In both, the REMOTE side is complete — /v1/connect commits the team,
+# its opening policy and the whole roster in one transaction — and only local,
+# derived state is missing. There is nothing to roll back on either side.
+#
+# Deliberately absent, and not an oversight: a route that REMOVES a
+# registration. This protocol carries no credential — reaching the server is
+# the permission, and the trust boundary is the network it sits on. A delete
+# route would let anyone who can reach the server destroy a team's registration
+# with nothing but a team_id, which is strictly worse than the dead end it
+# would be removing. The reason /v1/connect refuses to WRITE to a team that
+# already exists is the same reason it must not offer to delete one.
+#
+# Returns 0 when the binding was written, 1 when the registration is not ours
+# or the server could not be read.
+_remote_adopt_registration() {
+  local team="$1" cfg="$2" endpoint="$3" team_id="$4" binding_cipher="$5"
+  local caps_file members_file http_code remote_team_name local_team_name \
+    local_ids remote_ids cfg_escaped members_escaped
+  caps_file="$(mktemp "${TMPDIR:-/tmp}/agmsg-caps.XXXXXX")"
+  members_file="$(mktemp "${TMPDIR:-/tmp}/agmsg-members.XXXXXX")"
+  trap 'rm -f "$caps_file" "$members_file"' EXIT INT TERM
+
+  http_code="$(_remote_http_get_json "$endpoint/v1/capabilities" "$team_id" "$caps_file")"
+  if [ "$http_code" != "200" ]; then
+    echo "agmsg: '$endpoint' holds a registration for team '$team' but its capabilities could not be read (HTTP $http_code); cannot confirm the registration is this team's." >&2
+    rm -f "$caps_file" "$members_file"; trap - EXIT INT TERM
+    return 1
+  fi
+
+  # Confirm the registration is OURS before adopting it. team_id is minted
+  # locally, so a server holding it is almost certainly holding our own earlier
+  # attempt -- but "almost certainly" is not something to write a binding on.
+  # The name is the cheap check; the roster is the one that means it, because
+  # every member_id was minted on this machine too.
+  remote_team_name="$(_remote_read_config_field "$caps_file" '$.team_name')"
+  local_team_name="$(_remote_read_config_field "$cfg" '$.name')"
+  if [ "$remote_team_name" != "$local_team_name" ]; then
+    echo "agmsg: '$endpoint' already has team_id $team_id, but registered under the name '$remote_team_name' while this team is '$local_team_name'. Refusing to adopt a registration that is not this team's." >&2
+    rm -f "$caps_file" "$members_file"; trap - EXIT INT TERM
+    return 1
+  fi
+
+  http_code="$(_remote_http_get_json "$endpoint/v1/members" "$team_id" "$members_file")"
+  if [ "$http_code" != "200" ]; then
+    echo "agmsg: '$endpoint' holds a registration for team '$team' but its roster could not be read (HTTP $http_code); cannot confirm the registration is this team's." >&2
+    rm -f "$caps_file" "$members_file"; trap - EXIT INT TERM
+    return 1
+  fi
+  cfg_escaped="$(sed "s/'/''/g" "$cfg")"
+  members_escaped="$(sed "s/'/''/g" "$members_file")"
+  local_ids="$(agmsg_sqlite_mem \
+    "SELECT coalesce(group_concat(mid, ','), '') FROM
+       (SELECT json_extract(value, '\$.member_id') AS mid
+          FROM json_each(json_extract('$cfg_escaped', '\$.agents')) ORDER BY mid);")"
+  remote_ids="$(agmsg_sqlite_mem \
+    "SELECT coalesce(group_concat(mid, ','), '') FROM
+       (SELECT json_extract(value, '\$.member_id') AS mid
+          FROM json_each(json_extract('$members_escaped', '\$.members')) ORDER BY mid);")"
+  if [ "$local_ids" != "$remote_ids" ]; then
+    echo "agmsg: '$endpoint' already has team_id $team_id, but its roster is not this team's. Refusing to adopt it. This is a real conflict, not a half-finished connect — resolve it before connecting this team here." >&2
+    rm -f "$caps_file" "$members_file"; trap - EXIT INT TERM
+    return 1
+  fi
+
+  echo "Team '$team' is already registered on $endpoint; adopting that registration and continuing." >&2
+  _remote_write_binding "$cfg" "$endpoint" "$binding_cipher" "$caps_file" || {
+    rm -f "$caps_file" "$members_file"; trap - EXIT INT TERM
+    return 1
+  }
+  rm -f "$caps_file" "$members_file"
+  trap - EXIT INT TERM
+  return 0
+}
+
 # _remote_local_disconnect <team> <cfg> [expected_binding_revision]
 # Marks the binding disconnected. That is now the whole of it: there is no
 # credential to delete and nothing to revoke, so this writes disconnected_at
@@ -1074,59 +1226,47 @@ cmd_connect() {
         json('[]'))
     );" > "$body_file"
 
-  echo "Connecting team '$team' to $endpoint ..." >&2
-  http_code="$(_remote_http_post_json "$endpoint/v1/connect" "$body_file" "$resp_file" "$header_file")"
-  if [ "$http_code" = "409" ]; then
-    echo "agmsg: team '$team' (team_id $team_id) is already registered on this remote. A team_id registers once — this is a uniqueness conflict (like a non-fast-forward push), not a transient error to retry." >&2
-    exit 1
-  fi
-  if [ "$http_code" != "200" ]; then
-    echo "agmsg: connect failed — $endpoint/v1/connect returned HTTP $http_code" >&2
-    exit 1
+  # A connect that already registered this team here must not register it
+  # again. The steps AFTER registration -- key setup, the store move, the
+  # engine -- are the ones that fail, and they are all local and all
+  # re-derivable, so the way back in is to skip the one step that is already
+  # done. Matching on endpoint AND remote_team_id AND a recorded
+  # server_instance_id: a binding pointing somewhere else is not this
+  # connection's business, and one with no server_instance_id never completed a
+  # registration to adopt.
+  local existing_endpoint existing_remote_team_id existing_server_instance
+  existing_endpoint="$(_remote_read_config_field "$cfg" '$.remote_binding.endpoint')"
+  existing_remote_team_id="$(_remote_read_config_field "$cfg" '$.remote_binding.remote_team_id')"
+  existing_server_instance="$(_remote_read_config_field "$cfg" '$.remote_binding.server_instance_id')"
+  if [ "$existing_endpoint" = "$endpoint" ] \
+    && [ "$existing_remote_team_id" = "$team_id" ] \
+    && [ -n "$existing_server_instance" ] && [ "$existing_server_instance" != "null" ]; then
+    _remote_adopt_registration "$team" "$cfg" "$endpoint" "$team_id" "$binding_cipher" || exit 1
+  else
+    echo "Connecting team '$team' to $endpoint ..." >&2
+    http_code="$(_remote_http_post_json "$endpoint/v1/connect" "$body_file" "$resp_file" "$header_file")"
+    if [ "$http_code" = "409" ]; then
+      # The server holds this team_id and we hold no binding for it. That is
+      # what a POST which committed but whose response never arrived leaves
+      # behind -- the registration is complete, and the only thing missing is
+      # our record of it. Rebuild that record instead of stopping: the
+      # capability snapshot behind /v1/capabilities is the same object
+      # /v1/connect returns on success. _remote_adopt_registration refuses if
+      # the team there turns out not to be ours.
+      _remote_adopt_registration "$team" "$cfg" "$endpoint" "$team_id" "$binding_cipher" || exit 1
+    elif [ "$http_code" != "200" ]; then
+      echo "agmsg: connect failed — $endpoint/v1/connect returned HTTP $http_code" >&2
+      exit 1
+    else
+      _remote_write_binding "$cfg" "$endpoint" "$binding_cipher" "$resp_file" || exit 1
+    fi
   fi
 
-  # The response is the server's capability snapshot: server_instance_id,
-  # protocol_version, the team ids it now holds, min_available_seq, and the
-  # write policy. The whole object is the binding's capabilities record.
-  local resp_escaped server_instance_id remote_team_id remote_team_name \
-    protocol_version min_available_seq
-  resp_escaped="$(sed "s/'/''/g" "$resp_file")"
-  {
-    IFS= read -r server_instance_id
-    IFS= read -r remote_team_id
-    IFS= read -r remote_team_name
-    IFS= read -r protocol_version
-    IFS= read -r min_available_seq
-  } < <(agmsg_sqlite_mem \
-      "SELECT json_extract('$resp_escaped', '\$.server_instance_id');
-       SELECT json_extract('$resp_escaped', '\$.team_id');
-       SELECT json_extract('$resp_escaped', '\$.team_name');
-       SELECT json_extract('$resp_escaped', '\$.protocol_version');
-       SELECT json_extract('$resp_escaped', '\$.min_available_seq');")
-
-  # Record the binding on the team config. No credential is stored: the
-  # response holds nothing that cannot be re-fetched by connecting again, and
-  # the team_id is a value we minted ourselves.
-  local connected_at updated
-  connected_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  agmsg_lock_acquire "$TEAMS_DIR/$team" || exit 1
-  cfg_escaped="$(sed "s/'/''/g" "$cfg")"
-  updated=$(agmsg_sqlite_mem \
-    "SELECT json_set('$cfg_escaped', '\$.remote_binding', json_object(
-       'endpoint', '$(_agmsg_sqlesc "$endpoint")',
-       'server_instance_id', '$(_agmsg_sqlesc "$server_instance_id")',
-       'remote_team_id', '$(_agmsg_sqlesc "$remote_team_id")',
-       'remote_team_name', '$(_agmsg_sqlesc "$remote_team_name")',
-       'protocol_version', $protocol_version,
-       'cipher_profile', '$binding_cipher',
-       'capabilities', json('$resp_escaped'),
-       'connected_at', '$(_agmsg_sqlesc "$connected_at")',
-       'disconnected_at', null,
-       'binding_revision',
-         coalesce(json_extract('$cfg_escaped', '\$.remote_binding.binding_revision'), 0) + 1
-     ));")
-  agmsg_write_atomic "$cfg" "$updated"
-  agmsg_lock_release
+  # Read back what was recorded, rather than what any one path parsed. Both
+  # ways in write the binding through _remote_write_binding, so the config is
+  # the single place that knows the answer after either.
+  local remote_team_name
+  remote_team_name="$(_remote_read_config_field "$cfg" '$.remote_binding.remote_team_name')"
 
   if [ "$e2ee" -eq 0 ] && ! _remote_binding_allows_cipher "$cfg" none; then
     echo "agmsg: this remote does not allow $binding_cipher; no sync engine was started." >&2

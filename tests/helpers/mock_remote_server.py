@@ -39,6 +39,13 @@ CONNECT_SERVER_ID = "018f3f7e-3333-7000-8000-000000000001"
 # make the server disagree with the client's binding.
 HEALTH_TEAM_ID = os.environ.get("MOCK_HEALTH_TEAM_ID", "")
 REGISTERED_TEAM_IDS = set()
+# team_id -> {"team_name": str, "members": [...]}, what /v1/connect was sent.
+REGISTERED_TEAMS = {}
+# Armed by GET /_test/drop-next-connect, consumed by the next /v1/connect:
+# commit the registration, answer nothing. Armed through a route rather than an
+# env var because the registration has to SURVIVE into the retry, and a restart
+# to change the env would take it with it.
+DROP_NEXT_CONNECT = False
 
 
 PULL_SERVER_ID = CONNECT_SERVER_ID
@@ -168,6 +175,11 @@ class Handler(BaseHTTPRequestHandler):
                 "team_id": team_id,
             })
             return
+        if self.path == "/_test/drop-next-connect":
+            global DROP_NEXT_CONNECT
+            DROP_NEXT_CONNECT = True
+            self._send_json(200, {"armed": True})
+            return
         if self.path == "/v1/capabilities":
             team_id = self.headers.get("Agmsg-Team-ID", "")
             current_seq = (len(PULL_MESSAGES) + len(PUSHED_MESSAGES)
@@ -176,6 +188,10 @@ class Handler(BaseHTTPRequestHandler):
                 "protocol_version": 1,
                 "server_instance_id": CONNECT_SERVER_ID,
                 "team_id": team_id,
+                # The real snapshot carries the name the server holds, and a
+                # client rebuilding a lost binding compares against it.
+                "team_name": REGISTERED_TEAMS.get(team_id, {}).get(
+                    "team_name", CONNECT_TEAM_NAME or ""),
                 "current_seq": str(current_seq),
                 "next_sequence_boundary": str(current_seq + 1),
                 "min_available_seq": "0",
@@ -209,6 +225,18 @@ class Handler(BaseHTTPRequestHandler):
         route = parts[0]
         query = parts[1] if len(parts) > 1 else ""
         if route == "/v1/members":
+            team_id = self.headers.get("Agmsg-Team-ID", "")
+            if team_id in REGISTERED_TEAMS:
+                self._send_json(200, {
+                    "protocol_version": 1,
+                    "server_instance_id": CONNECT_SERVER_ID,
+                    "team_id": team_id,
+                    "min_available_seq": "0",
+                    "cipher_profile": TEAM_CIPHER_PROFILE or None,
+                    "members_revision": "0",
+                    "members": REGISTERED_TEAMS[team_id]["members"],
+                })
+                return
             self._send_json(200, {
                 "protocol_version": 1,
                 "server_instance_id": PULL_SERVER_ID,
@@ -419,6 +447,31 @@ class Handler(BaseHTTPRequestHandler):
                                       "error": {"code": "team-already-exists"}})
                 return
             REGISTERED_TEAM_IDS.add(team_id)
+            # What the server now holds for this team. The real one stores the
+            # name and roster it was sent and answers /v1/capabilities and
+            # /v1/members from that; reading them back is how a client that
+            # lost this response rebuilds its binding, so the mock has to hold
+            # them too or that path cannot be tested honestly.
+            REGISTERED_TEAMS[team_id] = {
+                "team_name": CONNECT_TEAM_NAME or data.get("team_name", ""),
+                "members": [{"member_id": m.get("member_id", ""),
+                             "name": m.get("name", ""),
+                             "registrations": []}
+                            for m in data.get("members", [])],
+            }
+            global DROP_NEXT_CONNECT
+            if DROP_NEXT_CONNECT:
+                # The registration is committed and the client is told nothing.
+                # This is the POST that succeeded on the server and whose
+                # response never arrived -- the one case where a retry finds a
+                # team it owns and holds no binding for it.
+                DROP_NEXT_CONNECT = False
+                self.close_connection = True
+                try:
+                    self.connection.close()
+                except Exception:
+                    pass
+                return
             # The capability snapshot the client reads back into its binding.
             self._send_json(200, {
                 "protocol_version": 1,
