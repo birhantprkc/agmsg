@@ -159,9 +159,111 @@ jobs:
           sqlite3 --version
           bats --version
 
+      # Diagnostics for the shards that report every test ok and then sit
+      # silent until the job's cap. The sampler writes to a file and never to
+      # this step's stdout: a process holding that pipe is one of the things
+      # under suspicion, so the instrument must not be able to cause what it is
+      # measuring. It closes fds 3 and 4 for the same reason, and gives itself a
+      # hard lifetime so it cannot outlive the job it is watching.
+      - name: Start hang sampler
+        if: needs.changes.outputs.docs_only != 'true'
+        continue-on-error: true
+        run: |
+          set +e
+          cat > "$RUNNER_TEMP/sampler.sh" <<'SAMPLER'
+          #!/usr/bin/env bash
+          out="$RUNNER_TEMP/hang-samples.txt"
+          : > "$out"
+          for i in $(seq 1 46); do
+            [ -f "$RUNNER_TEMP/bats-done" ] && { echo "== bats finished, sampler stopping at sample $i" >> "$out"; break; }
+            {
+              echo "===== sample $i  $(date -u +%H:%M:%S)"
+              ps -ef 2>/dev/null | grep -vE '\[' | tail -n +2
+              # One lsof over every candidate at once. Per-pid calls put the two
+              # ends of a pipe in separate blocks minutes apart in the log, and
+              # a reader has to spot that two numbers match; in the 08-01 hang
+              # nobody did, and a 14-line cap had cut the decisive line anyway.
+              pids="$(ps -eo pid=,comm= 2>/dev/null \
+                | awk '$2 ~ /node|python|bats|bash/ {printf "%s%s", sep, $1; sep=","}')"
+              if [ -n "$pids" ]; then
+                lsof -F pcftDin -p "$pids" 2>/dev/null > "$RUNNER_TEMP/sample-lsof.txt"
+                echo "----- pipes held by more than one process:"
+                awk -f "$GITHUB_WORKSPACE/.github/scripts/pipe-holders.awk" "$RUNNER_TEMP/sample-lsof.txt"
+                echo "----- every descriptor they hold (no cap):"
+                lsof -p "$pids" 2>/dev/null
+              fi
+              echo "----- bats temp dirs left behind:"
+              ls -la "${TMPDIR:-/tmp}" 2>/dev/null \
+                | awk 'tolower($0) ~ /bats/ { n++; if (n <= 20) print }'
+            } >> "$out" 2>&1
+            sleep 30
+          done
+          SAMPLER
+          chmod +x "$RUNNER_TEMP/sampler.sh"
+          nohup "$RUNNER_TEMP/sampler.sh" >/dev/null 2>&1 3>&- 4>&- &
+          echo "sampler pid $!"
+
       - name: Run bats suite (this shard)
         if: needs.changes.outputs.docs_only != 'true'
-        run: xargs bats --print-output-on-failure < shard-files.txt
+        run: |
+          set +e
+          xargs bats --print-output-on-failure < shard-files.txt
+          status=$?
+          : > "$RUNNER_TEMP/bats-done"
+          exit $status
+
+      # always() so this also runs when the job is cancelled at its cap, which
+      # is the only case that matters here.
+      # continue-on-error and a best-effort body: this step exists to describe a
+      # failure, and a probe that returns non-zero -- lsof on a pid that has just
+      # exited, a grep that matches nothing -- must never be what turns a green
+      # shard red. The runner's default shell is `bash -e`, so -e is dropped
+      # explicitly and every probe is allowed to fail. `head` is avoided in
+      # pipelines for the same reason: it closes the pipe early and SIGPIPEs
+      # whatever was writing.
+      - name: Hang forensics
+        if: always() && needs.changes.outputs.docs_only != 'true'
+        continue-on-error: true
+        run: |
+          set +e
+          set +o pipefail 2>/dev/null || true
+          echo "##### live snapshot at $(date -u +%H:%M:%S 2>/dev/null)"
+          ps -ef 2>/dev/null | awk 'NR > 1 && NR <= 61'
+          # One snapshot over every candidate, so both ends of a pipe are in the
+          # same dump and can be matched by machine rather than by eye.
+          pids="$(ps -eo pid=,comm= 2>/dev/null \
+            | awk '$2 ~ /node|python|bats|bash|sleep/ {printf "%s%s", sep, $1; sep=","}')"
+          if [ -n "$pids" ]; then
+            lsof -F pcftDin -p "$pids" 2>/dev/null > "$RUNNER_TEMP/forensic-lsof.txt"
+          else
+            : > "$RUNNER_TEMP/forensic-lsof.txt"
+          fi
+          echo "##### pipes held by more than one process:"
+          echo "##### (a shard that reported every test ok and is still open is usually one of these:"
+          echo "#####  a process that outlived its caller, holding the pipe bats is waiting to see close)"
+          awk -f "$GITHUB_WORKSPACE/.github/scripts/pipe-holders.awk" "$RUNNER_TEMP/forensic-lsof.txt"
+          echo "##### every descriptor those processes hold (no per-pid cap):"
+          lsof -p "$pids" 2>/dev/null
+          echo "##### bats temp remnants:"
+          ls -la "${TMPDIR:-/tmp}" 2>/dev/null \
+            | awk 'tolower($0) ~ /bats/ { n++; if (n <= 20) print }'
+          echo "##### sampler timeline:"
+          if [ -s "$RUNNER_TEMP/hang-samples.txt" ]; then
+            cat "$RUNNER_TEMP/hang-samples.txt" 2>/dev/null
+          else
+            echo "(no samples)"
+          fi
+          exit 0
+
+      - name: Upload hang samples
+        if: always() && needs.changes.outputs.docs_only != 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: hang-samples-${{ matrix.os }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/hang-samples.txt
+          if-no-files-found: ignore
+          retention-days: 3
 
       - name: Record which files this shard ran
         if: needs.changes.outputs.docs_only != 'true'
@@ -226,7 +328,11 @@ jobs:
     needs: changes
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Was 10, sized for the vectors and one filtered test. This job now runs
+    # every age-gated test -- about a hundred, across two files -- on top of a
+    # go install, so the old cap would have turned a slow runner into a
+    # cancellation rather than a result.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -266,12 +372,25 @@ jobs:
           AGMSG_AGE_BIN="$age_bin" bats --print-output-on-failure tests/test_jsonl_remote_sync.bats
           AGE_BIN="$age_bin" node docs/spec/vectors/verify-age-v1-vectors.mjs
 
-      - name: Run encrypted onboarding CLI roundtrip
+      # Every test that gates itself on age, discovered from the tree rather than
+      # listed here. A list is how #567 happened on the Windows side: a file the
+      # list did not name ran in no job at all, and CI went on reporting green
+      # while never executing it. The same hole was open here -- 31 tests gate on
+      # age, the shards skip them for want of the binary, and this job named one
+      # of them, so 30 were executed nowhere. Two of those were already red.
+      - name: Run every age-gated test
         if: needs.changes.outputs.docs_only != 'true'
         run: |
           command -v age >/dev/null
           command -v age-keygen >/dev/null
-          bats --print-output-on-failure --filter 'remote unlock:' tests/test_remote.bats
+          files="$(grep -rl 'skip_if_no_age' tests/*.bats | sort | tr '\n' ' ')"
+          echo "age-gated files: $files"
+          # A discovery that finds nothing must fail loudly. Silently running no
+          # tests is indistinguishable from running them all successfully, which
+          # is the failure this step exists to end.
+          [ -n "$files" ] || { echo "::error::no age-gated test files found; the discovery is broken"; exit 1; }
+          # shellcheck disable=SC2086
+          bats --print-output-on-failure $files
 
   # Continuously verify that the storage contract is backend-portable: run the
   # SAME driver-agnostic contract suite against the jsonl driver (the sqlite run
@@ -532,19 +651,6 @@ jobs:
         if: needs.changes.outputs.server_changed != 'false' || needs.changes.outputs.sync_changed != 'false'
         run: npm run build
 
-      - name: Compiled admin onboarding smoke test
-        if: needs.changes.outputs.server_changed != 'false' || needs.changes.outputs.sync_changed != 'false'
-        env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/agmsg_test
-        run: |
-          team_json=$(npm run --silent admin -- team create --name ci-onboarding --json)
-          printf '%s\n' "$team_json" | grep -Eq '^\{"team_id":"[0-9a-f-]+","team_name":"ci-onboarding"\}$'
-          connect_command=$(npm run --silent admin -- \
-            token issue --team ci-onboarding --endpoint https://sync.example.test)
-          test "$(printf '%s\n' "$connect_command" | wc -l)" -eq 1
-          printf '%s\n' "$connect_command" | grep -Eq \
-            '^agmsg remote connect --endpoint https://sync\.example\.test agmsg_pair_[A-Za-z0-9_-]+$'
-
       - name: Compiled start smoke test
         if: needs.changes.outputs.server_changed != 'false' || needs.changes.outputs.sync_changed != 'false'
         env:
@@ -594,32 +700,35 @@ jobs:
             docker logs "$CONTAINER_NAME"
             exit 1
           fi
-          docker exec "$CONTAINER_NAME" npm run --silent admin -- \
-            team create --name ci-docker-onboarding \
-            --team-id 018f3f7e-0000-7000-8000-000000000901 >/dev/null
-          connect_command=$(docker exec "$CONTAINER_NAME" npm run --silent admin -- \
-            token issue --team ci-docker-onboarding --endpoint http://127.0.0.1:8788)
-          pairing_token=${connect_command##* }
-          docker exec --env PAIRING_TOKEN="$pairing_token" "$CONTAINER_NAME" \
-            node --input-type=module -e '
+          # A container really registering a team and serving a read, through the
+          # current protocol: the client mints the team_id and posts it to
+          # /v1/connect, and the data plane takes the team from its header. No
+          # token is exchanged and no credential is presented, because none
+          # exists to present.
+          docker exec "$CONTAINER_NAME" node --input-type=module -e '
             const endpoint = "http://127.0.0.1:8788";
             const team = "018f3f7e-0000-7000-8000-000000000901";
             const common = {"Agmsg-Protocol-Version": "1"};
-            const exchange = await fetch(`${endpoint}/v1/pairing/exchange`, {
+            const connected = await fetch(`${endpoint}/v1/connect`, {
               method: "POST",
               headers: {...common, "Content-Type": "application/json"},
-              body: JSON.stringify({token: process.env.PAIRING_TOKEN}),
+              body: JSON.stringify({
+                team_id: team,
+                team_name: "ci-docker-onboarding",
+                members: [],
+              }),
             });
-            if (exchange.status !== 200) process.exit(1);
-            const connected = await exchange.json();
+            if (connected.status !== 200) {
+              console.error("connect:", connected.status, await connected.text());
+              process.exit(1);
+            }
             const members = await fetch(`${endpoint}/v1/members`, {
-              headers: {
-                ...common,
-                "Agmsg-Team-ID": team,
-                Authorization: `Bearer ${connected.credential}`,
-              },
+              headers: {...common, "Agmsg-Team-ID": team},
             });
-            if (members.status !== 200) process.exit(1);
+            if (members.status !== 200) {
+              console.error("members:", members.status, await members.text());
+              process.exit(1);
+            }
           '
 
   # Windows leg for the app: the command layer's bash resolution and path

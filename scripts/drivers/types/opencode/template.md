@@ -146,6 +146,18 @@ If argument is "reset":
 1. Run: `~/.agents/skills/__SKILL_NAME__/scripts/reset.sh "$(pwd)" opencode`
 2. Tell the user the result.
 
+If argument starts with "rename" but not "rename-team":
+1. Accept only an explicit user request. Parse either `<team> <old_name> <new_name>`, or `<old_name> <new_name>` only when this agent belongs to exactly one team.
+2. Never invent either name. Before execution, repeat the resolved team, old name, and new name and ask the user to confirm. Wait for confirmation.
+3. Run: `bash ~/.agents/skills/__SKILL_NAME__/scripts/rename.sh <team> <old_name> <new_name>`
+4. Show the result. For a connected team, the `member_renamed` journal event propagates the rename to other machines.
+
+If argument starts with "rename-team":
+1. Accept only an explicit user request. Parse `<old_team> <new_team>`.
+2. Never invent either team name. Before execution, repeat the old and new team names and ask the user to confirm. Wait for confirmation.
+3. Run: `bash ~/.agents/skills/__SKILL_NAME__/scripts/rename-team.sh <old_team> <new_team>`
+4. Show the result.
+
 If argument starts with "remote connect":
 1. Parse the required `--endpoint <url>` and `<team>`, plus optional `--e2ee`.
 2. Run: `bash ~/.agents/skills/__SKILL_NAME__/scripts/remote.sh connect --endpoint <url> [--e2ee] <team>`
@@ -160,20 +172,31 @@ If argument starts with "remote pull":
 5. Show the output to the user.
 
 If argument starts with "remote unlock":
-1. Parse `<team>`, one or more `--snapshot <file>` arguments in ascending revision order, exactly one of `--identity <file>` or `--identity-stdin`, and optional `--confirm-digest <sha256>`.
-2. Run: `bash ~/.agents/skills/__SKILL_NAME__/scripts/remote.sh unlock <team> --snapshot <file> [--snapshot <file> ...] (--identity <file>|--identity-stdin) [--confirm-digest <sha256>]`
-3. The snapshot digest must be compared over a separate live channel. Never infer or auto-confirm it. Raw identity material is a permanent secret; when `--identity-stdin` is needed, tell the user to run the command in their own terminal rather than asking them to paste the identity into agent chat.
+1. Parse `<team>`, `--bundle <file>`, and `--confirm-digest <sha256>`.
+2. Run: `bash ~/.agents/skills/__SKILL_NAME__/scripts/remote.sh unlock <team> --bundle <file> --confirm-digest <sha256>`
+3. The snapshot digest must be compared over a separate live channel. Never infer or auto-confirm it. The bundle is permanent secret key material; tell the user to transfer and handle it only through their own trusted channel, never by pasting it into agent chat.
 4. Show the complete result, including the imported-envelope count and engine PID.
+5. The advanced form with repeatable `--snapshot` plus `--identity` or `--identity-stdin` remains available when explicitly requested.
 
 If argument starts with "remote status":
 1. Parse an optional `<team>` and `--json`.
 2. Run: `bash ~/.agents/skills/__SKILL_NAME__/scripts/remote.sh status [<team>] [--json]`
 3. Show the output to the user.
 
+If argument starts with "remote sync start":
+1. Parse the required `<team>`.
+2. Run: `bash ~/.agents/skills/__SKILL_NAME__/scripts/remote.sh sync start <team>`
+3. Show the output to the user.
+
 If argument starts with "remote disconnect":
 1. Parse the required `<team>`.
 2. Run: `bash ~/.agents/skills/__SKILL_NAME__/scripts/remote.sh disconnect <team>`
 3. Show the output to the user.
+
+If argument starts with "remote forget":
+1. Parse the required `<team>`. This permanently deletes that team's local roster, history, keys, trust, and sync state, but never changes the server.
+2. Do not add `--yes` yourself. Run: `bash ~/.agents/skills/__SKILL_NAME__/scripts/remote.sh forget <team>`
+3. The command requires the user to confirm in their terminal. If this agent has no interactive terminal, show the deletion summary and tell the user to rerun the displayed command directly; never bypass confirmation for them.
 
 If argument starts with "key generate" followed by an optional team name:
 1. Run: `~/.agents/skills/__SKILL_NAME__/scripts/key.sh generate [<team>]`
@@ -184,6 +207,11 @@ If argument starts with "key show":
 2. Run: `~/.agents/skills/__SKILL_NAME__/scripts/key.sh show [<team>] [--reveal-secret]`
 3. `--reveal-secret` requires a real interactive terminal and is refused in agent mode — if the user wants to reveal a secret, tell them to run it themselves directly in their own terminal rather than through you.
 4. Show the output to the user.
+
+If argument starts with "key handoff" followed by a team name:
+1. Parse optional `--out <file>` and run: `bash ~/.agents/skills/__SKILL_NAME__/scripts/key.sh handoff <team> [--out <file>]`
+2. The output bundle contains every epoch identity and is itself permanent secret key material. Never read it into agent chat or display its contents.
+3. Show the bundle path, latest snapshot digest, and full secrecy warning.
 
 If argument starts with "key import" followed by a team name:
 1. **Do not ask the user to paste the private identity into this chat, and do not run this command yourself.** This identity is a permanent secret. Tell the user to run this directly in their own terminal:

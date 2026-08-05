@@ -11,16 +11,14 @@ setup() {
   MOCK_PYTHON3="$(command -v python3)"
   bash "$SCRIPTS/join.sh" testteam alice claude-code /tmp/project-a
 
-  # Start the mock pairing-exchange/revoke server on an OS-assigned port.
-  MOCK_REVOKE_FAIL="${MOCK_REVOKE_FAIL:-}" \
-  MOCK_REVOKE_BAD_HEADER="${MOCK_REVOKE_BAD_HEADER:-}" \
-  MOCK_REVOKE_BAD_BODY="${MOCK_REVOKE_BAD_BODY:-}" \
-  MOCK_REVOKE_LARGE_BODY="${MOCK_REVOKE_LARGE_BODY:-}" \
+  # Start the mock remote server on an OS-assigned port.
   MOCK_PULL_MIXED="${MOCK_PULL_MIXED:-}" \
   MOCK_PULL_AGE="${MOCK_PULL_AGE:-}" \
   MOCK_PULL_AGE_ENVELOPE_FILE="${MOCK_PULL_AGE_ENVELOPE_FILE:-}" \
   MOCK_PULL_TEAM_ID="${MOCK_PULL_TEAM_ID:-}" \
+  MOCK_HEALTH_TEAM_ID="${MOCK_HEALTH_TEAM_ID:-}" \
   MOCK_CONNECT_NO_AGE="${MOCK_CONNECT_NO_AGE:-}" \
+  MOCK_CONNECT_TEAM_NAME="${MOCK_CONNECT_TEAM_NAME:-}" \
     "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
     </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
   MOCK_SERVER_PID=$!
@@ -78,15 +76,13 @@ restart_mock_server() {
   kill "$MOCK_SERVER_PID" 2>/dev/null || true
   wait "$MOCK_SERVER_PID" 2>/dev/null || true
   : > "$TEST_SKILL_DIR/server.port"
-  MOCK_REVOKE_FAIL="${MOCK_REVOKE_FAIL:-}" \
-  MOCK_REVOKE_BAD_HEADER="${MOCK_REVOKE_BAD_HEADER:-}" \
-  MOCK_REVOKE_BAD_BODY="${MOCK_REVOKE_BAD_BODY:-}" \
-  MOCK_REVOKE_LARGE_BODY="${MOCK_REVOKE_LARGE_BODY:-}" \
   MOCK_PULL_MIXED="${MOCK_PULL_MIXED:-}" \
   MOCK_PULL_AGE="${MOCK_PULL_AGE:-}" \
   MOCK_PULL_AGE_ENVELOPE_FILE="${MOCK_PULL_AGE_ENVELOPE_FILE:-}" \
   MOCK_PULL_TEAM_ID="${MOCK_PULL_TEAM_ID:-}" \
+  MOCK_HEALTH_TEAM_ID="${MOCK_HEALTH_TEAM_ID:-}" \
   MOCK_CONNECT_NO_AGE="${MOCK_CONNECT_NO_AGE:-}" \
+  MOCK_CONNECT_TEAM_NAME="${MOCK_CONNECT_TEAM_NAME:-}" \
     "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
       </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
   MOCK_SERVER_PID=$!
@@ -186,11 +182,34 @@ skip_if_no_age() {
 @test "connect: registers a client-owned team (happy path, Done-when 1)" {
   run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Connected: team 'testteam' (org 'testteam') (plain)."* ]]
+  # Same name on both sides — the ordinary case — so the line says it once.
+  [[ "$output" == *"Connected: team 'testteam' (plain)."* ]]
+  [[ "$output" != *"org"* ]]
   # A binding is recorded on the team config, and it carries no credential:
   # the register model writes none and none is fetched back.
   [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$SCRIPTS/../teams/testteam/config.json') AS TEXT), '\$.remote_binding.connected_at');")" != "" ]
   [ ! -f "$SCRIPTS/../run/remote-credentials/testteam.json" ]
+}
+
+@test "connect: when the server's name differs, it is quoted AS the server's — never as an org" {
+  # Every other connect case here asks for a team whose remote name comes back
+  # identical, so the two names cannot be told apart in the output. That is how
+  # this line spent its life calling the server's TEAM name an "org": while the
+  # strings match, a wrong label reads as a redundant one. Only a differing
+  # pair can see it, so this test makes them differ.
+  MOCK_CONNECT_TEAM_NAME="renamed-upstream"
+  export MOCK_CONNECT_TEAM_NAME
+  teardown
+  setup
+
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -eq 0 ]
+  # The local name leads; the server's is offered as the server's.
+  [[ "$output" == *"Connected: team 'testteam' (on the server: 'renamed-upstream') (plain)."* ]]
+  # And nothing in this output claims to be an org: the connect response
+  # carries server_instance_id / team_id / team_name / min_available_seq, and
+  # no org at all, so there is nothing here that could honestly be labelled one.
+  [[ "$output" != *"org"* ]]
 }
 
 @test "connect --e2ee generates a key and establishes age-v1 before engine start" {
@@ -198,7 +217,7 @@ skip_if_no_age() {
 
   run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Connected: team 'testteam' (org 'testteam') (age-v1 encrypted)."* ]]
+  [[ "$output" == *"Connected: team 'testteam' (age-v1 encrypted)."* ]]
   [[ "$output" == *"Back this up now"* ]]
   [[ "$output" == *"key.sh show testteam --snapshot --out <file>"* ]]
   sync_config="$TEST_SKILL_DIR/db/remote-sync/testteam.json"
@@ -329,6 +348,123 @@ skip_if_no_age() {
   [[ "$output" != *"revoke it from the console"* ]]
 }
 
+@test "disconnect: refuses when the binding was replaced after it chose one" {
+  # The generation guard, on a binding with no credential -- which is every
+  # binding now. disconnect decides what to unbind from one snapshot, then stops
+  # the engine, then writes. A reconnect landing in that gap installs a NEWER
+  # binding, and marking THAT disconnected would tear down a connection this
+  # call never touched.
+  #
+  # Ordered by a synchronisation primitive, not by a delay. The stand-in engine
+  # traps TERM and reports it: receiving TERM proves disconnect has already
+  # taken its snapshot and is inside the engine stop, which is exactly the gap.
+  # The replacement lands there, and only then is the engine let go.
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  local cfg="$SCRIPTS/../teams/testteam/config.json"
+  local pidfile="$SCRIPTS/../run/remote-sync.testteam.pid"
+  local termed="$TEST_SKILL_DIR/engine-termed"
+  local release="$TEST_SKILL_DIR/engine-release"
+
+  # Replace the real engine with one that stops when we say so. Its argv has to
+  # end the way the status check expects, or the stop declines to reap it.
+  local real_pid; real_pid="$(cat "$pidfile" 2>/dev/null || true)"
+  [ -n "$real_pid" ] && kill "$real_pid" 2>/dev/null
+  TERMED="$termed" RELEASE="$release" bash -c '
+    trap "touch \"$TERMED\"" TERM
+    while [ ! -f "$RELEASE" ]; do sleep 0.02; done
+  ' "$SCRIPTS/internal/remote-sync.mjs" run --team testteam &
+  local fake=$!
+  echo "$fake" > "$pidfile"
+
+  bash "$SCRIPTS/remote.sh" disconnect testteam > "$TEST_SKILL_DIR/dc.out" 2>&1 &
+  local dc=$!
+
+  # Wait for the seam itself, not for a duration.
+  local i
+  for i in $(seq 1 300); do
+    [ -f "$termed" ] && break
+    sleep 0.02
+  done
+  [ -f "$termed" ] || { echo "disconnect never reached the engine stop"; false; }
+
+  # A concurrent reconnect: same team, newer generation.
+  python3 - "$cfg" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    document = json.load(handle)
+binding = document["remote_binding"]
+binding["binding_revision"] = int(binding.get("binding_revision") or 0) + 1
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(document, handle)
+    handle.write("\n")
+PY
+
+  touch "$release"
+  local dc_status=0
+  wait "$dc" || dc_status=$?
+  wait "$fake" 2>/dev/null || true
+  local out; out="$(cat "$TEST_SKILL_DIR/dc.out")"
+  echo "disconnect exited $dc_status; output: $out"
+
+  [ "$dc_status" -ne 0 ] || { echo "disconnect succeeded against a replaced binding"; false; }
+  [[ "$out" == *"binding changed to something else during disconnect"* ]]
+  # ...and the newer binding is still active.
+  [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$cfg') AS TEXT), '\$.remote_binding.disconnected_at');")" = "" ]
+}
+
+@test "disconnect: no replacement can land while the engine it chose is being stopped" {
+  # The half the generation check cannot cover. connect writes its binding under
+  # the team lock and starts the engine after releasing it, so a reconnect
+  # landing between disconnect's snapshot and an unlocked stop would have ITS
+  # engine killed by a call that then refuses to write. The stop therefore
+  # happens inside the same hold as the snapshot.
+  #
+  # Observed by exclusion rather than by racing: while disconnect is inside the
+  # stop, a separate process asks for the same lock with a short retry budget
+  # and must be refused. Nothing here depends on who wins a lock -- being shut
+  # out IS the invariant.
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  local pidfile="$SCRIPTS/../run/remote-sync.testteam.pid"
+  local termed="$TEST_SKILL_DIR/engine-termed"
+  local release="$TEST_SKILL_DIR/engine-release"
+
+  local real_pid; real_pid="$(cat "$pidfile" 2>/dev/null || true)"
+  [ -n "$real_pid" ] && kill "$real_pid" 2>/dev/null
+  # argv has to end the way _remote_sync_engine_status expects, or the stop
+  # declines to reap it and the seam is never reached.
+  TERMED="$termed" RELEASE="$release" bash -c '
+    trap "touch \"$TERMED\"" TERM
+    while [ ! -f "$RELEASE" ]; do sleep 0.02; done
+  ' "$SCRIPTS/internal/remote-sync.mjs" run --team testteam &
+  local engine=$!
+  echo "$engine" > "$pidfile"
+
+  bash "$SCRIPTS/remote.sh" disconnect testteam > "$TEST_SKILL_DIR/dc.out" 2>&1 &
+  local dc=$!
+
+  local i
+  for i in $(seq 1 300); do [ -f "$termed" ] && break; sleep 0.02; done
+  [ -f "$termed" ] || { echo "disconnect never reached the engine stop"; false; }
+
+  # A would-be replacement writer, while the stop is in progress.
+  run env AGMSG_LOCK_TRIES=5 SCRIPTS="$SCRIPTS" bash -c '
+    . "$SCRIPTS/lib/registry-lock.sh"
+    agmsg_lock_acquire "$SCRIPTS/../teams/testteam"
+  '
+  [ "$status" -ne 0 ] || {
+    echo "the lock was available during the engine stop: a reconnect could have landed"
+    false
+  }
+  [[ "$output" == *"timed out acquiring registry lock"* ]]
+
+  touch "$release"
+  local dc_status=0
+  wait "$dc" || dc_status=$?
+  wait "$engine" 2>/dev/null || true
+  # Nothing was contending, so the disconnect itself completes normally.
+  [ "$dc_status" -eq 0 ] || { echo "disconnect failed: $(cat "$TEST_SKILL_DIR/dc.out")"; false; }
+}
+
 @test "disconnect: fails for a team that isn't connected" {
   run bash "$SCRIPTS/remote.sh" disconnect testteam
   [ "$status" -ne 0 ]
@@ -345,6 +481,8 @@ skip_if_no_age() {
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.local_team');")" = "testteam" ]
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.endpoint');")" = "$ENDPOINT" ]
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.state');")" = "active" ]
+  [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.engine_state');")" = "running" ]
+  [ "$(sqlite_mem "SELECT json_type('$(echo "$output" | sed "s/'/''/g")', '\$.engine_pid');")" = "integer" ]
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.server_instance_id');")" != "" ]
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.remote_team_id');")" != "" ]
   # The register binding carries no credential; the field is still emitted for
@@ -358,6 +496,8 @@ skip_if_no_age() {
   run bash "$SCRIPTS/remote.sh" status testteam --json
   [ "$status" -eq 0 ]
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.state');")" = "disconnected" ]
+  [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.engine_state');")" = "stopped" ]
+  [ "$(sqlite_mem "SELECT json_type('$(echo "$output" | sed "s/'/''/g")', '\$.engine_pid');")" = "null" ]
 }
 
 @test "status --json: errors for a team that has never been connected" {
@@ -404,182 +544,16 @@ skip_if_no_age() {
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.local_team');")" = "$team" ]
 }
 
-# --- pending list / abort (ADR 0007 addendum) -------------------------------
 
-_valid_pending_response_json() {
-  # A fully-valid exchange response body, matching the shape
-  # test_remote.bats's own "resumes from a hand-crafted pending record"
-  # test already establishes as this branch's strict-validator baseline.
-  local credential_id="$1" server_instance_id="$2" remote_team_id="$3" remote_team_name="$4"
-  python3 -c "
-import json
-response = {
-    'credential': 'orphan-test-credential-value',
-    'credential_id': '$credential_id',
-    'server_instance_id': '$server_instance_id',
-    'remote_team_id': '$remote_team_id',
-    'remote_team_name': '$remote_team_name',
-    'protocol_version': 1,
-    'capabilities': {
-        'protocol_version': 1,
-        'server_instance_id': '$server_instance_id',
-        'team_id': '$remote_team_id',
-        'team_name': '$remote_team_name',
-        'accepted_envelope_versions': [1],
-        'write_allowed_ciphers': ['none'],
-        'policy_revision': '0', 'effective_from_seq': '1',
-        'current_seq': '0', 'next_sequence_boundary': '1',
-        'min_available_seq': '0', 'max_blob_bytes': '1048576',
-        'policy_history': [{
-            'policy_revision': '0', 'effective_from_seq': '1',
-            'accepted_envelope_versions': [1],
-            'write_allowed_ciphers': ['none'],
-        }],
-    },
-}
-print(json.dumps(response))
-"
-}
 
-_write_pending_record() {
-  local key="$1" endpoint="$2" raw_response_text="$3" pending_dir="$4"
-  mkdir -p "$pending_dir"
-  python3 -c "
-import json, sys
-raw = sys.stdin.read()
-json.dump({'endpoint': '$endpoint', 'protocol_header_verified': True, 'raw_response_text': raw},
-          open('$pending_dir/$key.json', 'w'))
-" <<< "$raw_response_text"
-}
 
-@test "pending list: reports nothing when there are no pending records" {
-  run bash "$SCRIPTS/remote.sh" pending list
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"No pending connect records"* ]]
-  run bash "$SCRIPTS/remote.sh" pending list --json
-  [ "$status" -eq 0 ]
-  [ -z "$output" ]
-}
 
-@test "pending list --json: reports a valid orphaned record with its metadata, no credential" {
-  local token="orphan-test-token"
-  local key
-  key=$(python3 -c "import hashlib; print(hashlib.sha256('$ENDPOINT'.encode()+b'\x00'+'$token'.encode()).hexdigest())")
-  local pending_dir="$SCRIPTS/../run/remote-connect-pending"
-  local resp
-  resp=$(_valid_pending_response_json \
-    "018f3f7e-6666-7000-8000-000000000006" \
-    "018f3f7e-3333-7000-8000-000000000003" \
-    "018f3f7e-4444-7000-8000-000000000004" \
-    "orphanteam")
-  _write_pending_record "$key" "$ENDPOINT" "$resp" "$pending_dir"
 
-  run bash "$SCRIPTS/remote.sh" pending list --json
-  [ "$status" -eq 0 ]
-  [ "$(echo "$output" | wc -l | tr -d ' ')" -eq 1 ]
-  local escaped; escaped="$(echo "$output" | sed "s/'/''/g")"
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.pending_id');")" = "$key" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.endpoint');")" = "$ENDPOINT" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.credential_id');")" = "018f3f7e-6666-7000-8000-000000000006" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.valid');")" = "1" ]
-  # The raw credential must never appear anywhere in the listing output.
-  [[ "$output" != *"orphan-test-credential-value"* ]]
-}
 
-@test "pending list --json: reports valid:false and null metadata for a record whose content fails validation" {
-  local pending_dir="$SCRIPTS/../run/remote-connect-pending"
-  local key; key="$(printf 'a%.0s' $(seq 1 64))"
-  _write_pending_record "$key" "$ENDPOINT" '{not valid json' "$pending_dir"
 
-  run bash "$SCRIPTS/remote.sh" pending list --json
-  [ "$status" -eq 0 ]
-  local escaped; escaped="$(echo "$output" | sed "s/'/''/g")"
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.pending_id');")" = "$key" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.endpoint');")" = "$ENDPOINT" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.valid');")" = "0" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.credential_id');")" = "" ]
-}
 
-@test "pending list --json: still reports pending_id even when the envelope itself is corrupt" {
-  local pending_dir="$SCRIPTS/../run/remote-connect-pending"
-  mkdir -p "$pending_dir"
-  local key; key="$(printf 'b%.0s' $(seq 1 64))"
-  printf 'not even json' > "$pending_dir/$key.json"
 
-  run bash "$SCRIPTS/remote.sh" pending list --json
-  [ "$status" -eq 0 ]
-  local escaped; escaped="$(echo "$output" | sed "s/'/''/g")"
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.pending_id');")" = "$key" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.endpoint');")" = "" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.valid');")" = "0" ]
-}
 
-@test "pending list --json: does not enumerate a quarantined record (only normal <id>.json files)" {
-  local token="quarantine-visibility-token"
-  local key
-  key=$(python3 -c "import hashlib; print(hashlib.sha256('$ENDPOINT'.encode()+b'\x00'+'$token'.encode()).hexdigest())")
-  local pending_dir="$SCRIPTS/../run/remote-connect-pending"
-  # Legacy 2-key envelope (no protocol_header_verified) — triggers
-  # cmd_connect's own quarantine path on resume, exercised here directly by
-  # hand-crafting the pre-quarantine legacy file and quarantining it the
-  # same way cmd_connect would.
-  mkdir -p "$pending_dir"
-  python3 -c "
-import json
-json.dump({'endpoint': '$ENDPOINT', 'raw_response_text': '{}'}, open('$pending_dir/$key.json', 'w'))
-"
-  mv "$pending_dir/$key.json" "$pending_dir/$key.json.unverified.20260101T000000Z.1"
-
-  run bash "$SCRIPTS/remote.sh" pending list --json
-  [ "$status" -eq 0 ]
-  [ -z "$output" ]
-  run bash "$SCRIPTS/remote.sh" pending list
-  [[ "$output" == *"No pending connect records"* ]]
-}
-
-@test "pending abort: rejects a malformed pending_id" {
-  run bash "$SCRIPTS/remote.sh" pending abort "not-a-valid-id"
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"invalid pending_id"* ]]
-  run bash "$SCRIPTS/remote.sh" pending abort "../../escape"
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"invalid pending_id"* ]]
-}
-
-@test "pending abort: removes a valid pending record" {
-  local token="abort-test-token"
-  local key
-  key=$(python3 -c "import hashlib; print(hashlib.sha256('$ENDPOINT'.encode()+b'\x00'+'$token'.encode()).hexdigest())")
-  local pending_dir="$SCRIPTS/../run/remote-connect-pending"
-  _write_pending_record "$key" "$ENDPOINT" '{}' "$pending_dir"
-
-  run bash "$SCRIPTS/remote.sh" pending abort "$key"
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"Aborted pending connect record $key"* ]]
-  [ ! -f "$pending_dir/$key.json" ]
-}
-
-@test "pending abort: fails clearly for an unknown pending_id" {
-  local key; key="$(printf 'c%.0s' $(seq 1 64))"
-  run bash "$SCRIPTS/remote.sh" pending abort "$key"
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"no pending connect record"* ]]
-}
-
-@test "pending abort: aborting the same pending_id twice is not silently treated as success" {
-  local token="double-abort-token"
-  local key
-  key=$(python3 -c "import hashlib; print(hashlib.sha256('$ENDPOINT'.encode()+b'\x00'+'$token'.encode()).hexdigest())")
-  local pending_dir="$SCRIPTS/../run/remote-connect-pending"
-  _write_pending_record "$key" "$ENDPOINT" '{}' "$pending_dir"
-
-  bash "$SCRIPTS/remote.sh" pending abort "$key"
-  run bash "$SCRIPTS/remote.sh" pending abort "$key"
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"no pending connect record"* ]]
-}
-
-# --- pending/connect lock barrier (co1 delta review) ------------------------
 #
 # Deterministic, single-threaded simulation of the race co1 flagged (see
 # feat/remote-connect-onboarding's PR #479): rather than actually racing two
@@ -601,43 +575,8 @@ VALUES ('remote-pending.$key', $owner_pid, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 "
 }
 
-@test "pending abort: blocks (not deletes) when a concurrent connect resume already holds this pending_id's lock (barrier test)" {
-  local token="lock-barrier-abort-token"
-  local key
-  key=$(python3 -c "import hashlib; print(hashlib.sha256('$ENDPOINT'.encode()+b'\x00'+'$token'.encode()).hexdigest())")
-  local pending_dir="$SCRIPTS/../run/remote-connect-pending"
-  _write_pending_record "$key" "$ENDPOINT" '{}' "$pending_dir"
-  _insert_pending_lock_row "$key" "$$"
 
-  AGMSG_PENDING_LOCK_TRIES=3 run bash "$SCRIPTS/remote.sh" pending abort "$key"
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"timed out acquiring pending lock"* ]]
-  [ -f "$pending_dir/$key.json" ]
-}
 
-@test "pending abort: reclaims a stale lock left by a dead owner instead of blocking forever (barrier test)" {
-  local token="lock-barrier-stale-token"
-  local key
-  key=$(python3 -c "import hashlib; print(hashlib.sha256('$ENDPOINT'.encode()+b'\x00'+'$token'.encode()).hexdigest())")
-  local pending_dir="$SCRIPTS/../run/remote-connect-pending"
-  _write_pending_record "$key" "$ENDPOINT" '{}' "$pending_dir"
-
-  ( : ) &
-  local dead_pid=$!
-  wait "$dead_pid" 2>/dev/null || true
-  _insert_pending_lock_row "$key" "$dead_pid"
-
-  AGMSG_PENDING_LOCK_TRIES=20 run bash "$SCRIPTS/remote.sh" pending abort "$key"
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"Aborted pending connect record $key"* ]]
-  [ ! -f "$pending_dir/$key.json" ]
-}
-
-@test "remote.sh: unknown pending subcommand prints usage and exits non-zero" {
-  run bash "$SCRIPTS/remote.sh" pending bogus
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"Usage:"* ]]
-}
 
 # --- dispatch --------------------------------------------------------------
 
@@ -672,12 +611,6 @@ VALUES ('remote-pending.$key', $owner_pid, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
   [[ "$output" == *"requires python3"* ]]
 }
 
-@test "remote pending: fails fast with an install message when python3 is absent" {
-  local no_py3; no_py3="$(path_without_python3)"
-  run env PATH="$no_py3" bash "$SCRIPTS/remote.sh" pending list
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"requires python3"* ]]
-}
 
 @test "remote doctor: still runs without python3, and reports it as a failed check (not a crash)" {
   local no_py3; no_py3="$(path_without_python3)"
@@ -733,9 +666,9 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   [ -f "$cfg" ]
   # Not minted here: the id is the one the server answered with.
   [ "$(sqlite_mem "SELECT json_extract(readfile('$(rf "$cfg")'), '\$.team_id');")" = "$PULL_TEAM_ID" ]
-  [ "$(sqlite_mem "SELECT json_extract(readfile('$(rf "$cfg")'), '\$.drivers.layout');")" = "per-team" ]
+  [ "$(sqlite_mem "SELECT json_extract(readfile('$(rf "$cfg")'), '\$.drivers.partition');")" = "per-team" ]
   [ -f "$TEST_SKILL_DIR/db/teams/cloned/messages.db" ]
-  # Pull arrives into an empty local team, so it can select the isolated layout
+  # Pull arrives into an empty local team, so it can select the isolated partition
   # before bootstrap. Imported remote rows must never leak into the shared
   # store that local-only teams and external readers still use.
   if sqlite3 "$TEST_SKILL_DIR/db/messages.db" \
@@ -833,7 +766,7 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" encrypted
   [ "$status" -eq 0 ]
   [[ "$output" == *"This team is encrypted"* ]]
-  [[ "$output" == *"Run remote.sh unlock with the snapshot and identity you were handed."* ]]
+  [[ "$output" == *"Run remote.sh unlock --bundle with the secret handoff bundle you were given."* ]]
 
   local cfg before after
   cfg="$TEST_SKILL_DIR/teams/encrypted/config.json"
@@ -853,11 +786,13 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   skip_if_no_age
 
   bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam >/dev/null
-  local source_cfg snapshot key_id recipient identity team_id envelope digest
+  local source_cfg snapshot bundle key_id recipient identity team_id envelope digest
   source_cfg="$TEST_SKILL_DIR/teams/testteam/config.json"
   snapshot="$TEST_SKILL_DIR/handed-snapshot.json"
+  bundle="$TEST_SKILL_DIR/handed-bundle.json"
   envelope="$TEST_SKILL_DIR/handed-envelope.json"
   bash "$SCRIPTS/key.sh" show testteam --snapshot --out "$snapshot" 2>/dev/null
+  bash "$SCRIPTS/key.sh" handoff testteam --out "$bundle" >/dev/null 2>&1
   key_id="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.remote_key.current.key_id');")"
   recipient="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.remote_key.current.recipient');")"
   team_id="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.team_id');")"
@@ -919,7 +854,7 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   [ ! -d "$PEER_SKILL_DIR/run/remote-trust" ]
 
   run bash "$peer_scripts/remote.sh" unlock encrypted \
-    --snapshot "$snapshot" --identity "$identity" --confirm-digest "$digest"
+    --bundle "$bundle" --confirm-digest "$digest"
   [ "$status" -eq 0 ]
   [[ "$output" == *"imported 1 envelope(s); engine running (pid "* ]]
   local pidfile first_pid second_pid
@@ -928,7 +863,7 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   first_pid="$(cat "$pidfile")"
   [ -d "$PEER_SKILL_DIR/run/remote-trust" ]
   run bash "$peer_scripts/remote.sh" unlock encrypted \
-    --snapshot "$snapshot" --identity "$identity" --confirm-digest "$digest"
+    --bundle "$bundle" --confirm-digest "$digest"
   [ "$status" -eq 0 ]
   [[ "$output" == *"imported 0 envelope(s); engine running (pid "* ]]
   second_pid="$(cat "$pidfile")"
@@ -952,6 +887,244 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   pushed_cipher="$(curl -sS "$ENDPOINT/_test/pushed" |
     jq -r '.messages[-1].envelope.cipher')"
   [ "$pushed_cipher" = "age-v1" ]
+}
+
+@test "remote unlock --authenticated-bundle-stdin: takes exact bytes, refuses everything else" {
+  skip_if_no_age
+
+  # Same handed-authority setup as the --bundle test above, kept separate rather
+  # than factored out: a shared fixture would let a change made for one mode
+  # quietly redefine what the other one is asserting.
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam >/dev/null
+  local source_cfg bundle key_id recipient team_id envelope
+  source_cfg="$TEST_SKILL_DIR/teams/testteam/config.json"
+  bundle="$TEST_SKILL_DIR/auth-bundle.json"
+  envelope="$TEST_SKILL_DIR/auth-envelope.json"
+  # Export the snapshot first: the handoff bundle carries the *confirmed* chain,
+  # and the epoch is only confirmed once a snapshot has been exported. Skipping
+  # this hands over a bundle that cannot open what the envelope was sealed to.
+  bash "$SCRIPTS/key.sh" show testteam --snapshot --out "$TEST_SKILL_DIR/auth-snapshot.json" 2>/dev/null
+  bash "$SCRIPTS/key.sh" handoff testteam --out "$bundle" >/dev/null 2>&1
+  key_id="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.remote_key.current.key_id');")"
+  recipient="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.remote_key.current.recipient');")"
+  team_id="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.team_id');")"
+  # wire_id must be exactly this: tests/helpers/mock_remote_server.py:83 serves a
+  # row with that id, and an envelope carrying any other one is pulled but never
+  # matched — which surfaces as "envelopes remain blocked after reprocessing",
+  # i.e. as an unlock failure rather than as a fixture mismatch.
+  jq -nc \
+    --arg key_id "$key_id" \
+    --arg recipient "$recipient" \
+    --arg team_id "$team_id" \
+    '{
+      type:"sync_seal", envelope_v:1, cipher:"age-v1",
+      key_id:$key_id, recipients:[$recipient], max_blob_bytes:1048576,
+      wire_id:"20000000-0000-4000-8000-000000000001",
+      team_id:$team_id, protocol_version:1,
+      projection:{
+        body:"authenticated ciphertext", created_at:"2026-01-02T00:00:00.000000Z",
+        from_agent:"member-1", to_agent:"member-1"
+      }
+    }' | node "$SCRIPTS/internal/sync-cipher.mjs" seal > "$envelope"
+  bash "$SCRIPTS/remote.sh" disconnect testteam >/dev/null 2>&1 || true
+
+  MOCK_PULL_AGE=1
+  MOCK_PULL_AGE_ENVELOPE_FILE="$envelope"
+  MOCK_PULL_TEAM_ID="$team_id"
+  restart_mock_server
+
+  PEER_SKILL_DIR="$(mktemp -d)"
+  export PEER_SKILL_DIR
+  mkdir -p "$PEER_SKILL_DIR"/{scripts,db,teams}
+  cp -R "$BATS_TEST_DIRNAME"/../scripts/. "$PEER_SKILL_DIR/scripts/"
+  chmod +x "$PEER_SKILL_DIR/scripts/"*.sh
+  chmod +x "$PEER_SKILL_DIR/scripts/"*.js 2>/dev/null || true
+  chmod +x "$PEER_SKILL_DIR/scripts/drivers/types/codex/"*.sh 2>/dev/null || true
+  bash "$PEER_SKILL_DIR/scripts/internal/init-db.sh"
+  local peer_scripts="$PEER_SKILL_DIR/scripts"
+
+  run bash "$peer_scripts/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$team_id" encrypted
+  [ "$status" -eq 0 ]
+
+  # Combining the new mode with any other input mode is an error, not a
+  # precedence rule: two authorities disagreeing about which bytes were
+  # authenticated must not resolve silently in either direction.
+  local digest; digest="$(shasum -a 256 "$bundle" | awk '{print $1}')"
+  run bash -c "bash '$peer_scripts/remote.sh' unlock encrypted --authenticated-bundle-stdin --confirm-digest '$digest' < '$bundle'"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"cannot be combined"* ]]
+  run bash -c "bash '$peer_scripts/remote.sh' unlock encrypted --authenticated-bundle-stdin --bundle '$bundle' < '$bundle'"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"cannot be combined"* ]]
+
+  # Empty stdin must fail closed rather than fall through to some other mode.
+  run bash -c "bash '$peer_scripts/remote.sh' unlock encrypted --authenticated-bundle-stdin < /dev/null"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"no bundle bytes on stdin"* ]]
+
+  # Truncated and trailing-garbage input must fail too: "we did not authenticate
+  # this" has to lose, and a partial read that merely looked like a bundle is
+  # exactly what a fail-open would accept.
+  head -c 64 "$bundle" > "$TEST_SKILL_DIR/partial.json"
+  run bash -c "bash '$peer_scripts/remote.sh' unlock encrypted --authenticated-bundle-stdin < '$TEST_SKILL_DIR/partial.json'"
+  [ "$status" -ne 0 ]
+  cat "$bundle" > "$TEST_SKILL_DIR/trailing.json"
+  printf 'garbage\n' >> "$TEST_SKILL_DIR/trailing.json"
+  run bash -c "bash '$peer_scripts/remote.sh' unlock encrypted --authenticated-bundle-stdin < '$TEST_SKILL_DIR/trailing.json'"
+  [ "$status" -ne 0 ]
+
+  # None of the failures above may have imported trust or key material.
+  [ "$(sqlite_mem "SELECT json_type(json_extract(CAST(readfile('$(rf "$PEER_SKILL_DIR/teams/encrypted/config.json")') AS TEXT), '\$.remote_key'));")" = "" ]
+  [ ! -e "$PEER_SKILL_DIR/run/remote-credentials/encrypted" ]
+
+  # The success path, fed through a PIPE rather than a redirect. A pipe has no
+  # pathname, so this also proves the bytes are taken from the stream and not
+  # re-opened by name — which is the entire reason this mode is stdin-only.
+  run bash -c "cat '$bundle' | bash '$peer_scripts/remote.sh' unlock encrypted --authenticated-bundle-stdin"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"imported 1 envelope(s); engine running (pid "* ]]
+  # It must NOT have asked for, or accepted, a digest along the way.
+  [[ "$output" != *"separate live channel"* ]]
+  wait_for_file "$PEER_SKILL_DIR/run/remote-sync.encrypted.pid"
+  [ -d "$PEER_SKILL_DIR/run/remote-trust" ]
+
+  run bash "$peer_scripts/history.sh" encrypted member-1
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"authenticated ciphertext"* ]]
+
+  # The decrypted bundle must not survive as a plaintext file: taking it on stdin
+  # is pointless if we then leave a copy behind.
+  run bash -c "ls -d \${TMPDIR:-/tmp}/agmsg-handoff.* 2>/dev/null | wc -l"
+  [ "$(echo "$output" | tr -d '[:space:]')" = "0" ]
+
+  local pid; pid="$(cat "$PEER_SKILL_DIR/run/remote-sync.encrypted.pid")"
+  kill "$pid" 2>/dev/null || true
+  wait_for_pid_exit "$pid"
+}
+
+@test "remote unlock --authenticated-bundle-stdin: the captured bundle is 0600 whatever the umask" {
+  # The capture holds a team's key history in the clear until the trap fires, so
+  # its mode must not depend on how the caller's shell happened to be configured.
+  # Observed at the real boundary: remote.sh hands the path to remote-sync.sh, so
+  # a stand-in there reports the mode of the actual file remote.sh created. A
+  # structural "is there a chmod" grep would pass on code that chmods the wrong
+  # path, or too late.
+  local peer; peer="$(mktemp -d)"
+  mkdir -p "$peer"/{scripts,db,teams}
+  cp -R "$BATS_TEST_DIRNAME"/../scripts/. "$peer/scripts/"
+  chmod +x "$peer/scripts/"*.sh
+  bash "$peer/scripts/internal/init-db.sh"
+
+  # A team the unlock will accept as an encrypted pulled team, so it reaches the
+  # capture. Nothing beyond the capture needs to succeed.
+  bash "$peer/scripts/join.sh" locked alice claude-code "$peer" >/dev/null 2>&1
+  local cfg="$peer/teams/locked/config.json"
+  python3 - "$cfg" <<'PY'
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p))
+cfg["remote_binding"] = {"cipher_profile": "age-v1", "connected_at": "2026-01-01T00:00:00Z"}
+json.dump(cfg, open(p, "w"))
+PY
+
+  local seen="$peer/observed-mode"
+  cat > "$peer/scripts/remote-sync.sh" <<PY
+#!/usr/bin/env bash
+# Stand-in: report the mode of the file remote.sh captured, then stop the unlock.
+for a in "\$@"; do
+  if [ "\$prev" = "--bundle" ]; then
+    if stat -f '%Lp' "\$a" >/dev/null 2>&1; then stat -f '%Lp' "\$a" > "$seen"
+    else stat -c '%a' "\$a" > "$seen"; fi
+  fi
+  prev="\$a"
+done
+exit 1
+PY
+  chmod +x "$peer/scripts/remote-sync.sh"
+
+  # A deliberately permissive umask: without the fix the capture inherits it.
+  run bash -c "umask 000; printf 'BUNDLE BYTES' | bash '$peer/scripts/remote.sh' unlock locked --authenticated-bundle-stdin"
+  [ "$status" -ne 0 ]          # the stand-in refuses; only the capture matters here
+  [ -f "$seen" ]               # and it must actually have been reached
+  [ "$(cat "$seen")" = "600" ]
+  rm -rf "$peer"
+}
+
+@test "remote unlock: a health response naming another team stops the configure" {
+  skip_if_no_age
+
+  # `configure` is the only caller of health(), and `cmd_unlock` is the only
+  # caller of configure — so this is the path where reading the answer back can
+  # be observed at all. Before this check, remote_team_id was whatever was passed
+  # in and was never compared against the server, so a disagreement stayed
+  # invisible until the first push failed, far from the step that caused it.
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam >/dev/null
+  local source_cfg bundle key_id recipient team_id envelope snapshot digest
+  source_cfg="$TEST_SKILL_DIR/teams/testteam/config.json"
+  bundle="$TEST_SKILL_DIR/hm-bundle.json"
+  snapshot="$TEST_SKILL_DIR/hm-snapshot.json"
+  envelope="$TEST_SKILL_DIR/hm-envelope.json"
+  bash "$SCRIPTS/key.sh" show testteam --snapshot --out "$snapshot" 2>/dev/null
+  bash "$SCRIPTS/key.sh" handoff testteam --out "$bundle" >/dev/null 2>&1
+  key_id="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.remote_key.current.key_id');")"
+  recipient="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.remote_key.current.recipient');")"
+  team_id="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.team_id');")"
+  jq -nc --arg key_id "$key_id" --arg recipient "$recipient" --arg team_id "$team_id" \
+    '{ type:"sync_seal", envelope_v:1, cipher:"age-v1",
+       key_id:$key_id, recipients:[$recipient], max_blob_bytes:1048576,
+       wire_id:"20000000-0000-4000-8000-000000000001",
+       team_id:$team_id, protocol_version:1,
+       projection:{ body:"hm ciphertext", created_at:"2026-01-02T00:00:00.000000Z",
+         from_agent:"member-1", to_agent:"member-1" } }' |
+    node "$SCRIPTS/internal/sync-cipher.mjs" seal > "$envelope"
+  bash "$SCRIPTS/remote.sh" disconnect testteam >/dev/null 2>&1 || true
+
+  MOCK_PULL_AGE=1
+  MOCK_PULL_AGE_ENVELOPE_FILE="$envelope"
+  MOCK_PULL_TEAM_ID="$team_id"
+  # The server answers /v1/health with a DIFFERENT team than the one this
+  # machine is bound to.
+  MOCK_HEALTH_TEAM_ID="018f3f7e-9999-7999-8999-999999999999"
+  restart_mock_server
+
+  PEER_SKILL_DIR="$(mktemp -d)"
+  export PEER_SKILL_DIR
+  mkdir -p "$PEER_SKILL_DIR"/{scripts,db,teams}
+  cp -R "$BATS_TEST_DIRNAME"/../scripts/. "$PEER_SKILL_DIR/scripts/"
+  chmod +x "$PEER_SKILL_DIR/scripts/"*.sh
+  bash "$PEER_SKILL_DIR/scripts/internal/init-db.sh"
+  local peer_scripts="$PEER_SKILL_DIR/scripts"
+
+  run bash "$peer_scripts/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$team_id" encrypted
+  [ "$status" -eq 0 ]
+
+  digest="$(shasum -a 256 "$snapshot" | awk '{print $1}')"
+  run bash "$peer_scripts/remote.sh" unlock encrypted --bundle "$bundle" --confirm-digest "$digest"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"health team does not match"* ]]
+
+  # Fail closed: no sync state and no engine for a binding the server disowns.
+  [ ! -e "$PEER_SKILL_DIR/db/remote-sync/encrypted.json" ]
+  [ ! -e "$PEER_SKILL_DIR/run/remote-sync.encrypted.pid" ]
+
+  # The same unlock succeeds once the server agrees, so the failure above is the
+  # mismatch and not something else in this setup. Switched in place rather than
+  # by restarting: a restart moves the port, and the peer would then fail to
+  # reach the endpoint it recorded at pull time — a green-looking pass for the
+  # wrong reason, or a red one.
+  curl -sS "$ENDPOINT/_test/health-team=" >/dev/null
+  run bash "$peer_scripts/remote.sh" unlock encrypted --bundle "$bundle" --confirm-digest "$digest"
+  [ "$status" -eq 0 ]
+  local pid; pid="$(cat "$PEER_SKILL_DIR/run/remote-sync.encrypted.pid" 2>/dev/null || true)"
+  [ -n "$pid" ] && { kill "$pid" 2>/dev/null || true; wait_for_pid_exit "$pid"; }
+}
+
+@test "remote unlock: --bundle still requires a matching --confirm-digest" {
+  # The ordinary gate is unchanged by the new mode. Asserted on its own so that a
+  # regression here cannot hide inside the larger handed-authority test.
+  run bash "$SCRIPTS/remote.sh" unlock testteam --bundle /dev/null
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"requires --confirm-digest"* ]]
 }
 
 @test "remote doctor: age is optional — its absence does not fail the run" {

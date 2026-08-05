@@ -7,13 +7,6 @@ import * as duplicateKeyJson from "json-dup-key-validator";
 import type { Pool } from "pg";
 import { ZodError, z } from "zod";
 import type { Config } from "./config.js";
-import {
-  authenticateCredential,
-  credentialBinding,
-  exchangePairingToken,
-  revokeCredential,
-  type CredentialIdentity,
-} from "./credentials.js";
 import { errorBody, ProtocolError } from "./errors.js";
 import {
   MAX_REQUEST_BYTES,
@@ -38,8 +31,6 @@ import {
 } from "./storage.js";
 
 const emptyQuerySchema = z.object({}).strict();
-const pairingExchangeSchema = z.object({ token: z.string().min(32).max(256) }).strict();
-const credentialParamsSchema = z.object({ credentialId: uuidV7Schema }).strict();
 const teamParamsSchema = z.object({ teamId: uuidV7Schema }).strict();
 const teamLookupQuerySchema = z.object({ name: teamNameSchema }).strict();
 
@@ -63,30 +54,6 @@ function requestedTeamId(request: FastifyRequest): string {
   return parsed.data;
 }
 
-function bearerSecret(request: FastifyRequest): string | undefined {
-  const authorization = request.headers.authorization;
-  return typeof authorization === "string" && authorization.startsWith("Bearer ")
-    ? authorization.slice("Bearer ".length)
-    : undefined;
-}
-
-async function scopedCredential(
-  pool: Pool,
-  request: FastifyRequest,
-  includeRevoked = false,
-): Promise<{ teamId: string; credential?: CredentialIdentity }> {
-  requireProtocol(request);
-  const teamId = requestedTeamId(request);
-  const secret = bearerSecret(request);
-  if (!secret) {
-    throw new ProtocolError(401, "unauthenticated", "valid credentials are required");
-  }
-  const credential = await authenticateCredential(pool, teamId, secret, includeRevoked);
-  if (!credential) {
-    throw new ProtocolError(401, "unauthenticated", "valid credentials are required");
-  }
-  return { teamId, credential };
-}
 
 async function scopedTeamId(
   _pool: Pool,
@@ -100,9 +67,8 @@ async function scopedTeamId(
   // Agmsg-Team-ID header alone, and the data-plane operations already reject a
   // team that does not exist (404), so an unknown id cannot read another team's
   // data. Do NOT "restore" a credential check here reading this as an
-  // oversight. (scopedCredential itself stays: /v1/pairing/exchange and
-  // /v1/credentials/:id/revoke — the pre-connect path this replaces — still use
-  // it, and are removed separately.)
+  // oversight: there is no credential to check. The pre-connect pairing and
+  // per-credential revoke routes this replaced have been removed.
   requireProtocol(request);
   return requestedTeamId(request);
 }
@@ -113,11 +79,9 @@ export function createApp(pool: Pool, config: Config): FastifyInstance {
       level: config.logLevel,
       redact: {
         paths: [
+          // Nothing here issues or accepts one any more, but a client may
+          // still send an Authorization header and it must not reach the log.
           "req.headers.authorization",
-          "req.body.token",
-          "res.body.credential",
-          "token",
-          "credential",
         ],
         censor: "[REDACTED]",
       },
@@ -219,9 +183,34 @@ async function dataPlaneRoutes(
     void reply.status(500).send(errorBody(protocolError));
   });
 
-  app.get("/v1/health", async (_request, reply) => {
+  app.get("/v1/health", async (request, reply) => {
+    // Parsed OUTSIDE the try: the catch below turns anything thrown into 503
+    // "database unavailable", so a malformed header validated in there would be
+    // reported as a dead server. Same substitution this branch is fixing on the
+    // client, one layer down.
+    const teamId = request.headers["agmsg-team-id"] === undefined
+      ? undefined
+      : requestedTeamId(request);
     try {
-      return await health(pool);
+      // The team header is OPTIONAL here, and only here.
+      //
+      // /v1/health answers two different questions. "Is this server up" is asked
+      // before any team exists — by an operator checking an endpoint, by a
+      // probe, by a client that has not connected yet — and requiring a team
+      // would make that unanswerable. "Am I still bound to the team I think I
+      // am" is asked by a configured client, which always has one to send.
+      //
+      // So: echo the team back when asked about one, and stay answerable when
+      // not. A client that sends the header and gets no team_id treats that as a
+      // disagreement rather than as consent, which is what makes the optional
+      // side safe — the check lives on the side that knows what it expects.
+      // The team comes back from the DB, never from the header we were handed.
+      // Returning the caller's own value would let it compare its value with
+      // itself and read that as agreement — true even for a team this server has
+      // never had. health() reads the row and omits team_id when there is none,
+      // staying 200 — this route is also how "is the server up" is asked, and a
+      // 404 would be indistinguishable from "no such route".
+      return await health(pool, teamId);
     } catch {
       return reply.status(503).send({
         status: "unavailable",
@@ -265,14 +254,6 @@ async function dataPlaneRoutes(
     const body = readStateSyncSchema.parse(request.body);
     reply.header("Cache-Control", "no-store");
     return syncReadState(pool, teamId, body);
-  });
-
-  app.post("/v1/pairing/exchange", { bodyLimit: MAX_REQUEST_BYTES }, async (request, reply) => {
-    requireProtocol(request);
-    emptyQuerySchema.parse(request.query);
-    const body = pairingExchangeSchema.parse(request.body);
-    reply.header("Cache-Control", "no-store");
-    return exchangePairingToken(pool, body.token);
   });
 
   // Registers a team the client owns. No credential: reaching the server is the
@@ -321,27 +302,6 @@ async function dataPlaneRoutes(
     return getMessages(pool, params.teamId, parseSequence(query.after), query.limit);
   });
 
-  app.post("/v1/credentials/:credentialId/revoke", { bodyLimit: MAX_REQUEST_BYTES }, async (request, reply) => {
-    emptyQuerySchema.parse(request.query);
-    z.undefined().parse(request.body);
-    const params = credentialParamsSchema.parse(request.params);
-    const authenticated = await scopedCredential(pool, request, true);
-    if (
-      authenticated.credential &&
-      authenticated.credential.credentialId !== params.credentialId
-    ) {
-      const binding = await credentialBinding(pool, authenticated.teamId);
-      throw new ProtocolError(
-        403,
-        "credential-scope-violation",
-        "a credential may revoke only itself",
-        { credential_id: params.credentialId },
-        binding,
-      );
-    }
-    reply.header("Cache-Control", "no-store");
-    return revokeCredential(pool, authenticated.teamId, params.credentialId);
-  });
 }
 
 export const dataPlane = fp(dataPlaneRoutes, {

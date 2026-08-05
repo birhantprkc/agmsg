@@ -46,6 +46,10 @@ source "$SCRIPT_DIR/lib/storage.sh"
 source "$SCRIPT_DIR/lib/type-registry.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/role-session.sh"  # role->session reverse lookup (#339)
+# Only DEFINES agmsg_close_inherited_fds; nothing is closed here. The type
+# plug calls it inside a subshell around its own long-lived spawn, so this
+# shell's descriptors are untouched. See lib/close-fds.sh.
+source "$SCRIPT_DIR/lib/close-fds.sh"
 
 # Identity sanity check — no point launching a watcher with an empty pair set.
 PAIRS=$("$SCRIPT_DIR/identities.sh" "$PROJECT" "$TYPE" 2>/dev/null || true)

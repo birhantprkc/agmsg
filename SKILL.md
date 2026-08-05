@@ -72,6 +72,12 @@ Do NOT manually edit config files. Always use join.sh. If the name was recently 
 # Message history
 ~/.agents/skills/agmsg/scripts/history.sh <team> [agent_id] [limit]
 
+# Export a team's message history as JSONL — one message_sent record per line,
+# chronological. Default to stdout (pipeable); --out <file> writes a file.
+# --agent limits to one agent; --limit keeps the most recent N (omit = all
+# currently retained). Output is plaintext (the local store is plaintext).
+~/.agents/skills/agmsg/scripts/export.sh --team <team> [--agent <agent>] [--limit N] [--out <file>]
+
 # List team members
 ~/.agents/skills/agmsg/scripts/team.sh <team>
 
@@ -177,6 +183,24 @@ Do NOT manually edit config files. Always use join.sh. If the name was recently 
 ~/.agents/skills/agmsg/scripts/despawn.sh <team> <from> <name> [--force] [--timeout N]
 ```
 
+### Rename
+
+If argument starts with "rename" but not "rename-team":
+1. Accept only an explicit user request. Parse either `<team> <old_name> <new_name>`,
+   or `<old_name> <new_name>` only when this agent belongs to exactly one team.
+2. Never invent either name. Before execution, repeat the resolved team, old name,
+   and new name and ask the user to confirm. Wait for confirmation.
+3. Run: `bash ~/.agents/skills/agmsg/scripts/rename.sh <team> <old_name> <new_name>`
+4. Show the result. For a connected team, the `member_renamed` journal event
+   propagates the rename to other machines.
+
+If argument starts with "rename-team":
+1. Accept only an explicit user request. Parse `<old_team> <new_team>`.
+2. Never invent either team name. Before execution, repeat the old and new team
+   names and ask the user to confirm. Wait for confirmation.
+3. Run: `bash ~/.agents/skills/agmsg/scripts/rename-team.sh <old_team> <new_team>`
+4. Show the result.
+
 ### Remote sync
 
 Remote setup is no-auth. Do not ask for a token or create one.
@@ -204,26 +228,40 @@ If argument starts with "remote pull":
 5. Show the output to the user.
 
 If argument starts with "remote unlock":
-1. Parse `<team>`, one or more `--snapshot <file>` arguments in ascending revision order, exactly one of
-   `--identity <file>` or `--identity-stdin`, and optional
-   `--confirm-digest <sha256>`.
-2. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh unlock <team> --snapshot <file> [--snapshot <file> ...] (--identity <file>|--identity-stdin) [--confirm-digest <sha256>]`
+1. Parse `<team>`, `--bundle <file>`, and `--confirm-digest <sha256>`.
+2. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh unlock <team> --bundle <file> --confirm-digest <sha256>`
 3. The snapshot digest must be compared over a separate live channel. Never
-   infer or auto-confirm it. Raw identity material is a permanent secret; when
-   `--identity-stdin` is needed, tell the user to run the command in their own
-   terminal rather than asking them to paste the identity into agent chat.
+   infer or auto-confirm it. The bundle is permanent secret key material; tell
+   the user to transfer and handle it only through their own trusted channel,
+   never by pasting it into agent chat.
 4. Show the complete result, including the imported-envelope count and engine
    PID.
+5. The advanced form with repeatable `--snapshot` plus `--identity` or
+   `--identity-stdin` remains available when explicitly requested.
 
 If argument starts with "remote status":
 1. Parse an optional `<team>` and `--json`.
 2. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh status [<team>] [--json]`
 3. Show the output to the user.
 
+If argument starts with "remote sync start":
+1. Parse the required `<team>`.
+2. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh sync start <team>`
+3. Show the output to the user.
+
 If argument starts with "remote disconnect":
 1. Parse the required `<team>`.
 2. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh disconnect <team>`
 3. Show the output to the user.
+
+If argument starts with "remote forget":
+1. Parse the required `<team>`. This permanently deletes that team's local
+   roster, history, keys, trust, and sync state, but never changes the server.
+2. Do not add `--yes` yourself. Run:
+   `bash ~/.agents/skills/agmsg/scripts/remote.sh forget <team>`
+3. The command requires the user to confirm in their terminal. If this agent
+   has no interactive terminal, show the deletion summary and tell the user to
+   rerun the displayed command directly; never bypass confirmation for them.
 
 ### End-to-end encryption
 
@@ -237,6 +275,13 @@ If argument starts with "key show":
 3. `--reveal-secret` requires a real interactive terminal and is refused in
    agent mode. Tell the user to run it directly in their own terminal.
 4. Show the output to the user.
+
+If argument starts with "key handoff" followed by a team name:
+1. Parse optional `--out <file>` and run:
+   `bash ~/.agents/skills/agmsg/scripts/key.sh handoff <team> [--out <file>]`
+2. The output bundle contains every epoch identity and is itself permanent
+   secret key material. Never read it into agent chat or display its contents.
+3. Show the bundle path, latest snapshot digest, and full secrecy warning.
 
 If argument starts with "key import" followed by a team name:
 1. Do not ask the user to paste the private identity into this chat, and do not

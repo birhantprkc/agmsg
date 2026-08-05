@@ -15,4 +15,14 @@ export AGMSG_SYNC_DRIVER="$SCRIPT_DIR/internal/storage-sync-driver.sh"
 NODE_BIN="$(agmsg_resolve_node)"
 export AGMSG_SYNC_NODE_BIN="$NODE_BIN"
 export AGMSG_SYNC_CIPHER_HELPER="$SCRIPT_DIR/internal/sync-cipher.mjs"
+# The engine outlives the command that starts it, so whatever it inherits it
+# holds for as long as it runs — including a descriptor internal to bats,
+# which then waits for an EOF that cannot arrive. Closing 3 and 4 by name
+# cannot reach it, because the harness picks the number.
+# The range close and the reasoning behind it now live in lib/close-fds.sh,
+# because codex-bridge-launcher.sh needs exactly the same thing and had the
+# insufficient by-name form until a macOS shard hung on it.
+. "$SCRIPT_DIR/lib/close-fds.sh"
+agmsg_close_inherited_fds
+
 exec "$NODE_BIN" "$SCRIPT_DIR/internal/remote-sync.mjs" "$@"

@@ -102,23 +102,28 @@ bash ~/.agents/skills/agmsg/scripts/remote.sh connect \
 ```
 
 If the team has no key yet, connect creates one and prints the mandatory backup
-notice. It also shows how to export the compact public epoch snapshot. Transfer
-that snapshot and the private key to machine B through a separate trusted
-channel. Machine B still imports the key explicitly and live-confirms the
-displayed snapshot digest; the message server never distributes key material.
-After `pull` reports that the team is locked, machine B runs one command with
-the handed files and the digest verified over that separate live channel:
+notice. On machine A, export one secret handoff bundle containing the confirmed
+snapshot chain and every epoch identity:
+
+```sh
+bash ~/.agents/skills/agmsg/scripts/key.sh handoff <team> --out <bundle-file>
+```
+
+Transfer that bundle to machine B through a separate trusted channel. The
+message server never distributes key material. Compare the displayed snapshot
+digest over a separate live channel. After `pull` reports that the team is
+locked, machine B runs:
 
 ```sh
 bash ~/.agents/skills/agmsg/scripts/remote.sh unlock <team> \
-  --snapshot <snapshot-file> [--snapshot <next-snapshot-file> ...] \
-  --identity <identity-file> \
+  --bundle <bundle-file> \
   --confirm-digest <verified-sha256>
 ```
 
 `unlock` imports the identity, records the trust anchor, reprocesses quarantined
 envelopes, and starts the encrypted sync engine. It is safe to repeat with the
-same confirmed files.
+same confirmed bundle. The bundle contains private keys: keep it secret and
+delete the transferred copy when it is no longer needed.
 
 ## Reference
 
@@ -174,6 +179,29 @@ That install's commands are under `~/.agents/skills/agmsg-test/scripts/`.
 
 For the single-machine, two-install rehearsal, see
 [Try it on one machine](design/remote-sync.md#try-it-on-one-machine).
+
+**Separate the install, not just the environment.** It is tempting to fake a
+second machine with `AGMSG_SYNC_CONNECTION_DIR`, `AGMSG_STORAGE_PATH` and
+friends, pointed at one install. That separates less than it looks like it
+does, and the part it misses fails quietly:
+
+- Five files under `scripts/` read `AGMSG_SYNC_CONNECTION_DIR`: `remote.sh`,
+  `remote-sync.sh`, `key.sh`, `internal/migrate-team-store.sh` and
+  `internal/remote-sync.mjs`. Connection state does move.
+- `send.sh`, `history.sh`, `team.sh` and `inbox.sh` do not. They resolve the
+  team config from the install directory — `team.sh` reads
+  `$SCRIPT_DIR/../teams/$TEAM/config.json` — so both "machines" share it.
+
+The result is a second machine that writes into its own store and can read its
+own history, while the config the sync engine works from belongs to the first
+one. Symptoms seen: `team.sh` answering `Team not found`, the roster driver
+failing on a path under the first install, and a sync engine reporting
+`push.prepared count:0` forever while local sends land in the local store.
+
+A real second machine is a separate install, so test one that way: run
+`install.sh --cmd agmsg-test` (or copy the checkout) and give each machine its
+own directory. #610 fixed one instance of this — the roster driver was not
+handed its file — but it was one instance, not the class.
 
 ### Back up before connecting
 

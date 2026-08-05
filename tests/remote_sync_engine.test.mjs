@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, unlink,
+import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, unlink,
   writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,6 +14,7 @@ import {
   configure,
   cycle,
   driver,
+  exportAgeHandoff,
   exportAgeSnapshot,
   isRetryable,
   initialAgeSnapshot,
@@ -38,11 +39,13 @@ import {
   validateConfiguredAgeIdentities,
   validateCapabilities,
   validateErrorBinding,
+  errorCode,
   validateMembers,
   validateReadStatePage,
   validateResyncResult,
   validateResyncStatus,
   verifyAgeSnapshot,
+  verifyAgeHandoff,
 } from "../scripts/internal/remote-sync.mjs";
 
 const config = {
@@ -109,7 +112,8 @@ test("a rotator provisions its confirmed snapshot at the server boundary", async
       epoch_snapshots: [initial],
       checkpoint: { epoch_revision: "0", writer_generation: "0",
         snapshot_sha256: ageSnapshotDigest(initial), confirmed_at: "2026-07-29T00:00:00Z" },
-      identity_files: {},
+      identity_files: { [oldKeyId]: join(root, "run", "remote-credentials", "demo",
+        "keys", `${oldKeyId}.key`) },
       age_version: "v1.3.1",
     },
   };
@@ -121,7 +125,14 @@ test("a rotator provisions its confirmed snapshot at the server boundary", async
     const keyDir = join(root, "run", "remote-credentials", "demo", "keys");
     await mkdir(teamDir, { recursive: true });
     await mkdir(keyDir, { recursive: true });
-    await writeFile(join(teamDir, "config.json"), `${JSON.stringify(teamConfig)}\n`);
+    await writeFile(join(teamDir, "config.json"), `${JSON.stringify({ ...teamConfig,
+      remote_binding: { endpoint: "https://sync.example.test",
+        server_instance_id: config.server_instance_id,
+        remote_team_id: config.remote_team_id, protocol_version: 1,
+        capabilities: { write_allowed_ciphers: ["none", "age-v1"] },
+        cipher_profile: "age-v1", connected_at: "2026-07-29T00:00:00Z",
+        disconnected_at: null },
+    })}\n`);
     await writeFile(join(teamDir, "roster.jsonl"), [
       JSON.stringify({ type: "key_rotated", ...rotation,
         at: "2026-07-30T00:00:00.000000Z", server_seq: undefined }),
@@ -131,6 +142,7 @@ test("a rotator provisions its confirmed snapshot at the server boundary", async
         server_instance_id: config.server_instance_id,
         remote_team_id: config.remote_team_id }), "",
     ].join("\n"));
+    await writeFile(join(keyDir, `${oldKeyId}.key`), `${identity}\n`, { mode: 0o600 });
     await writeFile(join(keyDir, `${newKeyId}.key`), `${identity}\n`, { mode: 0o600 });
     const snapshot = nextLocalAgeSnapshot(rotationConfig, teamConfig, rotation);
     assert.equal(snapshot.epoch_revision, "1");
@@ -154,6 +166,17 @@ test("a rotator provisions its confirmed snapshot at the server boundary", async
     const exported = JSON.parse(await readFile(exportedPath, "utf8"));
     assert.equal(exported.epoch_revision, "1");
     assert.equal(exported.history.length, 2);
+    const handoffPath = join(root, "age-handoff.json");
+    await exportAgeHandoff({ team: "demo", out: handoffPath });
+    const handoff = JSON.parse(await readFile(handoffPath, "utf8"));
+    assert.equal(handoff.snapshots.length, 2);
+    assert.deepEqual(handoff.identities.map((entry) => entry.key_id), [oldKeyId, newKeyId]);
+    assert.equal((await stat(handoffPath)).mode & 0o077, 0);
+    const extracted = await verifyAgeHandoff({ team: "demo", bundle: handoffPath,
+      "out-dir": join(root, "handoff-extracted") });
+    assert.equal(extracted.snapshot_sha256, ageSnapshotDigest(snapshot));
+    assert.equal(extracted.snapshot_paths.length, 2);
+    assert.equal(extracted.identities.length, 2);
     const confirmedStored = structuredClone(stored);
     const rolledBack = structuredClone(confirmedStored);
     rolledBack.age_v1.epoch_snapshots = [initial];
@@ -582,7 +605,7 @@ test("explicit reprocess walks past a permanent first keyset page", async () => 
     ];
   };
   const result = await reprocessCycle(config, 1, {
-    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
     requestCall: async () => capabilities,
     driverCall,
     evaluateCall: async () => ({ status: "authentication_failed", reason: "still blocked",
@@ -608,7 +631,7 @@ test("reprocess completion counts imported outcomes and requires empty blocking 
   const id = "550e8400-e29b-41d4-a716-446655440001";
   let imported = false;
   const result = await reprocessCycle(config, 100, {
-    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
     requestCall: async () => capabilities,
     driverCall: async (operation, _config, input) => {
       if (operation === "apply") {
@@ -657,7 +680,7 @@ test("reprocess routes recovered roster mutations away from message storage", as
   let rosterApplied = false;
   let messageApplied = false;
   const result = await reprocessCycle(config, 100, {
-    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
     requestCall: async () => capabilities,
     driverCall: async (operation, _config, input) => {
       if (operation === "apply") {
@@ -726,7 +749,7 @@ test("reprocess preserves server order across roster mutations and rotations", a
   let activeEpoch = 0;
   const rosterOrder = [];
   const result = await reprocessCycle(config, 100, {
-    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
     requestCall: async () => capabilities,
     driverCall: async (operation, _config, input) => {
       if (operation === "apply") {
@@ -786,7 +809,7 @@ test("reprocess does not advance storage when an ordered roster flush fails", as
   let storageApplied = false;
   let activated = false;
   await assert.rejects(reprocessCycle(config, 100, {
-    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
     requestCall: async () => ({ ...capsFor(["age-v1"]), current_seq: "2",
       next_sequence_boundary: "3" }),
     driverCall: async (operation) => {
@@ -830,7 +853,7 @@ test("explicit reprocess rejects an unbounded walk through duplicate server sequ
     "550e8400-e29b-41d4-a716-446655440002"];
   let pageIndex = 0;
   await assert.rejects(() => reprocessCycle(config, 1, {
-    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
     requestCall: async () => capabilities,
     driverCall: async (operation) => {
       if (operation === "apply") {
@@ -1128,6 +1151,64 @@ test("resolved protocol errors enforce the immutable binding", () => {
   assert.doesNotThrow(() => validateErrorBinding(config, 401, {
     protocol_version: 1, error: { code: "unauthenticated" },
   }));
+});
+
+test("an error that carries no binding is reported as itself, not as a mismatch", () => {
+  // The allowlist was {400,401,426}, so everything else went through
+  // validateBinding — which compares body.team_id, `undefined` in an ordinary
+  // error body. Every 403, 404, 409 and 500 therefore arrived as "server/team
+  // binding mismatch": the one message meaning "you are talking to the wrong
+  // team" stood in for forbidden, missing, conflicting, and crashed alike.
+  //
+  // Whether a body carries a binding is the real question, so that is what is
+  // asked. Statuses listed explicitly rather than looped from a range: each one
+  // is a diagnosis a caller acts on differently.
+  for (const status of [403, 404, 409, 500]) {
+    assert.doesNotThrow(
+      () => validateErrorBinding(config, status, { error: { code: "some-server-error" } }),
+      `status ${status} must not be reported as a binding mismatch`,
+    );
+  }
+  // A PARTIAL binding is still a binding claim, and the partial one is what
+  // matters: a body with only protocol_version reached validateBinding under the
+  // allowlist and was refused for the missing pair. Triggering on two of the
+  // three fields would have let it through — the inversion loosening a path
+  // instead of tightening it. The value being the correct 1 is the sharp case:
+  // it is right, and the rest is still missing.
+  for (const status of [403, 500]) {
+    assert.throws(() => validateErrorBinding(config, status, {
+      protocol_version: 1, error: { code: "partial-binding" },
+    }), /binding mismatch/u, `status ${status} with only protocol_version must be refused`);
+  }
+  // But protocol_version is not itself an identity claim — every well-formed
+  // reply carries one, including an ordinary 401. Treating it as one everywhere
+  // would turn "your credential was rejected" back into "binding mismatch",
+  // which is the bug this whole change exists to remove.
+  assert.doesNotThrow(() => validateErrorBinding(config, 401, {
+    protocol_version: 1, error: { code: "unauthenticated" },
+  }));
+  // Presence is the trigger, so a mismatched binding on a status the old
+  // allowlist skipped is now caught rather than waved through.
+  assert.throws(() => validateErrorBinding(config, 400, {
+    protocol_version: 1,
+    server_instance_id: "018f3f7e-0000-7000-8000-000000000099",
+    team_id: config.remote_team_id,
+    error: { code: "bad-request" },
+  }), /binding mismatch/u);
+});
+
+test("a masked 500 becomes retryable again", () => {
+  // Not a side effect — the point. While validateBinding swallowed it, the
+  // caller never built the Error that carries `status`, and isRetryable saw
+  // `undefined`: a 500 was treated as permanent even though it is in the
+  // retryable set. Passing the body through restores that.
+  assert.doesNotThrow(() =>
+    validateErrorBinding(config, 500, { error: { code: "internal" } }));
+  const escalated = Object.assign(new Error("HTTP 500 internal"), { status: 500 });
+  assert.equal(isRetryable(escalated), true);
+  // And the mismatch itself stays permanent: retrying a wrong-team binding
+  // would just repeat it.
+  assert.equal(isRetryable(new Error("server/team binding mismatch")), false);
 });
 
 test("run retry classification excludes permanent HTTP and validation failures", () => {
@@ -1738,8 +1819,12 @@ test("age configure authenticates the connected credential before retaining trus
     globalThis.fetch = async () => {
       calls += 1;
       if (calls === 1) {
+        // The health reply has to name the team, or configure refuses here and
+        // the credential check below is never reached — this test would then
+        // pass on the wrong rejection.
         return new Response(JSON.stringify({ status: "ok", database: "ok",
-          server_instance_id: config.server_instance_id }), {
+          server_instance_id: config.server_instance_id,
+          team_id: config.remote_team_id }), {
           status: 200, headers: { "Agmsg-Protocol-Version": "1" },
         });
       }
@@ -1818,7 +1903,11 @@ test("age configure extends a stored chain and activates its announced epoch", a
     process.env.AGMSG_AGE_BIN = fakeAge;
     globalThis.fetch = async (url) => {
       const body = String(url).endsWith("/v1/health") ?
-        { status: "ok", database: "ok", server_instance_id: config.server_instance_id } :
+        // team_id too: configure now reads it back and refuses a server that
+        // names a different team, so a stub that omits it is a server which
+        // does not answer per-team.
+        { status: "ok", database: "ok", server_instance_id: config.server_instance_id,
+          team_id: config.remote_team_id } :
         capsFor(["age-v1"]);
       return new Response(JSON.stringify(body), {
         status: 200, headers: { "Agmsg-Protocol-Version": "1" },
@@ -1972,7 +2061,7 @@ test("cycle: a large pull page (backlog present) is requested and accepted at pu
   }));
   let pullPath = null;
   const result = await cycle(config, { pushLimit: 100, pullLimit: 1000 }, {
-    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
     requestCall: async (_config, path) => {
       if (path === "/v1/capabilities") return capabilities;
       if (path.startsWith("/v1/messages?after=")) { pullPath = path; return { messages, next_after: "500", has_more: false }; }
@@ -2015,7 +2104,7 @@ test("cycle routes roster payloads through the existing message transport", asyn
   });
   const rosterOperations = [];
   await cycle(config, { pushLimit: 100, pullLimit: 1000 }, {
-    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
     requestCall: async (_config, path, init) => {
       if (path === "/v1/capabilities") return capability();
       if (path === "/v1/messages" && init?.method === "POST") {
@@ -2204,7 +2293,7 @@ test("cycle pushes a key rotation alone and waits for ordered pull before activa
   };
   let activated = 0;
   await cycle(config, { pushLimit: 100, pullLimit: 1000 }, {
-    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
     requestCall: async (_config, path, init) => {
       if (path === "/v1/capabilities") return capsFor(["none"]);
       if (path === "/v1/messages" && init?.method === "POST") {
@@ -2260,7 +2349,7 @@ test("cycle records a pulled key rotation before halting for a missing replaceme
   let recorded = false;
   let storageApplied = false;
   await assert.rejects(cycle(config, { pushLimit: 100, pullLimit: 1000 }, {
-    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
     requestCall: async (_config, path) => {
       if (path === "/v1/capabilities") return {
         ...capsFor(["none"]), current_seq: "1", next_sequence_boundary: "2",
@@ -2333,7 +2422,7 @@ async function runCycleWithPush({ writeCiphers, candidateCount, pushLimit }) {
   let posted = false;
   let reconcileCalled = false;
   const result = await cycle(config, { pushLimit, pullLimit: 1000 }, {
-    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
     requestCall: async (_config, path, init) => {
       if (path === "/v1/capabilities") return capabilities;
       if (path === "/v1/messages" && init?.method === "POST") {
@@ -2385,7 +2474,7 @@ test("cycle: a batch that fails after prepare re-sends the same candidates and c
   let reconcileAcks = null;
   const postedIdsPerAttempt = [];
   const deps = {
-    healthCall: async () => ({ server_instance_id: config.server_instance_id }),
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
     requestCall: async (_config, path, init) => {
       if (path === "/v1/capabilities") return capabilities;
       if (path === "/v1/messages" && init?.method === "POST") {
@@ -2427,4 +2516,464 @@ test("cycle: a batch that fails after prepare re-sends the same candidates and c
   assert.deepEqual(postedIdsPerAttempt, [candidateIds, candidateIds]);
   assert.deepEqual(reconcileAcks.map((ack) => ack.id), candidateIds);
   assert.ok(reconcileAcks.every((ack) => ack.disposition === "duplicate"));
+});
+
+test("the roster driver is handed a resolved file path, from the connection root", async () => {
+  // Only `remote.sh pull` ever set AGMSG_SYNC_LOCAL_ROSTER_FILE, so every other
+  // caller left the driver to guess — and its guess was the skill directory. A
+  // second machine keeps its teams under its own connection directory, so an
+  // existing roster looked missing.
+  //
+  // The engine derives the path now and passes the file, at the one place both
+  // drivers go through. This drives a stand-in driver that reports what it was
+  // given, so what is measured is the value that crosses the process boundary,
+  // not a re-derivation of the same expression.
+  const root = await mkdtemp(join(tmpdir(), "agmsg-roster-env-"));
+  const connection = join(root, "connection");
+  const skill = join(root, "skill");
+  await mkdir(join(connection, "teams", "demo"), { recursive: true });
+  await mkdir(skill, { recursive: true });
+  const script = join(root, "driver.sh");
+  await writeFile(script, `#!/usr/bin/env bash
+printf '{"type":"seen","roster":"%s","connection_dir":"%s","trust_dir":"%s"}\\n' \\
+  "\${AGMSG_SYNC_LOCAL_ROSTER_FILE:-}" "\${AGMSG_SYNC_CONNECTION_DIR:-}" "\${AGMSG_SYNC_TRUST_DIR:-}"
+`, { mode: 0o700 });
+
+  const previous = {
+    driver: process.env.AGMSG_SYNC_ROSTER_DRIVER,
+    connection: process.env.AGMSG_SYNC_CONNECTION_DIR,
+    skill: process.env.SKILL_DIR,
+    roster: process.env.AGMSG_SYNC_LOCAL_ROSTER_FILE,
+    trust: process.env.AGMSG_SYNC_TRUST_DIR,
+  };
+  process.env.AGMSG_SYNC_ROSTER_DRIVER = script;
+  process.env.AGMSG_SYNC_CONNECTION_DIR = connection;
+  process.env.SKILL_DIR = skill;
+  delete process.env.AGMSG_SYNC_LOCAL_ROSTER_FILE;
+  process.env.AGMSG_SYNC_TRUST_DIR = "/durable/trust";
+  try {
+    const [seen] = await rosterDriver("prepare", config, []);
+    assert.equal(seen.roster, join(connection, "teams", "demo", "config.json"));
+    assert.notEqual(seen.roster, join(skill, "teams", "demo", "config.json"));
+    // The directories stay stripped: the driver is given the one file it needs
+    // and is not put back in the business of deriving locations.
+    assert.equal(seen.connection_dir, "");
+    assert.equal(seen.trust_dir, "");
+  } finally {
+    for (const [key, value] of [
+      ["AGMSG_SYNC_ROSTER_DRIVER", previous.driver],
+      ["AGMSG_SYNC_CONNECTION_DIR", previous.connection],
+      ["SKILL_DIR", previous.skill],
+      ["AGMSG_SYNC_LOCAL_ROSTER_FILE", previous.roster],
+      ["AGMSG_SYNC_TRUST_DIR", previous.trust],
+    ]) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("only the roster file may be set after the strip — nothing else can be re-added", async () => {
+  // The strip is the boundary, and it has to be one. An earlier version took a
+  // general "extra environment" object applied after the deletes, which let any
+  // caller put TOKEN, TRUST_DIR or an age identity back; the rule that they
+  // never cross lived in a comment instead of in the function. runDriver now
+  // accepts one named path and nothing else, so this asserts the shape of the
+  // parameter rather than the good behaviour of today's only caller.
+  const source = await readFile(new URL("../scripts/internal/remote-sync.mjs", import.meta.url), "utf8");
+  const signature = /function runDriver\(\{([^}]*)\}\)/u.exec(source);
+  assert.ok(signature, "runDriver's destructured parameters could not be read");
+  const parameters = signature[1].split(",").map((name) => name.trim().split(/[:=]/u)[0].trim());
+  // No general environment/env/extraEnv escape hatch — the reviewable property.
+  for (const forbidden of ["environment", "env", "extraEnv", "envOverrides"]) {
+    assert.ok(!parameters.includes(forbidden),
+      `runDriver takes "${forbidden}", which re-opens the secret boundary`);
+  }
+  assert.ok(parameters.includes("rosterFile"), "the one permitted value is missing");
+  // And exactly one assignment into the child environment after the deletes.
+  const afterStrip = source.slice(source.indexOf("function runDriver"), source.indexOf("const child = spawn"));
+  const assignments = afterStrip.match(/childEnvironment\.[A-Z_]+\s*=/gu) ?? [];
+  assert.deepEqual(assignments, ["childEnvironment.AGMSG_SYNC_LOCAL_ROSTER_FILE ="]);
+});
+
+test("a secret handed in as the roster file cannot reach the driver as a secret", async () => {
+  // The complement of the shape check: drive the real path and confirm the only
+  // thing that lands is the roster variable.
+  //
+  // Note what this test can and cannot do. With a general environment parameter
+  // it would still pass, because the only caller passes just the roster path —
+  // which is exactly why the shape check above exists as well. Behaviour proves
+  // today's callers behave; the parameter list proves a future one cannot.
+  const root = await mkdtemp(join(tmpdir(), "agmsg-roster-allowlist-"));
+  const script = join(root, "driver.sh");
+  await writeFile(script, `#!/usr/bin/env bash
+printf '{"type":"seen","token":"%s","trust":"%s","conn":"%s","identity":"%s","roster":"%s"}\\n' \\
+  "\${AGMSG_SYNC_TOKEN:-}" "\${AGMSG_SYNC_TRUST_DIR:-}" "\${AGMSG_SYNC_CONNECTION_DIR:-}" \\
+  "\${AGMSG_AGE_IDENTITY:-}" "\${AGMSG_SYNC_LOCAL_ROSTER_FILE:-}"
+`, { mode: 0o700 });
+  const previous = {
+    driver: process.env.AGMSG_SYNC_ROSTER_DRIVER,
+    token: process.env.AGMSG_SYNC_TOKEN,
+    trust: process.env.AGMSG_SYNC_TRUST_DIR,
+    connection: process.env.AGMSG_SYNC_CONNECTION_DIR,
+    identity: process.env.AGMSG_AGE_IDENTITY,
+    roster: process.env.AGMSG_SYNC_LOCAL_ROSTER_FILE,
+  };
+  process.env.AGMSG_SYNC_ROSTER_DRIVER = script;
+  process.env.AGMSG_SYNC_TOKEN = "must-not-cross";
+  process.env.AGMSG_SYNC_TRUST_DIR = "/durable/trust";
+  process.env.AGMSG_SYNC_CONNECTION_DIR = root;
+  process.env.AGMSG_AGE_IDENTITY = "AGE-SECRET-KEY-1FIXTURE";
+  delete process.env.AGMSG_SYNC_LOCAL_ROSTER_FILE;
+  try {
+    const [seen] = await rosterDriver("prepare", config, []);
+    assert.equal(seen.token, "");
+    assert.equal(seen.trust, "");
+    assert.equal(seen.conn, "");
+    assert.equal(seen.identity, "");
+    assert.equal(seen.roster, join(root, "teams", config.local_team, "config.json"));
+  } finally {
+    for (const [key, value] of [
+      ["AGMSG_SYNC_ROSTER_DRIVER", previous.driver],
+      ["AGMSG_SYNC_TOKEN", previous.token],
+      ["AGMSG_SYNC_TRUST_DIR", previous.trust],
+      ["AGMSG_SYNC_CONNECTION_DIR", previous.connection],
+      ["AGMSG_AGE_IDENTITY", previous.identity],
+      ["AGMSG_SYNC_LOCAL_ROSTER_FILE", previous.roster],
+    ]) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// --- push batching: bytes, and the 413 split ------------------------------
+
+// A candidate whose wire size is dominated by `bytes` of blob.
+function bulkyCandidate(index, bytes) {
+  return {
+    type: "sync_push_candidate",
+    local_position: String(index + 1),
+    local_id: `m${index}`,
+    id: `550e8400-e29b-41d4-a716-${String(index + 1).padStart(12, "0")}`,
+    envelope: { v: 1, cipher: "none", key_id: null, blob: "A".repeat(bytes) },
+  };
+}
+
+function pushHarness(candidates, onPost) {
+  const capabilities = {
+    protocol_version: 1, server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id, team_name: "demo", min_available_seq: "0",
+    current_seq: "0", next_sequence_boundary: "1", accepted_envelope_versions: [1],
+    write_allowed_ciphers: ["none"], policy_revision: "0", effective_from_seq: "1",
+    max_blob_bytes: "1048576", policy_history: [{ policy_revision: "0",
+      effective_from_seq: "1", accepted_envelope_versions: [1],
+      write_allowed_ciphers: ["none"] }],
+  };
+  return {
+    healthCall: async () => ({ server_instance_id: config.server_instance_id,
+      team_id: config.remote_team_id }),
+    requestCall: async (_config, path, options) => {
+      if (path === "/v1/capabilities") return capabilities;
+      if (path === "/v1/messages") return onPost(JSON.parse(options.body).messages);
+      if (path.startsWith("/v1/messages?after=")) {
+        return { messages: [], next_after: "0", has_more: false };
+      }
+      throw new Error(`unexpected request ${path}`);
+    },
+    driverCall: async (operation) => {
+      if (operation === "prepare") {
+        return [{ type: "sync_state",
+          driver_generation: "018f3f7e-0000-7000-8000-000000000099",
+          transport_cursor: "0" }, ...candidates];
+      }
+      if (operation === "reconcile") return [{ type: "sync_reconcile_result", count: 1 }];
+      if (operation === "apply") return [{ type: "sync_apply_result", transport_cursor: "0" }];
+      throw new Error(`unexpected storage operation ${operation}`);
+    },
+    logApplyCall: async () => {},
+    eventCall: async () => {},
+    readStateCycleCall: async () => {},
+  };
+}
+
+// Sequences come from a counter that keeps advancing across POSTs, the way a
+// real server assigns them. Restarting at 1 per response would make the
+// concatenated acks non-monotonic, and validateAckMapping rejects that — a
+// property of the stub, not of the split, but one that hides the real behaviour
+// if it is wrong.
+function ackAllFrom(counter) {
+  return (messages) => ({
+    protocol_version: 1, server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id, team_name: "demo", min_available_seq: "0",
+    current_seq: String(counter.value + messages.length), policy_revision: "0",
+    acks: messages.map((message) => ({ id: message.id,
+      server_seq: String(++counter.value), disposition: "stored" })),
+  });
+}
+
+test("push splits a page by BYTES, not by message count", async () => {
+  // The count limit was 1000, so a thousand small messages and a thousand large
+  // ones were the same batch and only the second kind was ever refused. Twelve
+  // messages of 64 KiB is far under any count limit and far over the byte one.
+  const candidates = Array.from({ length: 12 }, (_unused, index) =>
+    bulkyCandidate(index, 64 * 1024));
+  const posts = [];
+  const ack = ackAllFrom({ value: 0 });
+  await cycle(config, { pushLimit: 100, pullLimit: 1000 },
+    pushHarness(candidates, (messages) => { posts.push(messages.length); return ack(messages); }));
+  assert.ok(posts.length > 1, `expected more than one POST, got ${posts.length}`);
+  assert.equal(posts.reduce((sum, n) => sum + n, 0), 12); // every message sent exactly once
+});
+
+test("push halves on 413 and every message still lands, in order", async () => {
+  // The server refuses anything above four at a time. The client does not know
+  // that number and must not need to: it halves until the server accepts.
+  const candidates = Array.from({ length: 8 }, (_unused, index) => bulkyCandidate(index, 64));
+  const accepted = [];
+  const ack = ackAllFrom({ value: 0 });
+  let refusals = 0;
+  await cycle(config, { pushLimit: 100, pullLimit: 1000 },
+    pushHarness(candidates, (messages) => {
+      if (messages.length > 4) {
+        refusals += 1;
+        const error = new Error("HTTP 413 request-too-large");
+        error.status = 413;
+        error.body = { protocol_version: 1, server_instance_id: config.server_instance_id,
+          team_id: config.remote_team_id, error: { code: "request-too-large" } };
+        throw error;
+      }
+      accepted.push(...messages.map((m) => m.id));
+      return ack(messages);
+    }));
+  assert.ok(refusals > 0, "the server never refused, so no split was exercised");
+  assert.deepEqual(accepted, candidates.map((c) => c.id)); // all of them, in send order
+});
+
+test("a POST that fails after earlier ones succeeded still records their acks", async () => {
+  // Several POSTs cannot be atomic the way one was: when a later one dies, the
+  // rows the earlier ones stored are committed and their acks are in hand.
+  // Dropping them leaves the client with no record of messages the server holds
+  // — the exact state the split has to keep from happening. Both the failure and
+  // the prefix have to reach the caller.
+  const candidates = Array.from({ length: 8 }, (_unused, index) =>
+    bulkyCandidate(index, 256 * 1024));
+  const committed = [];
+  const reconciled = [];
+  const events = [];
+  let posts = 0;
+  const ack = ackAllFrom({ value: 0 });
+  const harness = pushHarness(candidates, (messages) => {
+    posts += 1;
+    if (posts === 2) {
+      const error = new Error("HTTP 409 conflict");
+      error.status = 409;
+      throw error;
+    }
+    committed.push(...messages.map((message) => message.id));
+    return ack(messages);
+  });
+  const dependencies = {
+    ...harness,
+    eventCall: async (name, payload) => { events.push([name, payload]); },
+    driverCall: async (operation, driverConfig, input) => {
+      if (operation === "reconcile") {
+        reconciled.push(...input.map((record) => record.id));
+        return [{ type: "sync_reconcile_result", count: input.length }];
+      }
+      return harness.driverCall(operation, driverConfig, input);
+    },
+  };
+  await assert.rejects(cycle(config, { pushLimit: 100, pullLimit: 1000 }, dependencies),
+    (error) => error.status === 409);
+  assert.ok(posts > 1, `expected the page to split, got ${posts} POST(s)`);
+  assert.ok(committed.length > 0, "the first POST stored nothing, so nothing was at risk");
+  // What the server kept is exactly what the client wrote down — no more (it
+  // must not claim rows the failed POST never stored) and no less.
+  assert.deepEqual(reconciled, committed);
+  assert.deepEqual(events.filter(([name]) => name === "push.partial")
+    .map(([, payload]) => payload), [{ acked: committed.length, of: candidates.length }]);
+});
+
+test("a half that fails after its sibling succeeded still records the sibling's acks", async () => {
+  // The same loss, one level down: the 413 halving is recursive, so a failure in
+  // the second half discards the first half's acks unless every layer carries
+  // them. Small messages, so the byte budget makes one group and the only split
+  // is the recursive one — this reaches code the batch-level test does not.
+  const candidates = Array.from({ length: 4 }, (_unused, index) => bulkyCandidate(index, 64));
+  const committed = [];
+  const reconciled = [];
+  let refused = false;
+  const ack = ackAllFrom({ value: 0 });
+  const harness = pushHarness(candidates, (messages) => {
+    if (messages.length > 2) { // refuse the whole group once, forcing the halving
+      refused = true;
+      const error = new Error("HTTP 413 request-too-large");
+      error.status = 413;
+      error.body = { protocol_version: 1, server_instance_id: config.server_instance_id,
+        team_id: config.remote_team_id, error: { code: "request-too-large" } };
+      throw error;
+    }
+    if (committed.length > 0) { // the second half, after the first one stored
+      const error = new Error("HTTP 503 unavailable");
+      error.status = 503;
+      throw error;
+    }
+    committed.push(...messages.map((message) => message.id));
+    return ack(messages);
+  });
+  await assert.rejects(cycle(config, { pushLimit: 100, pullLimit: 1000 }, {
+    ...harness,
+    driverCall: async (operation, driverConfig, input) => {
+      if (operation === "reconcile") {
+        reconciled.push(...input.map((record) => record.id));
+        return [{ type: "sync_reconcile_result", count: input.length }];
+      }
+      return harness.driverCall(operation, driverConfig, input);
+    },
+  }), (error) => error.status === 503);
+  assert.ok(refused, "the server never refused, so the recursive halving never ran");
+  assert.deepEqual(reconciled, committed);
+  assert.equal(committed.length, 2);
+});
+
+test("an event sink that fails costs neither the prefix nor the transport error", async () => {
+  // The recovery must not depend on the reporting. An event log that cannot be
+  // written is a reason to say so, never a reason to skip the durable write the
+  // acks exist for, or to surface itself as the cycle's error in place of the
+  // transport failure that caused it.
+  const candidates = Array.from({ length: 8 }, (_unused, index) =>
+    bulkyCandidate(index, 256 * 1024));
+  const committed = [];
+  const reconciled = [];
+  let posts = 0;
+  const ack = ackAllFrom({ value: 0 });
+  const harness = pushHarness(candidates, (messages) => {
+    posts += 1;
+    if (posts === 2) {
+      const error = new Error("HTTP 409 conflict");
+      error.status = 409;
+      throw error;
+    }
+    committed.push(...messages.map((message) => message.id));
+    return ack(messages);
+  });
+  const attempted = [];
+  const failed = await cycle(config, { pushLimit: 100, pullLimit: 1000 }, {
+    ...harness,
+    // Every event reachable once the push has failed throws — the two this
+    // change added, and the two that report the reconcile. None of them may sit
+    // between the acks and the durable write.
+    eventCall: async (name) => {
+      if (["push.partial", "push.partial-unrecorded", "push.ack", "push.reconciled"]
+        .includes(name)) {
+        attempted.push(name);
+        throw new Error("event log is unwritable");
+      }
+    },
+    driverCall: async (operation, driverConfig, input) => {
+      if (operation === "reconcile") {
+        reconciled.push(...input.map((record) => record.id));
+        return [{ type: "sync_reconcile_result", count: input.length }];
+      }
+      return harness.driverCall(operation, driverConfig, input);
+    },
+  }).then(() => null, (error) => error);
+  assert.ok(failed, "the cycle resolved, so the transport failure was swallowed");
+  assert.equal(failed.status, 409);
+  assert.match(failed.message, /409 conflict/u);
+  assert.ok(committed.length > 0, "the first POST stored nothing, so nothing was at risk");
+  assert.deepEqual(reconciled, committed);
+  // The write succeeded and only the log failed. Saying "unrecorded" here would
+  // send the next reader to resend a prefix that is already durable, so the
+  // classification is the assertion — a log failure is not a write failure.
+  assert.ok(!attempted.includes("push.partial-unrecorded"),
+    "a durable prefix was reported as unrecorded");
+  assert.equal(failed.cause, undefined, "an event failure took the cause slot");
+  // Reporting was still attempted, in order, after the write.
+  assert.deepEqual(attempted, ["push.partial", "push.ack", "push.reconciled"]);
+});
+
+test("push stops at one message rather than splitting forever, and names it", async () => {
+  // A single message the server refuses is a permanent dead end: no batching
+  // this client can do will get it across, and every later cycle retries it.
+  // The failure has to say which message and how big, or an operator sees a sync
+  // that stops progressing and nothing that points at the cause.
+  const candidates = [bulkyCandidate(0, 4096)];
+  const events = [];
+  let attempts = 0;
+  const harness = pushHarness(candidates, () => {
+    attempts += 1;
+    const error = new Error("HTTP 413 request-too-large");
+    error.status = 413;
+    // The HOSTED shape on purpose: a bare string, which is what the edge sends.
+    // If this event read body.error.code directly it would report detail:null
+    // for exactly the deployment the bridge was added for.
+    error.body = { protocol_version: 1, server_instance_id: config.server_instance_id,
+      team_id: config.remote_team_id, error: "payload_too_large" };
+    throw error;
+  });
+  harness.eventCall = async (name, payload) => { events.push([name, payload]); };
+  await assert.rejects(
+    cycle(config, { pushLimit: 100, pullLimit: 1000 }, harness),
+    (error) => {
+      assert.match(error.message, /cannot be pushed by splitting/u);
+      // The message a human reads has to carry the local coordinate too.
+      assert.ok(error.message.includes(candidates[0].local_id),
+        `error must name local_id, got: ${error.message}`);
+      assert.equal(error.local_id, candidates[0].local_id);
+      assert.equal(error.local_position, candidates[0].local_position);
+      assert.equal(error.wire_id, candidates[0].id);
+      return true;
+    });
+  assert.equal(attempts, 1, "a single message must not be split again");
+  const oversized = events.find(([name]) => name === "push.oversized");
+  assert.ok(oversized, "no push.oversized event was emitted");
+  // local_id is the coordinate in THIS machine's store — the row an operator can
+  // look at or delete. The wire id is a reservation this push minted and points
+  // at nothing locally, so reporting only that would say "sync is stuck" without
+  // saying on what. The fixture keeps them different on purpose.
+  assert.notEqual(candidates[0].local_id, candidates[0].id);
+  assert.equal(oversized[1].local_id, candidates[0].local_id);
+  assert.equal(oversized[1].local_position, candidates[0].local_position);
+  assert.equal(oversized[1].sync_axis, "messages");
+  assert.equal(oversized[1].wire_id, candidates[0].id); // still there, for correlation
+  assert.ok(oversized[1].bytes > 4096, "the reported size must be the real wire size");
+  assert.equal(oversized[1].detail, "payload_too_large");
+});
+
+test("an overlapping resend acks every message SENT, duplicates included", async () => {
+  // The property the split rests on. A retry after a partial success resends
+  // messages the server already has; validateAckMapping compares ack count with
+  // candidate count, so a server that acked only the newly stored ones would
+  // fail the whole push with "incomplete ack mapping". Nothing else in the suite
+  // sends an overlapping batch, so this would break silently.
+  const candidates = Array.from({ length: 4 }, (_unused, index) => bulkyCandidate(index, 64));
+  const alreadyStored = new Set([candidates[0].id, candidates[1].id]);
+  let seen = null;
+  await cycle(config, { pushLimit: 100, pullLimit: 1000 },
+    pushHarness(candidates, (messages) => {
+      seen = messages.map((message) => ({ id: message.id,
+        disposition: alreadyStored.has(message.id) ? "duplicate" : "stored" }));
+      return { protocol_version: 1, server_instance_id: config.server_instance_id,
+        team_id: config.remote_team_id, team_name: "demo", min_available_seq: "0",
+        current_seq: "4", policy_revision: "0",
+        acks: seen.map((ack, index) => ({ ...ack, server_seq: String(index + 1) })) };
+    }));
+  assert.equal(seen.length, 4);
+  assert.equal(seen.filter((ack) => ack.disposition === "duplicate").length, 2);
+});
+
+test("an error code is read from the protocol shape, and from the edge's for now", () => {
+  // The nested form is the protocol. The bare string is a bridge to what the
+  // hosted edge sends today, and this test says so on purpose: when the edge
+  // emits the nested shape, the string case here and the branch it covers both
+  // go away together.
+  assert.equal(errorCode({ error: { code: "request-too-large" } }), "request-too-large");
+  assert.equal(errorCode({ error: "payload_too_large" }), "payload_too_large"); // bridge
+  // Neither shape present, or present but empty: say so rather than inventing one.
+  assert.equal(errorCode({ error: {} }), "unknown-error");
+  assert.equal(errorCode({ error: "" }), "unknown-error");
+  assert.equal(errorCode({}), "unknown-error");
+  assert.equal(errorCode(undefined), "unknown-error");
 });

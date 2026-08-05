@@ -33,6 +33,8 @@ function usage() {
     [--age-identity KEY_ID=FILE ...]
   remote-sync.sh export-age-snapshot --team NAME [--out FILE]
   remote-sync.sh verify-age-snapshot --team NAME --age-snapshot FILE
+  remote-sync.sh export-age-handoff --team NAME --out FILE
+  remote-sync.sh verify-age-handoff --team NAME --bundle FILE --out-dir DIRECTORY
   remote-sync.sh once --team NAME [--limit N]
   remote-sync.sh run --team NAME [--limit N] [--interval SECONDS]
   remote-sync.sh reprocess --team NAME [--limit N]
@@ -348,9 +350,13 @@ export async function loadConfig(team) {
 }
 
 async function localAgentRoster(team) {
+  // One derivation for this path, shared with teamConfigPath: the connection
+  // root when there is one, the skill directory only as the single-machine
+  // default. This read used SKILL_DIR alone, so on a second machine — which
+  // always has its own connection directory — it looked in a directory nothing
+  // had written and reported the roster missing.
   const supplied = process.env.AGMSG_SYNC_LOCAL_ROSTER_FILE;
-  const skillRoot = process.env.SKILL_DIR;
-  const path = supplied || (skillRoot ? join(skillRoot, "teams", team, "config.json") : "");
+  const path = supplied || teamConfigPath(team);
   if (!path) throw new Error("local team roster path is unavailable");
   const value = JSON.parse(await readFile(path, "utf8"));
   if (!value?.agents || typeof value.agents !== "object" || Array.isArray(value.agents)) {
@@ -532,6 +538,118 @@ export async function exportAgeSnapshot(args) {
     process.stdout.write(`${canonical}\n`);
   }
   process.stderr.write(`Snapshot SHA-256: ${ageSnapshotDigest(snapshot)}\n`);
+}
+
+export async function exportAgeHandoff(args) {
+  const team = requireName(args.team, "team");
+  if (!args.out) throw new Error("export-age-handoff requires --out");
+  const config = await readStoredSyncConfig(team);
+  if (config.cipher_profile !== "age-v1") throw new Error("team is not configured for age-v1");
+  validateAgeConfiguration(config);
+  await validateRetainedAgeCheckpoint(config);
+  validateConfiguredAgeIdentities(config);
+  const snapshots = ageSnapshotChain(config.age_v1);
+  const latest = snapshots.at(-1);
+  const identities = [];
+  const seen = new Set();
+  for (const epoch of latest.history) {
+    if (seen.has(epoch.key_id)) continue;
+    seen.add(epoch.key_id);
+    const path = config.age_v1.identity_files[epoch.key_id];
+    if (!path) throw new Error(`local identity is missing for ${epoch.key_id}`);
+    const identity = (await readFile(path, "utf8")).trim();
+    identities.push({ key_id: epoch.key_id, identity });
+  }
+  const bundle = {
+    format_version: 1,
+    type: "agmsg_age_v1_handoff",
+    snapshots,
+    identities,
+  };
+  const canonical = canonicalJson(bundle);
+  const outputPath = resolve(args.out);
+  const directory = dirname(outputPath);
+  await mkdir(directory, { recursive: true });
+  const temporary = join(directory, `.${basename(outputPath)}.${process.pid}.tmp`);
+  await writeFile(temporary, canonical, { mode: 0o600, flag: "wx" });
+  await rename(temporary, outputPath);
+  process.stderr.write(`Snapshot SHA-256: ${ageSnapshotDigest(latest)}\n`);
+}
+
+export async function verifyAgeHandoff(args) {
+  const team = requireName(args.team, "team");
+  if (!args.bundle || !args["out-dir"]) {
+    throw new Error("verify-age-handoff requires --bundle and --out-dir");
+  }
+  const text = await readFile(resolve(args.bundle), "utf8");
+  const bundle = parseStrictJson(text);
+  if (text.trim() !== canonicalJson(bundle)) {
+    throw new Error("age handoff bundle must be RFC 8785 JCS without duplicate or noncanonical fields");
+  }
+  if (!bundle || bundle.format_version !== 1 || bundle.type !== "agmsg_age_v1_handoff" ||
+      !Array.isArray(bundle.snapshots) || bundle.snapshots.length < 1 ||
+      !Array.isArray(bundle.identities) ||
+      Object.keys(bundle).sort().join(",") !== "format_version,identities,snapshots,type") {
+    throw new Error("age handoff bundle is invalid");
+  }
+  const outputDirectory = resolve(args["out-dir"]);
+  await mkdir(outputDirectory, { recursive: true, mode: 0o700 });
+  const snapshotPaths = [];
+  for (let index = 0; index < bundle.snapshots.length; index += 1) {
+    const path = join(outputDirectory, `snapshot-${String(index).padStart(4, "0")}.json`);
+    await writeFile(path, canonicalJson(bundle.snapshots[index]), { mode: 0o600, flag: "wx" });
+    snapshotPaths.push(path);
+  }
+  const identityMappings = [];
+  const seen = new Set();
+  for (const entry of bundle.identities) {
+    if (!entry || Object.keys(entry).sort().join(",") !== "identity,key_id" ||
+        typeof entry.key_id !== "string" || !/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(entry.key_id) ||
+        typeof entry.identity !== "string" || seen.has(entry.key_id)) {
+      throw new Error("age handoff identity is invalid");
+    }
+    seen.add(entry.key_id);
+    const path = join(outputDirectory, `identity-${entry.key_id}.key`);
+    await writeFile(path, `${entry.identity.trim()}\n`, { mode: 0o600, flag: "wx" });
+    identityMappings.push({ key_id: entry.key_id, path });
+  }
+  const binding = await readConnectedBinding(team);
+  const latest = bundle.snapshots.at(-1);
+  const digest = ageSnapshotDigest(latest);
+  const config = {
+    format_version: 1,
+    local_team: team,
+    server_url: binding.endpoint,
+    server_instance_id: binding.server_instance_id,
+    remote_team_id: binding.remote_team_id,
+    protocol_version: binding.protocol_version,
+    cipher_profile: "age-v1",
+    local_security_history: [{ local_security_revision: "0", effective_from_seq: "1",
+      minimum_security_mode: "e2ee-required" }],
+    age_v1: {
+      epoch_snapshots: bundle.snapshots,
+      checkpoint: { epoch_revision: latest.epoch_revision, snapshot_sha256: digest,
+        writer_generation: latest.writer_generation, confirmed_at: new Date().toISOString() },
+      identity_files: Object.fromEntries(identityMappings.map(({ key_id, path }) => [key_id, path])),
+      age_version: "verification-only",
+    },
+  };
+  validateAgeConfiguration(config);
+  const expectedKeyIds = [...new Set(latest.history.map((epoch) => epoch.key_id))];
+  if (expectedKeyIds.length !== identityMappings.length ||
+      expectedKeyIds.some((keyId) => !seen.has(keyId))) {
+    throw new Error("age handoff bundle does not contain every epoch identity exactly once");
+  }
+  validateConfiguredAgeIdentities(config);
+  const result = {
+    type: "age_handoff_verified",
+    snapshot_sha256: digest,
+    epoch_revision: latest.epoch_revision,
+    snapshot_paths: snapshotPaths,
+    identities: identityMappings,
+  };
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+  return result;
 }
 
 export async function verifyAgeSnapshot(args) {
@@ -923,7 +1041,7 @@ async function send(config, path, init, authHeaders) {
   }
   if (!response.ok) {
     validateErrorBinding(config, response.status, body);
-    const code = body?.error?.code ?? "unknown-error";
+    const code = errorCode(body);
     const error = new Error(`HTTP ${response.status} ${code}`);
     error.status = response.status; error.code = code; error.body = body;
     throw error;
@@ -932,16 +1050,70 @@ async function send(config, path, init, authHeaders) {
   return body;
 }
 
-export function validateErrorBinding(config, status, body) {
-  const preResolution = status === 400 || status === 401 || status === 426;
-  const carriesBinding = body?.server_instance_id !== undefined || body?.team_id !== undefined;
-  if (!preResolution || carriesBinding) validateBinding(config, body);
+// Check the binding when the body actually carries one — not when the status
+// code happens to be outside a list.
+//
+// The list was {400,401,426}, so every other error ran through validateBinding,
+// which compares `body.team_id` to the configured one. An error body without a
+// binding has `undefined` there, so it failed the comparison and every 403, 404,
+// 409 and 500 arrived as "server/team binding mismatch". The one message that
+// means "you are talking to the wrong team" was what a caller saw for a
+// forbidden request, a missing team, a conflict, and a server crash alike.
+//
+// Checking presence instead is also the stronger rule: an error that DOES carry
+// a binding is verified whatever its status, where the allowlist would have
+// skipped a mismatched 400.
+// The error code.
+//
+// THE PROTOCOL SHAPE IS THE NESTED ONE: `{ error: { code, message, details } }`,
+// built by `errorBody()` in the reference server (server/src/errors.ts) — which
+// is the definition, since server/spec/v1.md is marked SUPERSEDED. That is what
+// a new implementation should emit and what a reader here should take as the
+// contract.
+//
+// The bare-string branch is a BRIDGE, not a second valid shape. The hosted edge
+// currently answers `{ error: "payload_too_large" }`, and reading only the
+// nested form turned every one of its errors into `unknown-error` — a 413 that
+// said nothing about being too large, which is how a real 9,784-message
+// migration ended with a stopped sync and no reason in the log.
+//
+// Accepting both keeps that legible today; it does not make both correct. When
+// the edge emits the nested shape, DELETE the string branch — leaving it is how
+// "two shapes" quietly becomes the contract and a third implementation picks
+// whichever it likes.
+export function errorCode(body) {
+  const error = body?.error;
+  if (typeof error === "string" && error.length > 0) return error;
+  if (typeof error?.code === "string" && error.code.length > 0) return error.code;
+  return "unknown-error";
 }
 
-async function health(serverUrl) {
+export function validateErrorBinding(config, status, body) {
+  // An identity claim is server_instance_id or team_id. Those name WHICH server
+  // and WHICH team, so a reply carrying either is asserting the binding and gets
+  // checked at any status.
+  const claimsIdentity = body?.server_instance_id !== undefined || body?.team_id !== undefined;
+  // `protocol_version` alone is not an identity claim — every well-formed reply
+  // in this protocol has one, including a plain 401. But once the server has
+  // resolved the request far enough to answer 403/404/409/500, a body that
+  // carries the protocol envelope and omits the identity is malformed for that
+  // stage, and the old code refused it. Keeping that refusal is why this is not
+  // simply "check when identity is present": the inversion must not loosen a
+  // path (co1 review).
+  const preResolution = status === 400 || status === 401 || status === 426;
+  const claimsProtocol = body?.protocol_version !== undefined;
+  if (claimsIdentity || (!preResolution && claimsProtocol)) validateBinding(config, body);
+}
+
+// `teamId` is required, not optional: a health check that does not say which
+// team it is asking about cannot be answered per-team, and an edge that routes
+// by team would have to guess. Same header name as send() — one name for one
+// fact, so a gateway does not have to know two.
+async function health(serverUrl, teamId) {
   let response;
   try {
     response = await fetch(endpoint(serverUrl, "/v1/health"), {
+      headers: { "Agmsg-Team-ID": teamId },
       redirect: "error", signal: AbortSignal.timeout(15_000),
     });
   } catch (error) {
@@ -1030,7 +1202,7 @@ export function validateMembers(config, value) {
 // only success does, because only success has to read all of stdout. What this
 // process owns is what it can be sure of releasing, so that is what it releases:
 // a grandchild is left to the operator, not chased through the process tree.
-function runDriver({ args, label, operation, parse, input }) {
+function runDriver({ args, label, operation, parse, input, rosterFile }) {
   return new Promise((resolve, reject) => {
     const childEnvironment = { ...process.env };
     delete childEnvironment.AGMSG_SYNC_TOKEN;
@@ -1041,6 +1213,13 @@ function runDriver({ args, label, operation, parse, input }) {
         delete childEnvironment[key];
       }
     }
+    // One named value may be set after the strip, and only this one: the roster
+    // file the caller resolved. A general "extra environment" parameter would
+    // make this boundary re-openable — any caller could put TOKEN, TRUST_DIR or
+    // an age identity back, and the rule that they never cross would live in a
+    // comment rather than in the function. Naming the single variable keeps the
+    // guarantee where it can be checked.
+    if (rosterFile) childEnvironment.AGMSG_SYNC_LOCAL_ROSTER_FILE = rosterFile;
     const child = spawn("bash", args, { stdio: ["pipe", "pipe", "pipe"], env: childEnvironment });
     let stdout = ""; let stderr = ""; let settled = false; let failure = null;
 
@@ -1129,6 +1308,20 @@ export async function driver(operation, config, input, extra = []) {
   });
 }
 
+// The roster file to hand the driver, when this process can work it out.
+//
+// Passing an explicit path is what keeps the driver out of the location
+// business: it receives one file rather than a directory to build a path from.
+// When neither a connection root nor a skill directory is set there is nothing
+// to derive, so nothing is passed and the driver's own fallback applies —
+// failing here instead would break callers that never had a root to begin with.
+function rosterFileFor(team) {
+  const supplied = process.env.AGMSG_SYNC_LOCAL_ROSTER_FILE;
+  if (supplied) return supplied;
+  if (!(process.env.AGMSG_SYNC_CONNECTION_DIR ?? process.env.SKILL_DIR)) return undefined;
+  return teamConfigPath(team);
+}
+
 export async function rosterDriver(operation, config, input, extra = []) {
   const script = process.env.AGMSG_SYNC_ROSTER_DRIVER ??
     join(dirname(fileURLToPath(import.meta.url)), "roster-sync-driver.sh");
@@ -1139,6 +1332,24 @@ export async function rosterDriver(operation, config, input, extra = []) {
     operation,
     parse: parseJsonl,
     input,
+    // The roster file, resolved here and handed over as one path — not the
+    // directory it sits in. A directory would put the driver back in the
+    // business of deriving locations, which is what AGMSG_SYNC_CONNECTION_DIR
+    // was doing before it was stripped, and the driver has no business knowing
+    // that layout.
+    //
+    // Set at this single point rather than by each subcommand that shells out.
+    // `remote.sh pull` already passed this variable, and it was the ONLY caller
+    // that did: every other path fell back to the driver's own guess, which
+    // pointed at the skill directory and missed a second machine's teams
+    // entirely. A per-subcommand fix would have left the next subcommand to
+    // remember; there is nothing to remember now.
+    // Derived only when a root exists to derive it from. teamConfigPath throws
+    // otherwise, and throwing here would fail the call before the driver was
+    // even started — turning a resolvable situation into a hard error for every
+    // caller that has no connection root, which is what happened the first time
+    // this was written unconditionally.
+    rosterFile: rosterFileFor(config.local_team),
   });
 }
 
@@ -1659,9 +1870,26 @@ export async function configure(args) {
   if (serverUrl !== binding.endpoint || args["team-id"] !== binding.remote_team_id) {
     throw new Error("configure binding does not match remote.sh connect");
   }
-  const ready = await health(serverUrl);
+  const ready = await health(serverUrl, binding.remote_team_id);
   if (ready.server_instance_id !== binding.server_instance_id) {
     throw new Error("health server instance does not match remote.sh connect");
+  }
+  // Read back what the server says the team is, and refuse if it disagrees.
+  //
+  // Sending the header alone would change nothing observable here — it would be
+  // a field that exists and that nobody consults, which this file already has
+  // one of (the handoff bundle's format_version is checked for `!== 1` and never
+  // used to negotiate). The check is the reason the header is worth adding.
+  //
+  // Until now `remote_team_id` was whatever was passed in on the command line,
+  // stored without ever being compared to the server. A mismatch stayed
+  // invisible until the first push failed, far from the step that caused it.
+  // Strict equality, with no exemption for a server that omits the field. An
+  // `!== undefined` guard would let exactly the case this is meant to catch pass
+  // silently — an endpoint that does not answer per-team looks identical to one
+  // that agrees with us. Absent is not agreement.
+  if (ready.team_id !== binding.remote_team_id) {
+    throw new Error("health team does not match remote.sh connect");
   }
   const config = {
     format_version: 1, local_team: team, server_url: serverUrl,
@@ -1836,6 +2064,155 @@ export async function readStateCycle(config, limit, dependencies = {}) {
   }
 }
 
+// How many bytes of message JSON to put in one POST before splitting.
+//
+// Deliberately well under the server's 2 MiB body limit, because the client
+// cannot know that limit: a proxy, a gateway, or a self-hosted deployment may
+// impose a smaller one, and the only number we control is our own. Counting
+// bytes rather than messages is the point — a thousand small messages and a
+// thousand large ones were the same batch before this, and only the second kind
+// was ever refused.
+const PUSH_BYTE_BUDGET = 512 * 1024;
+
+// The wire size of one message, measured the way the body is built rather than
+// estimated from the blob. `+1` covers the comma that joins it to the next.
+function wireBytes(candidate) {
+  return Buffer.byteLength(
+    JSON.stringify({ id: candidate.id, envelope: candidate.envelope }), "utf8") + 1;
+}
+
+// Split on the byte budget, never returning an empty group: a single message
+// over the budget goes out alone and the server decides. Refusing to send it
+// here would be this client inventing a limit the server never stated.
+function byBudget(candidates, budget) {
+  const groups = [];
+  let current = [];
+  let size = 0;
+  for (const candidate of candidates) {
+    const bytes = wireBytes(candidate);
+    if (current.length > 0 && size + bytes > budget) {
+      groups.push(current);
+      current = [];
+      size = 0;
+    }
+    current.push(candidate);
+    size += bytes;
+  }
+  if (current.length > 0) groups.push(current);
+  return groups;
+}
+
+// POST one group, halving on 413 until the server accepts it or one message is
+// left. Overlap is safe: a resent id is a no-op server-side and still returns an
+// ack (`disposition: "duplicate"`) carrying its stored position, so a retry that
+// repeats already-stored messages neither duplicates rows nor loses acks.
+//
+// Bounded by construction: each retry halves a group of at least two, so the
+// recursion depth is log2(group size) and a single message never splits again.
+async function postGroup(config, group, requestCall, eventCall) {
+  try {
+    return await requestCall(config, "/v1/messages", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages: group.map(({ id, envelope }) => ({ id, envelope })) }) });
+  } catch (error) {
+    if (error?.status !== 413) throw error;
+    if (group.length === 1) {
+      // The end of the line, and it must be said plainly: this row cannot be
+      // synced by any batching this client can do, and every later cycle will
+      // pick it up and fail here again.
+      //
+      // Named by `local_id`, which is the id of the row in this machine's own
+      // store — that is the thing an operator can look at or remove. `id` is the
+      // wire reservation this push minted; it identifies nothing locally, so a
+      // failure that quoted only that would say "sync is stuck" without saying
+      // on what. The wire id is still reported, for correlating with the
+      // server's logs, and the axis because a candidate can be a message or a
+      // roster mutation and the two live in different places.
+      const candidate = group[0];
+      const bytes = wireBytes(candidate) - 1;
+      const where = {
+        local_id: candidate.local_id ?? null,
+        local_position: candidate.local_position ?? null,
+        sync_axis: candidate.sync_axis ?? null,
+        wire_id: candidate.id,
+      };
+      // Through errorCode(), like every other reader: the caller may already
+      // have parsed it (error.code), and if not, the body still has to be read
+      // in both shapes. Reading `body.error.code` directly here would leave the
+      // one event this change exists for saying `detail: null` against the
+      // hosted edge — the case the whole bridge was added for.
+      await eventCall("push.oversized", { ...where, bytes,
+        detail: error?.code ?? errorCode(error?.body) });
+      const stuck = new Error(
+        `${where.sync_axis ?? "message"} ${where.local_id ?? candidate.id} ` +
+        `(local_position ${where.local_position ?? "unknown"}, wire ${candidate.id}) ` +
+        `is ${bytes} bytes and the server refuses it on its own (413); it cannot be ` +
+        "pushed by splitting and will block this team's sync until it is removed or " +
+        "the server's limit is raised");
+      stuck.status = 413;
+      Object.assign(stuck, where);
+      throw stuck;
+    }
+    const middle = Math.ceil(group.length / 2);
+    await eventCall("push.split", { count: group.length, halves: [middle, group.length - middle] });
+    const first = await postGroup(config, group.slice(0, middle), requestCall, eventCall);
+    const second = await carryAcks(first.acks, () =>
+      postGroup(config, group.slice(middle), requestCall, eventCall));
+    // Concatenated in send order, so the combined acks line up with the
+    // candidates the caller passed in — validateAckMapping compares positionally.
+    return { ...second, acks: [...first.acks, ...second.acks] };
+  }
+}
+
+// One POST is atomic; several are not. When a later POST dies — 4xx, 5xx, a
+// dropped socket — the rows the earlier ones stored are already committed on
+// the server, and the acks proving it are in hand. Throwing them away leaves
+// the client with no record of messages the server holds, which is the state
+// this whole path exists to avoid. So the error carries them: every layer that
+// concatenates acks concatenates them onto the failure too, and the top of the
+// push sees one prefix no matter how deep the split recursed.
+// Emit a diagnostic on a path that is already failing. Every other eventCall in
+// this file is awaited bare, and should be: on the success path an unwritable
+// event log is a real fault and failing the cycle is right. Here it is not —
+// the cycle has already failed, an error is already on its way up, and letting
+// the sink throw would replace that error with one about logging. Nothing is
+// swallowed silently: the caller still throws what actually went wrong.
+async function note(eventCall, name, payload) {
+  try {
+    await eventCall(name, payload);
+  } catch {
+    // Deliberately ignored; see above.
+  }
+}
+
+async function carryAcks(earned, attempt) {
+  try {
+    return await attempt();
+  } catch (error) {
+    if (earned.length > 0 && error && typeof error === "object") {
+      error.acks = [...earned, ...(error.acks ?? [])];
+    }
+    throw error;
+  }
+}
+
+// Send every candidate, in order, as one or more POSTs.
+async function postCandidates(config, candidates, requestCall, eventCall) {
+  const groups = byBudget(candidates, PUSH_BYTE_BUDGET);
+  if (groups.length > 1) {
+    await eventCall("push.batched", { count: candidates.length, batches: groups.length });
+  }
+  let last;
+  const acks = [];
+  for (const group of groups) {
+    last = await carryAcks(acks, () => postGroup(config, group, requestCall, eventCall));
+    acks.push(...last.acks);
+  }
+  // The last response carries the freshest server state (current_seq, floor);
+  // the acks are every group's, in the order they were sent.
+  return { ...last, acks };
+}
+
 // A single sync cycle: push one page (up to pushLimit) + drain the pull side
 // to exhaustion. pushLimit and pullLimit are decoupled — the pull page is
 // sized generously so a large pull backlog drains in few round-trips, while
@@ -1856,12 +2233,18 @@ export async function cycle(config, { pushLimit, pullLimit }, dependencies = {})
   const readStateCycleCall = dependencies.readStateCycleCall ?? readStateCycle;
   const activateKeyRotationsCall = dependencies.activateKeyRotationsCall ?? activateKeyRotations;
 
-  const ready = await healthCall(config.server_url);
+  const ready = await healthCall(config.server_url, config.remote_team_id);
   if (ready.server_instance_id !== config.server_instance_id) throw new Error("health server instance changed");
+  // Read back the team as well. Sending the header without checking the answer
+  // would leave a field that exists and that nobody consults; the check is what
+  // makes a server that has been re-pointed at another team fail here rather
+  // than at the first push.
+  if (ready.team_id !== config.remote_team_id) throw new Error("health team changed");
   const capabilities = await requestCall(config, "/v1/capabilities");
   validateCapabilities(config, capabilities);
   await eventCall("capabilities", { team: config.local_team, current_seq: capabilities.current_seq,
-    policy_revision: capabilities.policy_revision });
+    policy_revision: capabilities.policy_revision,
+    startup_nonce: process.env.AGMSG_SYNC_START_NONCE || undefined });
 
   const writeProfile = selectWriteProfile(config, capabilities);
   const prepareInput = [{ type: "sync_prepare", envelope_v: 1,
@@ -1894,21 +2277,76 @@ export async function cycle(config, { pushLimit, pullLimit }, dependencies = {})
   if (!writeProfile.eligible) {
     await eventCall("push.blocked", { reason: writeProfile.reason });
   } else if (candidates.length > 0) {
-    const posted = await requestCall(config, "/v1/messages", { method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messages: candidates.map(({ id, envelope }) => ({ id, envelope })) }) });
-    const ackRecords = validateAckMapping(candidates, posted.acks);
-    await eventCall("push.ack", { acks: ackRecords.map(({ id, server_seq, disposition }) => ({ id, server_seq, disposition })) });
-    const messageAcks = ackRecords.filter((_, index) => candidates[index].sync_axis === "messages");
-    const rosterAcks = ackRecords.filter((_, index) => candidates[index].sync_axis === "roster");
-    const [reconciled, rosterReconciled] = await Promise.all([
-      messageAcks.length > 0 ? driverCall("reconcile", config, messageAcks) : [],
-      rosterAcks.length > 0 ? rosterDriverCall("reconcile", config, rosterAcks) : [],
-    ]);
-    await eventCall("push.reconciled", {
-      result: reconciled[0] ?? null,
-      roster_result: rosterReconciled[0] ?? null,
-    });
+    // Record whatever the server acknowledged, then let the failure through.
+    // Both have to reach the caller: the cycle failed, and some of it durably
+    // succeeded. Reconciling first means a retry resends only what is actually
+    // missing — and the acks arrive as `duplicate` for anything it does resend,
+    // which the mapping already accepts.
+    // Recording and reporting are separate calls on purpose. Folded together,
+    // the caller cannot tell "the prefix was never written" from "the prefix
+    // was written and the log was not" — and the failing path acts on exactly
+    // that distinction.
+    const recordAcks = async (acks) => {
+      // Only a front prefix can be reconciled: the acks are in send order, so
+      // acks[i] belongs to candidates[i]. Slicing to the acks' own length is
+      // what makes the mapping's positional id check an assertion that this
+      // really is an unbroken prefix — a gap shows up as an id mismatch.
+      const ackRecords = validateAckMapping(candidates.slice(0, acks.length), acks);
+      const messageAcks = ackRecords.filter((_, index) => candidates[index].sync_axis === "messages");
+      const rosterAcks = ackRecords.filter((_, index) => candidates[index].sync_axis === "roster");
+      const [reconciled, rosterReconciled] = await Promise.all([
+        messageAcks.length > 0 ? driverCall("reconcile", config, messageAcks) : [],
+        rosterAcks.length > 0 ? rosterDriverCall("reconcile", config, rosterAcks) : [],
+      ]);
+      return { ackRecords, reconciled, rosterReconciled };
+    };
+    // `emit` is the bare eventCall on the success path and note() on the failing
+    // one. Nothing here runs before the write above.
+    const reportAcks = async (emit, { ackRecords, reconciled, rosterReconciled }) => {
+      await emit("push.ack", { acks: ackRecords.map(({ id, server_seq, disposition }) => ({ id, server_seq, disposition })) });
+      await emit("push.reconciled", {
+        result: reconciled[0] ?? null,
+        roster_result: rosterReconciled[0] ?? null,
+      });
+    };
+    let posted;
+    try {
+      posted = await postCandidates(config, candidates, requestCall, eventCall);
+    } catch (error) {
+      const earned = Array.isArray(error?.acks) ? error.acks : [];
+      if (earned.length > 0) {
+        // The try covers the durable write and nothing else. Widen it by one
+        // event and a log failure starts arriving here as a write failure —
+        // `push.partial-unrecorded` for a prefix that is on disk, and the next
+        // reader resends what must not be resent. The boundary is the write,
+        // not the function.
+        let written = null;
+        let writeFailure = null;
+        try {
+          written = await recordAcks(earned);
+        } catch (failure) {
+          writeFailure = failure;
+          // Neither the rows nor a note of them. Report it, but keep it under
+          // the transport error rather than in front of it — that error is the
+          // reason any of this happened.
+          if (error && typeof error === "object" && error.cause === undefined) {
+            error.cause = failure;
+          }
+        }
+        // Everything below is reporting, on a path that has already failed, so
+        // none of it may throw: an unwritable log must not replace the
+        // transport error on its way up.
+        const emit = (name, payload) => note(eventCall, name, payload);
+        await emit("push.partial", { acked: earned.length, of: candidates.length });
+        if (written) {
+          await reportAcks(emit, written);
+        } else {
+          await emit("push.partial-unrecorded", { reason: writeFailure.message });
+        }
+      }
+      throw error;
+    }
+    await reportAcks(eventCall, await recordAcks(posted.acks));
   }
   // A full push page (and eligible) means at least a full page was available,
   // so the loop treats it as "more remains" and stays in catch-up. An exactly-
@@ -2089,8 +2527,13 @@ export async function reprocessCycle(config, limit, dependencies = {}) {
   const logApplyCall = dependencies.logApplyCall ?? logApplyOutcomes;
   const rosterDriverCall = dependencies.rosterDriverCall ?? rosterDriver;
   const activateKeyRotationsCall = dependencies.activateKeyRotationsCall ?? activateKeyRotations;
-  const ready = await healthCall(config.server_url);
+  const ready = await healthCall(config.server_url, config.remote_team_id);
   if (ready.server_instance_id !== config.server_instance_id) throw new Error("health server instance changed");
+  // Read back the team as well. Sending the header without checking the answer
+  // would leave a field that exists and that nobody consults; the check is what
+  // makes a server that has been re-pointed at another team fail here rather
+  // than at the first push.
+  if (ready.team_id !== config.remote_team_id) throw new Error("health team changed");
   const capabilities = await requestCall(config, "/v1/capabilities");
   validateCapabilities(config, capabilities);
   let after = null;
@@ -2424,7 +2867,7 @@ async function publicGet(serverUrl, path) {
   }
   const body = await response.json();
   if (!response.ok) {
-    const error = new Error(`HTTP ${response.status} ${body?.error?.code ?? "unknown-error"}`);
+    const error = new Error(`HTTP ${response.status} ${errorCode(body)}`);
     error.status = response.status;
     throw error;
   }
@@ -2442,13 +2885,16 @@ async function publicSnapshot(serverUrl, teamId) {
 async function main() {
   const [command, ...rest] = process.argv.slice(2);
   const args = options(rest);
-  if (!["configure", "export-age-snapshot", "verify-age-snapshot", "once", "run", "reprocess", "resync",
+  if (!["configure", "export-age-snapshot", "verify-age-snapshot", "export-age-handoff",
+        "verify-age-handoff", "once", "run", "reprocess", "resync",
         "unblock-read", "pull-bootstrap", "resolve-team"].includes(command)) {
     throw new Error(usage());
   }
   if (command === "configure") { await configure(args); return; }
   if (command === "export-age-snapshot") { await exportAgeSnapshot(args); return; }
   if (command === "verify-age-snapshot") { await verifyAgeSnapshot(args); return; }
+  if (command === "export-age-handoff") { await exportAgeHandoff(args); return; }
+  if (command === "verify-age-handoff") { await verifyAgeHandoff(args); return; }
   // Before any local team exists, so neither can go through loadConfig.
   if (command === "resolve-team") { await resolveTeam(args); return; }
   if (command === "pull-bootstrap") { await pullBootstrap(args); return; }

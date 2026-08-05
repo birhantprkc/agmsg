@@ -1,26 +1,11 @@
 #!/usr/bin/env python3
-"""Minimal mock of the remote-connect pairing-exchange + revoke endpoints, for
-bats tests exercising scripts/remote.sh without a real server. Not part of
-the shipped product — test-only.
+"""Minimal mock of the remote sync endpoints, for bats tests exercising
+scripts/remote.sh without a real server. Not part of the shipped product --
+test-only.
 
-Token -> response behavior, so tests can pick a scenario by token value:
-  good-token                    -> 200, write_allowed_ciphers = ["none"]
-  good-token-enc                -> 200, write_allowed_ciphers = ["age-v1"]
-  bad-token                     -> 401
-  malformed-credential-id-token -> 200, but credential_id contains '/'
-                                    (path-injection shape) — for B6
-  missing-field-token           -> 200, but protocol_version is omitted
-                                    entirely — for B6
-
-credential_id is a deterministic canonical UUIDv7 derived from the token
-for every other token value, so a test can reconnect
-with a fresh/different token and assert the OLD credential_id (tied to
-the OLD token) specifically got revoked before the new one was issued.
-
-Revoke: POST /v1/credentials/<id>/revoke -> 200 if <id> is one this
-server has ever issued, else 404; each revoked id is recorded so tests
-can assert on it via GET /_test/revoked. Set MOCK_REVOKE_FAIL=1 to make
-every revoke call fail (returns 500) for the server-unreachable test.
+Covers /v1/connect, /v1/capabilities, /v1/members, /v1/messages and
+/v1/read-state/sync. No credential is issued or checked anywhere: reaching the
+server is the permission, the same as the real one (docs/design/remote-sync.md).
 """
 import hashlib
 import json
@@ -29,22 +14,23 @@ import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import TCPServer
 
-REVOKE_FAIL = os.environ.get("MOCK_REVOKE_FAIL") == "1"
-REVOKE_BAD_HEADER = os.environ.get("MOCK_REVOKE_BAD_HEADER") == "1"
-REVOKE_BAD_BODY = os.environ.get("MOCK_REVOKE_BAD_BODY") == "1"
-REVOKE_LARGE_BODY = os.environ.get("MOCK_REVOKE_LARGE_BODY") == "1"
 PULL_MIXED = os.environ.get("MOCK_PULL_MIXED") == "1"
 PULL_AGE = os.environ.get("MOCK_PULL_AGE") == "1"
 PULL_AGE_ENVELOPE_FILE = os.environ.get("MOCK_PULL_AGE_ENVELOPE_FILE", "")
 CONNECT_CIPHERS = (["none"] if os.environ.get("MOCK_CONNECT_NO_AGE") == "1"
                    else ["none", "age-v1"])
-ISSUED_CREDENTIAL_IDS = set()
-REVOKED_CREDENTIAL_IDS = []
+# The name /v1/connect answers with. Empty means "echo back what was asked
+# for", which is the real server's behaviour and what every other case wants.
+CONNECT_TEAM_NAME = os.environ.get("MOCK_CONNECT_TEAM_NAME", "")
 
 # POST /v1/connect registers a client-owned team once. No credential is issued
 # or returned — reaching the server is the permission. A team_id already
 # registered is refused 409 (a uniqueness conflict, like a non-fast-forward).
 CONNECT_SERVER_ID = "018f3f7e-3333-7000-8000-000000000001"
+# What /v1/health reports as the team. Empty means "echo the requested one",
+# which is what a per-team edge does; a test sets it via /_test/health-team= to
+# make the server disagree with the client's binding.
+HEALTH_TEAM_ID = os.environ.get("MOCK_HEALTH_TEAM_ID", "")
 REGISTERED_TEAM_IDS = set()
 
 
@@ -159,11 +145,20 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        # Declared for the whole method: /_test/health-team assigns it, and
+        # Python requires the declaration to precede the first mention anywhere
+        # in the function — including the read in the /v1/health branch below.
+        global HEALTH_TEAM_ID
         if self.path == "/v1/health":
+            # Echo the team the caller asked about, the way a real per-team edge
+            # answers. MOCK_HEALTH_TEAM_ID overrides it so a test can make the
+            # server disagree with the local binding.
+            team_id = HEALTH_TEAM_ID or self.headers.get("Agmsg-Team-ID", "")
             self._send_json(200, {
                 "status": "ok",
                 "database": "ok",
                 "server_instance_id": CONNECT_SERVER_ID,
+                "team_id": team_id,
             })
             return
         if self.path == "/v1/capabilities":
@@ -190,11 +185,17 @@ class Handler(BaseHTTPRequestHandler):
                 }],
             })
             return
-        if self.path == "/_test/revoked":
-            self._send_json(200, {"revoked": REVOKED_CREDENTIAL_IDS})
-            return
         if self.path == "/_test/pushed":
             self._send_json(200, {"messages": PUSHED_MESSAGES})
+            return
+        # Change what /v1/health claims the team is, without restarting — a
+        # restart moves the port, and a client that already recorded the old one
+        # then fails to connect for a reason unrelated to what is under test.
+        if self.path.startswith("/_test/health-team"):
+            from urllib.parse import unquote
+            _, _, override = self.path.partition("=")
+            HEALTH_TEAM_ID = unquote(override)
+            self._send_json(200, {"health_team_id": HEALTH_TEAM_ID})
             return
         parts = self.path.split("?", 1)
         route = parts[0]
@@ -411,12 +412,16 @@ class Handler(BaseHTTPRequestHandler):
                 "protocol_version": 1,
                 "server_instance_id": CONNECT_SERVER_ID,
                 "team_id": team_id,
-                "team_name": data.get("team_name", ""),
+                # Normally the server answers with the name it was given, which
+                # is why local and remote names are the same in every other
+                # case here. MOCK_CONNECT_TEAM_NAME makes them differ, so a
+                # test can see which of the two a message is quoting.
+                "team_name": CONNECT_TEAM_NAME or data.get("team_name", ""),
                 "min_available_seq": "0",
                 "current_seq": "0",
                 "next_sequence_boundary": "1",
                 "accepted_envelope_versions": [1],
-                "write_allowed_ciphers": ["none", "age-v1"],
+                "write_allowed_ciphers": CONNECT_CIPHERS,
                 "policy_revision": "0",
                 "effective_from_seq": "1",
                 "max_blob_bytes": "1048576",
@@ -425,175 +430,6 @@ class Handler(BaseHTTPRequestHandler):
                                     "accepted_envelope_versions": [1],
                                     "write_allowed_ciphers": CONNECT_CIPHERS}],
             })
-            return
-
-        if self.path == "/v1/pairing/exchange":
-            try:
-                data = json.loads(raw) if raw else {}
-            except Exception:
-                self._send_json(400, {"error": "bad json"})
-                return
-            token = data.get("token", "")
-            if token == "bad-token":
-                self._send_json(401, {"error": "invalid token"})
-                return
-            if token == "large-body-token":
-                self._send_raw(200, "x" * (2 * 1024 * 1024 + 1))
-                return
-            if token == "large-header-token":
-                self._send_json(200, {"unexpected": "body"}, oversized_header=True)
-                return
-
-            if token == "missing-field-token":
-                self._send_json(200, {
-                    "credential": "session-credential-xyz",
-                    "credential_id": "cred-missing-field",
-                    "server_instance_id": "018f3f7e-1111-7000-8000-000000000001",
-                    "remote_team_id": "018f3f7e-2222-7000-8000-000000000002",
-                    "remote_team_name": "myteam",
-                    "capabilities": {"write_allowed_ciphers": ["none"]},
-                })
-                return
-
-            if token == "malformed-credential-id-token":
-                self._send_json(200, {
-                    "credential": "session-credential-xyz",
-                    "credential_id": "../../etc/passwd",
-                    "server_instance_id": "018f3f7e-1111-7000-8000-000000000001",
-                    "remote_team_id": "018f3f7e-2222-7000-8000-000000000002",
-                    "remote_team_name": "myteam",
-                    "protocol_version": 1,
-                    "capabilities": {"write_allowed_ciphers": ["none"]},
-                })
-                return
-
-            if token == "duplicate-key-token":
-                # json.dumps() can't produce a duplicate key from a dict
-                # (dicts can't have one) — hand-build the raw text so the
-                # SECOND "credential_id" is what a naive `.get()`-based
-                # parser would silently keep (python's own json.loads also
-                # keeps only the last occurrence unless duplicate-key
-                # detection is deliberately added).
-                self._send_raw(200, """{
-                    "credential": "session-credential-xyz",
-                    "credential_id": "cred-visible-in-review",
-                    "credential_id": "cred-smuggled-in-second-copy",
-                    "server_instance_id": "018f3f7e-1111-7000-8000-000000000001",
-                    "remote_team_id": "018f3f7e-2222-7000-8000-000000000002",
-                    "remote_team_name": "myteam",
-                    "protocol_version": 1,
-                    "capabilities": {"write_allowed_ciphers": ["none"]}
-                }""")
-                return
-
-            if token == "unknown-field-token":
-                self._send_json(200, {
-                    "credential": "session-credential-xyz",
-                    "credential_id": "cred-unknown-field",
-                    "server_instance_id": "018f3f7e-1111-7000-8000-000000000001",
-                    "remote_team_id": "018f3f7e-2222-7000-8000-000000000002",
-                    "remote_team_name": "myteam",
-                    "protocol_version": 1,
-                    "capabilities": {"write_allowed_ciphers": ["none"]},
-                    "unexpected_extra_field": "smuggled-value",
-                })
-                return
-
-            if token == "control-char-credential-token":
-                # A tab in the credential is what previously survived the
-                # newline-only check and then broke the hand-rolled
-                # sed-based JSON escaping in _remote_commit (E3) — reject
-                # it at the validator instead of relying only on the
-                # downstream write being fixed.
-                self._send_json(200, {
-                    "credential": "session-credential\twith-a-tab",
-                    "credential_id": "018f3f7e-7777-7000-8000-000000000007",
-                    "server_instance_id": "018f3f7e-1111-7000-8000-000000000001",
-                    "remote_team_id": "018f3f7e-2222-7000-8000-000000000002",
-                    "remote_team_name": "myteam",
-                    "protocol_version": 1,
-                    "capabilities": {"write_allowed_ciphers": ["none"]},
-                })
-                return
-
-            ciphers = ["age-v1"] if token == "good-token-enc" else ["none"]
-            digest = hashlib.sha256(token.encode()).hexdigest()
-            credential_id = (
-                f"018f3f7e-{digest[:4]}-7{digest[4:7]}-8{digest[7:10]}-{digest[10:22]}"
-            )
-            ISSUED_CREDENTIAL_IDS.add(credential_id)
-            capabilities = {
-                "protocol_version": 1,
-                "server_instance_id": "018f3f7e-1111-7000-8000-000000000001",
-                "team_id": "018f3f7e-2222-7000-8000-000000000002",
-                "team_name": "myteam",
-                "accepted_envelope_versions": [1],
-                "write_allowed_ciphers": ciphers,
-                "policy_revision": "0",
-                "effective_from_seq": "1",
-                "current_seq": "0",
-                "next_sequence_boundary": "1",
-                "min_available_seq": "0",
-                "max_blob_bytes": "1048576",
-                "policy_history": [{
-                    "policy_revision": "0",
-                    "effective_from_seq": "1",
-                    "accepted_envelope_versions": [1],
-                    "write_allowed_ciphers": ciphers,
-                }],
-            }
-            if token == "max-blob-zero-token":
-                capabilities["max_blob_bytes"] = "0"
-            elif token == "max-blob-over-token":
-                capabilities["max_blob_bytes"] = "1048577"
-            elif token == "future-policy-boundary-token":
-                capabilities["policy_revision"] = "1"
-                capabilities["effective_from_seq"] = "2"
-                capabilities["policy_history"].append({
-                    "policy_revision": "1",
-                    "effective_from_seq": "2",
-                    "accepted_envelope_versions": [1],
-                    "write_allowed_ciphers": ciphers,
-                })
-            response = {
-                "credential": "session-credential-" + token,
-                "credential_id": credential_id,
-                "server_instance_id": "018f3f7e-1111-7000-8000-000000000001",
-                "remote_team_id": "018f3f7e-2222-7000-8000-000000000002",
-                "remote_team_name": "myteam",
-                "protocol_version": 1,
-                "capabilities": capabilities,
-            }
-            if token == "missing-protocol-header-token":
-                self._send_json(200, response, protocol=None)
-            elif token == "wrong-protocol-header-token":
-                self._send_json(200, response, protocol="2")
-            else:
-                self._send_json(200, response)
-            return
-
-        if self.path.startswith("/v1/credentials/") and self.path.endswith("/revoke"):
-            if REVOKE_FAIL:
-                self._send_json(500, {"error": "simulated failure"})
-                return
-            cred_id = self.path.split("/")[3]
-            if cred_id in ISSUED_CREDENTIAL_IDS:
-                REVOKED_CREDENTIAL_IDS.append(cred_id)
-                response = {
-                    "protocol_version": 1,
-                    "server_instance_id": "018f3f7e-1111-7000-8000-000000000001",
-                    "team_id": "018f3f7e-2222-7000-8000-000000000002",
-                    "credential_id": cred_id,
-                    "revoked": True,
-                    "revoked_at": "2026-01-01T00:00:00.000000Z",
-                }
-                if REVOKE_BAD_BODY:
-                    response["team_id"] = "018f3f7e-9999-7000-8000-000000000009"
-                if REVOKE_LARGE_BODY:
-                    response["padding"] = "x" * 70_000
-                self._send_json(200, response, protocol=None if REVOKE_BAD_HEADER else "1")
-            else:
-                self._send_json(404, {"error": "unknown credential_id"})
             return
 
         self._send_json(404, {"error": "not found"})
