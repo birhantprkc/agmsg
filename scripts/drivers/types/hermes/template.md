@@ -27,6 +27,8 @@ Four possible outputs:
 `not_joined=true available_teams=<t1,t2,...>` (or `available_teams=none`)
 → Show the user the available teams from the output, then:
 
+  Before first-time setup, inspect the user's request. If they ask to join, import, or bring in a team that already exists on a server, do not call `join.sh`. Go directly to `remote pull` under Execute. First run `~/.agents/skills/__SKILL_NAME__/scripts/team-list.sh --json --scope all`; if a same-named local team has `binding_state` `none` or `disconnected`, stop and ask the user how to proceed. After pull succeeds, return to Identity setup so the user can register a new local agent in the pulled team.
+
   > **First-time setup required.**
   > Joining a team so this agent can send and receive messages.
   > - **Team name**: a group of agents that can message each other (available: <list from output>)
@@ -148,10 +150,11 @@ If argument starts with "remote connect":
 4. End by showing this copy-paste command for the other machine, with the actual endpoint and team substituted: `bash ~/.agents/skills/__SKILL_NAME__/scripts/remote.sh pull --endpoint <actual-url> <actual-team>`
 
 If argument starts with "remote pull":
-1. Use this command whenever the user asks to bring in a team that already exists on a server. Never use `join.sh` for that request.
-2. Parse the required `--endpoint <url>` and `<team>`, plus optional `--team-id <uuid>`.
-3. Run: `bash ~/.agents/skills/__SKILL_NAME__/scripts/remote.sh pull --endpoint <url> [--team-id <uuid>] <team>`
-4. Show the output to the user.
+1. When the user asks to join or bring in a team that already exists on a server, NEVER use `join.sh`, create a team, or create a same-named local team. Always use remote pull.
+2. Before pulling, check for a same-named local team. If one already exists without an active remote connection, stop and ask the user how to proceed; do not overwrite, merge, connect, or rename it on your own.
+3. Parse the required `--endpoint <url>` and `<team>`, plus optional `--team-id <uuid>`.
+4. Run: `bash ~/.agents/skills/__SKILL_NAME__/scripts/remote.sh pull --endpoint <url> [--team-id <uuid>] <team>`
+5. Show the output to the user.
 
 If argument starts with "remote unlock":
 1. Parse `<team>`, `--bundle <file>`, and `--confirm-digest <sha256>`.

@@ -64,6 +64,33 @@ write_node_launcher_fixtures() {
   [ "$status" -ne 0 ]
 }
 
+@test "agent templates route remote-import intent before not_joined identity setup" {
+  local template not_joined first_time guard
+  for template in "$BATS_TEST_DIRNAME"/../scripts/drivers/types/*/template.md; do
+    [ -f "$template" ] || continue
+    grep -q '^## Identity$' "$template" || continue
+    not_joined="$(grep -n '^\*\*C) Not in a team:\*\*$' "$template" | cut -d: -f1)"
+    first_time="$(grep -n '^  > \*\*First-time setup required\.\*\*$' "$template" | cut -d: -f1)"
+    guard="$(grep -n 'Before first-time setup, inspect the user'"'"'s request' "$template" | cut -d: -f1)"
+    [ -n "$not_joined" ]
+    [ "$not_joined" -lt "$guard" ]
+    [ "$guard" -lt "$first_time" ]
+    sed -n "${guard},$((first_time - 1))p" "$template" |
+      grep -q 'do not call `join.sh`'
+    sed -n "${guard},$((first_time - 1))p" "$template" |
+      grep -q 'team-list.sh --json --scope all'
+    sed -n "${guard},$((first_time - 1))p" "$template" |
+      grep -q 'Go directly to `remote pull`'
+  done
+
+  not_joined="$(grep -n '^### Step 2a: If not in a team' "$BATS_TEST_DIRNAME/../SKILL.md" | cut -d: -f1)"
+  first_time="$(grep -n '^Ask the user for a team name\.' "$BATS_TEST_DIRNAME/../SKILL.md" | cut -d: -f1)"
+  guard="$(grep -n '^Before first-time setup, inspect the user'"'"'s request\.' "$BATS_TEST_DIRNAME/../SKILL.md" | cut -d: -f1)"
+  [ -n "$not_joined" ]
+  [ "$not_joined" -lt "$guard" ]
+  [ "$guard" -lt "$first_time" ]
+}
+
 @test "type-registry: spawnable set is exactly eight of the ten built-ins (#277, #279)" {
   # hermes deliberately stays out (#279): no known CLI mode starts it
   # interactive with a seeded initial prompt. agmsg-app also stays out: it's
