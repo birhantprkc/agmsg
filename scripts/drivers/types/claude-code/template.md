@@ -248,6 +248,14 @@ If argument starts with "remote pull":
 4. Run: `bash ~/.agents/skills/__SKILL_NAME__/scripts/remote.sh pull --endpoint <url> [--team-id <uuid>] <team>`
 5. Show the output to the user.
 
+Machine B needs its own install, not just its own environment variables.
+Only `remote.sh`, `remote-sync.sh`, `key.sh` and the two internal helpers read
+`AGMSG_SYNC_CONNECTION_DIR`; `send.sh`, `history.sh`, `team.sh` and `inbox.sh`
+resolve the team config from the install directory. So a pull driven by
+environment variables alone succeeds, and the send that is supposed to confirm
+it then reports the team as missing — the failure lands one step after the
+cause. See "Use a separate install for testing" in `docs/remote-setup.md`.
+
 If argument starts with "remote unlock":
 1. Parse `<team>`, `--bundle <file>`, and `--confirm-digest <sha256>`.
 2. Run: `bash ~/.agents/skills/__SKILL_NAME__/scripts/remote.sh unlock <team> --bundle <file> --confirm-digest <sha256>`
