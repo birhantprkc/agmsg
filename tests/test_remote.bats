@@ -278,6 +278,49 @@ _binding_field() {  # $1 = team, $2 = json path under remote_binding
   # capability, and this line is meant to be read off a terminal.
 }
 
+@test "connect: the adopt path keeps the capability out of the terminal (#143)" {
+  # #635 pins this for the first connect's progress and non-200 lines. Those
+  # are not the messages this change added: adoption success, and every refusal
+  # in _remote_adopt_registration, print the endpoint too, and none of them are
+  # reached on a first connect. Routing them through _remote_endpoint_display
+  # is only static evidence until something drives them.
+  local secret="agsy_do_not_print_this_token"
+  local capability_endpoint="$ENDPOINT/t/$secret"
+
+  # Adoption success.
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$capability_endpoint" testteam
+  [ "$status" -eq 0 ]
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$capability_endpoint" testteam
+  [ "$status" -eq 0 ]
+  # Assert the line was PRINTED before asserting the secret is missing from it:
+  # "no token in the output" is trivially true of no output.
+  [[ "$output" == *"adopting that registration"* ]]
+  [[ "$output" != *"$secret"* ]]
+  [[ "$output" != *"/t/"* ]]
+
+  # A refusal on the same path.
+  run curl -sS --get --data-urlencode "team_name=testteam" --data-urlencode "profile=age-v1" \
+    "$ENDPOINT/_test/declare-cipher"
+  [ "$status" -eq 0 ]
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$capability_endpoint" testteam
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Refusing to record a profile"* ]]
+  [[ "$output" != *"$secret"* ]]
+  [[ "$output" != *"/t/"* ]]
+
+  # And a server-identity refusal, which prints the endpoint from a third place.
+  run curl -sS --get --data-urlencode "team_name=testteam" --data-urlencode "profile=none" \
+    "$ENDPOINT/_test/declare-cipher"
+  [ "$status" -eq 0 ]
+  run curl -sS "$ENDPOINT/_test/rotate-server-id"
+  [ "$status" -eq 0 ]
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$capability_endpoint" testteam
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Refusing to re-anchor"* ]]
+  [[ "$output" != *"$secret"* ]]
+  [[ "$output" != *"/t/"* ]]
+}
+
 @test "connect: refuses to adopt a registration whose roster is not this team's (#143)" {
   run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
   [ "$status" -eq 0 ]

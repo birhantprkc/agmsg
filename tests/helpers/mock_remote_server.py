@@ -165,7 +165,23 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _strip_capability_prefix(self):
+        """Serve the API beneath a `/t/<token>` prefix, like a hosted endpoint.
+
+        A hosted endpoint is `https://host/t/<token>` and the routes live under
+        it. Without this the fixture can only be reached at the bare root, so a
+        test cannot drive a real flow through a capability-bearing URL -- and
+        the thing worth asserting about such a URL is that the token never
+        reaches the terminal. The token is not checked: this server issues and
+        verifies no credential, exactly like the real one.
+        """
+        if self.path.startswith("/t/"):
+            rest = self.path[len("/t/"):]
+            cut = rest.find("/")
+            self.path = rest[cut:] if cut != -1 else "/"
+
     def do_GET(self):
+        self._strip_capability_prefix()
         # Declared for the whole method: /_test/health-team assigns it, and
         # Python requires the declaration to precede the first mention anywhere
         # in the function — including the read in the /v1/health branch below.
@@ -439,6 +455,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
+        self._strip_capability_prefix()
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b""
 
