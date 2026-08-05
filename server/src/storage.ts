@@ -305,11 +305,21 @@ export async function postMessages(
       // `IS NULL` only: a declaration, once made, is never rewritten by later
       // traffic — a team that switches profile changes it by declaring, not by
       // sending.
-      await client.query(
-        `UPDATE teams SET cipher_profile = $2
-          WHERE team_id = $1 AND cipher_profile IS NULL`,
-        [teamId, fresh[0]!.envelope.cipher],
-      );
+      //
+      // And only when this batch AGREES with itself. The policy allows both
+      // ciphers, so a single batch may legitimately carry a mix; taking the
+      // first message would let the order of an array decide a permanent fact
+      // about the team, and the same two messages sent the other way round
+      // would declare the opposite. A mixed batch stores normally and settles
+      // nothing — the team stays NULL until something says one thing.
+      const ciphers = new Set(fresh.map((message) => message.envelope.cipher));
+      if (ciphers.size === 1) {
+        await client.query(
+          `UPDATE teams SET cipher_profile = $2
+            WHERE team_id = $1 AND cipher_profile IS NULL`,
+          [teamId, fresh[0]!.envelope.cipher],
+        );
+      }
     }
 
     const seen = new Set<string>();

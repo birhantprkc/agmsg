@@ -102,6 +102,24 @@ describeDatabase("remote storage HTTP API v1", () => {
     };
   }
 
+  // Puts the shared team back into a state where a fresh message can be stored.
+  // The cases above deliberately break it — one empties the cipher policy, one
+  // exhausts the sequence — and they run first, so a declaration case that did
+  // not reset would be asserting on a 403 or a 507 instead of on a stored
+  // message.
+  async function resetTeamForDeclarationCase(
+    declaration: string | null,
+  ): Promise<void> {
+    await pool.query(
+      `UPDATE teams
+          SET cipher_profile = $2,
+              write_allowed_ciphers = ARRAY['none', 'age-v1']::TEXT[],
+              current_seq = (SELECT coalesce(max(team_seq), 0) FROM messages WHERE team_id = $1)
+        WHERE team_id = $1`,
+      [teamId, declaration],
+    );
+  }
+
   it("reports readiness and fixes the response protocol version", async () => {
     const response = await app.inject({ method: "GET", url: "/v1/health" });
     expect(response.statusCode).toBe(200);
@@ -890,7 +908,7 @@ describeDatabase("remote storage HTTP API v1", () => {
     // the machine that owns the team. This is where it is settled instead: a
     // route that already writes to the existing team (current_seq), reached by
     // a caller whose message got past the policy check.
-    await pool.query("UPDATE teams SET cipher_profile = NULL WHERE team_id = $1", [teamId]);
+    await resetTeamForDeclarationCase(null);
 
     const settling = message("750e8400-e29b-41d4-a716-4466554400a1", "settles it");
     const response = await app.inject({
@@ -908,10 +926,47 @@ describeDatabase("remote storage HTTP API v1", () => {
     expect(after.rows[0]?.cipher_profile).toBe("none");
   });
 
+  it("a batch that disagrees with itself settles nothing", async () => {
+    // The policy allows both ciphers, so one batch may legitimately carry a
+    // mix. Taking the first message would let the ORDER of an array decide a
+    // permanent fact — the same two messages the other way round would declare
+    // the opposite. That is still deciding from a sample; it just changed which
+    // sample. A mixed batch stores normally and leaves the team undeclared.
+    // Earlier cases in this suite leave the team unusable for a fresh write:
+    // one empties write_allowed_ciphers (-> 403) and one drives current_seq to
+    // the maximum (-> 507). Both are restored here, or this case would pass on
+    // a refusal that has nothing to do with mixing.
+    await resetTeamForDeclarationCase(null);
+
+    const plain = message("750e8400-e29b-41d4-a716-4466554400b1", "plain");
+    const sealed = {
+      id: "750e8400-e29b-41d4-a716-4466554400b2",
+      envelope: {
+        v: 1,
+        cipher: "age-v1",
+        key_id: "epoch-1",
+        blob: Buffer.from("opaque").toString("base64"),
+      },
+    };
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers,
+      payload: { messages: [plain, sealed] },
+    });
+    expect(response.statusCode).toBe(200);
+
+    const after = await pool.query<{ cipher_profile: string | null }>(
+      "SELECT cipher_profile FROM teams WHERE team_id = $1",
+      [teamId],
+    );
+    expect(after.rows[0]?.cipher_profile).toBeNull();
+  });
+
   it("never rewrites a declaration a team already has", async () => {
     // Once declared, later traffic does not reclassify the team: a team that
     // changes profile does so by declaring, not by what it happens to send.
-    await pool.query("UPDATE teams SET cipher_profile = 'age-v1' WHERE team_id = $1", [teamId]);
+    await resetTeamForDeclarationCase("age-v1");
 
     const later = message("750e8400-e29b-41d4-a716-4466554400a2", "plaintext");
     await app.inject({

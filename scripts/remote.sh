@@ -621,12 +621,13 @@ cmd_unlock() {
 agmsg: the encryption setting for '$team' is not known to the server, so this
 machine cannot tell a sealed history from an empty one and will not guess.
 
-The machine that already has '$team' knows. Reconnect it once, which records
-the declaration for everyone:
+The team was connected before that setting was carried. It is recorded the next
+time the machine that already has '$team' sends to it — one ordinary message is
+enough:
 
-    remote.sh connect --endpoint <endpoint> --e2ee $team
+    send.sh $team <an-agent-there> <another-agent> "hello"
 
-Then run this unlock again.
+Then pull '$team' here again and run this unlock.
 EOF
     exit 1
   fi

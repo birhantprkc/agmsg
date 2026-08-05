@@ -28,12 +28,17 @@ ALTER TABLE teams ALTER COLUMN write_allowed_ciphers
 -- machine must know to tell a sealed history from an empty one.
 --
 -- NULLABLE ON PURPOSE, and with no default. NULL means "connected before the
--- declaration was carried, and nobody has said yet". The server cannot fill it
--- in: it never stored the answer, and inferring it from messages.cipher would
--- be the same guess this column replaces — a team with no messages would be
--- declared unencrypted. It is filled the next time a machine that knows
--- connects. A default of 'none' would turn every one of those into a
--- confident, wrong statement that nobody could later tell from a real one.
+-- declaration was carried, and nobody has said yet". Migration cannot fill it:
+-- the server never stored the answer, and deriving one from messages.cipher at
+-- migration time would be the same guess this column replaces — a team with no
+-- messages would be declared unencrypted. A default of 'none' would turn every
+-- such row into a confident, wrong statement no later reader could tell from a
+-- real declaration.
+--
+-- It is settled instead when the team next stores a message, from that
+-- message's own cipher (see postMessages). NOT by a repeat connect: that route
+-- carries no credential and deliberately writes nothing about a team that
+-- already exists.
 ALTER TABLE teams ADD COLUMN IF NOT EXISTS cipher_profile TEXT
   CHECK (cipher_profile IN ('none', 'age-v1'));
 

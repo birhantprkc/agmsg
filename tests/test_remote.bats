@@ -804,8 +804,12 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
     --confirm-digest 0000000000000000000000000000000000000000000000000000000000000000 undeclared
   [ "$status" -ne 0 ]
   [[ "$output" == *"is not known to the server"* ]]
-  # Stopping is right; stopping without a next move is not.
-  [[ "$output" == *"remote.sh connect"* ]]
+  # Stopping is right; stopping without a next move is not — and the move named
+  # has to be one that works. A repeat connect deliberately writes nothing for a
+  # team that already exists, so naming it would be advice that cannot succeed.
+  # What settles the declaration is the owning machine sending a message.
+  [[ "$output" == *"send.sh"* ]]
+  [[ "$output" != *"remote.sh connect"* ]]
   [[ "$output" != *"not an encrypted pulled team awaiting unlock"* ]]
 }
 

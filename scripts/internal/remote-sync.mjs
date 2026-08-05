@@ -296,12 +296,12 @@ export async function loadConfig(team) {
   const selectedCipher = binding.cipher_profile ?? "none";
   // "unknown" is what `pull` writes when the server holds no declaration for
   // the team. It is refused separately from a garbled value because the remedy
-  // differs and is knowable: reconnect the machine that already has the team,
-  // which records the declaration for everyone. Starting the engine on a guess
-  // is the failure this path exists to remove.
+  // differs and is knowable: the setting is recorded the next time the machine
+  // that already has the team sends to it. Starting the engine on a guess is
+  // the failure this path exists to remove.
   if (selectedCipher === "unknown") {
     throw new Error(
-      "the encryption setting for this team is not known to the server; reconnect the machine that already has it");
+      "the encryption setting for this team is not known to the server; it is recorded when the machine that already has the team next sends a message, after which pull the team here again");
   }
   if (!["none", "age-v1"].includes(selectedCipher)) {
     throw new Error("connected team binding selects an unsupported cipher profile");
