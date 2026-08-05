@@ -162,7 +162,7 @@ class Handler(BaseHTTPRequestHandler):
         # Declared for the whole method: /_test/health-team assigns it, and
         # Python requires the declaration to precede the first mention anywhere
         # in the function — including the read in the /v1/health branch below.
-        global HEALTH_TEAM_ID
+        global HEALTH_TEAM_ID, CONNECT_SERVER_ID, DROP_NEXT_CONNECT
         if self.path == "/v1/health":
             # Echo the team the caller asked about, the way a real per-team edge
             # answers. MOCK_HEALTH_TEAM_ID overrides it so a test can make the
@@ -176,9 +176,14 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
         if self.path == "/_test/drop-next-connect":
-            global DROP_NEXT_CONNECT
             DROP_NEXT_CONNECT = True
             self._send_json(200, {"armed": True})
+            return
+        if self.path == "/_test/rotate-server-id":
+            # Same address, different server. Registrations stay, so a client
+            # can only tell by comparing the instance id it recorded.
+            CONNECT_SERVER_ID = "018f3f7e-2222-7000-8000-0000000000ff"
+            self._send_json(200, {"server_instance_id": CONNECT_SERVER_ID})
             return
         if self.path == "/v1/capabilities":
             team_id = self.headers.get("Agmsg-Team-ID", "")
@@ -192,10 +197,15 @@ class Handler(BaseHTTPRequestHandler):
                 # client rebuilding a lost binding compares against it.
                 "team_name": REGISTERED_TEAMS.get(team_id, {}).get(
                     "team_name", CONNECT_TEAM_NAME or ""),
+                # And the declaration it holds, which for a registered team is
+                # what that team was registered with -- not the env default.
+                "cipher_profile": (
+                    REGISTERED_TEAMS[team_id]["cipher_profile"]
+                    if team_id in REGISTERED_TEAMS
+                    else (TEAM_CIPHER_PROFILE or None)),
                 "current_seq": str(current_seq),
                 "next_sequence_boundary": str(current_seq + 1),
                 "min_available_seq": "0",
-                "cipher_profile": TEAM_CIPHER_PROFILE or None,
                 "accepted_envelope_versions": [1],
                 "write_allowed_ciphers": CONNECT_CIPHERS,
                 "policy_revision": "0",
@@ -454,6 +464,10 @@ class Handler(BaseHTTPRequestHandler):
             # them too or that path cannot be tested honestly.
             REGISTERED_TEAMS[team_id] = {
                 "team_name": CONNECT_TEAM_NAME or data.get("team_name", ""),
+                # The DECLARATION, kept as sent. A repeat connect must not be
+                # able to restate it, so reads answer from here, not from
+                # whatever the later caller asked for.
+                "cipher_profile": data.get("cipher_profile"),
                 "members": [{"member_id": m.get("member_id", ""),
                              "name": m.get("name", ""),
                              "registrations": []}

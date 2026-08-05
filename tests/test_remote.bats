@@ -172,6 +172,40 @@ _binding_field() {  # $1 = team, $2 = json path under remote_binding
   [ "$(_binding_field testteam remote_team_name)" = "testteam" ]
 }
 
+@test "connect: refuses to re-anchor a binding to a different server instance (#143)" {
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -eq 0 ]
+  local anchored
+  anchored="$(_binding_field testteam server_instance_id)"
+  [ -n "$anchored" ]
+
+  # Same address, different server. The registration is still there and the
+  # team_id, name and roster all still match -- the recorded instance id is
+  # the only thing that can tell these apart, which is why requiring it to
+  # merely EXIST is not the same as checking it.
+  run curl -sS "$ENDPOINT/_test/rotate-server-id"
+  [ "$status" -eq 0 ]
+
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Refusing to re-anchor"* ]]
+  # The binding still points at the server it was made against.
+  [ "$(_binding_field testteam server_instance_id)" = "$anchored" ]
+}
+
+@test "connect: a repeat run cannot restate the registered cipher profile (#143)" {
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam
+  [ "$status" -eq 0 ]
+  [ "$(_binding_field testteam cipher_profile)" = "age-v1" ]
+
+  # Plain re-run of an age-v1 registration. Recording 'none' here would be a
+  # downgrade written by a retry, against a server that still says age-v1.
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"registered on"*"as 'age-v1'"* ]]
+  [ "$(_binding_field testteam cipher_profile)" = "age-v1" ]
+}
+
 @test "connect: refuses to adopt a registration whose roster is not this team's (#143)" {
   run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
   [ "$status" -eq 0 ]

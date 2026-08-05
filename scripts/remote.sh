@@ -358,10 +358,20 @@ _remote_write_binding() {
 #
 # Returns 0 when the binding was written, 1 when the registration is not ours
 # or the server could not be read.
+# <expected_server_instance> is the server_instance_id the caller already has
+# recorded, or empty when it has none. When given it must match EXACTLY: the
+# endpoint is an address, not an identity, and the same address can come back
+# as a different server. Without the comparison a rebuilt (or substituted)
+# server holding a team with the same id, name and roster would have its own
+# instance id written over ours, silently re-anchoring the binding. Empty is
+# for the path that has nothing to compare -- a POST whose response was lost
+# leaves no recorded id, and there the first fetch IS the anchor.
 _remote_adopt_registration() {
-  local team="$1" cfg="$2" endpoint="$3" team_id="$4" binding_cipher="$5"
+  local team="$1" cfg="$2" endpoint="$3" team_id="$4" binding_cipher="$5" \
+    expected_server_instance="${6:-}"
   local caps_file members_file http_code remote_team_name local_team_name \
-    local_ids remote_ids cfg_escaped members_escaped
+    local_ids remote_ids cfg_escaped members_escaped \
+    fetched_server_instance declared_cipher
   caps_file="$(mktemp "${TMPDIR:-/tmp}/agmsg-caps.XXXXXX")"
   members_file="$(mktemp "${TMPDIR:-/tmp}/agmsg-members.XXXXXX")"
   trap 'rm -f "$caps_file" "$members_file"' EXIT INT TERM
@@ -369,6 +379,17 @@ _remote_adopt_registration() {
   http_code="$(_remote_http_get_json "$endpoint/v1/capabilities" "$team_id" "$caps_file")"
   if [ "$http_code" != "200" ]; then
     echo "agmsg: '$endpoint' holds a registration for team '$team' but its capabilities could not be read (HTTP $http_code); cannot confirm the registration is this team's." >&2
+    rm -f "$caps_file" "$members_file"; trap - EXIT INT TERM
+    return 1
+  fi
+
+  # Same server, not just the same address. Checked FIRST: if this is not the
+  # server the binding was made against, nothing else it says about the team
+  # means anything.
+  fetched_server_instance="$(_remote_read_config_field "$caps_file" '$.server_instance_id')"
+  if [ -n "$expected_server_instance" ] \
+    && [ "$expected_server_instance" != "$fetched_server_instance" ]; then
+    echo "agmsg: '$endpoint' is now server instance $fetched_server_instance, but team '$team' is bound to $expected_server_instance. Refusing to re-anchor the binding to a different server. If the server really was replaced, disconnect and connect again deliberately." >&2
     rm -f "$caps_file" "$members_file"; trap - EXIT INT TERM
     return 1
   fi
@@ -407,6 +428,25 @@ _remote_adopt_registration() {
     rm -f "$caps_file" "$members_file"; trap - EXIT INT TERM
     return 1
   fi
+
+  # The cipher profile of an existing registration is the DECLARATION already
+  # on the server, and this invocation's --e2ee (or its absence) does not get
+  # to restate it. Writing the requested mode here would let a plain re-run of
+  # `connect` record 'none' locally for a team registered as age-v1 -- a
+  # downgrade written by a retry, in the direction that matters.
+  #
+  # `null` is a real answer, distinct from 'none': nobody has declared yet.
+  # Only then does this machine's request stand.
+  declared_cipher="$(_remote_read_config_field "$caps_file" '$.cipher_profile')"
+  case "$declared_cipher" in
+    ''|null) ;;
+    "$binding_cipher") ;;
+    *)
+      echo "agmsg: team '$team' is registered on $endpoint as '$declared_cipher', but this connect asked for '$binding_cipher'. Refusing to record a profile the registration does not have. Re-run connect for '$declared_cipher'." >&2
+      rm -f "$caps_file" "$members_file"; trap - EXIT INT TERM
+      return 1
+      ;;
+  esac
 
   echo "Team '$team' is already registered on $endpoint; adopting that registration and continuing." >&2
   _remote_write_binding "$cfg" "$endpoint" "$binding_cipher" "$caps_file" || {
@@ -1230,10 +1270,12 @@ cmd_connect() {
   # again. The steps AFTER registration -- key setup, the store move, the
   # engine -- are the ones that fail, and they are all local and all
   # re-derivable, so the way back in is to skip the one step that is already
-  # done. Matching on endpoint AND remote_team_id AND a recorded
+  # done. Matching on endpoint AND remote_team_id, and requiring a recorded
   # server_instance_id: a binding pointing somewhere else is not this
   # connection's business, and one with no server_instance_id never completed a
-  # registration to adopt.
+  # registration to adopt. The recorded id is not just required to EXIST -- it
+  # is handed to the adopt path, which refuses unless the server answering now
+  # is the same one. Existence is a precondition; the identity check is there.
   local existing_endpoint existing_remote_team_id existing_server_instance
   existing_endpoint="$(_remote_read_config_field "$cfg" '$.remote_binding.endpoint')"
   existing_remote_team_id="$(_remote_read_config_field "$cfg" '$.remote_binding.remote_team_id')"
@@ -1241,7 +1283,8 @@ cmd_connect() {
   if [ "$existing_endpoint" = "$endpoint" ] \
     && [ "$existing_remote_team_id" = "$team_id" ] \
     && [ -n "$existing_server_instance" ] && [ "$existing_server_instance" != "null" ]; then
-    _remote_adopt_registration "$team" "$cfg" "$endpoint" "$team_id" "$binding_cipher" || exit 1
+    _remote_adopt_registration "$team" "$cfg" "$endpoint" "$team_id" \
+      "$binding_cipher" "$existing_server_instance" || exit 1
   else
     echo "Connecting team '$team' to $endpoint ..." >&2
     http_code="$(_remote_http_post_json "$endpoint/v1/connect" "$body_file" "$resp_file" "$header_file")"
