@@ -23,6 +23,13 @@ CONNECT_CIPHERS = (["none"] if os.environ.get("MOCK_CONNECT_NO_AGE") == "1"
 # for", which is the real server's behaviour and what every other case wants.
 CONNECT_TEAM_NAME = os.environ.get("MOCK_CONNECT_TEAM_NAME", "")
 
+# What the server DECLARES this team uses, as distinct from CONNECT_CIPHERS
+# above, which is what it would accept. Empty means "no machine has declared
+# it" and is sent as JSON null — the state a team connected by an older client
+# is in, and the one `pull` must not read as "unencrypted".
+TEAM_CIPHER_PROFILE = os.environ.get("MOCK_TEAM_CIPHER_PROFILE", "age-v1")
+
+
 # POST /v1/connect registers a client-owned team once. No credential is issued
 # or returned — reaching the server is the permission. A team_id already
 # registered is refused 409 (a uniqueness conflict, like a non-fast-forward).
@@ -172,6 +179,7 @@ class Handler(BaseHTTPRequestHandler):
                 "current_seq": str(current_seq),
                 "next_sequence_boundary": str(current_seq + 1),
                 "min_available_seq": "0",
+                "cipher_profile": TEAM_CIPHER_PROFILE or None,
                 "accepted_envelope_versions": [1],
                 "write_allowed_ciphers": CONNECT_CIPHERS,
                 "policy_revision": "0",
@@ -206,6 +214,7 @@ class Handler(BaseHTTPRequestHandler):
                 "server_instance_id": PULL_SERVER_ID,
                 "team_id": PULL_TEAM_ID,
                 "min_available_seq": "0",
+                "cipher_profile": TEAM_CIPHER_PROFILE or None,
                 "members_revision": "0",
                 "members": PULL_MEMBERS,
             })
@@ -315,6 +324,7 @@ class Handler(BaseHTTPRequestHandler):
                 "team_id": PULL_TEAM_ID,
                 "team_name": "pulled-team",
                 "min_available_seq": "0",
+                "cipher_profile": TEAM_CIPHER_PROFILE or None,
                 "current_seq": str(len(PULL_MESSAGES) + len(PUSHED_MESSAGES)),
                 "policy_revision": "0",
                 "accepted_envelope_versions": [1],
@@ -343,6 +353,7 @@ class Handler(BaseHTTPRequestHandler):
                 "team_id": PULL_TEAM_ID,
                 "team_name": "pulled-team",
                 "min_available_seq": "0",
+                "cipher_profile": TEAM_CIPHER_PROFILE or None,
                 "messages": page,
                 "next_after": page[-1]["server_seq"] if page else str(after),
                 "has_more": False,
@@ -384,6 +395,7 @@ class Handler(BaseHTTPRequestHandler):
                 "server_instance_id": PULL_SERVER_ID,
                 "team_id": PULL_TEAM_ID,
                 "min_available_seq": "0",
+                "cipher_profile": TEAM_CIPHER_PROFILE or None,
                 "current_seq": current,
                 "items": [
                     {"kind": "frontier", "member_id": member["member_id"],
@@ -418,6 +430,7 @@ class Handler(BaseHTTPRequestHandler):
                 # test can see which of the two a message is quoting.
                 "team_name": CONNECT_TEAM_NAME or data.get("team_name", ""),
                 "min_available_seq": "0",
+                "cipher_profile": TEAM_CIPHER_PROFILE or None,
                 "current_seq": "0",
                 "next_sequence_boundary": "1",
                 "accepted_envelope_versions": [1],

@@ -21,6 +21,27 @@ CREATE TABLE IF NOT EXISTS teams (
 ALTER TABLE teams ALTER COLUMN write_allowed_ciphers
   SET DEFAULT ARRAY['none', 'age-v1']::TEXT[];
 
+-- What this team actually uses, as DECLARED by the machine that connected it.
+-- `write_allowed_ciphers` above is a different thing: it is what the server
+-- will ACCEPT. A team may be allowed both and use one, so the allowed set can
+-- never answer "is this team encrypted" — which is exactly what a second
+-- machine must know to tell a sealed history from an empty one.
+--
+-- NULLABLE ON PURPOSE, and with no default. NULL means "connected before the
+-- declaration was carried, and nobody has said yet". Migration cannot fill it:
+-- the server never stored the answer, and deriving one from messages.cipher at
+-- migration time would be the same guess this column replaces — a team with no
+-- messages would be declared unencrypted. A default of 'none' would turn every
+-- such row into a confident, wrong statement no later reader could tell from a
+-- real declaration.
+--
+-- It is settled instead when the team next stores a message, from that
+-- message's own cipher (see postMessages). NOT by a repeat connect: that route
+-- carries no credential and deliberately writes nothing about a team that
+-- already exists.
+ALTER TABLE teams ADD COLUMN IF NOT EXISTS cipher_profile TEXT
+  CHECK (cipher_profile IN ('none', 'age-v1'));
+
 -- Name lookup is an equality probe from an unauthenticated route, so it must
 -- not be a sequential scan over every team.
 CREATE INDEX IF NOT EXISTS teams_name_idx ON teams(team_name);

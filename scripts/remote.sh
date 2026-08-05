@@ -470,7 +470,7 @@ cmd_pull() {
   _remote_write_pulled_team "$team" "$team_id" || exit 1
 
   local result pulled_id pulled_name imported pulled_sid pulled_protocol pulled_caps \
-    pulled_age_v1 binding_cipher
+    pulled_age_v1 pulled_cipher binding_cipher
   result="$(AGMSG_SYNC_CONNECTION_DIR="$CONNECTION_ROOT" \
     AGMSG_SYNC_LOCAL_ROSTER_FILE="$cfg" \
     "$SCRIPT_DIR/remote-sync.sh" pull-bootstrap \
@@ -490,8 +490,24 @@ cmd_pull() {
     echo "agmsg: server answered with a different team id" >&2; exit 1; }
   case "$pulled_age_v1" in ''|*[!0-9]*)
     echo "agmsg: pull returned an invalid encrypted-envelope count" >&2; exit 1 ;; esac
-  binding_cipher="none"
-  [ "$pulled_age_v1" -gt 0 ] && binding_cipher="age-v1"
+
+  # The team's cipher is a DECLARED fact, taken from the server's snapshot —
+  # not inferred from how many encrypted envelopes this pull happened to carry.
+  # The old inference read a team with no messages yet as unencrypted, wrote
+  # 'none' into the binding, and `unlock` then refused a team that was in fact
+  # sealed. Counting arrivals answers "what has been sent", never "what this
+  # team uses".
+  #
+  # An empty answer means no machine has declared it (a team connected before
+  # the declaration was carried). That is recorded as unknown rather than
+  # collapsed into 'none': the two are different facts, and only one of them is
+  # safe to act on.
+  pulled_cipher="$(_remote_json_field "$result" '$.capabilities.cipher_profile')"
+  case "$pulled_cipher" in
+    age-v1|none) binding_cipher="$pulled_cipher" ;;
+    ''|null)     binding_cipher="unknown" ;;
+    *) echo "agmsg: server declared an unsupported cipher profile" >&2; exit 1 ;;
+  esac
 
   # Bind AFTER the bootstrap, and by updating the config in place: the roster
   # driver has been projecting identity events into this file while the
@@ -596,6 +612,25 @@ cmd_unlock() {
   cfg="$(_remote_team_config "$team")"
   [ -f "$cfg" ] || { echo "agmsg: team not found: $team" >&2; exit 1; }
   binding_cipher="$(_remote_read_config_field "$cfg" '$.remote_binding.cipher_profile')"
+  # "Unknown" is a distinct answer from "not encrypted", and it has a distinct
+  # remedy, so it gets its own message. Refusing with the plain-team wording
+  # would send someone looking for a mistake they did not make: their team may
+  # well be sealed — nobody has told this server which.
+  if [ "$binding_cipher" = "unknown" ]; then
+    cat >&2 <<EOF
+agmsg: the encryption setting for '$team' is not known to the server, so this
+machine cannot tell a sealed history from an empty one and will not guess.
+
+The team was connected before that setting was carried. It is recorded the next
+time the machine that already has '$team' sends to it — one ordinary message is
+enough:
+
+    send.sh $team <an-agent-there> <another-agent> "hello"
+
+Then pull '$team' here again and run this unlock.
+EOF
+    exit 1
+  fi
   [ "$binding_cipher" = "age-v1" ] || {
     echo "agmsg: team '$team' is not an encrypted pulled team awaiting unlock" >&2
     exit 1
@@ -1023,9 +1058,14 @@ cmd_connect() {
   # would abort under `set -u`.
   trap 'rm -f "${body_file:-}" "${resp_file:-}" "${header_file:-}"' EXIT INT TERM
 
+  # `cipher_profile` is this machine's DECLARATION, decided above from --e2ee —
+  # not a guess. Sending it is what lets a second machine be told what the team
+  # uses instead of inferring it from how many encrypted messages happen to have
+  # arrived, which reads an empty team as an unencrypted one.
   agmsg_sqlite_mem "SELECT json_object(
       'team_id', json_extract('$cfg_escaped', '\$.team_id'),
       'team_name', json_extract('$cfg_escaped', '\$.name'),
+      'cipher_profile', '$binding_cipher',
       'members', coalesce(
         (SELECT json_group_array(json_object(
             'member_id', json_extract(value, '\$.member_id'),

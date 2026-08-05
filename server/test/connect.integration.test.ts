@@ -116,6 +116,31 @@ describeDatabase("POST /v1/connect", () => {
     expect(response.json().error.code).toBe("team-already-exists");
   });
 
+  it("a repeat connect writes nothing at all, declaration included", async () => {
+    // This route takes no credential, and its safety has always rested on a
+    // repeat connect changing nothing about an existing team. A backfill here
+    // would break that: anyone who knows a team_id could fix the profile before
+    // the machine that owns the team, and 'none' fixed first is the direction
+    // that hurts — a real second machine would then be told its sealed team is
+    // plaintext.
+    await pool.query("UPDATE teams SET cipher_profile = NULL WHERE team_id = $1", [teamId]);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/connect",
+      headers,
+      payload: { ...body, cipher_profile: "age-v1" },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error.code).toBe("team-already-exists");
+
+    const after = await pool.query<{ cipher_profile: string | null }>(
+      "SELECT cipher_profile FROM teams WHERE team_id = $1",
+      [teamId],
+    );
+    expect(after.rows[0]?.cipher_profile).toBeNull();
+  });
+
   it("rejects a roster with duplicate member names before touching the database", async () => {
     const response = await app.inject({
       method: "POST",

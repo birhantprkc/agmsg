@@ -20,6 +20,8 @@ type TeamRow = {
   write_allowed_ciphers: string[];
   max_blob_bytes: number;
   members_revision: string;
+  // Null until a machine declares it. Not the same as 'none'.
+  cipher_profile: string | null;
 };
 
 type LiveMessageRow = {
@@ -69,7 +71,8 @@ async function teamRow(
   const result = await client.query<TeamRow>(
     `SELECT team_id::text, team_name, current_seq::text, min_available_seq::text,
             policy_revision::text, accepted_envelope_versions,
-            write_allowed_ciphers, max_blob_bytes, members_revision::text
+            write_allowed_ciphers, max_blob_bytes, members_revision::text,
+            cipher_profile
        FROM teams WHERE team_id = $1${lock ? " FOR UPDATE" : ""}`,
     [id],
   );
@@ -83,14 +86,24 @@ function common(serverId: string, team: TeamRow): Record<string, unknown> {
     team_id: team.team_id,
     team_name: team.team_name,
     min_available_seq: team.min_available_seq,
+    // The DECLARED profile, distinct from write_allowed_ciphers, which says
+    // only what the server would accept. `null` is a real answer here — "no
+    // machine has declared it yet" — and a client must not read it as 'none'.
+    cipher_profile: team.cipher_profile ?? null,
   };
 }
 
 function notFound(serverId: string, teamId: string): ProtocolError {
-  return new ProtocolError(404, "team-not-found", "team is not provisioned", {}, {
-    serverInstanceId: serverId,
-    teamId,
-  });
+  return new ProtocolError(
+    404,
+    "team-not-found",
+    "team is not provisioned",
+    {},
+    {
+      serverInstanceId: serverId,
+      teamId,
+    },
+  );
 }
 
 function envelopeMatches(row: LiveMessageRow, envelope: Envelope): boolean {
@@ -157,7 +170,8 @@ export async function postMessages(
       [teamId, ids],
     );
     const existing = new Map<string, ExistingRecord>();
-    for (const row of liveResult.rows) existing.set(row.id, { kind: "live", row });
+    for (const row of liveResult.rows)
+      existing.set(row.id, { kind: "live", row });
     for (const row of tombstoneResult.rows) {
       existing.set(row.id, {
         kind: "tombstone",
@@ -184,7 +198,9 @@ export async function postMessages(
       }
     }
 
-    const fresh = [...firstById.values()].filter((message) => !existing.has(message.id));
+    const fresh = [...firstById.values()].filter(
+      (message) => !existing.has(message.id),
+    );
     for (const message of fresh) {
       const { envelope, id } = message;
       if (envelope.v !== 1 || !["none", "age-v1"].includes(envelope.cipher)) {
@@ -232,6 +248,48 @@ export async function postMessages(
       }
     }
 
+    // The team's single cipher, enforced before anything is stored.
+    //
+    // `write_allowed_ciphers` above is a different question — what the server
+    // will ACCEPT — and it permits both. `cipher_profile` is what this team
+    // chose, and a client reads it to decide whether plaintext may be pushed at
+    // all. A value that traffic is free to contradict is not a fact about the
+    // team, and a safety decision resting on it would be worse than none: it
+    // reads as dependable precisely because writes went through.
+    //
+    // So a batch that disagrees with the team, or with itself while the team is
+    // undeclared, is refused whole. Fail-closed and before the writes: a
+    // partial store would leave the team holding messages under a cipher it
+    // does not use, which is the state this column exists to make impossible.
+    if (fresh.length > 0) {
+      const ciphers = new Set(fresh.map((message) => message.envelope.cipher));
+      const expected = team.cipher_profile ?? (ciphers.size === 1 ? [...ciphers][0]! : null);
+      if (expected === null || ciphers.size !== 1 || !ciphers.has(expected)) {
+        // The refusal carries its own way out. One path here is reachable by a
+        // machine that has done nothing wrong: the team declared age-v1 after
+        // this machine last looked, so it is still sending plaintext. Blocking
+        // that write is right — it would be readable by the server — but the
+        // sender cannot act on "mismatch" alone. `remedy` names what makes it
+        // send the right thing, and `cipher_profile` says what to send.
+        throw new ProtocolError(
+          409,
+          "cipher-profile-mismatch",
+          team.cipher_profile === null
+            ? "an undeclared team cannot be settled by a batch that mixes ciphers"
+            : "message cipher does not match the team's declared cipher profile",
+          {
+            cipher_profile: team.cipher_profile,
+            batch_ciphers: [...ciphers].sort(),
+            remedy:
+              team.cipher_profile === null
+                ? "send one batch whose messages all use the same cipher; that settles the team"
+                : "re-read this team (remote.sh pull, or unlock if you hold the key) and send under its declared cipher",
+          },
+          binding,
+        );
+      }
+    }
+
     let next = BigInt(team.current_seq);
     if (BigInt(fresh.length) > MAX_SEQUENCE - next) {
       throw new ProtocolError(
@@ -270,10 +328,27 @@ export async function postMessages(
       existing.set(message.id, { kind: "live", row });
     }
     if (fresh.length > 0) {
-      await client.query("UPDATE teams SET current_seq = $2 WHERE team_id = $1", [
-        teamId,
-        next.toString(),
-      ]);
+      await client.query(
+        "UPDATE teams SET current_seq = $2 WHERE team_id = $1",
+        [teamId, next.toString()],
+      );
+      // A team registered before declarations were carried has cipher_profile
+      // NULL, and connect cannot fill it: that route takes no credential, so a
+      // write there would let anyone who knows a team_id fix the profile ahead
+      // of the machine that owns the team. It is settled here instead — by what
+      // the team actually stores — on a route that already writes to this same
+      // row (current_seq, one line above) and has already run every check.
+      //
+      // The batch is known to agree with itself by now: the guard above refused
+      // it otherwise, so this cannot be decided by which message came first.
+      //
+      // `IS NULL` only. Once declared, a team is not reclassified by later
+      // traffic — and traffic that disagrees never reaches this point at all.
+      await client.query(
+        `UPDATE teams SET cipher_profile = $2
+          WHERE team_id = $1 AND cipher_profile IS NULL`,
+        [teamId, fresh[0]!.envelope.cipher],
+      );
     }
 
     const seen = new Set<string>();
@@ -284,7 +359,8 @@ export async function postMessages(
       seen.add(message.id);
       return {
         id: message.id,
-        server_seq: record.kind === "live" ? record.row.team_seq : record.sequence,
+        server_seq:
+          record.kind === "live" ? record.row.team_seq : record.sequence,
         disposition: stored ? "stored" : "duplicate",
       };
     });
@@ -294,15 +370,21 @@ export async function postMessages(
       const target = next - retentionMaxLiveMessages;
       if (target > effectiveFloor) {
         retentionNotice = await retainThroughLocked(
-          client, teamId, effectiveFloor, target,
+          client,
+          teamId,
+          effectiveFloor,
+          target,
         );
         effectiveFloor = target;
       }
     }
 
     return {
-      ...common(serverId, { ...team, current_seq: next.toString(),
-        min_available_seq: effectiveFloor.toString() }),
+      ...common(serverId, {
+        ...team,
+        current_seq: next.toString(),
+        min_available_seq: effectiveFloor.toString(),
+      }),
       policy_revision: team.policy_revision,
       acks,
     };
@@ -392,7 +474,8 @@ export async function syncReadState(
           WHERE existing.wire_id IS NULL`,
         [teamId, exactMembers, exactWires],
       );
-      for (const row of novel.rows) novelExactPairs.add(`${row.member_id}:${row.wire_id}`);
+      for (const row of novel.rows)
+        novelExactPairs.add(`${row.member_id}:${row.wire_id}`);
     }
 
     // The authenticated retention floor is a safe baseline for every existing
@@ -432,20 +515,30 @@ export async function syncReadState(
 
     await deleteCoveredExact(client, teamId, floor);
 
-    const survivingRequestExact = exactWires.length === 0
-      ? new Set<string>()
-      : new Set((await client.query<{ member_id: string; wire_id: string }>(
-        `SELECT incoming.member_id::text, incoming.wire_id::text
+    const survivingRequestExact =
+      exactWires.length === 0
+        ? new Set<string>()
+        : new Set(
+            (
+              await client.query<{ member_id: string; wire_id: string }>(
+                `SELECT incoming.member_id::text, incoming.wire_id::text
            FROM unnest($2::uuid[], $3::uuid[]) AS incoming(member_id, wire_id)
            JOIN read_exact current
              ON current.team_id=$1 AND current.member_id=incoming.member_id
             AND current.wire_id=incoming.wire_id`,
-        [teamId, exactMembers, exactWires],
-      )).rows
-        .filter((row) => novelExactPairs.has(`${row.member_id}:${row.wire_id}`))
-        .map((row) => row.member_id));
+                [teamId, exactMembers, exactWires],
+              )
+            ).rows
+              .filter((row) =>
+                novelExactPairs.has(`${row.member_id}:${row.wire_id}`),
+              )
+              .map((row) => row.member_id),
+          );
 
-    const memberOverflow = await client.query<{ member_id: string; exact_count: string }>(
+    const memberOverflow = await client.query<{
+      member_id: string;
+      exact_count: string;
+    }>(
       `SELECT member_id::text, COUNT(*)::text AS exact_count
          FROM read_exact WHERE team_id = $1
         GROUP BY member_id HAVING COUNT(*) > $2
@@ -459,14 +552,19 @@ export async function syncReadState(
     const teamCount = Number(teamCountResult.rows[0]?.exact_count ?? "0");
     if (memberOverflow.rows[0] || teamCount > MAX_EXACT_PER_TEAM) {
       const causalMemberId = input.updates.find((update) =>
-        survivingRequestExact.has(update.member_id))?.member_id;
-      const offender = memberOverflow.rows[0] ?? (await client.query<{ member_id: string; exact_count: string }>(
-        `SELECT member_id::text, COUNT(*)::text AS exact_count
+        survivingRequestExact.has(update.member_id),
+      )?.member_id;
+      const offender =
+        memberOverflow.rows[0] ??
+        (
+          await client.query<{ member_id: string; exact_count: string }>(
+            `SELECT member_id::text, COUNT(*)::text AS exact_count
            FROM read_exact WHERE team_id = $1
             AND ($2::uuid IS NULL OR member_id=$2::uuid)
           GROUP BY member_id ORDER BY COUNT(*) DESC, member_id LIMIT 1`,
-        [teamId, causalMemberId ?? null],
-      )).rows[0];
+            [teamId, causalMemberId ?? null],
+          )
+        ).rows[0];
       throw new ProtocolError(
         409,
         "read-state-limit-exceeded",
@@ -521,15 +619,22 @@ export async function syncReadState(
     );
     const hasMore = result.rows.length > input.page_limit;
     const page = result.rows.slice(0, input.page_limit);
-    const items = page.map((row) => row.kind_order === 0
-      ? { kind: "frontier", member_id: row.member_id, server_seq: row.server_seq }
-      : { kind: "exact", member_id: row.member_id, wire_id: row.wire_id });
+    const items = page.map((row) =>
+      row.kind_order === 0
+        ? {
+            kind: "frontier",
+            member_id: row.member_id,
+            server_seq: row.server_seq,
+          }
+        : { kind: "exact", member_id: row.member_id, wire_id: row.wire_id },
+    );
     const last = items.at(-1);
-    const nextPageAfter = hasMore && last
-      ? last.kind === "frontier"
-        ? { member_id: last.member_id, kind: "frontier" }
-        : { member_id: last.member_id, kind: "exact", wire_id: last.wire_id }
-      : null;
+    const nextPageAfter =
+      hasMore && last
+        ? last.kind === "frontier"
+          ? { member_id: last.member_id, kind: "frontier" }
+          : { member_id: last.member_id, kind: "exact", wire_id: last.wire_id }
+        : null;
 
     return {
       ...common(serverId, team),
@@ -633,7 +738,12 @@ export async function retainThrough(
       );
     }
 
-    const notice = await retainThroughLocked(client, teamId, currentFloor, through);
+    const notice = await retainThroughLocked(
+      client,
+      teamId,
+      currentFloor,
+      through,
+    );
     return {
       ...common(serverId, { ...team, min_available_seq: through.toString() }),
       retained_through: through.toString(),
@@ -659,7 +769,10 @@ export async function getMessages(
           410,
           "resync-required",
           "cursor predates retained history",
-          { after: after.toString(), min_available_seq: team.min_available_seq },
+          {
+            after: after.toString(),
+            min_available_seq: team.min_available_seq,
+          },
           { serverInstanceId: serverId, teamId },
         );
       }
@@ -744,11 +857,10 @@ export async function getCapabilities(
   pool: Pool,
   teamId: string,
 ): Promise<Record<string, unknown>> {
-  return inTransaction(
-    pool,
-    (client) => capabilitySnapshot(client, teamId),
-    { readOnly: true, repeatableRead: true },
-  );
+  return inTransaction(pool, (client) => capabilitySnapshot(client, teamId), {
+    readOnly: true,
+    repeatableRead: true,
+  });
 }
 
 // Registers a team the client already owns: the team row and its opening
@@ -760,58 +872,69 @@ export async function connectTeam(
   input: ConnectInput,
 ): Promise<Record<string, unknown>> {
   return inTransaction(pool, async (client) => {
-    const serverId = await serverInstanceId(client);
-    // The team and its opening policy row.
-    // team_policy_history is required: capabilitySnapshot (and so
-    // GET /v1/capabilities) reads it, and a team without it is out of bounds.
-    //
-    // ON CONFLICT makes the primary key the sole arbiter of "already
-    // registered", so the refusal holds under concurrency, not just serially: a
-    // second connect for the same team_id inserts nothing, and a concurrent one
-    // blocks on the first transaction's commit before it resolves to the same.
-    // A read-then-insert would instead let two connects both miss the row and
-    // the losing INSERT raise a raw primary-key violation (500) — the retry a
-    // timed-out client sends races its own first attempt exactly this way.
-    const inserted = await client.query(
-      `INSERT INTO teams
+      const serverId = await serverInstanceId(client);
+      // The team and its opening policy row.
+      // team_policy_history is required: capabilitySnapshot (and so
+      // GET /v1/capabilities) reads it, and a team without it is out of bounds.
+      //
+      // ON CONFLICT makes the primary key the sole arbiter of "already
+      // registered", so the refusal holds under concurrency, not just serially: a
+      // second connect for the same team_id inserts nothing, and a concurrent one
+      // blocks on the first transaction's commit before it resolves to the same.
+      // A read-then-insert would instead let two connects both miss the row and
+      // the losing INSERT raise a raw primary-key violation (500) — the retry a
+      // timed-out client sends races its own first attempt exactly this way.
+      const inserted = await client.query(
+        `INSERT INTO teams
          (team_id, team_name, members_revision,
-          accepted_envelope_versions, write_allowed_ciphers)
-       VALUES ($1, $2, 0, ARRAY[1], ARRAY['none', 'age-v1']::TEXT[])
+          accepted_envelope_versions, write_allowed_ciphers, cipher_profile)
+       VALUES ($1, $2, 0, ARRAY[1], ARRAY['none', 'age-v1']::TEXT[], $3)
        ON CONFLICT (team_id) DO NOTHING`,
-      [input.team_id, input.team_name],
-    );
-    // Refused as a uniqueness conflict, the same reason git refuses a
-    // non-fast-forward push — not an authorization decision.
-    if (inserted.rowCount === 0) {
-      throw new ProtocolError(
-        409,
-        "team-already-exists",
-        "a team with this id is already registered",
-        { team_id: input.team_id },
-        { serverInstanceId: serverId, teamId: input.team_id },
+        // A client that sends no declaration leaves NULL. Nothing stands in for
+        // it: an absent declaration and a declared 'none' are different facts,
+        // and only one of them is safe to act on.
+        [input.team_id, input.team_name, input.cipher_profile ?? null],
       );
-    }
-    await client.query(
-      `INSERT INTO team_policy_history
+      // A repeat connect writes NOTHING, including no declaration. This route
+      // carries no credential, and its safety rests on exactly that: knowing a
+      // team_id is not permission to change an existing team. One write here —
+      // even one narrowed to `IS NULL` — would let anyone holding a team_id
+      // fix the profile before the machine that owns the team, and 'none' fixed
+      // first is the dangerous direction. A team already registered is settled
+      // by a message it stores, below, not by being named again.
+      //
+      // Refused as a uniqueness conflict, the same reason git refuses a
+      // non-fast-forward push — not an authorization decision.
+      if (inserted.rowCount === 0) {
+        throw new ProtocolError(
+          409,
+          "team-already-exists",
+          "a team with this id is already registered",
+          { team_id: input.team_id },
+          { serverInstanceId: serverId, teamId: input.team_id },
+        );
+      }
+      await client.query(
+        `INSERT INTO team_policy_history
          (team_id, policy_revision, effective_from_seq,
           accepted_envelope_versions, write_allowed_ciphers)
        VALUES ($1, 0, 1, ARRAY[1], ARRAY['none', 'age-v1']::TEXT[])`,
-      [input.team_id],
-    );
-    // The roster the client owns. member_identity_history is append-only and
-    // retires a (team, name) for the life of the team; members is the live set.
-    // The schema has already rejected duplicate ids or names within the batch.
-    for (const member of input.members) {
-      await client.query(
-        `INSERT INTO member_identity_history (team_id, member_id, name)
+        [input.team_id],
+      );
+      // The roster the client owns. member_identity_history is append-only and
+      // retires a (team, name) for the life of the team; members is the live set.
+      // The schema has already rejected duplicate ids or names within the batch.
+      for (const member of input.members) {
+        await client.query(
+          `INSERT INTO member_identity_history (team_id, member_id, name)
          VALUES ($1, $2, $3)`,
-        [input.team_id, member.member_id, member.name],
-      );
-      await client.query(
-        `INSERT INTO members (team_id, member_id, name) VALUES ($1, $2, $3)`,
-        [input.team_id, member.member_id, member.name],
-      );
-    }
+          [input.team_id, member.member_id, member.name],
+        );
+        await client.query(
+          `INSERT INTO members (team_id, member_id, name) VALUES ($1, $2, $3)`,
+          [input.team_id, member.member_id, member.name],
+        );
+      }
     return capabilitySnapshot(client, input.team_id);
   });
 }
@@ -911,11 +1034,10 @@ export async function getTeamSnapshot(
   pool: Pool,
   teamId: string,
 ): Promise<Record<string, unknown>> {
-  return inTransaction(
-    pool,
-    (client) => capabilitySnapshot(client, teamId),
-    { readOnly: true, repeatableRead: true },
-  );
+  return inTransaction(pool, (client) => capabilitySnapshot(client, teamId), {
+    readOnly: true,
+    repeatableRead: true,
+  });
 }
 
 export async function getMembers(
@@ -951,7 +1073,10 @@ export async function getMembers(
 // "no such route" to a client checking whether the server is up at all. Absence
 // carries the disagreement instead, and the client — which knows which team it
 // expects — is where that is judged.
-export async function health(pool: Pool, teamId?: string): Promise<{
+export async function health(
+  pool: Pool,
+  teamId?: string,
+): Promise<{
   status: "ok";
   server_instance_id: string;
   protocol: { supported_versions: number[] };

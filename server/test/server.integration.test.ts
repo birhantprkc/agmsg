@@ -102,6 +102,24 @@ describeDatabase("remote storage HTTP API v1", () => {
     };
   }
 
+  // Puts the shared team back into a state where a fresh message can be stored.
+  // The cases above deliberately break it — one empties the cipher policy, one
+  // exhausts the sequence — and they run first, so a declaration case that did
+  // not reset would be asserting on a 403 or a 507 instead of on a stored
+  // message.
+  async function resetTeamForDeclarationCase(
+    declaration: string | null,
+  ): Promise<void> {
+    await pool.query(
+      `UPDATE teams
+          SET cipher_profile = $2,
+              write_allowed_ciphers = ARRAY['none', 'age-v1']::TEXT[],
+              current_seq = (SELECT coalesce(max(team_seq), 0) FROM messages WHERE team_id = $1)
+        WHERE team_id = $1`,
+      [teamId, declaration],
+    );
+  }
+
   it("reports readiness and fixes the response protocol version", async () => {
     const response = await app.inject({ method: "GET", url: "/v1/health" });
     expect(response.statusCode).toBe(200);
@@ -878,5 +896,153 @@ describeDatabase("remote storage HTTP API v1", () => {
       [["750e8400-e29b-41d4-a716-446655440003", "750e8400-e29b-41d4-a716-446655440004"]],
     );
     expect(rows.rows[0]?.count).toBe("0");
+  });
+
+  // Last on purpose: the cases above assert exact sequence numbers against a
+  // team they share, so a message stored here would move every one of them.
+  // Placing these first is what broke nine of them.
+  it("settles an undeclared team's cipher from the first message it stores", async () => {
+    // Teams registered before declarations were carried have cipher_profile
+    // NULL, and `connect` must not fill it — that route takes no credential, so
+    // a write there would let anyone holding a team_id fix the profile ahead of
+    // the machine that owns the team. This is where it is settled instead: a
+    // route that already writes to the existing team (current_seq), reached by
+    // a caller whose message got past the policy check.
+    await resetTeamForDeclarationCase(null);
+
+    const settling = message("750e8400-e29b-41d4-a716-4466554400a1", "settles it");
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers,
+      payload: { messages: [settling] },
+    });
+    expect(response.statusCode).toBe(200);
+
+    const after = await pool.query<{ cipher_profile: string | null }>(
+      "SELECT cipher_profile FROM teams WHERE team_id = $1",
+      [teamId],
+    );
+    expect(after.rows[0]?.cipher_profile).toBe("none");
+  });
+
+  it("refuses a batch that disagrees with itself, storing none of it", async () => {
+    // cipher_profile exists so a client can decide whether plaintext may be
+    // pushed at all. A value that traffic is free to contradict is not a fact
+    // about the team, and a safety decision resting on it would be worse than
+    // none — it reads as dependable precisely because writes went through. So
+    // a mix is refused whole, before anything is stored.
+    await resetTeamForDeclarationCase(null);
+
+    const plain = message("750e8400-e29b-41d4-a716-4466554400b1", "plain");
+    const sealed = {
+      id: "750e8400-e29b-41d4-a716-4466554400b2",
+      envelope: {
+        v: 1,
+        cipher: "age-v1",
+        key_id: "epoch-1",
+        blob: Buffer.from("opaque").toString("base64"),
+      },
+    };
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers,
+      payload: { messages: [plain, sealed] },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error.code).toBe("cipher-profile-mismatch");
+    // A refusal a sender can act on.
+    expect(response.json().error.details.remedy).toBeTruthy();
+
+    const after = await pool.query<{ cipher_profile: string | null }>(
+      "SELECT cipher_profile FROM teams WHERE team_id = $1",
+      [teamId],
+    );
+    expect(after.rows[0]?.cipher_profile).toBeNull();
+    // Nothing from the batch landed: a partial store would leave the team
+    // holding messages under a cipher it does not use.
+    const stored = await pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM messages WHERE id = ANY($1::uuid[])",
+      [[plain.id, sealed.id]],
+    );
+    expect(stored.rows[0]?.count).toBe("0");
+  });
+
+  it("refuses plaintext for a team that declared age-v1, and says what to do", async () => {
+    // Reachable by a machine that has done nothing wrong: the team declared
+    // age-v1 after it last looked. Blocking the write is right — the server
+    // could read it — but "mismatch" alone is not actionable, so the refusal
+    // names the declared profile and how to get back in step.
+    await resetTeamForDeclarationCase("age-v1");
+
+    const plain = message("750e8400-e29b-41d4-a716-4466554400c1", "plain");
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers,
+      payload: { messages: [plain] },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error.code).toBe("cipher-profile-mismatch");
+    expect(response.json().error.details.cipher_profile).toBe("age-v1");
+    expect(response.json().error.details.remedy).toContain("pull");
+
+    const stored = await pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM messages WHERE id = $1",
+      [plain.id],
+    );
+    expect(stored.rows[0]?.count).toBe("0");
+  });
+
+  it("refuses age-v1 for a team that declared none", async () => {
+    await resetTeamForDeclarationCase("none");
+
+    const sealed = {
+      id: "750e8400-e29b-41d4-a716-4466554400c2",
+      envelope: {
+        v: 1,
+        cipher: "age-v1",
+        key_id: "epoch-1",
+        blob: Buffer.from("opaque").toString("base64"),
+      },
+    };
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers,
+      payload: { messages: [sealed] },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error.details.cipher_profile).toBe("none");
+
+    const stored = await pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM messages WHERE id = $1",
+      [sealed.id],
+    );
+    expect(stored.rows[0]?.count).toBe("0");
+  });
+
+  it("leaves an existing declaration alone even when traffic agrees with it", async () => {
+    // Traffic that disagrees is refused above, so the remaining question is
+    // whether an agreeing batch can still rewrite the column — it must not. The
+    // fill is `IS NULL` only: a declared team is settled, and changing it is a
+    // declaration, never a side effect of sending.
+    await resetTeamForDeclarationCase("none");
+
+    const later = message("750e8400-e29b-41d4-a716-4466554400a2", "plaintext");
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers,
+      payload: { messages: [later] },
+    });
+    expect(response.statusCode).toBe(200);
+
+    const after = await pool.query<{ cipher_profile: string | null }>(
+      "SELECT cipher_profile FROM teams WHERE team_id = $1",
+      [teamId],
+    );
+    expect(after.rows[0]?.cipher_profile).toBe("none");
   });
 });
