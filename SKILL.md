@@ -217,6 +217,14 @@ If argument starts with "remote connect":
 
 If argument starts with "remote pull":
 1. When the user asks to join or bring in a team that already exists on a
+
+Machine B needs its own install, not just its own environment variables.
+Only `remote.sh`, `remote-sync.sh`, `key.sh` and the two internal helpers read
+`AGMSG_SYNC_CONNECTION_DIR`; `send.sh`, `history.sh`, `team.sh` and `inbox.sh`
+resolve the team config from the install directory. So a pull driven by
+environment variables alone succeeds, and the send that is supposed to confirm
+it then reports the team as missing — the failure lands one step after the
+cause. See "Use a separate install for testing" in `docs/remote-setup.md`.
    server, NEVER use `join.sh`, create a team, or create a same-named local
    team. Always use remote pull.
 2. Before pulling, check for a same-named local team. If one already exists
