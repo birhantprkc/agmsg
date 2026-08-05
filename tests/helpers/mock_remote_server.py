@@ -19,6 +19,9 @@ PULL_AGE = os.environ.get("MOCK_PULL_AGE") == "1"
 PULL_AGE_ENVELOPE_FILE = os.environ.get("MOCK_PULL_AGE_ENVELOPE_FILE", "")
 CONNECT_CIPHERS = (["none"] if os.environ.get("MOCK_CONNECT_NO_AGE") == "1"
                    else ["none", "age-v1"])
+# The name /v1/connect answers with. Empty means "echo back what was asked
+# for", which is the real server's behaviour and what every other case wants.
+CONNECT_TEAM_NAME = os.environ.get("MOCK_CONNECT_TEAM_NAME", "")
 
 # POST /v1/connect registers a client-owned team once. No credential is issued
 # or returned — reaching the server is the permission. A team_id already
@@ -409,7 +412,11 @@ class Handler(BaseHTTPRequestHandler):
                 "protocol_version": 1,
                 "server_instance_id": CONNECT_SERVER_ID,
                 "team_id": team_id,
-                "team_name": data.get("team_name", ""),
+                # Normally the server answers with the name it was given, which
+                # is why local and remote names are the same in every other
+                # case here. MOCK_CONNECT_TEAM_NAME makes them differ, so a
+                # test can see which of the two a message is quoting.
+                "team_name": CONNECT_TEAM_NAME or data.get("team_name", ""),
                 "min_available_seq": "0",
                 "current_seq": "0",
                 "next_sequence_boundary": "1",
