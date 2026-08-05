@@ -1007,6 +1007,11 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   cmd_name="$(basename "$TEST_SKILL_DIR")"
   [[ "$output" == *"This team is now local and ready for normal use."* ]]
   [[ "$output" == *"Open your agent and invoke its installed '$cmd_name' command, then join with a new agent name."* ]]
+  # And NOT the locked branch's guidance. Asserting only that the right line is
+  # present would pass for an output carrying both, which is what a reader
+  # cannot reconcile -- the shape reported in #147.
+  [[ "$output" != *"local but locked"* ]]
+  [[ "$output" != *"unlock"* ]]
   local cfg
   cfg="$TEST_SKILL_DIR/teams/cloned/config.json"
   [ -f "$cfg" ]
@@ -1160,7 +1165,10 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" encrypted
   [ "$status" -eq 0 ]
   [[ "$output" == *"This team is encrypted"* ]]
-  [[ "$output" == *"Run remote.sh unlock --bundle with the secret handoff bundle you were given."* ]]
+  # The remedy, in a form that can be typed: an absolute path (remote.sh is
+  # not on PATH) and both flags unlock actually requires.
+  [[ "$output" == *"$SCRIPTS/remote.sh"*"unlock"*"--bundle"*"--confirm-digest"* ]]
+  [[ "$output" != *"Run remote.sh unlock"* ]]
 
   local cfg before after
   cfg="$TEST_SKILL_DIR/teams/encrypted/config.json"
@@ -1227,6 +1235,15 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   run bash "$peer_scripts/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$team_id" encrypted
   [ "$status" -eq 0 ]
   [[ "$output" == *"local but locked"* ]]
+  # The remedy has to be typable. `remote.sh` is not on PATH, and --bundle
+  # without --confirm-digest is refused by unlock itself, so a line naming
+  # either alone sends the operator into a wall.
+  [[ "$output" == *"$peer_scripts/remote.sh"* ]]
+  [[ "$output" == *"unlock"*"--bundle"*"--confirm-digest"* ]]
+  [[ "$output" != *"Run remote.sh unlock"* ]]
+  # And NOT the plaintext branch's guidance -- the same output must not also
+  # say the team is ready.
+  [[ "$output" != *"ready for normal use"* ]]
 
   digest="$(shasum -a 256 "$snapshot" | awk '{print $1}')"
   run bash "$peer_scripts/remote.sh" unlock encrypted \
@@ -1634,4 +1651,29 @@ assert_lookup_rejected() {
   assert_lookup_rejected protocol
   assert_lookup_rejected server_id
   assert_lookup_rejected root_name
+}
+
+@test "remote pull: the unlock line it prints can actually be run (#147)" {
+  # Typed, not read. A remedy line is only worth printing if a shell can run
+  # it: this takes the line out of the output, fills the placeholders, and
+  # requires the failure to be about the BUNDLE -- never "command not found"
+  # (remote.sh is not on PATH) and never a usage error (--bundle alone is
+  # refused, so a line naming only --bundle is a dead end with extra steps).
+  MOCK_PULL_AGE=1
+  MOCK_TEAM_CIPHER_PROFILE=age-v1
+  restart_mock_server
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" encrypted
+  [ "$status" -eq 0 ]
+
+  local printed
+  printed="$(printf '%s\n' "$output" | grep -F 'remote.sh' | grep -F 'unlock' | head -1 | sed 's/^ *//')"
+  [ -n "$printed" ]
+
+  local runnable="${printed//<file>/\/nonexistent\/bundle.json}"
+  runnable="${runnable//<sha256>/0000000000000000000000000000000000000000000000000000000000000000}"
+  run eval "$runnable"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"command not found"* ]]
+  [[ "$output" != *"No such file or directory"*"remote.sh"* ]]
+  [[ "$output" != *"Usage: remote.sh unlock"* ]]
 }
