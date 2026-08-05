@@ -319,6 +319,30 @@ _binding_field() {  # $1 = team, $2 = json path under remote_binding
   [[ "$output" == *"Refusing to re-anchor"* ]]
   [[ "$output" != *"$secret"* ]]
   [[ "$output" != *"/t/"* ]]
+
+  # A roster refusal, which is the fourth place in this function that prints
+  # the endpoint. Driven from the same capability URL.
+  run bash "$SCRIPTS/remote.sh" disconnect testteam
+  [ "$status" -eq 0 ]
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$capability_endpoint" testteam
+  [ "$status" -eq 0 ]
+  local cfg="$TEST_SKILL_DIR/teams/testteam/config.json"
+  local updated
+  updated="$(sqlite_mem "SELECT json_set(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.agents.intruder', json_object('member_id', '018f3f7e-9999-7000-8000-00000000beef'));")"
+  printf '%s' "$updated" > "$cfg"
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$capability_endpoint" testteam
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"roster is not this team's"* ]]
+  [[ "$output" != *"$secret"* ]]
+  [[ "$output" != *"/t/"* ]]
+
+  # Four of the seven places this function prints the endpoint are driven
+  # here: adoption success, cipher mismatch, instance mismatch, roster
+  # mismatch. The remaining three -- capabilities unreadable, roster
+  # unreadable, name mismatch -- need the server to misbehave in ways this
+  # fixture cannot currently produce, and rest on the static guard in
+  # tests/test_endpoint_redaction_guard.bats. Saying which is which is the
+  # point: "the adopt path is covered" would not be true.
 }
 
 @test "connect: refuses to adopt a registration whose roster is not this team's (#143)" {

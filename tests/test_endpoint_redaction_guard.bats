@@ -20,16 +20,24 @@ setup() {
 # Lines that write $endpoint to the user's terminal without redacting it.
 # Only output statements count: the URLs handed to curl must stay complete,
 # and assignments are how the value gets built in the first place.
-# Judged per OCCURRENCE, not per line. A message can redact the endpoint in one
-# place and print it raw in another on the same line, and excluding any line
-# that mentions the helper would wave exactly that through -- measured: adding
-# a raw `$endpoint` to a line that already redacted one was not caught until
-# this was rewritten. So the safe form is deleted from the line first, and
-# whatever `$endpoint` survives is a leak.
+# Three things this has to survive, each one having already slipped past a
+# version of it:
+#
+#   1. Per OCCURRENCE, not per line. A message can redact the endpoint once and
+#      print it raw as well; excluding every line that mentions the helper
+#      waves exactly that through.
+#   2. Both spellings. `${endpoint}` is the same expansion as `$endpoint` and a
+#      fixed-string search for the second does not see the first.
+#   3. Continuations. `echo "..." \` + `"$endpoint"` puts the leak on a
+#      different physical line from the word `echo`.
+#
+# So: join continuations first, then delete the safe form, then look for any
+# surviving expansion of the name on a line that writes output.
 scan_for_raw_endpoint() {  # $1 = file
-  sed 's/\$(_remote_endpoint_display "\$endpoint")//g' "$1" \
-    | grep -nE '^[[:space:]]*(echo|printf)[[:space:]]' \
-    | grep -F '$endpoint' \
+  sed -e :a -e '/\\$/N; s/\\\n//; ta' "$1" \
+    | sed -E 's/\$\(_remote_endpoint_display "\$\{?endpoint\}?"\)//g' \
+    | grep -nE '(^|[[:space:]]|;|&&|\|\|)(echo|printf)[[:space:]]' \
+    | grep -E '\$\{?endpoint\}?' \
     || true
 }
 
@@ -73,6 +81,46 @@ offenders() {
   found="$(scan_for_raw_endpoint "$scratch")"
   [ -n "$found" ]
   [[ "$found" == *"talking to"* ]]
+}
+
+@test "endpoint redaction: the guard notices the braced spelling" {
+  # ${endpoint} is the same expansion. A fixed-string search for $endpoint
+  # does not see it, and the leak is identical.
+  local scratch="$BATS_TEST_TMPDIR/remote-braced-leak.sh"
+  cp "$REMOTE_SH" "$scratch"
+  printf '%s\n' '  echo "agmsg: braced ${endpoint}" >&2' >> "$scratch"
+
+  local found
+  found="$(scan_for_raw_endpoint "$scratch")"
+  [ -n "$found" ]
+  [[ "$found" == *"braced"* ]]
+}
+
+@test "endpoint redaction: the guard notices a leak on a continuation line" {
+  # The word `echo` and the leak are on different physical lines, so a check
+  # that looks at one line at a time sees an echo with no endpoint, then an
+  # endpoint with no echo, and reports neither.
+  local scratch="$BATS_TEST_TMPDIR/remote-continued-leak.sh"
+  cp "$REMOTE_SH" "$scratch"
+  printf '%s\n' '  echo "agmsg: continued" \' '    "$endpoint" >&2' >> "$scratch"
+
+  local found
+  found="$(scan_for_raw_endpoint "$scratch")"
+  [ -n "$found" ]
+  [[ "$found" == *"continued"* ]]
+}
+
+@test "endpoint redaction: the guard does not fire on the redacted form" {
+  # The other half of a usable guard: it must stay quiet on correct code, in
+  # both spellings, or the fix for a false negative becomes a false positive.
+  local scratch="$BATS_TEST_TMPDIR/remote-clean.sh"
+  cp "$REMOTE_SH" "$scratch"
+  printf '%s\n' \
+    '  echo "agmsg: on $(_remote_endpoint_display "$endpoint")" >&2' \
+    '  echo "agmsg: on $(_remote_endpoint_display "${endpoint}")" >&2' \
+    >> "$scratch"
+
+  [ -z "$(scan_for_raw_endpoint "$scratch")" ]
 }
 
 @test "endpoint redaction: the helper drops path, query, fragment and userinfo" {
