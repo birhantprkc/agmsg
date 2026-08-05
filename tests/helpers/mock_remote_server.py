@@ -53,6 +53,16 @@ REGISTERED_TEAMS = {}
 # env var because the registration has to SURVIVE into the retry, and a restart
 # to change the env would take it with it.
 DROP_NEXT_CONNECT = False
+# Armed by GET /_test/fail-next?route=<capabilities|members>: every request to
+# that route answers 500 until the server is restarted. Lets a test drive the
+# client's "could not read it" branches, which a fixture that always succeeds
+# cannot reach.
+#
+# Sticky, not one-shot: a connected team has a sync engine polling in the
+# background, and it would consume a single armed failure before the command
+# under test ever issued its request. The test then saw a success it had asked
+# to fail. Each test starts its own server, so nothing has to clear this.
+FAIL_NEXT = set()
 
 
 PULL_SERVER_ID = CONNECT_SERVER_ID
@@ -185,7 +195,7 @@ class Handler(BaseHTTPRequestHandler):
         # Declared for the whole method: /_test/health-team assigns it, and
         # Python requires the declaration to precede the first mention anywhere
         # in the function — including the read in the /v1/health branch below.
-        global HEALTH_TEAM_ID, CONNECT_SERVER_ID, DROP_NEXT_CONNECT
+        global HEALTH_TEAM_ID, CONNECT_SERVER_ID, DROP_NEXT_CONNECT, FAIL_NEXT
         if self.path == "/v1/health":
             # Echo the team the caller asked about, the way a real per-team edge
             # answers. MOCK_HEALTH_TEAM_ID overrides it so a test can make the
@@ -207,6 +217,9 @@ class Handler(BaseHTTPRequestHandler):
             # can only tell by comparing the instance id it recorded.
             CONNECT_SERVER_ID = "018f3f7e-2222-7000-8000-0000000000ff"
             self._send_json(200, {"server_instance_id": CONNECT_SERVER_ID})
+            return
+        if self.path == "/v1/capabilities" and "capabilities" in FAIL_NEXT:
+            self._send_json(500, {"error": {"code": "server-error"}})
             return
         if self.path == "/v1/capabilities":
             team_id = self.headers.get("Agmsg-Team-ID", "")
@@ -257,6 +270,33 @@ class Handler(BaseHTTPRequestHandler):
         parts = self.path.split("?", 1)
         route = parts[0]
         query = parts[1] if len(parts) > 1 else ""
+        if route == "/_test/fail-next":
+            for pair in query.split("&"):
+                if pair.startswith("route="):
+                    FAIL_NEXT.add(pair[len("route="):])
+            self._send_json(200, {"armed": sorted(FAIL_NEXT)})
+            return
+        if route == "/_test/rename-team":
+            # Make the server hold a different name for a registered team, so
+            # the client's name-mismatch branch can be reached.
+            from urllib.parse import unquote_plus as _uqp
+            was, now = "", ""
+            for pair in query.split("&"):
+                if pair.startswith("from="):
+                    was = _uqp(pair[len("from="):])
+                elif pair.startswith("to="):
+                    now = _uqp(pair[len("to="):])
+            hit = [tid for tid, rec in REGISTERED_TEAMS.items()
+                   if rec["team_name"] == was]
+            if hit:
+                REGISTERED_TEAMS[hit[0]]["team_name"] = now
+                self._send_json(200, {"team_name": now})
+            else:
+                self._send_json(404, {"error": {"code": "not-registered"}})
+            return
+        if route == "/v1/members" and "members" in FAIL_NEXT:
+            self._send_json(500, {"error": {"code": "server-error"}})
+            return
         if route == "/_test/declare-cipher":
             # Set the declaration a registered team carries, without the client
             # having to be able to MAKE that declaration. Declaring age-v1 for

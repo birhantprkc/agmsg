@@ -34,6 +34,7 @@ setup() {
   wait_for_file_contains "$TEST_SKILL_DIR/server.port" '^[0-9][0-9]*$'
   MOCK_PORT="$(cat "$TEST_SKILL_DIR/server.port")"
   ENDPOINT="http://127.0.0.1:$MOCK_PORT"
+  CAPABILITY_SECRET="agsy_do_not_print_this_token"
 }
 
 cleanup_sync_engines() {
@@ -278,71 +279,111 @@ _binding_field() {  # $1 = team, $2 = json path under remote_binding
   # capability, and this line is meant to be read off a terminal.
 }
 
-@test "connect: the adopt path keeps the capability out of the terminal (#143)" {
-  # #635 pins this for the first connect's progress and non-200 lines. Those
-  # are not the messages this change added: adoption success, and every refusal
-  # in _remote_adopt_registration, print the endpoint too, and none of them are
-  # reached on a first connect. Routing them through _remote_endpoint_display
-  # is only static evidence until something drives them.
-  local secret="agsy_do_not_print_this_token"
-  local capability_endpoint="$ENDPOINT/t/$secret"
+# --- #143: nothing this path prints may carry the capability ---------------
+#
+# A hosted endpoint is `https://host/t/<token>` and that token IS the
+# permission. These assert on the BYTES OF A RUN, not on the source. An
+# earlier version of this guard read remote.sh looking for output statements
+# and was wrong three times running: it saw only a literal `$endpoint` on the
+# same physical line as `echo`, then only `echo|printf` -- while `${endpoint}`,
+# line continuations, `cat` with a here-doc, `tee` and a redirected block are
+# all ordinary ways to write the same leak. Enumerating how a program can
+# print something loses by one, every time. What the user sees does not depend
+# on which primitive produced it, so that is what is checked.
+#
+# Every branch of _remote_adopt_registration that prints the endpoint is driven
+# below. A new branch belongs here too.
 
-  # Adoption success.
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$capability_endpoint" testteam
-  [ "$status" -eq 0 ]
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$capability_endpoint" testteam
-  [ "$status" -eq 0 ]
-  # Assert the line was PRINTED before asserting the secret is missing from it:
-  # "no token in the output" is trivially true of no output.
-  [[ "$output" == *"adopting that registration"* ]]
-  [[ "$output" != *"$secret"* ]]
-  [[ "$output" != *"/t/"* ]]
+# Fails if the capability appears in anything the command wrote. The expected
+# substring is required as well: "the token is absent" is trivially true of no
+# output, and would keep passing if the message were deleted or renamed.
+assert_no_capability() {  # $1 = expected substring, rest = command
+  local expect="$1"; shift
+  run "$@"
+  [[ "$output" == *"$expect"* ]] || {
+    echo "expected to see: $expect"; echo "actual output: $output"; return 1; }
+  [[ "$output" != *"$CAPABILITY_SECRET"* ]] || {
+    echo "TOKEN LEAKED in: $output"; return 1; }
+  [[ "$output" != *"/t/"* ]] || {
+    echo "capability PATH leaked in: $output"; return 1; }
+}
 
-  # A refusal on the same path.
-  run curl -sS --get --data-urlencode "team_name=testteam" --data-urlencode "profile=age-v1" \
-    "$ENDPOINT/_test/declare-cipher"
-  [ "$status" -eq 0 ]
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$capability_endpoint" testteam
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"Refusing to record a profile"* ]]
-  [[ "$output" != *"$secret"* ]]
-  [[ "$output" != *"/t/"* ]]
+# NOT a command substitution: that runs in a subshell, so an assignment inside
+# it is thrown away and the secret would be the empty string -- which every
+# output contains, making the leak check pass on anything. CAPABILITY_SECRET is
+# set in setup() instead.
+_capability_endpoint() {
+  printf '%s' "$ENDPOINT/t/$CAPABILITY_SECRET"
+}
 
-  # And a server-identity refusal, which prints the endpoint from a third place.
-  run curl -sS --get --data-urlencode "team_name=testteam" --data-urlencode "profile=none" \
-    "$ENDPOINT/_test/declare-cipher"
-  [ "$status" -eq 0 ]
-  run curl -sS "$ENDPOINT/_test/rotate-server-id"
-  [ "$status" -eq 0 ]
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$capability_endpoint" testteam
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"Refusing to re-anchor"* ]]
-  [[ "$output" != *"$secret"* ]]
-  [[ "$output" != *"/t/"* ]]
+@test "redaction: adoption success does not print the capability (#143)" {
+  local cap; cap="$(_capability_endpoint)"
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+  assert_no_capability "adopting that registration" \
+    bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+}
 
-  # A roster refusal, which is the fourth place in this function that prints
-  # the endpoint. Driven from the same capability URL.
-  run bash "$SCRIPTS/remote.sh" disconnect testteam
-  [ "$status" -eq 0 ]
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$capability_endpoint" testteam
-  [ "$status" -eq 0 ]
-  local cfg="$TEST_SKILL_DIR/teams/testteam/config.json"
-  local updated
-  updated="$(sqlite_mem "SELECT json_set(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.agents.intruder', json_object('member_id', '018f3f7e-9999-7000-8000-00000000beef'));")"
+@test "redaction: an unreadable capabilities response does not print it (#143)" {
+  local cap; cap="$(_capability_endpoint)"
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+  curl -sS "$ENDPOINT/_test/fail-next?route=capabilities" >/dev/null
+  assert_no_capability "capabilities could not be read" \
+    bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+}
+
+@test "redaction: an unreadable roster response does not print it (#143)" {
+  local cap; cap="$(_capability_endpoint)"
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+  curl -sS "$ENDPOINT/_test/fail-next?route=members" >/dev/null
+  assert_no_capability "roster could not be read" \
+    bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+}
+
+@test "redaction: a server-instance mismatch does not print it (#143)" {
+  local cap; cap="$(_capability_endpoint)"
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+  curl -sS "$ENDPOINT/_test/rotate-server-id" >/dev/null
+  assert_no_capability "Refusing to re-anchor" \
+    bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+}
+
+@test "redaction: a team-name mismatch does not print it (#143)" {
+  local cap; cap="$(_capability_endpoint)"
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+  curl -sS --get --data-urlencode "from=testteam" --data-urlencode "to=someone-elses" \
+    "$ENDPOINT/_test/rename-team" >/dev/null
+  assert_no_capability "not this team's" \
+    bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+}
+
+@test "redaction: a roster mismatch does not print it (#143)" {
+  local cap; cap="$(_capability_endpoint)"
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+  local cfg="$TEST_SKILL_DIR/teams/testteam/config.json" updated
+  updated="$(sqlite_mem "SELECT json_set(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.agents.intruder', json_object('member_id', '018f3f7e-9999-7000-8000-00000000cafe'));")"
   printf '%s' "$updated" > "$cfg"
-  run bash "$SCRIPTS/remote.sh" connect --endpoint "$capability_endpoint" testteam
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"roster is not this team's"* ]]
-  [[ "$output" != *"$secret"* ]]
-  [[ "$output" != *"/t/"* ]]
+  assert_no_capability "roster is not this team's" \
+    bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+}
 
-  # Four of the seven places this function prints the endpoint are driven
-  # here: adoption success, cipher mismatch, instance mismatch, roster
-  # mismatch. The remaining three -- capabilities unreadable, roster
-  # unreadable, name mismatch -- need the server to misbehave in ways this
-  # fixture cannot currently produce, and rest on the static guard in
-  # tests/test_endpoint_redaction_guard.bats. Saying which is which is the
-  # point: "the adopt path is covered" would not be true.
+@test "redaction: a cipher-profile mismatch does not print it (#143)" {
+  local cap; cap="$(_capability_endpoint)"
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+  curl -sS --get --data-urlencode "team_name=testteam" --data-urlencode "profile=age-v1" \
+    "$ENDPOINT/_test/declare-cipher" >/dev/null
+  assert_no_capability "Refusing to record a profile" \
+    bash "$SCRIPTS/remote.sh" connect --endpoint "$cap" testteam
+}
+
+@test "redaction: the helper drops path, query, fragment and userinfo (#143)" {
+  # The one source-level claim kept: it is about the helper's own behaviour,
+  # not about who remembers to call it.
+  eval "$(sed -n '/^_remote_endpoint_display() {/,/^}/p' "$SCRIPTS/remote.sh")"
+  [ "$(_remote_endpoint_display 'https://host/t/secret')" = "https://host" ]
+  [ "$(_remote_endpoint_display 'https://user:tok@host/t/secret')" = "https://host" ]
+  [ "$(_remote_endpoint_display 'https://host/t/secret?q=1#frag')" = "https://host" ]
+  [ "$(_remote_endpoint_display 'http://127.0.0.1:8080')" = "http://127.0.0.1:8080" ]
+  [ "$(_remote_endpoint_display 'https://host/a@b/c')" = "https://host" ]
 }
 
 @test "connect: refuses to adopt a registration whose roster is not this team's (#143)" {
