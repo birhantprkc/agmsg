@@ -110,6 +110,33 @@ _remote_validate_endpoint() {
   python3 "$SCRIPT_DIR/internal/validate-endpoint.py" "$1"
 }
 
+# An endpoint, safe to print. Keeps the scheme, host and port; DROPS everything
+# else, and the list of what it drops is the point of this function:
+#
+#   path      — a hosted endpoint is `https://host/t/<token>`, and that token IS
+#               the capability. Anyone who reads it off a terminal, a screen
+#               share or a pasted log can connect as this team.
+#   userinfo  — `scheme://user:pass@host` puts a credential before the host, so
+#               a "host and port only" rule that forgets it prints the password.
+#   query, fragment — no current endpoint carries either, and that is exactly
+#               why they would be missed when one does.
+#
+# The caller keeps the team name in the message. That is what makes host-only
+# enough to identify the destination: a team has one endpoint, so `team 'X' to
+# host:port` names it exactly without naming the secret.
+_remote_endpoint_display() {
+  local url="$1" scheme rest
+  case "$url" in
+    *://*) scheme="${url%%://*}://"; rest="${url#*://}" ;;
+    *) scheme=""; rest="$url" ;;
+  esac
+  # Cut the path/query/fragment FIRST. Doing userinfo first would let an `@`
+  # inside a path decide where the host ends.
+  rest="${rest%%/*}"; rest="${rest%%\?*}"; rest="${rest%%#*}"
+  rest="${rest##*@}"
+  printf '%s%s' "$scheme" "$rest"
+}
+
 # Read an interactive value without coupling it to the token transport.
 # `connect --token-stdin` intentionally consumes fd 0 through EOF before the
 # E2EE bootstrap starts. In a real terminal the choice/identity must therefore
@@ -380,7 +407,7 @@ _remote_adopt_registration() {
 
   http_code="$(_remote_http_get_json "$endpoint/v1/capabilities" "$team_id" "$caps_file")"
   if [ "$http_code" != "200" ]; then
-    echo "agmsg: '$endpoint' holds a registration for team '$team' but its capabilities could not be read (HTTP $http_code); cannot confirm the registration is this team's." >&2
+    echo "agmsg: '$(_remote_endpoint_display "$endpoint")' holds a registration for team '$team' but its capabilities could not be read (HTTP $http_code); cannot confirm the registration is this team's." >&2
     rm -f "$caps_file" "$members_file"; trap - EXIT INT TERM
     return 1
   fi
@@ -391,7 +418,7 @@ _remote_adopt_registration() {
   fetched_server_instance="$(_remote_read_config_field "$caps_file" '$.server_instance_id')"
   if [ -n "$expected_server_instance" ] \
     && [ "$expected_server_instance" != "$fetched_server_instance" ]; then
-    echo "agmsg: '$endpoint' is now server instance $fetched_server_instance, but team '$team' is bound to $expected_server_instance. Refusing to re-anchor the binding to a different server. If the server really was replaced, disconnect and connect again deliberately." >&2
+    echo "agmsg: '$(_remote_endpoint_display "$endpoint")' is now server instance $fetched_server_instance, but team '$team' is bound to $expected_server_instance. Refusing to re-anchor the binding to a different server. If the server really was replaced, disconnect and connect again deliberately." >&2
     rm -f "$caps_file" "$members_file"; trap - EXIT INT TERM
     return 1
   fi
@@ -404,14 +431,14 @@ _remote_adopt_registration() {
   remote_team_name="$(_remote_read_config_field "$caps_file" '$.team_name')"
   local_team_name="$(_remote_read_config_field "$cfg" '$.name')"
   if [ "$remote_team_name" != "$local_team_name" ]; then
-    echo "agmsg: '$endpoint' already has team_id $team_id, but registered under the name '$remote_team_name' while this team is '$local_team_name'. Refusing to adopt a registration that is not this team's." >&2
+    echo "agmsg: '$(_remote_endpoint_display "$endpoint")' already has team_id $team_id, but registered under the name '$remote_team_name' while this team is '$local_team_name'. Refusing to adopt a registration that is not this team's." >&2
     rm -f "$caps_file" "$members_file"; trap - EXIT INT TERM
     return 1
   fi
 
   http_code="$(_remote_http_get_json "$endpoint/v1/members" "$team_id" "$members_file")"
   if [ "$http_code" != "200" ]; then
-    echo "agmsg: '$endpoint' holds a registration for team '$team' but its roster could not be read (HTTP $http_code); cannot confirm the registration is this team's." >&2
+    echo "agmsg: '$(_remote_endpoint_display "$endpoint")' holds a registration for team '$team' but its roster could not be read (HTTP $http_code); cannot confirm the registration is this team's." >&2
     rm -f "$caps_file" "$members_file"; trap - EXIT INT TERM
     return 1
   fi
@@ -426,7 +453,7 @@ _remote_adopt_registration() {
        (SELECT json_extract(value, '\$.member_id') AS mid
           FROM json_each(json_extract('$members_escaped', '\$.members')) ORDER BY mid);")"
   if [ "$local_ids" != "$remote_ids" ]; then
-    echo "agmsg: '$endpoint' already has team_id $team_id, but its roster is not this team's. Refusing to adopt it. This is a real conflict, not a half-finished connect — resolve it before connecting this team here." >&2
+    echo "agmsg: '$(_remote_endpoint_display "$endpoint")' already has team_id $team_id, but its roster is not this team's. Refusing to adopt it. This is a real conflict, not a half-finished connect — resolve it before connecting this team here." >&2
     rm -f "$caps_file" "$members_file"; trap - EXIT INT TERM
     return 1
   fi
@@ -444,33 +471,38 @@ _remote_adopt_registration() {
     ''|null) ;;
     "$binding_cipher") ;;
     *)
-      # Name the invocation that would work, not the profile. connect takes no
-      # profile argument -- age-v1 is --e2ee and none is its absence -- so
-      # "re-run for age-v1" would be an instruction with no command behind it.
+      # Name the change to make, not the profile: connect takes no profile
+      # argument -- age-v1 is --e2ee and none is its absence -- so "re-run for
+      # age-v1" would be an instruction with no command behind it.
+      #
+      # The endpoint is deliberately NOT reproduced here. It can carry a
+      # capability, and this line exists to be read off a terminal and acted
+      # on; printing a runnable command would mean printing the secret in it.
+      # So the instruction names the flag and the team, and refers to the
+      # endpoint the caller already has rather than echoing it back.
+      #
+      # The team IS spliced in, so it goes through agmsg_shq: a team name may
+      # legally contain a single quote (lib/validate.sh rejects only empty /
+      # . / .. / slashes / a leading dash / control characters), and a bare
+      # '...' would close early and leave the rest as syntax for whatever
+      # shell this gets pasted into.
       local recovery
       case "$declared_cipher" in
-        # agmsg_shq, not bare '...': a team name may legally contain a single
-        # quote (lib/validate.sh rejects only empty / . / .. / slashes / a
-        # leading dash / control characters), and one would close the quote
-        # early and leave the rest of the line as syntax for whatever shell
-        # this gets pasted into. Quoted rather than passed after `--`, too:
-        # this parser has no end-of-options marker and would take one as the
-        # team name.
-        age-v1) recovery="remote.sh connect --endpoint $(agmsg_shq "$endpoint") --e2ee $(agmsg_shq "$team")" ;;
-        none)   recovery="remote.sh connect --endpoint $(agmsg_shq "$endpoint") $(agmsg_shq "$team")" ;;
+        age-v1) recovery="re-run the same connect for $(agmsg_shq "$team") with --e2ee added" ;;
+        none)   recovery="re-run the same connect for $(agmsg_shq "$team") without --e2ee" ;;
         *)      recovery="" ;;
       esac
       if [ -n "$recovery" ]; then
-        echo "agmsg: team '$team' is registered on $endpoint as '$declared_cipher', but this connect asked for '$binding_cipher'. Refusing to record a profile the registration does not have. Connect the way it is registered: $recovery" >&2
+        echo "agmsg: team '$team' is registered on $(_remote_endpoint_display "$endpoint") as '$declared_cipher', but this connect asked for '$binding_cipher'. Refusing to record a profile the registration does not have. To connect it the way it is registered, $recovery." >&2
       else
-        echo "agmsg: team '$team' is registered on $endpoint as '$declared_cipher', which this version does not know how to connect as (it understands 'none' and 'age-v1'). Refusing to record a profile the registration does not have." >&2
+        echo "agmsg: team '$team' is registered on $(_remote_endpoint_display "$endpoint") as '$declared_cipher', which this version does not know how to connect as (it understands 'none' and 'age-v1'). Refusing to record a profile the registration does not have." >&2
       fi
       rm -f "$caps_file" "$members_file"; trap - EXIT INT TERM
       return 1
       ;;
   esac
 
-  echo "Team '$team' is already registered on $endpoint; adopting that registration and continuing." >&2
+  echo "Team '$team' is already registered on $(_remote_endpoint_display "$endpoint"); adopting that registration and continuing." >&2
   _remote_write_binding "$cfg" "$endpoint" "$binding_cipher" "$caps_file" || {
     rm -f "$caps_file" "$members_file"; trap - EXIT INT TERM
     return 1
@@ -1319,7 +1351,7 @@ cmd_connect() {
     _remote_adopt_registration "$team" "$cfg" "$endpoint" "$team_id" \
       "$binding_cipher" "$existing_server_instance" || exit 1
   else
-    echo "Connecting team '$team' to $endpoint ..." >&2
+    echo "Connecting team '$team' to $(_remote_endpoint_display "$endpoint") ..." >&2
     http_code="$(_remote_http_post_json "$endpoint/v1/connect" "$body_file" "$resp_file" "$header_file")"
     if [ "$http_code" = "409" ]; then
       # The server holds this team_id and we hold no binding for it. That is
@@ -1331,7 +1363,7 @@ cmd_connect() {
       # the team there turns out not to be ours.
       _remote_adopt_registration "$team" "$cfg" "$endpoint" "$team_id" "$binding_cipher" || exit 1
     elif [ "$http_code" != "200" ]; then
-      echo "agmsg: connect failed — $endpoint/v1/connect returned HTTP $http_code" >&2
+      echo "agmsg: connect failed — $(_remote_endpoint_display "$endpoint")/v1/connect returned HTTP $http_code" >&2
       exit 1
     else
       _remote_write_binding "$cfg" "$endpoint" "$binding_cipher" "$resp_file" || exit 1

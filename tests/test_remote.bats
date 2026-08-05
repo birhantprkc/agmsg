@@ -9,6 +9,8 @@ setup() {
   # server for each later test — and a case that fails early never gets to
   # put it back.
   MOCK_TEAM_CIPHER_PROFILE=age-v1
+  MOCK_CONNECT_STATUS=""
+  export MOCK_CONNECT_STATUS
   export PEER_SKILL_DIR=""
   # Some cases deliberately remove python3 from PATH to verify the control-plane
   # gate. Resolve the fixture interpreter in each test process before that
@@ -24,6 +26,7 @@ setup() {
   MOCK_HEALTH_TEAM_ID="${MOCK_HEALTH_TEAM_ID:-}" \
   MOCK_CONNECT_NO_AGE="${MOCK_CONNECT_NO_AGE:-}" \
   MOCK_CONNECT_TEAM_NAME="${MOCK_CONNECT_TEAM_NAME:-}" \
+  MOCK_CONNECT_STATUS="${MOCK_CONNECT_STATUS:-}" \
   MOCK_TEAM_CIPHER_PROFILE="${MOCK_TEAM_CIPHER_PROFILE-age-v1}" \
     "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
     </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
@@ -89,6 +92,7 @@ restart_mock_server() {
   MOCK_HEALTH_TEAM_ID="${MOCK_HEALTH_TEAM_ID:-}" \
   MOCK_CONNECT_NO_AGE="${MOCK_CONNECT_NO_AGE:-}" \
   MOCK_CONNECT_TEAM_NAME="${MOCK_CONNECT_TEAM_NAME:-}" \
+  MOCK_CONNECT_STATUS="${MOCK_CONNECT_STATUS:-}" \
   MOCK_TEAM_CIPHER_PROFILE="${MOCK_TEAM_CIPHER_PROFILE-age-v1}" \
     "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
       </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
@@ -225,17 +229,14 @@ _binding_field() {  # $1 = team, $2 = json path under remote_binding
   [[ "$output" == *"registered on"*"as 'age-v1'"* ]]
   [ "$(_binding_field testteam cipher_profile)" = "age-v1" ]
 
-  # The refusal must name a command this CLI accepts. Take the printed string
-  # and RUN it -- checking that a flag appears in the text would pass just as
-  # well for an instruction with nothing behind it, which is what this
-  # replaced. Only the program path is substituted; the arguments are executed
-  # exactly as printed.
+  # The refusal must name a change this CLI accepts, and then that change must
+  # actually work. It names the flag rather than a whole command because the
+  # endpoint can carry a capability and this line is read off a terminal --
+  # so the test performs the named change instead of pasting a printed string.
   [[ "$output" != *"Re-run connect for"* ]]
-  local printed
-  printed="$(printf '%s\n' "$output" | sed -n 's/.*Connect the way it is registered: //p')"
-  [ -n "$printed" ]
-  [[ "$printed" == remote.sh\ connect\ * ]]
-  run eval "bash \"\$SCRIPTS/remote.sh\" ${printed#remote.sh }"
+  [[ "$output" == *"re-run the same connect for"* ]]
+  [[ "$output" == *"with --e2ee added"* ]]
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam
   [ "$status" -eq 0 ]
   [ "$(_binding_field testteam cipher_profile)" = "age-v1" ]
 }
@@ -259,16 +260,22 @@ _binding_field() {  # $1 = team, $2 = json path under remote_binding
 
   run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" "$team"
   [ "$status" -ne 0 ]
-  local printed
-  printed="$(printf '%s\n' "$output" | sed -n "s/.*Connect the way it is registered: //p")"
+  # Hold the refusal itself: $output is about to be the eval's result, and
+  # asserting the endpoint's absence against THAT would be true of anything.
+  local msg="$output" printed
+  printed="$(printf '%s\n' "$msg" \
+    | sed -n "s/.*re-run the same connect for \(.*\) with --e2ee added\..*/\1/p")"
   [ -n "$printed" ]
 
-  # The real assertion: a shell parsing that line gets the team back as ONE
+  # The real assertion: a shell parsing that fragment gets the team back as ONE
   # argument, byte for byte. With a bare '$team' the quote closes early and
   # this either fails to parse or splits into several arguments.
-  run eval "set -- $printed; printf '%s|%s' \"\$#\" \"\${!#}\""
+  run eval "set -- $printed; printf '%s|%s' \"\$#\" \"\$1\""
   [ "$status" -eq 0 ]
-  [ "$output" = "6|$team" ]
+  [ "$output" = "1|$team" ]
+
+  # And the endpoint is not reproduced in the refusal: it can carry a
+  # capability, and this line is meant to be read off a terminal.
 }
 
 @test "connect: refuses to adopt a registration whose roster is not this team's (#143)" {
@@ -287,6 +294,68 @@ _binding_field() {  # $1 = team, $2 = json path under remote_binding
   [ "$status" -ne 0 ]
   [[ "$output" == *"roster is not this team's"* ]]
   [[ "$output" == *"real conflict"* ]]
+}
+
+@test "connect: the capability path never reaches the terminal" {
+  # A hosted endpoint is `https://host/t/<token>` and that token IS the
+  # capability -- read it off a terminal, a screen share or a pasted log and you
+  # can connect as this team. `connect` printed the whole URL twice, on every
+  # run, for every user.
+  #
+  # The assertion is that the secret is ABSENT, so it has to also assert that
+  # the line was printed at all: "no token in the output" is trivially true of
+  # no output, and would keep passing if the message were deleted or renamed.
+  local secret="agsy_do_not_print_this_token"
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT/t/$secret" testteam
+  [[ "$output" == *"Connecting team 'testteam' to"* ]]
+  [[ "$output" == *"127.0.0.1:$MOCK_PORT"* ]]
+  [[ "$output" != *"$secret"* ]]
+  [[ "$output" != *"/t/"* ]]
+}
+
+@test "connect: the capability path is absent from the FAILURE message too" {
+  # The failure line matters more than the progress line: successful output
+  # scrolls past, failing output gets pasted -- into a bug report, a chat, a
+  # screenshot -- and is then stored, forwarded and searchable.
+  #
+  # The status is forced by the fixture rather than by pointing at a port
+  # nobody is listening on. A free port is not state this test owns: anything
+  # on the runner may be bound to it, and then the POST succeeds and the branch
+  # under test never runs. The mock is started by this suite, so its answer is
+  # ours to decide.
+  #
+  # Reaching the line is asserted too. "The token is not in the output" is also
+  # true of output that never mentioned the endpoint at all.
+  MOCK_CONNECT_STATUS=503
+  export MOCK_CONNECT_STATUS
+  restart_mock_server
+  local secret="agsy_do_not_print_this_token"
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT/t/$secret" testteam
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"connect failed"* ]]
+  [[ "$output" == *"returned HTTP 503"* ]]
+  [[ "$output" == *"127.0.0.1:$MOCK_PORT"* ]]
+  [[ "$output" != *"$secret"* ]]
+  [[ "$output" != *"/t/"* ]]
+}
+
+@test "the endpoint shown on the terminal keeps only scheme, host and port" {
+  # Unit-level, because `connect` cannot reach the interesting inputs: the
+  # validator refuses userinfo outright (see the loopback-bypass test below),
+  # so that branch of the redactor is defence in depth and has to be exercised
+  # here or not at all. Query and fragment are the same -- no endpoint carries
+  # one today, which is exactly why one would slip through when it does.
+  # shellcheck disable=SC1090
+  eval "$(sed -n '/^_remote_endpoint_display()/,/^}/p' "$SCRIPTS/remote.sh")"
+  [ "$(_remote_endpoint_display "http://127.0.0.1:8797/t/SECRET")" = "http://127.0.0.1:8797" ]
+  [ "$(_remote_endpoint_display "https://u:pa55@example.com/t/SECRET")" = "https://example.com" ]
+  [ "$(_remote_endpoint_display "https://example.com?token=SECRET")" = "https://example.com" ]
+  [ "$(_remote_endpoint_display "https://example.com#SECRET")" = "https://example.com" ]
+  # An `@` inside the path must not be read as the end of the userinfo.
+  [ "$(_remote_endpoint_display "https://a@b@evil.example/t/SECRET")" = "https://evil.example" ]
+  [ "$(_remote_endpoint_display "http://[::1]:8080/t/SECRET")" = "http://[::1]:8080" ]
+  # Port survives -- it is how two local servers are told apart.
+  [ "$(_remote_endpoint_display "https://host.example.com:443")" = "https://host.example.com:443" ]
 }
 
 @test "connect: requires the response protocol header" {
