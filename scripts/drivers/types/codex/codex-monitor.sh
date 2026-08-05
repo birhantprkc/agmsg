@@ -10,6 +10,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 RUN_DIR="$SKILL_DIR/run"
+# This starts the codex app-server and the bridge launcher, both of which
+# outlive it. The `3>&- 4>&-` on those spawn lines closes the two descriptors
+# we can name; the harness's is not one of them. See lib/close-fds.sh.
+# shellcheck source=../../../lib/close-fds.sh
+source "$SCRIPT_DIR/../../../lib/close-fds.sh"
+agmsg_close_inherited_fds
 # shellcheck source=../../../lib/hash.sh
 source "$SCRIPT_DIR/../../../lib/hash.sh"
 # shellcheck source=../../../lib/compat.sh

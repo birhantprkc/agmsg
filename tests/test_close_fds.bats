@@ -73,14 +73,21 @@ setup() {
   [[ "$output" =~ "CLOSED" ]]
 }
 
-# Both spawn paths must use it. This is a source check on purpose — it is not
-# asserting behaviour, it is asserting that neither caller was left behind, and
-# being left behind is exactly how the bridge came to hang a shard while the
-# engine was already fixed.
+# Every long-lived spawn path must use it. A source check on purpose: it is not
+# asserting behaviour, it is asserting that no caller was left behind, and being
+# left behind is exactly how the bridge came to hang a shard while the engine
+# was already fixed.
+#
+# NOT listed, deliberately: scripts/drivers/types/codex/_session-start.sh. It
+# spawns a long-lived child the same way, but it is SOURCED into
+# session-start.sh's global context, so calling this there would close the
+# descriptors of the shell that sourced it rather than of a process about to
+# exec. It needs a different treatment and has not had one.
 @test "close-fds: every long-lived spawn path calls it" {
   for f in \
     "$BATS_TEST_DIRNAME/../scripts/remote-sync.sh" \
-    "$BATS_TEST_DIRNAME/../scripts/drivers/types/codex/codex-bridge-launcher.sh"
+    "$BATS_TEST_DIRNAME/../scripts/drivers/types/codex/codex-bridge-launcher.sh" \
+    "$BATS_TEST_DIRNAME/../scripts/drivers/types/codex/codex-monitor.sh"
   do
     grep -q 'agmsg_close_inherited_fds' "$f" || {
       echo "no fd close in $f"
