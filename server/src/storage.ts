@@ -94,10 +94,16 @@ function common(serverId: string, team: TeamRow): Record<string, unknown> {
 }
 
 function notFound(serverId: string, teamId: string): ProtocolError {
-  return new ProtocolError(404, "team-not-found", "team is not provisioned", {}, {
-    serverInstanceId: serverId,
-    teamId,
-  });
+  return new ProtocolError(
+    404,
+    "team-not-found",
+    "team is not provisioned",
+    {},
+    {
+      serverInstanceId: serverId,
+      teamId,
+    },
+  );
 }
 
 function envelopeMatches(row: LiveMessageRow, envelope: Envelope): boolean {
@@ -164,7 +170,8 @@ export async function postMessages(
       [teamId, ids],
     );
     const existing = new Map<string, ExistingRecord>();
-    for (const row of liveResult.rows) existing.set(row.id, { kind: "live", row });
+    for (const row of liveResult.rows)
+      existing.set(row.id, { kind: "live", row });
     for (const row of tombstoneResult.rows) {
       existing.set(row.id, {
         kind: "tombstone",
@@ -191,7 +198,9 @@ export async function postMessages(
       }
     }
 
-    const fresh = [...firstById.values()].filter((message) => !existing.has(message.id));
+    const fresh = [...firstById.values()].filter(
+      (message) => !existing.has(message.id),
+    );
     for (const message of fresh) {
       const { envelope, id } = message;
       if (envelope.v !== 1 || !["none", "age-v1"].includes(envelope.cipher)) {
@@ -277,10 +286,10 @@ export async function postMessages(
       existing.set(message.id, { kind: "live", row });
     }
     if (fresh.length > 0) {
-      await client.query("UPDATE teams SET current_seq = $2 WHERE team_id = $1", [
-        teamId,
-        next.toString(),
-      ]);
+      await client.query(
+        "UPDATE teams SET current_seq = $2 WHERE team_id = $1",
+        [teamId, next.toString()],
+      );
     }
 
     const seen = new Set<string>();
@@ -291,7 +300,8 @@ export async function postMessages(
       seen.add(message.id);
       return {
         id: message.id,
-        server_seq: record.kind === "live" ? record.row.team_seq : record.sequence,
+        server_seq:
+          record.kind === "live" ? record.row.team_seq : record.sequence,
         disposition: stored ? "stored" : "duplicate",
       };
     });
@@ -301,15 +311,21 @@ export async function postMessages(
       const target = next - retentionMaxLiveMessages;
       if (target > effectiveFloor) {
         retentionNotice = await retainThroughLocked(
-          client, teamId, effectiveFloor, target,
+          client,
+          teamId,
+          effectiveFloor,
+          target,
         );
         effectiveFloor = target;
       }
     }
 
     return {
-      ...common(serverId, { ...team, current_seq: next.toString(),
-        min_available_seq: effectiveFloor.toString() }),
+      ...common(serverId, {
+        ...team,
+        current_seq: next.toString(),
+        min_available_seq: effectiveFloor.toString(),
+      }),
       policy_revision: team.policy_revision,
       acks,
     };
@@ -399,7 +415,8 @@ export async function syncReadState(
           WHERE existing.wire_id IS NULL`,
         [teamId, exactMembers, exactWires],
       );
-      for (const row of novel.rows) novelExactPairs.add(`${row.member_id}:${row.wire_id}`);
+      for (const row of novel.rows)
+        novelExactPairs.add(`${row.member_id}:${row.wire_id}`);
     }
 
     // The authenticated retention floor is a safe baseline for every existing
@@ -439,20 +456,30 @@ export async function syncReadState(
 
     await deleteCoveredExact(client, teamId, floor);
 
-    const survivingRequestExact = exactWires.length === 0
-      ? new Set<string>()
-      : new Set((await client.query<{ member_id: string; wire_id: string }>(
-        `SELECT incoming.member_id::text, incoming.wire_id::text
+    const survivingRequestExact =
+      exactWires.length === 0
+        ? new Set<string>()
+        : new Set(
+            (
+              await client.query<{ member_id: string; wire_id: string }>(
+                `SELECT incoming.member_id::text, incoming.wire_id::text
            FROM unnest($2::uuid[], $3::uuid[]) AS incoming(member_id, wire_id)
            JOIN read_exact current
              ON current.team_id=$1 AND current.member_id=incoming.member_id
             AND current.wire_id=incoming.wire_id`,
-        [teamId, exactMembers, exactWires],
-      )).rows
-        .filter((row) => novelExactPairs.has(`${row.member_id}:${row.wire_id}`))
-        .map((row) => row.member_id));
+                [teamId, exactMembers, exactWires],
+              )
+            ).rows
+              .filter((row) =>
+                novelExactPairs.has(`${row.member_id}:${row.wire_id}`),
+              )
+              .map((row) => row.member_id),
+          );
 
-    const memberOverflow = await client.query<{ member_id: string; exact_count: string }>(
+    const memberOverflow = await client.query<{
+      member_id: string;
+      exact_count: string;
+    }>(
       `SELECT member_id::text, COUNT(*)::text AS exact_count
          FROM read_exact WHERE team_id = $1
         GROUP BY member_id HAVING COUNT(*) > $2
@@ -466,14 +493,19 @@ export async function syncReadState(
     const teamCount = Number(teamCountResult.rows[0]?.exact_count ?? "0");
     if (memberOverflow.rows[0] || teamCount > MAX_EXACT_PER_TEAM) {
       const causalMemberId = input.updates.find((update) =>
-        survivingRequestExact.has(update.member_id))?.member_id;
-      const offender = memberOverflow.rows[0] ?? (await client.query<{ member_id: string; exact_count: string }>(
-        `SELECT member_id::text, COUNT(*)::text AS exact_count
+        survivingRequestExact.has(update.member_id),
+      )?.member_id;
+      const offender =
+        memberOverflow.rows[0] ??
+        (
+          await client.query<{ member_id: string; exact_count: string }>(
+            `SELECT member_id::text, COUNT(*)::text AS exact_count
            FROM read_exact WHERE team_id = $1
             AND ($2::uuid IS NULL OR member_id=$2::uuid)
           GROUP BY member_id ORDER BY COUNT(*) DESC, member_id LIMIT 1`,
-        [teamId, causalMemberId ?? null],
-      )).rows[0];
+            [teamId, causalMemberId ?? null],
+          )
+        ).rows[0];
       throw new ProtocolError(
         409,
         "read-state-limit-exceeded",
@@ -528,15 +560,22 @@ export async function syncReadState(
     );
     const hasMore = result.rows.length > input.page_limit;
     const page = result.rows.slice(0, input.page_limit);
-    const items = page.map((row) => row.kind_order === 0
-      ? { kind: "frontier", member_id: row.member_id, server_seq: row.server_seq }
-      : { kind: "exact", member_id: row.member_id, wire_id: row.wire_id });
+    const items = page.map((row) =>
+      row.kind_order === 0
+        ? {
+            kind: "frontier",
+            member_id: row.member_id,
+            server_seq: row.server_seq,
+          }
+        : { kind: "exact", member_id: row.member_id, wire_id: row.wire_id },
+    );
     const last = items.at(-1);
-    const nextPageAfter = hasMore && last
-      ? last.kind === "frontier"
-        ? { member_id: last.member_id, kind: "frontier" }
-        : { member_id: last.member_id, kind: "exact", wire_id: last.wire_id }
-      : null;
+    const nextPageAfter =
+      hasMore && last
+        ? last.kind === "frontier"
+          ? { member_id: last.member_id, kind: "frontier" }
+          : { member_id: last.member_id, kind: "exact", wire_id: last.wire_id }
+        : null;
 
     return {
       ...common(serverId, team),
@@ -640,7 +679,12 @@ export async function retainThrough(
       );
     }
 
-    const notice = await retainThroughLocked(client, teamId, currentFloor, through);
+    const notice = await retainThroughLocked(
+      client,
+      teamId,
+      currentFloor,
+      through,
+    );
     return {
       ...common(serverId, { ...team, min_available_seq: through.toString() }),
       retained_through: through.toString(),
@@ -666,7 +710,10 @@ export async function getMessages(
           410,
           "resync-required",
           "cursor predates retained history",
-          { after: after.toString(), min_available_seq: team.min_available_seq },
+          {
+            after: after.toString(),
+            min_available_seq: team.min_available_seq,
+          },
           { serverInstanceId: serverId, teamId },
         );
       }
@@ -751,11 +798,10 @@ export async function getCapabilities(
   pool: Pool,
   teamId: string,
 ): Promise<Record<string, unknown>> {
-  return inTransaction(
-    pool,
-    (client) => capabilitySnapshot(client, teamId),
-    { readOnly: true, repeatableRead: true },
-  );
+  return inTransaction(pool, (client) => capabilitySnapshot(client, teamId), {
+    readOnly: true,
+    repeatableRead: true,
+  });
 }
 
 // Registers a team the client already owns: the team row and its opening
@@ -766,64 +812,100 @@ export async function connectTeam(
   pool: Pool,
   input: ConnectInput,
 ): Promise<Record<string, unknown>> {
-  return inTransaction(pool, async (client) => {
-    const serverId = await serverInstanceId(client);
-    // The team and its opening policy row.
-    // team_policy_history is required: capabilitySnapshot (and so
-    // GET /v1/capabilities) reads it, and a team without it is out of bounds.
-    //
-    // ON CONFLICT makes the primary key the sole arbiter of "already
-    // registered", so the refusal holds under concurrency, not just serially: a
-    // second connect for the same team_id inserts nothing, and a concurrent one
-    // blocks on the first transaction's commit before it resolves to the same.
-    // A read-then-insert would instead let two connects both miss the row and
-    // the losing INSERT raise a raw primary-key violation (500) — the retry a
-    // timed-out client sends races its own first attempt exactly this way.
-    const inserted = await client.query(
-      `INSERT INTO teams
+  // Set when a repeat connect carries a declaration for a team that has none.
+  // The transaction below throws on that path, so the write cannot live inside
+  // it; it is applied after, on its own.
+  let backfillDeclaration: string | undefined;
+  try {
+    return await inTransaction(pool, async (client) => {
+      const serverId = await serverInstanceId(client);
+      // The team and its opening policy row.
+      // team_policy_history is required: capabilitySnapshot (and so
+      // GET /v1/capabilities) reads it, and a team without it is out of bounds.
+      //
+      // ON CONFLICT makes the primary key the sole arbiter of "already
+      // registered", so the refusal holds under concurrency, not just serially: a
+      // second connect for the same team_id inserts nothing, and a concurrent one
+      // blocks on the first transaction's commit before it resolves to the same.
+      // A read-then-insert would instead let two connects both miss the row and
+      // the losing INSERT raise a raw primary-key violation (500) — the retry a
+      // timed-out client sends races its own first attempt exactly this way.
+      const inserted = await client.query(
+        `INSERT INTO teams
          (team_id, team_name, members_revision,
           accepted_envelope_versions, write_allowed_ciphers, cipher_profile)
        VALUES ($1, $2, 0, ARRAY[1], ARRAY['none', 'age-v1']::TEXT[], $3)
        ON CONFLICT (team_id) DO NOTHING`,
-      // A client that sends no declaration leaves NULL. Nothing stands in for
-      // it: an absent declaration and a declared 'none' are different facts,
-      // and only one of them is safe to act on.
-      [input.team_id, input.team_name, input.cipher_profile ?? null],
-    );
-    // Refused as a uniqueness conflict, the same reason git refuses a
-    // non-fast-forward push — not an authorization decision.
-    if (inserted.rowCount === 0) {
-      throw new ProtocolError(
-        409,
-        "team-already-exists",
-        "a team with this id is already registered",
-        { team_id: input.team_id },
-        { serverInstanceId: serverId, teamId: input.team_id },
+        // A client that sends no declaration leaves NULL. Nothing stands in for
+        // it: an absent declaration and a declared 'none' are different facts,
+        // and only one of them is safe to act on.
+        [input.team_id, input.team_name, input.cipher_profile ?? null],
       );
-    }
-    await client.query(
-      `INSERT INTO team_policy_history
+      // A team registered before declarations were carried has cipher_profile
+      // NULL, and nothing else can ever fill it: the server never stored the
+      // answer and no other request supplies one. So a repeat connect that brings
+      // a declaration leaves the missing one behind, and the "reconnect the
+      // machine that already has the team" that `unlock` prints becomes advice
+      // that works.
+      //
+      // Recorded OUTSIDE this transaction, because the next statement throws and
+      // would roll it back with everything else — the first version of this did
+      // exactly that and left the column NULL while appearing to fill it.
+      //
+      // Deliberately narrow: it writes only where the column IS NULL, so it can
+      // never overwrite an existing declaration, and it does not soften the
+      // refusal — registering a team twice is still 409.
+      if (inserted.rowCount === 0 && input.cipher_profile !== undefined) {
+        backfillDeclaration = input.cipher_profile;
+      }
+      // Refused as a uniqueness conflict, the same reason git refuses a
+      // non-fast-forward push — not an authorization decision.
+      if (inserted.rowCount === 0) {
+        throw new ProtocolError(
+          409,
+          "team-already-exists",
+          "a team with this id is already registered",
+          { team_id: input.team_id },
+          { serverInstanceId: serverId, teamId: input.team_id },
+        );
+      }
+      await client.query(
+        `INSERT INTO team_policy_history
          (team_id, policy_revision, effective_from_seq,
           accepted_envelope_versions, write_allowed_ciphers)
        VALUES ($1, 0, 1, ARRAY[1], ARRAY['none', 'age-v1']::TEXT[])`,
-      [input.team_id],
-    );
-    // The roster the client owns. member_identity_history is append-only and
-    // retires a (team, name) for the life of the team; members is the live set.
-    // The schema has already rejected duplicate ids or names within the batch.
-    for (const member of input.members) {
-      await client.query(
-        `INSERT INTO member_identity_history (team_id, member_id, name)
-         VALUES ($1, $2, $3)`,
-        [input.team_id, member.member_id, member.name],
+        [input.team_id],
       );
-      await client.query(
-        `INSERT INTO members (team_id, member_id, name) VALUES ($1, $2, $3)`,
-        [input.team_id, member.member_id, member.name],
+      // The roster the client owns. member_identity_history is append-only and
+      // retires a (team, name) for the life of the team; members is the live set.
+      // The schema has already rejected duplicate ids or names within the batch.
+      for (const member of input.members) {
+        await client.query(
+          `INSERT INTO member_identity_history (team_id, member_id, name)
+         VALUES ($1, $2, $3)`,
+          [input.team_id, member.member_id, member.name],
+        );
+        await client.query(
+          `INSERT INTO members (team_id, member_id, name) VALUES ($1, $2, $3)`,
+          [input.team_id, member.member_id, member.name],
+        );
+      }
+      return capabilitySnapshot(client, input.team_id);
+    });
+  } finally {
+    // Runs on both exits, but only ever set on the 409 path. Its own statement,
+    // so the rollback that carries the refusal cannot take it too. `IS NULL`
+    // keeps it to filling a gap: an existing declaration is never rewritten,
+    // and two machines racing to fill the same gap agree on whichever lands
+    // first rather than flipping the team back and forth.
+    if (backfillDeclaration !== undefined) {
+      await pool.query(
+        `UPDATE teams SET cipher_profile = $2
+          WHERE team_id = $1 AND cipher_profile IS NULL`,
+        [input.team_id, backfillDeclaration],
       );
     }
-    return capabilitySnapshot(client, input.team_id);
-  });
+  }
 }
 
 async function roster(
@@ -921,11 +1003,10 @@ export async function getTeamSnapshot(
   pool: Pool,
   teamId: string,
 ): Promise<Record<string, unknown>> {
-  return inTransaction(
-    pool,
-    (client) => capabilitySnapshot(client, teamId),
-    { readOnly: true, repeatableRead: true },
-  );
+  return inTransaction(pool, (client) => capabilitySnapshot(client, teamId), {
+    readOnly: true,
+    repeatableRead: true,
+  });
 }
 
 export async function getMembers(
@@ -961,7 +1042,10 @@ export async function getMembers(
 // "no such route" to a client checking whether the server is up at all. Absence
 // carries the disagreement instead, and the client — which knows which team it
 // expects — is where that is judged.
-export async function health(pool: Pool, teamId?: string): Promise<{
+export async function health(
+  pool: Pool,
+  teamId?: string,
+): Promise<{
   status: "ok";
   server_instance_id: string;
   protocol: { supported_versions: number[] };

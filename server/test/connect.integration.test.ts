@@ -116,6 +116,52 @@ describeDatabase("POST /v1/connect", () => {
     expect(response.json().error.code).toBe("team-already-exists");
   });
 
+  it("lets a repeat connect supply a declaration the team never had, still answering 409", async () => {
+    // A team registered before declarations were carried. Nothing else can fill
+    // this in — the server never stored the answer — so the advice `unlock`
+    // prints ("reconnect the machine that already has the team") has to be
+    // advice that works. Without this it names a dead end, and every
+    // pre-existing team stays unknown for good.
+    await pool.query("UPDATE teams SET cipher_profile = NULL WHERE team_id = $1", [teamId]);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/connect",
+      headers,
+      payload: { ...body, cipher_profile: "age-v1" },
+    });
+    // Still refused as a repeat registration: this fills a gap, it does not
+    // register the team again.
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error.code).toBe("team-already-exists");
+
+    const after = await pool.query<{ cipher_profile: string | null }>(
+      "SELECT cipher_profile FROM teams WHERE team_id = $1",
+      [teamId],
+    );
+    expect(after.rows[0]?.cipher_profile).toBe("age-v1");
+  });
+
+  it("a repeat connect never overwrites a declaration the team already has", async () => {
+    // The same path must not become a way to reclassify a team. Only absence is
+    // fillable.
+    await pool.query("UPDATE teams SET cipher_profile = 'age-v1' WHERE team_id = $1", [teamId]);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/connect",
+      headers,
+      payload: { ...body, cipher_profile: "none" },
+    });
+    expect(response.statusCode).toBe(409);
+
+    const after = await pool.query<{ cipher_profile: string | null }>(
+      "SELECT cipher_profile FROM teams WHERE team_id = $1",
+      [teamId],
+    );
+    expect(after.rows[0]?.cipher_profile).toBe("age-v1");
+  });
+
   it("rejects a roster with duplicate member names before touching the database", async () => {
     const response = await app.inject({
       method: "POST",
