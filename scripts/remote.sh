@@ -1120,7 +1120,21 @@ cmd_connect() {
 
   local connection_security="plain"
   [ "$binding_cipher" = "age-v1" ] && connection_security="age-v1 encrypted"
-  echo "Connected: team '$team'${remote_team_name:+ (org '$remote_team_name')} ($connection_security). Sync engine running."
+  # `remote_team_name` is the team's name ON THE SERVER, read out of the connect
+  # response above. That response carries no org — server_instance_id, team_id,
+  # team_name, min_available_seq — so the word "org" named something the server
+  # had never sent. While the two names match it reads as harmless repetition,
+  # which is why it lasted: every test connected a team whose local and remote
+  # names were the same string.
+  #
+  # So it is said only when it is news. Same name, nothing to add; different
+  # name, the operator is told which one the server is using, under a label
+  # that is true.
+  local server_side=""
+  if [ -n "$remote_team_name" ] && [ "$remote_team_name" != "$team" ]; then
+    server_side=" (on the server: '$remote_team_name')"
+  fi
+  echo "Connected: team '$team'$server_side ($connection_security). Sync engine running."
   if [ "$e2ee" -eq 1 ]; then
     echo "Export the public epoch snapshot with: key.sh show $team --snapshot --out <file>"
     echo "Transfer that snapshot and the key out of band; the other machine must import and live-confirm them before syncing."

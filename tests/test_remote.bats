@@ -18,6 +18,7 @@ setup() {
   MOCK_PULL_TEAM_ID="${MOCK_PULL_TEAM_ID:-}" \
   MOCK_HEALTH_TEAM_ID="${MOCK_HEALTH_TEAM_ID:-}" \
   MOCK_CONNECT_NO_AGE="${MOCK_CONNECT_NO_AGE:-}" \
+  MOCK_CONNECT_TEAM_NAME="${MOCK_CONNECT_TEAM_NAME:-}" \
     "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
     </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
   MOCK_SERVER_PID=$!
@@ -81,6 +82,7 @@ restart_mock_server() {
   MOCK_PULL_TEAM_ID="${MOCK_PULL_TEAM_ID:-}" \
   MOCK_HEALTH_TEAM_ID="${MOCK_HEALTH_TEAM_ID:-}" \
   MOCK_CONNECT_NO_AGE="${MOCK_CONNECT_NO_AGE:-}" \
+  MOCK_CONNECT_TEAM_NAME="${MOCK_CONNECT_TEAM_NAME:-}" \
     "$MOCK_PYTHON3" "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
       </dev/null > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" 3>&- &
   MOCK_SERVER_PID=$!
@@ -180,11 +182,34 @@ skip_if_no_age() {
 @test "connect: registers a client-owned team (happy path, Done-when 1)" {
   run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Connected: team 'testteam' (org 'testteam') (plain)."* ]]
+  # Same name on both sides — the ordinary case — so the line says it once.
+  [[ "$output" == *"Connected: team 'testteam' (plain)."* ]]
+  [[ "$output" != *"org"* ]]
   # A binding is recorded on the team config, and it carries no credential:
   # the register model writes none and none is fetched back.
   [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$SCRIPTS/../teams/testteam/config.json') AS TEXT), '\$.remote_binding.connected_at');")" != "" ]
   [ ! -f "$SCRIPTS/../run/remote-credentials/testteam.json" ]
+}
+
+@test "connect: when the server's name differs, it is quoted AS the server's — never as an org" {
+  # Every other connect case here asks for a team whose remote name comes back
+  # identical, so the two names cannot be told apart in the output. That is how
+  # this line spent its life calling the server's TEAM name an "org": while the
+  # strings match, a wrong label reads as a redundant one. Only a differing
+  # pair can see it, so this test makes them differ.
+  MOCK_CONNECT_TEAM_NAME="renamed-upstream"
+  export MOCK_CONNECT_TEAM_NAME
+  teardown
+  setup
+
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -eq 0 ]
+  # The local name leads; the server's is offered as the server's.
+  [[ "$output" == *"Connected: team 'testteam' (on the server: 'renamed-upstream') (plain)."* ]]
+  # And nothing in this output claims to be an org: the connect response
+  # carries server_instance_id / team_id / team_name / min_available_seq, and
+  # no org at all, so there is nothing here that could honestly be labelled one.
+  [[ "$output" != *"org"* ]]
 }
 
 @test "connect --e2ee generates a key and establishes age-v1 before engine start" {
@@ -192,7 +217,7 @@ skip_if_no_age() {
 
   run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Connected: team 'testteam' (org 'testteam') (age-v1 encrypted)."* ]]
+  [[ "$output" == *"Connected: team 'testteam' (age-v1 encrypted)."* ]]
   [[ "$output" == *"Back this up now"* ]]
   [[ "$output" == *"key.sh show testteam --snapshot --out <file>"* ]]
   sync_config="$TEST_SKILL_DIR/db/remote-sync/testteam.json"
