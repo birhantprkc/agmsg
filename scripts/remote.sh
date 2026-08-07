@@ -800,15 +800,26 @@ cmd_pull() {
     echo "Pulled '$pulled_name' into local team '$team' ($imported message(s)). Sync engine running."
   fi
   if [ "$pulled_age_v1" -gt 0 ]; then
-    # Print something that can be typed. `remote.sh` is not on PATH and never
-    # has been: it lives in this install's scripts directory, whose name is
-    # whatever the install was given -- which is why the sibling branch below
-    # already goes through $cmd_name. The old line named a bare script the
-    # shell cannot find, and named only --bundle, while --bundle without
-    # --confirm-digest is refused a few lines into unlock. Both halves have to
-    # be right, or this is a dead end with extra steps.
-    echo "This team is local but locked. Unlock it with the secret handoff bundle you were given:"
-    echo "  bash $(agmsg_shq "$SKILL_DIR/scripts/remote.sh") unlock $(agmsg_shq "$team") --bundle <file> --confirm-digest <sha256>"
+    # The state, always. Dropping this would let a finished pull read as a
+    # usable team, which is the worse failure of the two: the messages are
+    # here and none of them can be read yet.
+    echo "This team is local but locked."
+
+    # The route, only when nobody else owns it. Both halves of this are the
+    # plain install's: `remote.sh` is not on PATH -- it lives in this
+    # install's scripts directory, whose name is whatever the install was
+    # given -- and "the secret handoff bundle you were given" describes
+    # material a caller's operator was never handed. Theirs arrives through a
+    # different ceremony entirely, and telling them to go find a bundle sends
+    # them looking for something that does not exist.
+    #
+    # --confirm-digest is named alongside --bundle because unlock refuses the
+    # one without the other a few lines in. A route worth printing is one that
+    # runs.
+    if agmsg_operator_guidance_is_ours; then
+      echo "Unlock it with the secret handoff bundle you were given:"
+      echo "  bash $(agmsg_shq "$SKILL_DIR/scripts/remote.sh") unlock $(agmsg_shq "$team") --bundle <file> --confirm-digest <sha256>"
+    fi
   else
     echo "This team is now local and ready for normal use."
     echo "Open your agent and invoke its installed '$cmd_name' command, then join with a new agent name."
