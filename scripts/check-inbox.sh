@@ -153,7 +153,26 @@ IFS=',' read -ra TEAM_LIST <<< "$TEAMS"
 for team in "${TEAM_LIST[@]}"; do
   storage_store_exists "$team" || continue
 
-  # ONE guarded boundary for everything that reads or formats.
+  # ONE guarded boundary for everything that reads or formats — and it must NOT
+  # be invoked from a condition context.
+  #
+  # `RESULT=$(...) || _rc=$?` looks equivalent and is not. Putting the
+  # substitution on the left of `||` makes the whole thing a tested command, and
+  # errexit is then suppressed for what runs inside it — including the `set -e`
+  # the subshell sets for itself. Measured: storage_init returned 13,
+  # storage_list_unread carried on regardless, the assignment landed empty and
+  # SUCCEEDED, and the `[ -n "" ] || exit 98` two lines later became the
+  # subshell's status. A backend failure arrived at the caller as "this team has
+  # no unread messages", and the poll reported a clean turn.
+  #
+  # A single non-conditional assignment with errexit lifted around it does not
+  # have that property: the subshell's own `set -e` aborts at the first failure
+  # and its status is what `$?` holds. The lift is two lines wide and restored
+  # immediately.
+  #
+  # This is also why the failing operations are not listed with `|| return`
+  # inside: an enumeration is short by one the next time an operation is added,
+  # which is the defect this file exists to fix.
   #
   # The first attempt listed the substitutions and guarded each -- and missed
   # one (`_arr`), which is the whole failure mode this file is about: an
@@ -164,6 +183,7 @@ for team in "${TEAM_LIST[@]}"; do
   #
   # 97 and 98 are the two ordinary reasons to skip a team, carried as statuses
   # because a subshell cannot `continue` its caller's loop.
+  set +e
   RESULT=$(
     set -euo pipefail
     # Honor actas exclusivity locks. If (team, AGENT) is held by another live
@@ -189,13 +209,14 @@ for team in "${TEAM_LIST[@]}"; do
              json_extract(value,'\$.id')
       FROM json_each('$(printf '%s' "$_arr" | sed "s/'/''/g")');
     "
-  ) || {
-    _rc=$?
-    case "$_rc" in
-      97|98) continue ;;
-      *) LOOP_RC=$_rc; LOOP_FAILED_TEAM="$team"; break ;;
-    esac
-  }
+  )
+  _rc=$?
+  set -e
+  case "$_rc" in
+    0)     ;;
+    97|98) continue ;;
+    *)     LOOP_RC=$_rc; LOOP_FAILED_TEAM="$team"; break ;;
+  esac
 
   COUNT=$(printf '%s\n' "$RESULT" | grep -c . || true)
   OUTPUT+="$COUNT new message(s) in $team:"$'\n'
