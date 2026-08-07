@@ -3,10 +3,20 @@
 # The remote-setup walkthrough now offers the Compose path (#665), and points
 # at `server/compose.yaml` for its values instead of restating them.
 #
-# Restating them is the failure this guards. Two copies of a password disagree
-# eventually, and the copy in the walkthrough is the one someone pastes. So the
-# check derives the values FROM compose.yaml rather than listing them here: if
-# the password changes, this still holds, which a hardcoded literal would not.
+# The contract is narrower than "no compose value appears here", and the
+# difference is the point (review):
+#
+#   credentials and database settings   NOT duplicated. Two copies of a
+#                                       password disagree eventually, and the
+#                                       copy in the walkthrough is the one
+#                                       someone pastes.
+#   the published port                  IS written. A reader needs it to run
+#                                       the health check, so hiding it behind
+#                                       a link would be worse. It is pinned
+#                                       against compose.yaml instead.
+#
+# Both are derived FROM compose.yaml rather than listed here: after the
+# password or the port changes, these still hold, which a literal would not.
 #
 # The cross-file links are checked by resolving them, because a walkthrough
 # that sends you to another file is only as good as the anchor it names.
@@ -42,6 +52,20 @@ slug() {
   [ -n "$password" ]
   run grep -F -q -- "$password" "$DOC"
   [ "$status" -ne 0 ]
+}
+
+@test "remote-setup: the localhost health check uses compose's published port" {
+  # The one compose value the doc DOES carry, kept in sync rather than trusted.
+  # Published as "<host>:<container>"; the host side is what a reader curls.
+  port="$(sed -n 's/^[[:space:]]*-[[:space:]]*"\([0-9][0-9]*\):[0-9][0-9]*"[[:space:]]*$/\1/p' "$COMPOSE" | head -1)"
+  [ -n "$port" ]
+
+  # Every localhost URL in the doc, derived rather than the one I remembered
+  # to look at: a second one added later with the old port is exactly the
+  # drift this exists for.
+  used="$(grep -o 'http://127\.0\.0\.1:[0-9]*' "$DOC" | sed 's|.*:||' | sort -u)"
+  [ -n "$used" ]
+  [ "$used" = "$port" ]
 }
 
 @test "remote-setup: no connection string is spelled out in the doc" {

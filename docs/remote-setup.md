@@ -26,7 +26,7 @@ cd server
 docker compose up -d --build
 ```
 
-Nothing to fill in: the database name, user, password and port are in
+Nothing to fill in: the database name, user and password are in
 `server/compose.yaml`. They are development defaults — read
 [Network boundary](#network-boundary) before this server is reachable by
 anyone else.
