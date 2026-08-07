@@ -97,6 +97,59 @@ EOF
   [[ "$output" == *"Recipient fingerprint:"* ]]
   [[ "$output" == *"Back this up now"* ]]
   [[ "$output" == *"no server-side recovery"* ]]
+  # The facts ride along with it, and are asserted here too so the split
+  # between fact and guidance cannot quietly move.
+  [[ "$output" == *"no copy of it survives anywhere"* ]]
+  [[ "$output" == *"becomes permanently unreadable"* ]]
+  [[ "$output" == *"revoke its ability to read history"* ]]
+  # Where nothing keeps a copy, losing the device IS losing the key. That
+  # implication belongs to this path only, so it is stated in the guidance
+  # rather than left for the reader to derive.
+  [[ "$output" == *"losing this device loses"* ]]
+}
+
+@test "key generate: a caller that owns the guidance gets the facts without ours" {
+  skip_if_no_age
+  # A larger tool runs this with stdio inherited, so whatever it prints lands
+  # in front of ITS operator. Guidance written for a plain install names a
+  # route that operator does not have -- and "there is no server-side
+  # recovery" is simply false where the tool keeps a sealed copy on a server.
+  #
+  # Both directions are asserted, here and above: with only the default case,
+  # a suppression that never fires would still be green, and with only this
+  # one, a version that printed nothing at all would be too.
+  AGMSG_OPERATOR_GUIDANCE=caller run bash "$SCRIPTS/key.sh" generate testteam
+  [ "$status" -eq 0 ]
+
+  # Still speaks, and still says what the key IS. Silence here would be its
+  # own defect: these are true however agmsg was invoked.
+  [[ "$output" == *"Generated a new key for team 'testteam'"* ]]
+  [[ "$output" == *"Recipient fingerprint:"* ]]
+  [[ "$output" == *"no copy of it survives anywhere"* ]]
+  [[ "$output" == *"becomes permanently unreadable"* ]]
+  [[ "$output" == *"revoke its ability to read history"* ]]
+
+  # And says nothing about what to do next, or where a copy is kept.
+  [[ "$output" != *"Back this up now"* ]]
+  [[ "$output" != *"no server-side recovery"* ]]
+  [[ "$output" != *"--reveal-secret"* ]]
+  [[ "$output" != *"password manager"* ]]
+
+  # And does not assert that losing the DEVICE loses the history. That is
+  # true only where nothing keeps a copy; a caller may hold a sealed copy of
+  # this same key and be able to recover it. Asserting it on their behalf is
+  # the same premise this change exists to stop asserting.
+  [[ "$output" != *"losing this device loses"* ]]
+  [[ "$output" != *"If this device is lost"* ]]
+}
+
+@test "key generate: an unrecognised guidance setting still prints the guidance" {
+  skip_if_no_age
+  # Fail toward speaking. A typo'd or future value must not silence a page of
+  # instructions -- the quiet mode is asked for by name or not at all.
+  AGMSG_OPERATOR_GUIDANCE=cloud run bash "$SCRIPTS/key.sh" generate testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"no server-side recovery"* ]]
 }
 
 @test "key generate: stores public recipient (not secret) in team config" {
