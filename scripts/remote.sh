@@ -700,15 +700,55 @@ cmd_pull() {
   # Refused for the reason git refuses a non-fast-forward push: two teams that
   # each grew their own history do not become one by pointing at the same
   # remote. A second machine arrives empty and clones.
-  local cfg existing
+  local cfg
   cfg="$(_remote_team_config "$team")"
   if [ -f "$cfg" ]; then
-    existing="$(agmsg_sqlite "$(agmsg_db_path "$team")" \
-      "SELECT COUNT(*) FROM events WHERE type='message_sent';" 2>/dev/null | tr -d '\r')"
-    case "$existing" in ''|*[!0-9]*) existing=0 ;; esac
-    if [ "$existing" -gt 0 ]; then
-      echo "agmsg: local team '$team' already has history; pull clones into an empty team" >&2
+    # Asked through the storage driver, never in SQL from here.
+    #
+    # The old guard counted `FROM events WHERE type='message_sent'` itself.
+    # Two things were wrong with that. The SQLite driver keeps history in TWO
+    # shapes -- the event log and the legacy `messages` table, which api.sh
+    # unions -- so on a legacy store the query failed on a missing table every
+    # time; and `existing="$(...)"` is an assignment, not a `local`
+    # declaration, so its status is the substitution's and `set -e` ended pull
+    # right there. With `2>/dev/null` swallowing the reason the operator got
+    # exit 1 and a blank screen, and the guard never once ran -- including for
+    # the team it exists to refuse.
+    #
+    # Copying api.sh's union here would fix today's store and break again on
+    # the next driver; JSONL and partition drivers are in the same contract.
+    # So the question goes to whoever owns the answer:
+    #
+    #   no store        history zero, continue. That is a local shell with
+    #                   nothing in it -- exactly what a caller leaves behind
+    #                   when it creates the team and installs a key before
+    #                   pulling. Asking must not CREATE one either: a read
+    #                   that materialises an empty database is how "does it
+    #                   exist" stops being answerable.
+    #   store, empty    continue.
+    #   store, any row  refuse, as before.
+    #   cannot read     refuse, and say so. An unknown history rounded down to
+    #                   empty is how a non-fast-forward guard stops guarding.
+    local backend history_status=0 first_row
+    backend="$(agmsg_storage_driver 2>/dev/null || printf 'unknown')"
+    if ! agmsg_storage_load; then
+      echo "agmsg: cannot load the '$backend' storage driver to check team '$team' for history" >&2
+      echo "agmsg: refusing to pull rather than treat an unknown history as an empty one." >&2
       exit 1
+    fi
+    if storage_store_exists "$team" 2>/dev/null; then
+      # --limit 1: whether there is any history, not how much. Nothing here
+      # needs a count, and asking for one makes a large team pay for a yes/no.
+      first_row="$(storage_history "$team" --limit 1 2>/dev/null)" || history_status=$?
+      if [ "$history_status" -ne 0 ]; then
+        echo "agmsg: cannot read the local history of team '$team' from the '$backend' store" >&2
+        echo "agmsg: refusing to pull rather than treat an unreadable history as an empty one." >&2
+        exit 1
+      fi
+      if [ -n "$first_row" ]; then
+        echo "agmsg: local team '$team' already has history; pull clones into an empty team" >&2
+        exit 1
+      fi
     fi
   fi
 
@@ -792,14 +832,59 @@ cmd_pull() {
   # second machine, whose pulled team answered "connected" while running nothing.
   local cmd_name
   cmd_name="$(basename "$SKILL_DIR")"
-  if [ "$pulled_age_v1" -gt 0 ]; then
+  # Whether the engine runs is a question about THIS MACHINE, not about the
+  # team. The old test was `age-v1 envelopes arrived` -- which says the team is
+  # sealed, and nothing at all about whether the key to open it is here. Those
+  # came apart the moment a caller could deliver the key before the pull: the
+  # key was installed, the engine was halted anyway because ciphertext had
+  # arrived, and the operator was told to go import key material they already
+  # had. Nothing decrypted, because the thing that decrypts was the thing that
+  # had been stopped.
+  #
+  # Whether a key is NEEDED comes from the server's declaration, not from how
+  # many sealed envelopes happened to arrive. A team declared age-v1 with an
+  # empty history needs the key for everything it is about to receive; gating
+  # on the count skipped the check entirely for that team and started the
+  # engine on a machine that cannot read a word of what comes next -- the same
+  # "connected, reading nothing" this is meant to end, reached from the other
+  # side.
+  #
+  # Anything that is not a clear `none` is treated as needing the key:
+  #   age-v1                 declared sealed
+  #   unknown / legacy       nobody has said; assuming plaintext is the
+  #                          optimistic guess, and the optimistic guess is
+  #                          what produces a silently unreadable team
+  #   none + age envelopes   the declaration and the traffic disagree, and a
+  #                          disagreement is not permission to proceed
+  #
+  # Asked once, here, and every line below is a description of this answer.
+  local needs_key=0
+  case "$binding_cipher" in
+    none) [ "$pulled_age_v1" -gt 0 ] && needs_key=1 ;;
+    *)    needs_key=1 ;;
+  esac
+
+  local can_read=0
+  if [ "$needs_key" -eq 1 ] && ! _remote_holds_current_key "$team" "$cfg"; then
+    can_read=1
+  fi
+
+  if [ "$can_read" -ne 0 ]; then
     echo "Pulled '$pulled_name' into local team '$team' ($imported message(s))."
-    echo "This team is encrypted; its sync engine is halted until the handed key material is imported and confirmed."
+    echo "This team is encrypted and this machine does not hold the key for its current epoch, so its sync engine is halted."
   else
     _remote_sync_engine_start "$team"
-    echo "Pulled '$pulled_name' into local team '$team' ($imported message(s)). Sync engine running."
+    if [ "$needs_key" -eq 1 ]; then
+      # Says what was checked, and stops there. The identity for the current
+      # epoch is here; messages sealed to an earlier key are a different
+      # question and this did not ask it.
+      echo "Pulled '$pulled_name' into local team '$team' ($imported message(s)). Sync engine running."
+      echo "This team is encrypted; this machine holds the key for its current epoch."
+    else
+      echo "Pulled '$pulled_name' into local team '$team' ($imported message(s)). Sync engine running."
+    fi
   fi
-  if [ "$pulled_age_v1" -gt 0 ]; then
+  if [ "$can_read" -ne 0 ]; then
     # The state, always. Dropping this would let a finished pull read as a
     # usable team, which is the worse failure of the two: the messages are
     # here and none of them can be read yet.
@@ -1098,6 +1183,37 @@ EOF
 # pidfile lifecycle in two places (here and watch.sh); factoring it into a shared
 # lib is intentionally deferred, not overlooked.
 _remote_sync_engine_pidfile() { printf '%s' "$CONNECTION_ROOT/run/remote-sync.$1.pid"; }
+
+# _remote_holds_current_key <team> -> 0 when this machine holds the identity
+# for the team's CURRENT epoch, 1 otherwise.
+#
+# What this measures, exactly, because the difference matters to what gets
+# printed: the identity file for the epoch named in the config is present, and
+# the recipient derived from it equals the recipient the config records for
+# that epoch. That is "the key this team's current messages are sealed to is
+# here and is the right one".
+#
+# It is NOT "every pulled message opens". A team that has rotated has older
+# envelopes sealed to earlier keys, and this says nothing about those. The
+# wording at the call site is held to that same line -- a check that proves
+# one thing must not be reported as the other.
+#
+# No age binary, or a file that does not yield a recipient, answers 1: a
+# machine that cannot derive the key cannot read with it either, and guessing
+# in the optimistic direction is how "connected" came to mean "running
+# nothing".
+_remote_holds_current_key() {
+  local team="$1" cfg="$2" key_id recipient identity derived
+  key_id="$(_remote_read_config_field "$cfg" '$.remote_key.current.key_id')"
+  recipient="$(_remote_read_config_field "$cfg" '$.remote_key.current.recipient')"
+  case "$key_id" in ''|null) return 1 ;; esac
+  case "$recipient" in ''|null) return 1 ;; esac
+  identity="$CONNECTION_ROOT/run/remote-credentials/$team/keys/$key_id.key"
+  [ -r "$identity" ] || return 1
+  command -v age-keygen >/dev/null 2>&1 || return 1
+  derived="$(age-keygen -y "$identity" 2>/dev/null)" || return 1
+  [ -n "$derived" ] && [ "$derived" = "$recipient" ]
+}
 
 _remote_sync_engine_start() {
   local team="$1" startup_nonce="${2:-}" pidfile logfile old_pid old_state

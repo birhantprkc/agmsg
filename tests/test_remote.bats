@@ -1056,6 +1056,13 @@ VALUES ('remote-pending.$key', $owner_pid, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
 
 @test "remote pull: clones a team, keeping the id the server gave" {
+  # This team is a PLAIN one: say so. The fixture's default declaration is
+  # age-v1, and the engine now follows the declaration rather than the
+  # envelope count -- a team declared sealed with no key on this machine is
+  # locked, correctly, and that is a different test from this one.
+  MOCK_TEAM_CIPHER_PROFILE=none
+  restart_mock_server
+
   run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" cloned
   [ "$status" -eq 0 ]
   local cmd_name
@@ -1086,6 +1093,13 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
 }
 
 @test "remote pull: starts a background sync engine that disconnect stops" {
+  # This team is a PLAIN one: say so. The fixture's default declaration is
+  # age-v1, and the engine now follows the declaration rather than the
+  # envelope count -- a team declared sealed with no key on this machine is
+  # locked, correctly, and that is a different test from this one.
+  MOCK_TEAM_CIPHER_PROFILE=none
+  restart_mock_server
+
   run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" cloned
   [ "$status" -eq 0 ]
   # "Machine two ... pulls the team down, and continues" — continuing IS the
@@ -1121,6 +1135,22 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   bash "$SCRIPTS/join.sh" occupied alice claude-code /tmp/project-b >/dev/null
   bash "$SCRIPTS/send.sh" occupied alice alice "already mine" >/dev/null
   run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" occupied
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"already has history"* ]]
+}
+
+@test "remote pull: refuses a team whose history is in the LEGACY table (#147)" {
+  # The shape the old guard could not see. It counted the event log only, so a
+  # store whose history lives in the legacy `messages` table read as empty --
+  # and this is the one case the guard exists to refuse. Asking the driver
+  # instead means whichever shape that driver keeps is the shape that answers.
+  bash "$SCRIPTS/join.sh" legacyteam alice claude-code /tmp/project-legacy >/dev/null
+  local db
+  db="$(cd "$TEST_SKILL_DIR" && bash -c '. scripts/lib/storage.sh; agmsg_db_path legacyteam')"
+  sqlite3 "$db" "INSERT INTO messages (team, from_agent, to_agent, body, created_at)
+                 VALUES ('legacyteam','alice','alice','old news','2026-01-01T00:00:00Z');"
+
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" legacyteam
   [ "$status" -ne 0 ]
   [[ "$output" == *"already has history"* ]]
 }
@@ -1182,6 +1212,87 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.remote_binding.cipher_profile');")" = "age-v1" ]
 }
 
+@test "remote pull: a declared-sealed EMPTY team without the key does not start its engine (#147)" {
+  # The hole the envelope count left. Zero sealed envelopes arrive, so a
+  # count-based gate never asks about the key at all and starts the engine --
+  # on a machine that cannot read a word of what this team is about to
+  # receive. Whether a key is needed is the server's DECLARATION, not the
+  # traffic so far.
+  MOCK_PULL_AGE=0
+  MOCK_TEAM_CIPHER_PROFILE=age-v1
+  restart_mock_server
+
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" encrypted
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"Sync engine running"* ]]
+  [[ "$output" == *"does not hold the key"* ]]
+  [[ "$output" == *"local but locked"* ]]
+  [ ! -f "$TEST_SKILL_DIR/run/remote-sync.encrypted.pid" ]
+}
+
+@test "remote pull: a declared-sealed EMPTY team WITH the key starts its engine (#147)" {
+  skip_if_no_age
+  # The other side of the same gate: same declaration, same zero envelopes,
+  # and the key present. Without this case a version that simply never starts
+  # the engine for a sealed team would pass the test above.
+  MOCK_PULL_AGE=0
+  MOCK_TEAM_CIPHER_PROFILE=age-v1
+  restart_mock_server
+
+  # The state a caller leaves behind when it delivers key material first: the
+  # team exists locally and empty, its config names an epoch, and the identity
+  # for that epoch is on disk. Created through join.sh so the team has a real
+  # (empty) store -- pull's "already has history" guard reads one, and a
+  # hand-written config with no store makes it abort with nothing to show.
+  bash "$SCRIPTS/join.sh" encrypted alice claude-code /tmp/project-keyed >/dev/null
+  local key_id="epoch-preinstalled" identity recipient cfg updated
+  identity="$TEST_SKILL_DIR/run/remote-credentials/encrypted/keys/$key_id.key"
+  mkdir -p "$(dirname "$identity")"
+  age-keygen -o "$identity" 2>/dev/null
+  chmod 600 "$identity"
+  recipient="$(age-keygen -y "$identity")"
+  cfg="$TEST_SKILL_DIR/teams/encrypted/config.json"
+  # The team_id has to be the server's: pull keeps an existing config but
+  # refuses one whose id names a different team. A caller pre-seeding this has
+  # already resolved the same id, so matching it is what really happens.
+  updated="$(sqlite_mem "SELECT json_set(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.team_id', '$PULL_TEAM_ID', '\$.remote_key.current', json_object('key_id', '$key_id', 'recipient', '$recipient'));")"
+  printf '%s' "$updated" > "$cfg"
+
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" encrypted
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Sync engine running"* ]]
+  [[ "$output" == *"holds the key for its current epoch"* ]]
+  [[ "$output" != *"does not hold the key"* ]]
+  [[ "$output" != *"local but locked"* ]]
+}
+
+@test "remote pull: an unreadable local history stops the pull, loudly (#147)" {
+  # An unknown history is not an empty one. Rounding it down is how the
+  # non-fast-forward guard stops guarding -- the single case it exists to
+  # refuse would sail through it. And the old code did worse than round: the
+  # failed count aborted the script under set -e with its reason discarded, so
+  # the operator saw exit 1 and a blank screen.
+  MOCK_TEAM_CIPHER_PROFILE=none
+  restart_mock_server
+  bash "$SCRIPTS/join.sh" broken alice claude-code /tmp/project-broken >/dev/null
+
+  # A store that exists and cannot be read as one.
+  local db
+  db="$(cd "$TEST_SKILL_DIR" && bash -c '. scripts/lib/storage.sh; agmsg_db_path broken')"
+  mkdir -p "$(dirname "$db")"
+  printf 'not a database' > "$db"
+
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" broken
+  [ "$status" -ne 0 ]
+  # It says something at all -- the defect was silence.
+  [ -n "$output" ]
+  [[ "$output" == *"cannot read the local history of team 'broken'"* ]]
+  # Names the backend, not a path: the guard asks the driver now, and the
+  # driver owns where its store lives. A path would be this file guessing.
+  [[ "$output" == *"store"* ]]
+  [[ "$output" == *"rather than treat an unreadable history as an empty one"* ]]
+}
+
 @test "remote pull: no declaration is recorded as unknown, and unlock names the fix" {
   # A team connected before the declaration was carried. The server answers
   # null. Writing 'none' here is what made the binding unfixable, so it is
@@ -1237,6 +1348,52 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   [[ "$output" == *"selected age-v1"* ]]
   after="$(curl -sS "$ENDPOINT/v1/teams/$PULL_TEAM_ID" | jq -r '.current_seq')"
   [ "$after" = "$before" ]
+}
+
+@test "pull decision: the engine follows the key, not the ciphertext (#147)" {
+  skip_if_no_age
+  # The predicate on its own. The pull fixture cannot produce a team that is
+  # both freshly pulled AND already keyed -- that state is created by a caller
+  # delivering key material before the pull, which is exactly the case the old
+  # test (ciphertext arrived -> halt) got wrong. So this drives the real
+  # function against the three states that decide it.
+  local probe="$BATS_TEST_TMPDIR/probe.sh"
+  {
+    echo 'set -euo pipefail'
+    echo 'SCRIPT_DIR="$1"; CONNECTION_ROOT="$2"; cfg="$3"'
+    echo '. "$SCRIPT_DIR/lib/storage.sh"'
+    sed -n '/^_remote_read_config_field() {/,/^}/p' "$SCRIPTS/remote.sh"
+    sed -n '/^_remote_holds_current_key() {/,/^}/p' "$SCRIPTS/remote.sh"
+    echo '_remote_holds_current_key keyed "$cfg"'
+  } > "$probe"
+
+  local cfg="$TEST_SKILL_DIR/teams/keyed/config.json"
+  local key_id="epoch-here" identity recipient
+  identity="$TEST_SKILL_DIR/run/remote-credentials/keyed/keys/$key_id.key"
+  mkdir -p "$(dirname "$cfg")" "$(dirname "$identity")"
+  age-keygen -o "$identity" 2>/dev/null
+  recipient="$(age-keygen -y "$identity")"
+
+  # Present and matching the recorded epoch: this machine can read.
+  jq -nc --arg k "$key_id" --arg r "$recipient" \
+    '{name:"keyed", remote_key:{current:{key_id:$k, recipient:$r}}}' > "$cfg"
+  run bash "$probe" "$SCRIPTS" "$TEST_SKILL_DIR" "$cfg"
+  [ "$status" -eq 0 ]
+
+  # The file is still there, but it is not the key this epoch is sealed to.
+  # Presence alone must not answer yes -- that is the difference between
+  # "a key is here" and "the key is here".
+  jq -nc --arg k "$key_id" \
+    '{name:"keyed", remote_key:{current:{key_id:$k, recipient:"age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"}}}' > "$cfg"
+  run bash "$probe" "$SCRIPTS" "$TEST_SKILL_DIR" "$cfg"
+  [ "$status" -ne 0 ]
+
+  # And with no identity file at all.
+  rm -f "$identity"
+  jq -nc --arg k "$key_id" --arg r "$recipient" \
+    '{name:"keyed", remote_key:{current:{key_id:$k, recipient:$r}}}' > "$cfg"
+  run bash "$probe" "$SCRIPTS" "$TEST_SKILL_DIR" "$cfg"
+  [ "$status" -ne 0 ]
 }
 
 @test "remote unlock: confirms handed authority, reprocesses, and resumes age-v1 sync" {
