@@ -80,6 +80,11 @@ jobs:
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             case "$f" in
+              # Not covered by `docs/*` below: tests/test_remote_setup_doc.bats
+              # reads this file, and a guard that skips on a change to the file
+              # it guards is off exactly when it is needed. Same reason as
+              # SKILL.md further down.
+              docs/remote-setup.md) docs_only=false ;;
               docs/*) ;;
               site/*) ;;
               app/*) app_changed=true ;;

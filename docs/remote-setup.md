@@ -8,7 +8,7 @@ For encrypted sync, read
 
 ## Requirements
 
-- PostgreSQL 17
+- Docker with Compose — or PostgreSQL 17, if you bring your own database
 - Node.js 22 or later
 - Bash, SQLite, and curl
 - An agmsg checkout on the server host
@@ -18,31 +18,58 @@ Use HTTPS when the server is not on localhost.
 
 ## 1. Start the reference server
 
-Create an empty PostgreSQL database, then start the server from the repository
-checkout:
+The Compose stack brings up PostgreSQL and the server together. Run it from the
+`server` directory:
 
 ```sh
 cd server
-npm ci
-
-export DATABASE_URL="postgresql://<user>:<password>@127.0.0.1:5432/<db>"
-export HOST=0.0.0.0
-export PORT=8787
-npx tsx src/index.ts
+docker compose up -d --build
 ```
 
-Replace every value in angle brackets, especially `<db>`, with the real
-PostgreSQL values before running the command. The example will not work until
-you replace them.
+Nothing to fill in: the database name, user and password are in
+`server/compose.yaml`. They are development defaults — read
+[Network boundary](#network-boundary) before this server is reachable by
+anyone else.
 
-Make the server available to both machines at an HTTPS URL, then confirm it is
-ready:
+Confirm the server and database are ready. On the machine running Compose:
+
+```sh
+curl -fsS http://127.0.0.1:8787/v1/health
+```
+
+The response should contain `"status":"ok"` and `"database":"ok"`. If the
+containers are still starting, retry until it succeeds.
+
+Then make the server available to both machines at an HTTPS URL, and check it
+from there too:
 
 ```sh
 curl -fsS https://<server-url>/v1/health
 ```
 
-The response should contain `"status":"ok"` and `"database":"ok"`.
+### Using your own database instead
+
+If you already run PostgreSQL, start the server from source against it. The
+commands live in [`server/README.md` → Run from
+source](../server/README.md#run-from-source), which is the one place they are
+written down.
+
+Either way the server applies its own migrations at startup, so there is no
+schema step to run first.
+
+### Network boundary
+
+The reference profile has no authentication: reaching the server is the
+permission. Anyone who can reach it and name a team can read that team's
+remote stream. Keep it on a network you control, and use HTTPS for anything
+leaving localhost. Encrypting with `age-v1`
+([below](#extra-end-to-end-encryption)) keeps envelope contents from the
+server; it does not replace the boundary.
+
+The Compose stack publishes its port and ships a development password in
+`compose.yaml`. Change that password and terminate TLS in front of the service
+before this reaches a network you do not control — see
+[`server/README.md` → Compose configuration](../server/README.md#compose-configuration).
 
 ## 2. Connect the existing team on machine A
 
