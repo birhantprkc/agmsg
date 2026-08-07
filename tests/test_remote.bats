@@ -466,6 +466,35 @@ _capability_endpoint() {
   [ "$(_remote_endpoint_display "https://host.example.com:443")" = "https://host.example.com:443" ]
 }
 
+@test "pull: a caller that owns the guidance keeps the state and loses the route" {
+  skip_if_no_age
+  # The team is locked either way, and saying so is not optional: drop it and
+  # a finished pull reads as a usable team, which is the worse of the two
+  # failures -- the messages are here and none of them can be read yet.
+  #
+  # What goes is the route. `remote.sh` is not on a caller's operator's PATH,
+  # and "the secret handoff bundle you were given" describes material they
+  # were never handed; theirs arrives through a different ceremony. Sending
+  # them to look for a bundle sends them looking for something that does not
+  # exist.
+  MOCK_PULL_AGE=1
+  MOCK_TEAM_CIPHER_PROFILE=age-v1
+  restart_mock_server
+
+  AGMSG_OPERATOR_GUIDANCE=caller run bash "$SCRIPTS/remote.sh" pull \
+    --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" encrypted
+  [ "$status" -eq 0 ]
+
+  # The state survives.
+  [[ "$output" == *"This team is encrypted"* ]]
+  [[ "$output" == *"local but locked"* ]]
+
+  # The route does not.
+  [[ "$output" != *"handoff bundle you were given"* ]]
+  [[ "$output" != *"--confirm-digest"* ]]
+  [[ "$output" != *"scripts/remote.sh"*"unlock"* ]]
+}
+
 @test "connect: the out-of-band handoff line is printed by default" {
   skip_if_no_age
   run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam
