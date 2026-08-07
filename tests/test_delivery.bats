@@ -170,6 +170,52 @@ settings_file() {
   [[ "$output" == *"watch processes:"* ]]
 }
 
+# A pid that exists but this user cannot signal, so `kill -0` fails with EPERM
+# rather than ESRCH. pid 1 is that on any normal desktop or CI runner; when the
+# suite runs as root, or in a container where pid 1 is ours, there is no such
+# pid to borrow and the distinction under test cannot be staged.
+eperm_pid() {
+  local err
+  # An `A && skip` list is a FAILING command on exactly the run we want, which
+  # bats' errexit turns into a test failure instead of a skip.
+  if kill -0 1 2>/dev/null; then skip "pid 1 is signalable here; no EPERM fixture available"; fi
+  # `|| true`: the substitution's status is the failing kill, and a bare
+  # assignment carrying it trips errexit before the case can decide anything.
+  err="$(export LC_ALL=C; kill -0 1 2>&1)" || true
+  case "$err" in
+    *[Nn]'o such process'*) skip "pid 1 does not exist here" ;;
+  esac
+  echo 1
+}
+
+@test "delivery status: a live but unsignalable watcher is not counted as stale" {
+  local pid
+  pid="$(eperm_pid)"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT" >/dev/null
+  printf '%s\n' "$pid" > "$TEST_SKILL_DIR/run/watch.eperm-session.pid"
+  run bash "$SCRIPTS/delivery.sh" status claude-code "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  # `kill -0` answers "can I signal this", not "is this running". Under a
+  # sandbox every watcher fails it, and reading the exit status alone printed
+  # every live watcher as a stale pidfile.
+  [[ "$output" == *"watch processes: 1 alive, 0 stale pidfiles"* ]]
+}
+
+@test "delivery status: a genuinely dead watcher is still counted as stale" {
+  mkdir -p "$TEST_SKILL_DIR/run"
+  bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT" >/dev/null
+  local dead
+  dead="$(bash -c 'echo $$')"
+  wait_for_pid_exit "$dead" || true
+  printf '%s\n' "$dead" > "$TEST_SKILL_DIR/run/watch.dead-session.pid"
+  run bash "$SCRIPTS/delivery.sh" status claude-code "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  # The other half of the fix: treating EPERM as alive must not make everything
+  # look alive.
+  [[ "$output" == *"watch processes: 0 alive, 1 stale pidfiles"* ]]
+}
+
 @test "delivery status: derives 'turn' from settings with Stop only" {
   bash "$SCRIPTS/delivery.sh" set turn claude-code "$TEST_PROJECT" >/dev/null
   run bash "$SCRIPTS/delivery.sh" status claude-code "$TEST_PROJECT"
@@ -187,6 +233,167 @@ settings_file() {
   run bash "$SCRIPTS/delivery.sh" set bogus claude-code "$TEST_PROJECT"
   [ "$status" -ne 0 ]
   [[ "$output" =~ "Unknown mode" ]]
+}
+
+# --- project_path validation (#493) ---
+# `set` used to build a hooks/rule-file path directly from an unvalidated
+# project_path and `mkdir -p` it, so a malformed argument -- e.g. a literal
+# trailing newline byte, the kind an LLM-agent-composed command can produce,
+# as opposed to a `$(pwd)`-style substitution which already strips one --
+# silently created a bogus sibling directory (the exact "myproject\n" repro
+# in #493) and installed hooks into it. agmsg_validate_project_path now
+# rejects a malformed value before any file or directory is touched, rather
+# than silently correcting it -- a caller that built a bad command should see
+# a loud error naming the exact value it passed, not a value that happens to
+# work this one time and hides the bug in whatever generated it.
+
+@test "delivery set: rejects a project_path with a trailing newline and creates no directory (#493 exact repro)" {
+  # Adjacent-quote concatenation appends a literal newline byte to the
+  # argument -- this is the exact #493 repro shape, not a $(cmd) substitution
+  # (which would already have stripped it). $TEST_PROJECT itself exists, so
+  # this also proves the fix does not silently fall back to the trimmed,
+  # pre-existing directory -- it refuses the malformed value outright.
+  local bogus="$TEST_PROJECT"$'\n'
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$bogus"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "carriage return or newline" ]]
+  # No sibling "<real project>\n" directory (or anything else) was created.
+  [ ! -e "$bogus" ]
+  ! has_session_start "$(settings_file)"
+}
+
+@test "delivery set: rejects a nonexistent project_path and creates no directory" {
+  local bogus="$TEST_PROJECT/does-not-exist"
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$bogus"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "project path does not exist" ]]
+  [ ! -e "$bogus" ]
+}
+
+@test "delivery set: rejects an empty project_path" {
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code ""
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "Missing project_path" ]]
+}
+
+@test "delivery set: rejects a project_path that exists but cannot be entered" {
+  # -d passes for a directory with no execute bit, but every apply
+  # implementation then writes inside it. Prove we fail here with a clear
+  # message instead of later with a confusing mkdir error.
+  if [ "$(id -u)" -eq 0 ]; then
+    skip "running as root: permission bits do not restrict traversal"
+  fi
+  local locked="$TEST_PROJECT/locked"
+  mkdir -p "$locked"
+  chmod 000 "$locked"
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$locked"
+  chmod 755 "$locked"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "cannot be entered" ]]
+}
+
+@test "delivery set: rejects a project_path that is only whitespace" {
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "   "
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "empty or only whitespace" ]]
+}
+
+@test "delivery set: accepts a project_path with leading/trailing spaces, using it literally (#493 scope follow-up)" {
+  # A plain leading/trailing space is a valid POSIX path byte -- #493 is
+  # about CR/LF, not about whitespace in general -- so a directory legitimately
+  # named with padding must be accepted and used as-is, not rejected.
+  local padded="$TEST_PROJECT/  padded name  "
+  mkdir -p -- "$padded"
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$padded"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "Delivery mode set to 'monitor'" ]]
+  [ -f "$padded/.claude/settings.local.json" ]
+  has_session_start "$padded/.claude/settings.local.json"
+}
+
+@test "delivery set: accepts a project_path with leading/trailing tabs, using it literally (#493 scope follow-up)" {
+  local padded="$TEST_PROJECT/"$'\t'"tabbed name"$'\t'
+  mkdir -p -- "$padded"
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$padded"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "Delivery mode set to 'monitor'" ]]
+  [ -f "$padded/.claude/settings.local.json" ]
+  has_session_start "$padded/.claude/settings.local.json"
+}
+
+@test "delivery set: a space-padded spelling of an EXISTING dir is used literally, never trimmed into the real one" {
+  # "  $TEST_PROJECT  " is a RELATIVE pathname whose first byte is a space --
+  # NOT the real (absolute) project path. Accepting spaces as literal path
+  # bytes must not come with a silent fallback that trims the padding and
+  # resolves to the directory the caller probably meant: the value is used
+  # as-is, found not to exist, and rejected -- with the real project left
+  # untouched. (This pins the "accept literally" half of the #493 follow-up
+  # from the other side: the old trim-then-compare rejection also prevented
+  # this fallback, so its removal must not quietly introduce one.)
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "  $TEST_PROJECT  "
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "does not exist" ]]
+  ! has_session_start "$(settings_file)"
+}
+
+@test "delivery set: rejects a project_path with an embedded newline" {
+  local bogus="$TEST_PROJECT"$'\n'"extra"
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$bogus"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "carriage return or newline" ]]
+  [ ! -e "$bogus" ]
+}
+
+@test "delivery set: rejects a project_path with a trailing carriage return (CRLF line endings)" {
+  # The CR half of the CR/LF rule: a command composed on (or pasted from) a
+  # CRLF-line-ending environment leaves a bare \r on the value once the shell
+  # strips the \n. Same class of defect as the #493 repro, same rejection.
+  local bogus="$TEST_PROJECT"$'\r'
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$bogus"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "carriage return or newline" ]]
+  [ ! -e "$bogus" ]
+}
+
+@test "delivery set: rejects a project_path with a leading newline or an embedded carriage return" {
+  # The remaining corners of the "CR or LF anywhere" rule: leading (not just
+  # trailing) LF, and CR hiding mid-value rather than at an end.
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code $'\n'"$TEST_PROJECT"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "carriage return or newline" ]]
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"$'\r'"extra"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "carriage return or newline" ]]
+}
+
+@test "delivery set: an un-enterable relative path cannot validate via a same-named CDPATH match" {
+  # With CDPATH set, a bare `cd proj` can land in <cdpath-entry>/proj instead
+  # of ./proj -- so the traversability probe would test a DIFFERENT directory
+  # than the one `-d` just checked. The validator clears CDPATH for the probe;
+  # this pins that an un-enterable ./proj is still rejected even when an
+  # enterable directory of the same name sits on CDPATH.
+  if [ "$(id -u)" -eq 0 ]; then
+    skip "running as root: permission bits do not restrict traversal"
+  fi
+  local decoy_root="$TEST_PROJECT/cdpath-decoy"
+  mkdir -p "$decoy_root/proj"            # enterable decoy on CDPATH
+  mkdir -p "$TEST_PROJECT/here/proj"     # the real target, made un-enterable
+  chmod 000 "$TEST_PROJECT/here/proj"
+  cd "$TEST_PROJECT/here"
+  CDPATH="$decoy_root" run bash "$SCRIPTS/delivery.sh" set monitor claude-code "proj"
+  chmod 755 "$TEST_PROJECT/here/proj"
+  cd "$TEST_PROJECT"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "cannot be entered" ]]
+  # Nothing was written into the enterable decoy.
+  [ ! -e "$decoy_root/proj/.claude" ]
+}
+
+@test "delivery set: a normal valid project_path (the documented \$(pwd) shape) still works end to end" {
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "Delivery mode set to 'monitor'" ]]
+  has_session_start "$(settings_file)"
 }
 
 # --- in-session directives ---
@@ -689,6 +896,67 @@ JSON
   [ ! -f "$TEST_SKILL_DIR/run/watch.empty-pid.pid" ]
 }
 
+# watch.sh records its own $$ into watch.<token>.pid, so the pid recorded there
+# is minted in the MSYS pid space. The stale-pidfile sweep just above this in
+# session-start.sh ("Same defensive pass for stale watcher pidfiles") used to
+# probe it with _agmsg_pid_alive, which under MSYSTEM asks tasklist -- and
+# tasklist has no record of an MSYS-only pid, so a live watcher read as dead
+# and its pidfile got removed, freeing the next session to spawn a duplicate.
+# Routed through _agmsg_pid_alive_local (kill -0) instead. Unlike the "leaves
+# alive watcher pidfiles alone (when bound to a live CC instance)" test below,
+# this one binds NO cc-instance record, so only the sweep itself -- not the
+# separate dead-cc-instance passes above it -- decides the outcome.
+@test "session-start.sh: stale-pidfile sweep keeps a live watcher pidfile tasklist cannot see (#567-style regression)" {
+  skip_on_windows "stubs tasklist to model Git Bash; the real one is authoritative there"
+  mkdir -p "$TEST_SKILL_DIR/teams/myteam"
+  cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
+{"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
+JSON
+  bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT" >/dev/null
+  mkdir -p "$TEST_SKILL_DIR/run"
+  local stubdir="$TEST_SKILL_DIR/stub-bin"
+  mkdir -p "$stubdir"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$stubdir/tasklist"
+  chmod +x "$stubdir/tasklist"
+
+  sleep 30 3>&- &
+  local live_pid=$!
+  echo "$live_pid" > "$TEST_SKILL_DIR/run/watch.sweep-live.pid"
+
+  printf '{"session_id":"x"}' | env MSYSTEM=MINGW64 PATH="$stubdir:$PATH" \
+    bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" >/dev/null
+
+  [ -f "$TEST_SKILL_DIR/run/watch.sweep-live.pid" ]
+
+  kill "$live_pid" 2>/dev/null || true
+  wait "$live_pid" 2>/dev/null || true
+}
+
+# Native-Windows companion of the test above: exercises the real MSYS pid space
+# and the real tasklist.exe instead of a stub, so it proves the fix against the
+# actual environment the bug was found in rather than a model of it. No
+# cc-instance binding here either, for the same isolation reason.
+@test "session-start.sh: stale-pidfile sweep keeps a live watcher pidfile under real Git Bash (#567-style regression, native Windows only)" {
+  skip_unless_windows "exercises the real MSYS pid space and real tasklist"
+  mkdir -p "$TEST_SKILL_DIR/teams/myteam"
+  cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
+{"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
+JSON
+  bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT" >/dev/null
+  mkdir -p "$TEST_SKILL_DIR/run"
+
+  sleep 30 3>&- &
+  local live_pid=$!
+  echo "$live_pid" > "$TEST_SKILL_DIR/run/watch.sweep-live-native.pid"
+
+  printf '{"session_id":"x"}' | bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" >/dev/null
+
+  [ -f "$TEST_SKILL_DIR/run/watch.sweep-live-native.pid" ]
+
+  kill "$live_pid" 2>/dev/null || true
+  wait "$live_pid" 2>/dev/null || true
+}
+
 @test "session-start.sh leaves alive watcher pidfiles alone (when bound to a live CC instance)" {
   mkdir -p "$TEST_SKILL_DIR/teams/myteam"
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
@@ -718,6 +986,36 @@ JSON
   echo "$live_pid" > "$TEST_SKILL_DIR/run/watch.$CLAUDE_CODE_SESSION_ID.pid"
 
   run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "already streaming" ]]
+  ! [[ "$output" =~ "AGMSG-DIRECTIVE" ]]
+
+  kill "$live_pid" 2>/dev/null || true
+  unset CLAUDE_CODE_SESSION_ID
+}
+
+@test "emit monitor directive: skips when tasklist cannot see the live watcher (#567)" {
+  skip_on_windows "stubs tasklist to model Git Bash; the real one is authoritative there"
+  # watch.sh records its own $$, so the pid in watch.<sid>.pid is numbered in the
+  # MSYS pid space. `tasklist` reports Windows pids and has no record of it --
+  # measured on our own Windows runner, where $$, $! and a pid read back from a
+  # pidfile all come back with zero tasklist hits while kill -0 answers yes. A
+  # probe that asks tasklist therefore calls the running watcher dead, and this
+  # dedup emits a second directive beside the one already streaming.
+  mkdir -p "$TEST_SKILL_DIR/run"
+  local stubdir="$TEST_SKILL_DIR/stub-bin"
+  mkdir -p "$stubdir"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$stubdir/tasklist"
+  chmod +x "$stubdir/tasklist"
+
+  sleep 30 3>&- &
+  local live_pid=$!
+  CLAUDE_CODE_SESSION_ID="msys-live-sid"
+  export CLAUDE_CODE_SESSION_ID
+  echo "$live_pid" > "$TEST_SKILL_DIR/run/watch.$CLAUDE_CODE_SESSION_ID.pid"
+
+  run env MSYSTEM=MINGW64 PATH="$stubdir:$PATH" \
+    bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
   [[ "$output" =~ "already streaming" ]]
   ! [[ "$output" =~ "AGMSG-DIRECTIVE" ]]
@@ -1438,13 +1736,6 @@ JSON
   [ ! -f "$TEST_PROJECT/.opencode/rules/agmsg.md" ]
 }
 
-@test "opencode rejects monitor mode" {
-  run bash "$SCRIPTS/delivery.sh" set monitor opencode "$TEST_PROJECT"
-  [ "$status" -ne 0 ]
-  [[ "$output" =~ "not supported" ]]
-  [ ! -f "$TEST_PROJECT/.opencode/rules/agmsg.md" ]
-}
-
 @test "opencode rejects both mode" {
   run bash "$SCRIPTS/delivery.sh" set both opencode "$TEST_PROJECT"
   [ "$status" -ne 0 ]
@@ -1452,15 +1743,74 @@ JSON
   [ ! -f "$TEST_PROJECT/.opencode/rules/agmsg.md" ]
 }
 
-@test "opencode rejects monitor: does NOT delete an existing turn rule" {
+@test "opencode rejects both: does NOT delete an existing turn rule" {
   bash "$SCRIPTS/delivery.sh" set turn opencode "$TEST_PROJECT" >/dev/null
   [ -f "$TEST_PROJECT/.opencode/rules/agmsg.md" ]
-  run bash "$SCRIPTS/delivery.sh" set monitor opencode "$TEST_PROJECT"
+  run bash "$SCRIPTS/delivery.sh" set both opencode "$TEST_PROJECT"
   [ "$status" -ne 0 ]
   [ -f "$TEST_PROJECT/.opencode/rules/agmsg.md" ]
 }
 
-@test "opencode supports turn and off modes: status derives mode from rule file existence" {
+@test "opencode set monitor: passes the delivery_modes gate and writes a sentinel_monitor rule" {
+  run bash "$SCRIPTS/delivery.sh" set monitor opencode "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "Delivery mode set to 'monitor'" ]]
+  local rule_file="$TEST_PROJECT/.opencode/rules/agmsg.md"
+  [ -f "$rule_file" ]
+  run cat "$rule_file"
+  [[ "$output" == *"agmsg-delivery-mode: monitor"* ]]
+  [[ "$output" == *"sentinel_monitor"* ]]
+  [[ "$output" == *"watch.sh"* ]]
+  [[ "$output" == *"SENTINEL_SESSION_ID"* ]]
+  # Fallback instructions for when sentinel_monitor is unavailable.
+  [[ "$output" == *"check-inbox.sh"* ]]
+}
+
+@test "opencode set monitor: a project path containing an apostrophe stays one shell word" {
+  # An apostrophe is a legal POSIX path character and delivery.sh accepts it, so
+  # a literal '$project' wrap in the rule would end the argument early and let
+  # anything after it become live shell syntax. Both generated commands — the
+  # sentinel_monitor watcher and the fallback check-inbox — have to survive it.
+  local weird="$TEST_PROJECT/it's a proj"
+  mkdir -p "$weird"
+  run bash "$SCRIPTS/delivery.sh" set monitor opencode "$weird"
+  [ "$status" -eq 0 ]
+
+  local rule_file="$weird/.opencode/rules/agmsg.md"
+  [ -f "$rule_file" ]
+
+  # The path must not appear inside a single-quoted span that its own apostrophe
+  # terminates. Asserted by running the generated command lines through the
+  # shell's own parser: a broken quote fails to parse at all.
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      *watch.sh*|*check-inbox.sh*) ;;
+      *) continue ;;
+    esac
+    line="${line#- command: }"
+    line="${line#- Command: }"
+    run bash -n -c "$line"
+    [ "$status" -eq 0 ] || { echo "generated command does not parse: $line"; false; }
+  done < "$rule_file"
+}
+
+@test "opencode status: reports monitor when the monitor rule is present" {
+  bash "$SCRIPTS/delivery.sh" set monitor opencode "$TEST_PROJECT" >/dev/null
+  run bash "$SCRIPTS/delivery.sh" status opencode "$TEST_PROJECT"
+  [[ "$output" =~ "mode: monitor" ]]
+}
+
+@test "opencode set turn then monitor: rewrites the rule from turn to monitor" {
+  bash "$SCRIPTS/delivery.sh" set turn opencode "$TEST_PROJECT" >/dev/null
+  run bash "$SCRIPTS/delivery.sh" status opencode "$TEST_PROJECT"
+  [[ "$output" =~ "mode: turn" ]]
+  bash "$SCRIPTS/delivery.sh" set monitor opencode "$TEST_PROJECT" >/dev/null
+  run bash "$SCRIPTS/delivery.sh" status opencode "$TEST_PROJECT"
+  [[ "$output" =~ "mode: monitor" ]]
+}
+
+@test "opencode supports turn/monitor/off modes: status derives mode from rule file content" {
   run bash "$SCRIPTS/delivery.sh" status opencode "$TEST_PROJECT"
   [[ "$output" =~ "mode: off" ]]
 
@@ -1712,6 +2062,54 @@ EOF
   [[ "$output" != *"watch processes:"* ]]
 }
 
+@test "delivery status (codex): metadata project spelling variant is not a mismatch" {
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
+  mkdir -p "$TEST_SKILL_DIR/run"
+
+  # Same directory, different spelling (trailing slash). A verbatim compare
+  # calls this a mismatch; canonical comparison must not.
+  printf '%s\n' "$$" > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid"
+  cat > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.meta" <<EOF
+pid=$$
+project=$TEST_PROJECT/
+team=team
+name=alice
+type=codex
+EOF
+
+  run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Codex bridge: team/alice"* ]]
+  [[ "$output" != *"metadata mismatch"* ]]
+}
+
+@test "delivery status (codex): metadata project in native Windows spelling is not a mismatch" {
+  case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) ;; *) skip "needs a real Windows path spelling (cygpath)" ;; esac
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
+  mkdir -p "$TEST_SKILL_DIR/run"
+
+  # The bridge records the project via Node's path.resolve, i.e. the
+  # backslash form cygpath -w produces — the exact shape that made every
+  # live bridge read as "metadata mismatch" on Windows.
+  local win_project
+  win_project="$(cygpath -w "$TEST_PROJECT")"
+  printf '%s\n' "$$" > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid"
+  cat > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.meta" <<EOF
+pid=$$
+project=$win_project
+team=team
+name=alice
+type=codex
+EOF
+
+  run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Codex bridge: team/alice"* ]]
+  [[ "$output" != *"metadata mismatch"* ]]
+}
+
 @test "delivery status (codex): missing bridge metadata is reported as stale" {
   bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
   bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
@@ -1726,14 +2124,17 @@ EOF
   [[ "$output" != *"watch processes:"* ]]
 }
 
-@test "delivery status (codex): identity with no bridge reports not running" {
+@test "delivery status (codex): identity with no bridge and no seat says so, not \"not running\"" {
   bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
   bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
 
   run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
   [ "$status" -eq 0 ]
   [[ "$output" == *"mode: monitor"* ]]
-  [[ "$output" == *"Codex bridge: team/alice not running"* ]]
+  # No seat is the reason here, and it is a different problem from a process
+  # that died -- the old wording named the wrong one (#579).
+  [[ "$output" == *"Codex bridge: team/alice has no session recorded"* ]]
+  [[ "$output" != *"Codex bridge: team/alice not running"* ]]
   [[ "$output" != *"watch processes:"* ]]
 }
 
@@ -1850,7 +2251,7 @@ EOF
   run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
   [ "$status" -eq 0 ]
   [[ "$output" == *"Codex bridge: team/alice alive (pid $bpid)"* ]]
-  [[ "$output" == *"Codex bridge: team/bob not running"* ]]
+  [[ "$output" == *"Codex bridge: team/bob has no session recorded"* ]]
   [[ "$output" != *"watch processes:"* ]]
 
   kill "$bpid" 2>/dev/null || true
@@ -2110,4 +2511,126 @@ JSON
   bash "$SCRIPTS/delivery.sh" set turn grok-build "$TEST_PROJECT"
   run bash "$SCRIPTS/delivery.sh" status grok-build "$TEST_PROJECT"
   [[ "$output" =~ "mode: turn" ]]
+}
+
+@test "delivery status (codex): a recorded seat makes \"not running\" mean the process (#579)" {
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
+  # shellcheck disable=SC1090
+  SKILL_DIR="$TEST_SKILL_DIR" source "$SCRIPTS/lib/role-session.sh"
+  SKILL_DIR="$TEST_SKILL_DIR" agmsg_role_session_record team alice seat-uuid-1 "$TEST_PROJECT" codex
+
+  run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  # With a seat on record, the bridge really is just absent -- and the seat is
+  # printed so the reader can tell the two states apart at a glance.
+  [[ "$output" == *"Codex bridge: team/alice not running (seat recorded: seat-uuid-1)"* ]]
+  [[ "$output" != *"has no session recorded"* ]]
+}
+
+@test "delivery status (codex): a port that accepts but never answers does not stall status (#579)" {
+  # A stale port file whose port is now held by something that completes the TCP
+  # connect and then says nothing is the worst case for a diagnostic probe: the
+  # bridge's own defaults would wait 10s to connect plus 30s for a reply, per
+  # identity. status has to stay a status line.
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" team bob   codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
+
+  # Silent listener: accepts, then holds the socket open without ever replying.
+  local portfile="$TEST_SKILL_DIR/silent.port"
+  node -e '
+    const net = require("net");
+    const srv = net.createServer(() => {});
+    srv.listen(0, "127.0.0.1", () => {
+      require("fs").writeFileSync(process.argv[1], String(srv.address().port));
+    });
+  ' "$portfile" >/dev/null 2>&1 3>&- &
+  local listener=$!
+  local waited=0
+  while [ ! -s "$portfile" ] && [ "$waited" -lt 50 ]; do sleep 0.1; waited=$((waited + 1)); done
+  [ -s "$portfile" ]
+
+  # shellcheck disable=SC1090
+  source "$SCRIPTS/lib/hash.sh"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  cp "$portfile" "$TEST_SKILL_DIR/run/codex-app-server.$(printf '%s' "$TEST_PROJECT" | agmsg_sha1).port"
+
+  local start finish elapsed
+  start=$(date +%s)
+  run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  finish=$(date +%s)
+  elapsed=$((finish - start))
+
+  kill "$listener" 2>/dev/null || true
+  wait "$listener" 2>/dev/null || true
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"mode: monitor"* ]]
+  # Tight enough to fail on the bridge's own 10s connect default: this probe must
+  # carry a status-sized timeout of its own, not inherit a delivery-sized one.
+  [ "$elapsed" -lt 8 ]
+}
+
+@test "delivery status (codex): the loaded-thread probe runs once, not once per identity (#579)" {
+  # Bounding the timeout is not enough on its own -- N identities with no seat
+  # would still pay it N times. Counted rather than timed, so it cannot pass by
+  # being fast.
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" team bob   codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" team carol codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
+
+  local calls="$TEST_SKILL_DIR/probe-calls"
+  local fake="$TEST_SKILL_DIR/counting-node"
+  {
+    printf '#!/usr/bin/env bash
+'
+    printf 'printf x >> %q
+' "$calls"
+    printf 'printf "thr-a\nthr-b\n"
+'
+  } > "$fake"
+  chmod +x "$fake"
+
+  # shellcheck disable=SC1090
+  source "$SCRIPTS/lib/hash.sh"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf '1' > "$TEST_SKILL_DIR/run/codex-app-server.$(printf '%s' "$TEST_PROJECT" | agmsg_sha1).port"
+
+  AGMSG_NODE="$fake" run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  # Three seatless identities, one probe.
+  [ "$(wc -c < "$calls" | tr -d ' ')" = "1" ]
+  [[ "$output" == *"2 threads loaded"* ]]
+}
+
+@test "delivery status (codex): a thread already seated elsewhere is not called unexpected" {
+  # A loaded thread seats ONE role. When the only loaded thread belongs to alice,
+  # bob having no seat is the correct state — the old wording called it
+  # unexpected because it counted loaded threads rather than unclaimed ones.
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" team bob codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
+  mkdir -p "$TEST_SKILL_DIR/run"
+
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/hash.sh"
+  # The record has to land in the tree delivery.sh will read, so the helper needs
+  # the test's skill dir rather than the one it would derive for itself.
+  export SKILL_DIR="$TEST_SKILL_DIR"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/role-session.sh"
+  agmsg_role_session_record team alice thr-alice "$TEST_PROJECT" codex
+  [ -n "$(agmsg_role_session_uuid team alice)" ]
+  printf '1' > "$TEST_SKILL_DIR/run/codex-app-server.$(printf '%s' "$TEST_PROJECT" | agmsg_sha1).port"
+
+  local fake="$TEST_SKILL_DIR/fake-node-loaded"
+  { printf '#!/usr/bin/env bash\n'; printf 'printf %%s\\\\n thr-alice\n'; } > "$fake"
+  chmod +x "$fake"
+
+  AGMSG_NODE="$fake" run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Codex bridge: team/bob has no session recorded (the one loaded thread is already seated by another role)"* ]]
+  [[ "$output" != *"That combination is unexpected"* ]]
 }
