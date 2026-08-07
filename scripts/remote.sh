@@ -792,14 +792,37 @@ cmd_pull() {
   # second machine, whose pulled team answered "connected" while running nothing.
   local cmd_name
   cmd_name="$(basename "$SKILL_DIR")"
-  if [ "$pulled_age_v1" -gt 0 ]; then
+  # Whether the engine runs is a question about THIS MACHINE, not about the
+  # team. The old test was `age-v1 envelopes arrived` -- which says the team is
+  # sealed, and nothing at all about whether the key to open it is here. Those
+  # came apart the moment a caller could deliver the key before the pull: the
+  # key was installed, the engine was halted anyway because ciphertext had
+  # arrived, and the operator was told to go import key material they already
+  # had. Nothing decrypted, because the thing that decrypts was the thing that
+  # had been stopped.
+  #
+  # Asked once, here, and every line below is a description of this answer.
+  local can_read=0
+  if [ "$pulled_age_v1" -gt 0 ] && ! _remote_holds_current_key "$team" "$cfg"; then
+    can_read=1
+  fi
+
+  if [ "$can_read" -ne 0 ]; then
     echo "Pulled '$pulled_name' into local team '$team' ($imported message(s))."
-    echo "This team is encrypted; its sync engine is halted until the handed key material is imported and confirmed."
+    echo "This team is encrypted and this machine does not hold the key for its current epoch, so its sync engine is halted."
   else
     _remote_sync_engine_start "$team"
-    echo "Pulled '$pulled_name' into local team '$team' ($imported message(s)). Sync engine running."
+    if [ "$pulled_age_v1" -gt 0 ]; then
+      # Says what was checked, and stops there. The identity for the current
+      # epoch is here; messages sealed to an earlier key are a different
+      # question and this did not ask it.
+      echo "Pulled '$pulled_name' into local team '$team' ($imported message(s)). Sync engine running."
+      echo "This team is encrypted; this machine holds the key for its current epoch."
+    else
+      echo "Pulled '$pulled_name' into local team '$team' ($imported message(s)). Sync engine running."
+    fi
   fi
-  if [ "$pulled_age_v1" -gt 0 ]; then
+  if [ "$can_read" -ne 0 ]; then
     # The state, always. Dropping this would let a finished pull read as a
     # usable team, which is the worse failure of the two: the messages are
     # here and none of them can be read yet.
@@ -1098,6 +1121,37 @@ EOF
 # pidfile lifecycle in two places (here and watch.sh); factoring it into a shared
 # lib is intentionally deferred, not overlooked.
 _remote_sync_engine_pidfile() { printf '%s' "$CONNECTION_ROOT/run/remote-sync.$1.pid"; }
+
+# _remote_holds_current_key <team> -> 0 when this machine holds the identity
+# for the team's CURRENT epoch, 1 otherwise.
+#
+# What this measures, exactly, because the difference matters to what gets
+# printed: the identity file for the epoch named in the config is present, and
+# the recipient derived from it equals the recipient the config records for
+# that epoch. That is "the key this team's current messages are sealed to is
+# here and is the right one".
+#
+# It is NOT "every pulled message opens". A team that has rotated has older
+# envelopes sealed to earlier keys, and this says nothing about those. The
+# wording at the call site is held to that same line -- a check that proves
+# one thing must not be reported as the other.
+#
+# No age binary, or a file that does not yield a recipient, answers 1: a
+# machine that cannot derive the key cannot read with it either, and guessing
+# in the optimistic direction is how "connected" came to mean "running
+# nothing".
+_remote_holds_current_key() {
+  local team="$1" cfg="$2" key_id recipient identity derived
+  key_id="$(_remote_read_config_field "$cfg" '$.remote_key.current.key_id')"
+  recipient="$(_remote_read_config_field "$cfg" '$.remote_key.current.recipient')"
+  case "$key_id" in ''|null) return 1 ;; esac
+  case "$recipient" in ''|null) return 1 ;; esac
+  identity="$CONNECTION_ROOT/run/remote-credentials/$team/keys/$key_id.key"
+  [ -r "$identity" ] || return 1
+  command -v age-keygen >/dev/null 2>&1 || return 1
+  derived="$(age-keygen -y "$identity" 2>/dev/null)" || return 1
+  [ -n "$derived" ] && [ "$derived" = "$recipient" ]
+}
 
 _remote_sync_engine_start() {
   local team="$1" startup_nonce="${2:-}" pidfile logfile old_pid old_state

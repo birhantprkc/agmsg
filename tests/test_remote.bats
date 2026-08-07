@@ -1239,6 +1239,52 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   [ "$after" = "$before" ]
 }
 
+@test "pull decision: the engine follows the key, not the ciphertext (#147)" {
+  skip_if_no_age
+  # The predicate on its own. The pull fixture cannot produce a team that is
+  # both freshly pulled AND already keyed -- that state is created by a caller
+  # delivering key material before the pull, which is exactly the case the old
+  # test (ciphertext arrived -> halt) got wrong. So this drives the real
+  # function against the three states that decide it.
+  local probe="$BATS_TEST_TMPDIR/probe.sh"
+  {
+    echo 'set -euo pipefail'
+    echo 'SCRIPT_DIR="$1"; CONNECTION_ROOT="$2"; cfg="$3"'
+    echo '. "$SCRIPT_DIR/lib/storage.sh"'
+    sed -n '/^_remote_read_config_field() {/,/^}/p' "$SCRIPTS/remote.sh"
+    sed -n '/^_remote_holds_current_key() {/,/^}/p' "$SCRIPTS/remote.sh"
+    echo '_remote_holds_current_key keyed "$cfg"'
+  } > "$probe"
+
+  local cfg="$TEST_SKILL_DIR/teams/keyed/config.json"
+  local key_id="epoch-here" identity recipient
+  identity="$TEST_SKILL_DIR/run/remote-credentials/keyed/keys/$key_id.key"
+  mkdir -p "$(dirname "$cfg")" "$(dirname "$identity")"
+  age-keygen -o "$identity" 2>/dev/null
+  recipient="$(age-keygen -y "$identity")"
+
+  # Present and matching the recorded epoch: this machine can read.
+  jq -nc --arg k "$key_id" --arg r "$recipient" \
+    '{name:"keyed", remote_key:{current:{key_id:$k, recipient:$r}}}' > "$cfg"
+  run bash "$probe" "$SCRIPTS" "$TEST_SKILL_DIR" "$cfg"
+  [ "$status" -eq 0 ]
+
+  # The file is still there, but it is not the key this epoch is sealed to.
+  # Presence alone must not answer yes -- that is the difference between
+  # "a key is here" and "the key is here".
+  jq -nc --arg k "$key_id" \
+    '{name:"keyed", remote_key:{current:{key_id:$k, recipient:"age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"}}}' > "$cfg"
+  run bash "$probe" "$SCRIPTS" "$TEST_SKILL_DIR" "$cfg"
+  [ "$status" -ne 0 ]
+
+  # And with no identity file at all.
+  rm -f "$identity"
+  jq -nc --arg k "$key_id" --arg r "$recipient" \
+    '{name:"keyed", remote_key:{current:{key_id:$k, recipient:$r}}}' > "$cfg"
+  run bash "$probe" "$SCRIPTS" "$TEST_SKILL_DIR" "$cfg"
+  [ "$status" -ne 0 ]
+}
+
 @test "remote unlock: confirms handed authority, reprocesses, and resumes age-v1 sync" {
   skip_if_no_age
 
