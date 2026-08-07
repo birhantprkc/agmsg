@@ -199,7 +199,14 @@ for team in "${TEAM_LIST[@]}"; do
     # (project, type), NOT the session's in-memory actas role — the Codex
     # caveat documented in README.
     state=$(actas_lock_state "$team" "$AGENT" "${SESSION_ID:-}")
-    case "$state" in other:*) exit 97 ;; esac
+    # The leading `(` is load-bearing, not style. bash 3.2 -- which is /bin/bash
+    # on macOS, and what the macOS CI jobs run -- scans `$( ... )` for its
+    # closing paren without understanding `case`, so an unbalanced pattern paren
+    # ends the substitution early and the `;;` that follows is a syntax error.
+    # The whole file failed to parse; every check-inbox test on macOS died with
+    # "syntax error near unexpected token `;;'". Balancing the paren fixes it and
+    # is identical under bash 5.
+    case "$state" in (other:*) exit 97 ;; esac
 
     # Unread via the storage facade (§2.1 storage_list_unread = events ∪ legacy),
     # JSONL parsed in one pass with sqlite's JSON funcs (no jq; cf. lib/hooks-json.sh).
