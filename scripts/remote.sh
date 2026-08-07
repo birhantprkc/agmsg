@@ -864,12 +864,17 @@ cmd_pull() {
     *)    needs_key=1 ;;
   esac
 
-  local can_read=0
+  # Named for what it HOLDS. It is set when the key is missing, so the name
+  # has to say "cannot": a reader who trusts a `can_read` that means the
+  # opposite writes `[ "$can_read" -eq 1 ] && start_engine` and reopens the
+  # hole this decision closed. The value was always right; the label was the
+  # dangerous part.
+  local cannot_read=0
   if [ "$needs_key" -eq 1 ] && ! _remote_holds_current_key "$team" "$cfg"; then
-    can_read=1
+    cannot_read=1
   fi
 
-  if [ "$can_read" -ne 0 ]; then
+  if [ "$cannot_read" -ne 0 ]; then
     echo "Pulled '$pulled_name' into local team '$team' ($imported message(s))."
     echo "This team is encrypted and this machine does not hold the key for its current epoch, so its sync engine is halted."
   else
@@ -884,7 +889,7 @@ cmd_pull() {
       echo "Pulled '$pulled_name' into local team '$team' ($imported message(s)). Sync engine running."
     fi
   fi
-  if [ "$can_read" -ne 0 ]; then
+  if [ "$cannot_read" -ne 0 ]; then
     # The state, always. Dropping this would let a finished pull read as a
     # usable team, which is the worse failure of the two: the messages are
     # here and none of them can be read yet.
