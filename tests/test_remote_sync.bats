@@ -604,38 +604,56 @@ _reconcile_one_ack() {
 # Success and replay tests cannot see this; only a forced failure inside the
 # batch can.
 @test "sync contract: a failure inside the apply commits nothing (#689)" {
-  local remote page db
+  local first second db before_cursor
   db=$(agmsg_db_path demo)
-  remote=$(jq -nc '
+
+  # Apply one page for real first, so the sync mapping and the transport cursor
+  # hold a value that a partial commit could move. Asserting against a store
+  # where they do not exist yet cannot tell "did not advance" from "was never
+  # there".
+  first=$(jq -nc '
     {type:"sync_pull_message",server_seq:"1",
-     id:"550e8400-e29b-41d4-a716-4466554400b2",
+     id:"550e8400-e29b-41d4-a716-4466554400c1",
      server_received_at:"2026-07-20T13:00:01.000000Z",
      envelope:{v:1,cipher:"none",key_id:null,blob:(
-       {body:"must not survive",created_at:"2026-07-20T13:00:01.000000Z",
+       {body:"first arrival",created_at:"2026-07-20T13:00:01.000000Z",
         from_agent:"carol",to_agent:"bob"}|tojson|@base64)},
      status:"importable",policy_revision:"0",local_security_revision:"0",
-     projection:{body:"must not survive",created_at:"2026-07-20T13:00:01.000000Z",
+     projection:{body:"first arrival",created_at:"2026-07-20T13:00:01.000000Z",
                  from_agent:"carol",to_agent:"bob"}}')
-  page=$(printf '%s\n%s\n' "$remote" '{"type":"sync_pull_cursor","next_after":"1"}')
+  printf '%s\n%s\n' "$first" '{"type":"sync_pull_cursor","next_after":"1"}' \
+    | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
+  before_cursor=$(sqlite3 "$db" "SELECT transport_cursor FROM sync_bindings WHERE local_team='demo';" | tr -d '\r')
+  [ -n "$before_cursor" ]
 
-  # Make the mirror — and only the mirror — fail. Dropping the table does not
-  # work: storage_init recreates it with CREATE TABLE IF NOT EXISTS before the
-  # batch runs, so the mirror succeeds and the test proves nothing. A trigger
-  # survives that and aborts exactly the statement under test.
+  # Now make the mirror — and only the mirror — fail. Removing the table does
+  # not work: storage_init recreates it before the batch runs, so the mirror
+  # succeeds and the test proves nothing. A trigger survives that and aborts
+  # exactly the statement under test.
   sqlite3 "$db" "CREATE TRIGGER block_mirror BEFORE INSERT ON messages
                  BEGIN SELECT RAISE(ABORT,'mirror blocked for this test'); END;"
 
-  # Called directly, not through `run bash -c`: these are sourced functions and
-  # a child shell does not have them.
+  second=$(jq -nc '
+    {type:"sync_pull_message",server_seq:"2",
+     id:"550e8400-e29b-41d4-a716-4466554400c2",
+     server_received_at:"2026-07-20T13:00:02.000000Z",
+     envelope:{v:1,cipher:"none",key_id:null,blob:(
+       {body:"must not survive",created_at:"2026-07-20T13:00:02.000000Z",
+        from_agent:"carol",to_agent:"bob"}|tojson|@base64)},
+     status:"importable",policy_revision:"0",local_security_revision:"0",
+     projection:{body:"must not survive",created_at:"2026-07-20T13:00:02.000000Z",
+                 from_agent:"carol",to_agent:"bob"}}')
   local rc=0
-  printf '%s\n' "$page" | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1 \
-    >/dev/null 2>&1 || rc=$?
+  printf '%s\n%s\n' "$second" '{"type":"sync_pull_cursor","next_after":"2"}' \
+    | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null 2>&1 || rc=$?
   [ "$rc" -ne 0 ]
 
-  # The event is the batch's FIRST statement, so it is the one that survives a
-  # partial commit. Without -bail it is committed and the mirror is not, which
-  # is precisely the asymmetry this change exists to prevent.
+  # All three, not just the event. Asserting the event alone would also pass for
+  # an implementation that deleted the event afterwards and left the mapping and
+  # the cursor advanced -- which is the state that silently loses a message.
   [ "$(sqlite3 "$db" "SELECT count(*) FROM events WHERE body='must not survive';" | tr -d '\r')" -eq 0 ]
+  [ "$(sqlite3 "$db" "SELECT count(*) FROM sync_messages WHERE wire_id='550e8400-e29b-41d4-a716-4466554400c2';" | tr -d '\r')" -eq 0 ]
+  [ "$(sqlite3 "$db" "SELECT transport_cursor FROM sync_bindings WHERE local_team='demo';" | tr -d '\r')" = "$before_cursor" ]
 }
 
 # The other direction of the same correspondence. A row that was in the legacy
@@ -658,5 +676,5 @@ _reconcile_one_ack() {
 
   # And therefore counted once by each reader.
   [ "$(storage_history demo | jq -s '[.[]|select(.body=="older than the event log")]|length')" -eq 1 ]
-  [ "$(storage_list_unread demo bob | jq -s '[.[]|select(.body=="older than the event log")]|length')" -le 1 ]
+  [ "$(storage_list_unread demo bob | jq -s '[.[]|select(.body=="older than the event log")]|length')" -eq 1 ]
 }

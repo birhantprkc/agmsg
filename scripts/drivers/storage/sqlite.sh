@@ -324,7 +324,15 @@ storage_list_unread() {
         -- one keep working (#689); without this the union lists it twice, and
         -- marking one read leaves the other behind because the two branches
         -- number rows in different spaces.
-        AND NOT EXISTS (SELECT 1 FROM events e2 WHERE e2.legacy_id = m.id)
+        --
+        -- Live space only (seq > 0). A legacy row that was PROJECTED for push
+        -- also carries an event, but at a negative seq, deliberately below every
+        -- read cursor -- so the events branch above can never return it. Skipping
+        -- the legacy row on account of that event would remove the message from
+        -- the inbox entirely while history still showed it. Measured: the first
+        -- version of this dedupe did exactly that.
+        AND NOT EXISTS (SELECT 1 FROM events e2
+                         WHERE e2.legacy_id = m.id AND e2.seq > 0)
     )
     ORDER BY ts, src, ord ${limit:+LIMIT $limit};
   "

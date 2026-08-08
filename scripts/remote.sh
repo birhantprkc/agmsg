@@ -2024,8 +2024,22 @@ cmd_forget() {
         legacy_dedupe=" WHERE NOT EXISTS (SELECT 1 FROM events e WHERE e.legacy_id = m.id)"
       fi
       legacy_count="$(agmsg_sqlite "$store_path" \
-        "SELECT COUNT(*) FROM messages m$legacy_dedupe;" 2>/dev/null | tr -d '\r')"
-      case "$legacy_count" in ''|*[!0-9]*) legacy_count=0 ;; esac
+        "SELECT COUNT(*) FROM messages m$legacy_dedupe;" | tr -d '\r')" || {
+        echo "agmsg: cannot count messages in team store '$store_path'; refusing to delete it" >&2
+        exit 1
+      }
+      # A count that cannot be proved is not zero. The inspection above already
+      # refuses when it cannot read the table list, and this is the same kind of
+      # claim: normalising a failed query to 0 would tell the operator there is
+      # less to lose than there is, immediately before deleting it. A missing
+      # column is a different thing and is handled by the probe above -- that is
+      # a store shape we support, not a failure.
+      case "$legacy_count" in
+        ''|*[!0-9]*)
+          echo "agmsg: message count in team store '$store_path' was not a number; refusing to delete it" >&2
+          exit 1
+          ;;
+      esac
       event_count="$((event_count + legacy_count))"
     fi
   fi
