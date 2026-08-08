@@ -641,8 +641,8 @@ _remote_write_pulled_team() {
           # still knows by the old name. Which state the operator is in is
           # knowable here, so it is decided here rather than handed over as a
           # caveat to apply themselves.
-          # STILL connected, which is not the same as "has ever connected"
-          #. A disconnected team keeps its `connected_at` and gains a
+          # STILL connected, which is not the same as "has ever connected".
+          # A disconnected team keeps its `connected_at` and gains a
           # `disconnected_at`, so reading the first alone calls it connected
           # and withholds a route it is entitled to. This is the same predicate
           # `_remote_status_one` and `connect`'s re-adoption use: a binding is
