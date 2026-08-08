@@ -1,10 +1,10 @@
 #!/usr/bin/env bats
 
-# The remote-setup walkthrough now offers the Compose path (#665), and points
-# at `server/compose.yaml` for its values instead of restating them.
+# The remote-setup walkthroughs offer the Compose path (#665) and point at
+# `server/compose.yaml` for its values instead of restating them.
 #
 # The contract is narrower than "no compose value appears here", and the
-# difference is the point (review):
+# difference is the point:
 #
 #   credentials and database settings   NOT duplicated. Two copies of a
 #                                       password disagree eventually, and the
@@ -15,126 +15,255 @@
 #                                       a link would be worse. It is pinned
 #                                       against compose.yaml instead.
 #
-# Both are derived FROM compose.yaml rather than listed here: after the
-# password or the port changes, these still hold, which a literal would not.
+# Both are derived FROM compose.yaml, so both survive the value changing.
 #
-# The cross-file links are checked by resolving them, because a walkthrough
-# that sends you to another file is only as good as the anchor it names.
+# WHICH FILES: derived by glob, never named (#676). The first version of this
+# guard read `docs/remote-setup.md` and nothing else, and `docs/remote-setup.ja.md`
+# arrived an hour later carrying the same port — unguarded, silently. Naming one
+# file is how the next one arrives unwatched, so a third translation is covered
+# on the day it lands without anyone editing this file or the CI classifier.
+#
+# WHICH CHECKS: every one below is language-neutral, because the set they run
+# over is not. Commands, ports, connection strings and link targets are the
+# same in any language; headings are not, so an in-page link is resolved
+# against the headings of the file it lives in rather than against English.
 
-DOC="${BATS_TEST_DIRNAME}/../docs/remote-setup.md"
 COMPOSE="${BATS_TEST_DIRNAME}/../server/compose.yaml"
 SERVER_README="${BATS_TEST_DIRNAME}/../server/README.md"
+DOCS="${BATS_TEST_DIRNAME}/../docs"
+
+# Every walkthrough, one path per line. Empty output is a failure at the call
+# site, not a quiet pass: a glob that stops matching would make every check
+# below vacuous.
+walkthroughs() {
+  ls "$1"/remote-setup*.md 2>/dev/null
+}
 
 # An environment value out of compose.yaml, by key.
 compose_value() {
   sed -n "s/^[[:space:]]*$1:[[:space:]]*//p" "$COMPOSE" | head -1
 }
 
-# GitHub's heading anchor: lowercase, spaces to hyphens, punctuation dropped.
+# compose's published HOST port — the side a reader curls.
+compose_host_port() {
+  sed -n 's/^[[:space:]]*-[[:space:]]*"\([0-9][0-9]*\):[0-9][0-9]*"[[:space:]]*$/\1/p' "$COMPOSE" | head -1
+}
+
+# GitHub's heading anchor: lowercase, spaces to hyphens, ASCII punctuation
+# dropped. Only ASCII punctuation is removed — an allow-list of `a-z0-9-` would
+# erase a Japanese heading entirely and make every ja anchor "resolve" to the
+# empty string.
+#
+# Emits a trailing newline on purpose: `heading_anchors` calls this per heading
+# and greps the result with `-x`, so without one every anchor in a file arrives
+# concatenated into a single line and nothing ever matches. `$( )` strips it at
+# the call sites that compare directly.
 slug() {
-  printf '%s' "$1" \
+  printf '%s\n' "$1" \
     | tr '[:upper:]' '[:lower:]' \
     | tr ' ' '-' \
-    | tr -cd 'a-z0-9-'
+    | sed 's/[]`~!@#$%^&*()+=<>?,./:;"'"'"'|{}\\[]//g'
 }
 
-@test "remote-setup: the walkthrough offers the Compose path" {
-  grep -q 'docker compose up -d --build' "$DOC"
-  # And still reaches the health check, which is what tells you it worked.
-  grep -q '/v1/health' "$DOC"
+# The headings of a markdown file, as anchors, one per line.
+heading_anchors() {
+  sed -n 's/^#\{1,6\}[[:space:]]*//p' "$1" | while IFS= read -r h; do slug "$h"; done
 }
 
-@test "remote-setup: compose.yaml's password is not restated in the doc" {
-  password="$(compose_value POSTGRES_PASSWORD)"
-  # A positive control. If compose.yaml is restructured so the key stops
-  # parsing, an empty needle would match every file and this would pass while
-  # checking nothing.
-  [ -n "$password" ]
-  run grep -F -q -- "$password" "$DOC"
-  [ "$status" -ne 0 ]
-}
+# Everything wrong with one walkthrough, one problem per line. Empty means
+# clean. Takes its inputs so a fixture can be checked the same way the real
+# tree is — a guard that can only run against the repo cannot be shown to fail.
+check_walkthrough() {
+  local doc="$1" compose_password="$2" port="$3" readme="$4" problems="" used anchors a
 
-@test "remote-setup: the localhost health check uses compose's published port" {
-  # The one compose value the doc DOES carry, kept in sync rather than trusted.
-  # Published as "<host>:<container>"; the host side is what a reader curls.
-  port="$(sed -n 's/^[[:space:]]*-[[:space:]]*"\([0-9][0-9]*\):[0-9][0-9]*"[[:space:]]*$/\1/p' "$COMPOSE" | head -1)"
-  [ -n "$port" ]
+  grep -q 'docker compose up -d --build' "$doc" \
+    || problems="${problems}${doc}: does not offer the Compose path
+"
+  grep -q '/v1/health' "$doc" \
+    || problems="${problems}${doc}: never reaches the health check
+"
+  if grep -F -q -- "$compose_password" "$doc"; then
+    problems="${problems}${doc}: restates compose.yaml's password
+"
+  fi
+  if grep -q 'postgresql://' "$doc"; then
+    problems="${problems}${doc}: spells out a connection string
+"
+  fi
 
-  # Every localhost URL in the doc, derived rather than the one I remembered
-  # to look at: a second one added later with the old port is exactly the
-  # drift this exists for.
-  used="$(grep -o 'http://127\.0\.0\.1:[0-9]*' "$DOC" | sed 's|.*:||' | sort -u)"
-  [ -n "$used" ]
-  [ "$used" = "$port" ]
-}
+  used="$(grep -o 'http://127\.0\.0\.1:[0-9]*' "$doc" | sed 's|.*:||' | sort -u)"
+  if [ -z "$used" ]; then
+    problems="${problems}${doc}: names no localhost health-check URL
+"
+  elif [ "$used" != "$port" ]; then
+    problems="${problems}${doc}: localhost port(s) [$(echo $used)] are not compose's $port
+"
+  fi
 
-@test "remote-setup: no connection string is spelled out in the doc" {
-  # The from-source path moved to server/README.md rather than being copied.
-  # A `postgresql://` line here means the copy came back.
-  run grep -q 'postgresql://' "$DOC"
-  [ "$status" -ne 0 ]
-}
-
-@test "remote-setup: every link into server/README.md resolves to a heading" {
-  # Extract the anchors this doc points at, rather than checking the ones
-  # someone remembered to list.
-  anchors="$(grep -o '(\.\./server/README\.md#[a-z0-9-]*)' "$DOC" \
+  # Links into server/README.md, resolved against that file's headings.
+  anchors="$(grep -o '(\.\./server/README\.md#[a-z0-9-]*)' "$doc" \
     | sed 's|(\.\./server/README\.md#||; s|)||' | sort -u)"
-  [ -n "$anchors" ]
+  if [ -z "$anchors" ]; then
+    problems="${problems}${doc}: links into server/README.md nowhere
+"
+  fi
+  for a in $anchors; do
+    heading_anchors "$readme" | grep -q -x -- "$a" \
+      || problems="${problems}${doc}: points at server/README.md#${a}, not a heading there
+"
+  done
 
-  headings=""
-  while IFS= read -r line; do
-    case "$line" in
-      '#'*) headings="${headings}$(slug "${line#\#\# }")
-" ;;
-    esac
-  done < "$SERVER_README"
-
+  # In-page links, resolved against THIS file's own headings — which is what
+  # makes the check work for a translation whose headings are translated.
+  anchors="$(grep -o ']([#][^)]*)' "$doc" | sed 's|](#||; s|)||' | sort -u)"
+  if [ -z "$anchors" ]; then
+    problems="${problems}${doc}: has no in-page section links
+"
+  fi
   while IFS= read -r a; do
     [ -n "$a" ] || continue
-    printf '%s' "$headings" | grep -q -x -- "$a" || {
-      echo "docs/remote-setup.md points at server/README.md#$a, which is not a heading there" >&2
-      echo "headings found: $headings" >&2
-      return 1
-    }
+    heading_anchors "$doc" | grep -q -x -- "$a" \
+      || problems="${problems}${doc}: points at #${a}, not a heading in this file
+"
   done <<EOF
 $anchors
 EOF
+
+  printf '%s' "$problems"
 }
 
-@test "remote-setup: editing the guarded doc does not skip this suite" {
+@test "remote-setup: the walkthroughs are found by glob, not by name" {
+  # The positive control for everything below. If the glob stops matching, each
+  # per-file check would iterate over nothing and report clean.
+  n="$(walkthroughs "$DOCS" | wc -l | tr -d ' ')"
+  [ "$n" -ge 2 ] || return 1
+  walkthroughs "$DOCS" | grep -q 'remote-setup\.md$' || return 1
+  walkthroughs "$DOCS" | grep -q 'remote-setup\.ja\.md$' || return 1
+}
+
+@test "remote-setup: every walkthrough holds the contract" {
+  password="$(compose_value POSTGRES_PASSWORD)"
+  port="$(compose_host_port)"
+  # Non-empty first: an empty password would match every file, and an empty
+  # port would make the comparison meaningless.
+  [ -n "$password" ] || return 1
+  [ -n "$port" ] || return 1
+
+  problems=""
+  while IFS= read -r doc; do
+    [ -n "$doc" ] || continue
+    problems="${problems}$(check_walkthrough "$doc" "$password" "$port" "$SERVER_README")"
+  done <<EOF
+$(walkthroughs "$DOCS")
+EOF
+  [ -z "$problems" ] || { printf '%s\n' "$problems" >&2; return 1; }
+}
+
+@test "remote-setup: a THIRD walkthrough is covered the day it lands" {
+  # The whole point of #676. Two files passing proves only that someone
+  # remembered the second one; this adds a third that no line anywhere names,
+  # and breaks it, so the coverage is demonstrated rather than asserted.
+  password="$(compose_value POSTGRES_PASSWORD)"
+  port="$(compose_host_port)"
+  [ -n "$password" ] || return 1
+
+  fixture="$BATS_TEST_TMPDIR/docs"
+  mkdir -p "$fixture"
+  cp "$DOCS/remote-setup.md" "$fixture/remote-setup.md"
+  cp "$DOCS/remote-setup.ja.md" "$fixture/remote-setup.ja.md"
+  # A third translation, correct except for one stale port.
+  sed "s|http://127\.0\.0\.1:${port}|http://127.0.0.1:9999|" \
+    "$DOCS/remote-setup.md" > "$fixture/remote-setup.de.md"
+
+  # It is found without being named.
+  walkthroughs "$fixture" | grep -q 'remote-setup\.de\.md$' || return 1
+  n="$(walkthroughs "$fixture" | wc -l | tr -d ' ')"
+  [ "$n" -eq 3 ] || return 1
+
+  problems=""
+  while IFS= read -r doc; do
+    [ -n "$doc" ] || continue
+    problems="${problems}$(check_walkthrough "$doc" "$password" "$port" "$SERVER_README")"
+  done <<EOF
+$(walkthroughs "$fixture")
+EOF
+
+  # The third file is reported, and only the third.
+  printf '%s' "$problems" | grep -q 'remote-setup\.de\.md: localhost port' || {
+    echo "the third walkthrough's stale port was not reported. problems: [$problems]" >&2
+    return 1
+  }
+  printf '%s' "$problems" | grep -q 'remote-setup\.md:' && {
+    echo "a clean walkthrough was reported: [$problems]" >&2
+    return 1
+  }
+  printf '%s' "$problems" | grep -q 'remote-setup\.ja\.md:' && {
+    echo "a clean walkthrough was reported: [$problems]" >&2
+    return 1
+  }
+  return 0
+}
+
+@test "remote-setup: the port check reads the JAPANESE file too" {
+  # Named separately because "every walkthrough holds the contract" passing
+  # does not say which files it opened. This breaks ja specifically.
+  password="$(compose_value POSTGRES_PASSWORD)"
+  port="$(compose_host_port)"
+  fixture="$BATS_TEST_TMPDIR/ja"
+  mkdir -p "$fixture"
+  sed "s|http://127\.0\.0\.1:${port}|http://127.0.0.1:9999|" \
+    "$DOCS/remote-setup.ja.md" > "$fixture/remote-setup.ja.md"
+  problems="$(check_walkthrough "$fixture/remote-setup.ja.md" "$password" "$port" "$SERVER_README")"
+  printf '%s' "$problems" | grep -q 'localhost port' || {
+    echo "a stale port in the Japanese walkthrough went unreported: [$problems]" >&2
+    return 1
+  }
+}
+
+@test "remote-setup: a translated in-page link resolves against its own headings" {
+  # The reason the anchor check is not English-only: ja's boundary section is
+  # `### ネットワーク境界` and links to `(#ネットワーク境界)`. An anchor slug
+  # built from an ASCII allow-list would reduce both to the empty string and
+  # "resolve" every Japanese link to nothing.
+  [ "$(slug 'ネットワーク境界')" = 'ネットワーク境界' ] || return 1
+  [ "$(slug 'Network boundary')" = 'network-boundary' ] || return 1
+  [ "$(slug 'Run from source')" = 'run-from-source' ] || return 1
+  heading_anchors "$DOCS/remote-setup.ja.md" | grep -q -x 'ネットワーク境界' || return 1
+}
+
+@test "remote-setup: editing ANY walkthrough does not skip this suite" {
   # Everything above is decoration if the suite does not run on the change it
   # is watching for. The `changes` job maps `docs/*` to docs_only=true, which
-  # skips every bats shard, so this file has to be pulled out of that arm —
-  # the same reason SKILL.md is. Pinned here rather than trusted, because the
-  # line is one `case` arm and removing it fails nothing else.
-  # The workflow's own `case` is lifted out and RUN, rather than checked for a
-  # line in the right order: order is only one of the ways this arm can stop
-  # working, and the classifier is what actually decides.
+  # skips every bats shard.
+  #
+  # The workflow's own `case` is lifted out and RUN: order is only one of the
+  # ways an arm can stop working, and the classifier is what actually decides.
   workflow="${BATS_TEST_DIRNAME}/../.github/workflows/tests.yml"
   block="$(awk '/case ".f" in/,/^ *esac$/' "$workflow")"
-  # Positive control: an empty block would leave docs_only at whatever it was
-  # initialised to, and every case below would agree with itself.
-  [ -n "$block" ]
+  [ -n "$block" ] || return 1
 
   # `run bash -c`, not a `$( )` around the eval: bash 3.2 — which is what CI's
   # macOS runner has — cannot parse a `case` inside command substitution.
   classify='f="$1"; docs_only=true; app_changed=false; server_changed=false; sync_changed=false; eval "$2"; echo "$docs_only"'
 
-  run bash -c "$classify" _ docs/remote-setup.md "$block"
-  [ "$status" -eq 0 ]
-  [ "$output" = false ]
+  # Every walkthrough that exists, derived — not a list to keep in step.
+  while IFS= read -r doc; do
+    [ -n "$doc" ] || continue
+    rel="docs/$(basename "$doc")"
+    run bash -c "$classify" _ "$rel" "$block"
+    [ "$status" -eq 0 ] || return 1
+    [ "$output" = false ] || { echo "$rel is treated as docs-only" >&2; return 1; }
+  done <<EOF
+$(walkthroughs "$DOCS")
+EOF
 
-  # The arm is specific, not a hole punched through the whole docs tree.
+  # And one that does not exist yet, because that is the case this fixes.
+  run bash -c "$classify" _ docs/remote-setup.de.md "$block"
+  [ "$status" -eq 0 ] || return 1
+  [ "$output" = false ] || { echo "a future translation is treated as docs-only" >&2; return 1; }
+
+  # Still an exception, not a hole through the docs tree.
   run bash -c "$classify" _ docs/spec/v1.md "$block"
-  [ "$status" -eq 0 ]
-  [ "$output" = true ]
-}
-
-@test "remote-setup: the network boundary it links to is in this doc" {
-  # The walkthrough recommends a stack that publishes a port and ships a
-  # development password. The warning used to live only in server/README.md,
-  # which is not where someone standing up a server is reading.
-  grep -q '^### Network boundary' "$DOC"
-  grep -q '(#network-boundary)' "$DOC"
+  [ "$status" -eq 0 ] || return 1
+  [ "$output" = true ] || return 1
 }
