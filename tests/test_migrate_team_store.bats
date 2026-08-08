@@ -579,3 +579,47 @@ stored_types() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"first message ever, after migration"* ]]
 }
+
+# co1's review of #696: the fix above feeds MAX(local_position) straight into
+# sqlite_sequence.seq, an AUTOINCREMENT-authority column -- not a data column
+# like the ones the re-entry guard above already protects. SQLite ranks TEXT
+# above every INTEGER in its default comparison, so a single non-integer
+# cursor among this team's rows can make MAX() pick the damaged value over
+# any real one, corrupting how every future seq gets assigned on this store
+# -- not merely carrying a bad value forward unread the way the OLD (pre-#695)
+# first-time path already could.
+#
+# The existing "not an integer is refused" test above covers RE-ENTRY only
+# (it migrates alpha successfully first, then corrupts the DESTINATION to
+# test _missing_from_dest). This is the gap co1 named: the FIRST-TIME path
+# never validated source cursor types at all before this fix started writing
+# them into sqlite_sequence. Reproduced by corrupting the SHARED cursor
+# BEFORE ever migrating, so the very first attempt is what has to refuse.
+@test "migrate: a non-integer source cursor refuses the FIRST migration attempt, before anything is written to the destination (#695 follow-up)" {
+  bash "$SCRIPTS/send.sh" alpha ann bob "one" >/dev/null
+  sqlite3 "$SHARED" "INSERT OR REPLACE INTO read_cursors(team,agent,local_position)
+    VALUES('alpha','ann','abc');"
+  # The premise, measured rather than assumed: the column is declared
+  # INTEGER and sqlite stored text in it anyway.
+  [ "$(sqlite3 "$SHARED" "SELECT typeof(local_position) FROM read_cursors
+        WHERE team='alpha' AND agent='ann';")" = "text" ]
+
+  run migrate alpha
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "non-integer read cursor" ]]
+
+  # Refused, not repaired: the malformed value is still exactly what it was
+  # -- silently ignoring it in MAX() would have erased the evidence a bad
+  # cursor exists, which is explicitly not acceptable here (co1).
+  [ "$(sqlite3 "$SHARED" "SELECT local_position FROM read_cursors
+        WHERE team='alpha' AND agent='ann';")" = "abc" ]
+  # Nothing moved: the shared store still has the team's row, and no
+  # destination file was created at all -- the guard runs before $DEST is
+  # even touched.
+  [ "$(shared_rows alpha)" -eq 1 ]
+  # The literal expected per-team path, not store_of: with the migration
+  # refused, alpha's partition never flipped away from "shared", so
+  # store_of would resolve back to $SHARED itself (which of course exists)
+  # rather than say anything about whether a per-team file got created.
+  [ ! -e "$TEST_SKILL_DIR/db/teams/alpha/messages.db" ]
+}

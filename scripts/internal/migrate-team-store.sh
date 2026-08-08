@@ -193,6 +193,32 @@ if [ -e "$DEST" ]; then
   exit 1
 fi
 
+# #695 review (co1): the destination's sqlite_sequence floor below is set
+# from MAX(local_position) over this team's copied cursors. SQLite stores
+# whatever type a column is given even when it's declared INTEGER (the same
+# looseness "a cursor that is not an integer is refused" already guards on
+# the re-entry path, below, via _missing_from_dest) -- and its default
+# comparison rules rank TEXT above every INTEGER, so a single malformed
+# (text) cursor among this team's rows can make MAX() choose the text value
+# over any real one. That value would then land directly in
+# sqlite_sequence.seq, an AUTOINCREMENT-authority column, not just a data
+# column -- corrupting every future seq assignment on this store, not merely
+# carrying the bad cursor forward unread. Fail closed here, before ANY write
+# to $DEST, rather than let a non-integer through by having MAX() quietly
+# ignore it: silently dropping the bad cursor would erase the very evidence
+# a malformed read position exists, which is the same reason the rest of
+# this script never repairs data on the way through, only reports it.
+if has_table read_cursors; then
+  bad_agent="$(agmsg_sqlite "$SHARED" "SELECT agent FROM read_cursors
+    WHERE team='$(agmsg_sqlesc "$TEAM")' AND typeof(local_position) <> 'integer' LIMIT 1;")"
+  if [ -n "$bad_agent" ]; then
+    echo "team store: '$TEAM' has a non-integer read cursor for '$bad_agent' in the shared store; refusing to migrate" >&2
+    echo "team store: the shared store still holds its history and has NOT been touched." >&2
+    echo "team store: fix the malformed cursor (read_cursors.local_position for '$bad_agent') before retrying" >&2
+    exit 1
+  fi
+fi
+
 agmsg_storage_load
 
 # Build the destination directly rather than through storage_init: the team
