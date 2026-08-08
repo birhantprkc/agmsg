@@ -271,6 +271,41 @@ if [ -n "$ACTIVE_NAME" ]; then
   done <<< "$PAIRS"
 fi
 
+# Pairs another session currently holds, so each departure and each return is
+# announced once instead of every cycle. Membership is not a decision -- the
+# lock is -- it only records what has already been said (#683).
+#
+# Held as newline-separated entries and compared as EXACT strings, never as
+# patterns. A team name is arbitrary UTF-8 minus a path deny-list and an agent
+# name minus a JSON-path deny-list (validate.sh), so either may contain glob
+# metacharacters, a sed delimiter, or a space. A `case` pattern or an
+# `s|…|…|` built out of one is a bug that only appears for some names --
+# the class this repo has paid for before with quotes in names (#87). Newline
+# is the one byte a name cannot contain, control characters being rejected, so
+# it is the safe separator.
+HELD_ELSEWHERE=""
+
+_held_elsewhere_has() {
+  local want="$1" line
+  [ -n "$HELD_ELSEWHERE" ] || return 1
+  while IFS= read -r line; do
+    [ "$line" = "$want" ] && return 0
+  done <<< "$HELD_ELSEWHERE"
+  return 1
+}
+
+_held_elsewhere_without() {
+  local drop="$1" line out=""
+  [ -n "$HELD_ELSEWHERE" ] || return 0
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    [ "$line" = "$drop" ] && continue
+    out="${out:+$out
+}$line"
+  done <<< "$HELD_ELSEWHERE"
+  printf '%s' "$out"
+}
+
 while true; do
   # Liveness guard (#67): exit promptly once the originating agent session is
   # gone. A plain pipe gives no portable way to notice a *downstream* consumer
@@ -286,6 +321,66 @@ while true; do
   fi
   while IFS=$'\t' read -r pair_team pair_agent; do
     [ -z "$pair_team" ] && continue
+    # Ownership is re-read every cycle, because it can change under a running
+    # watcher and nothing else notices. The subscription set and the startup
+    # lock check both happen once, above; a session that claims this role
+    # afterwards moves the lock file and starts its own watcher, and this
+    # process would otherwise keep polling the same pair forever.
+    #
+    # That is not a harmless duplicate. The read cursor is one per
+    # (team, agent) and storage_watch_after excludes rows already read, so
+    # whoever polls first TAKES the row and the other sees nothing. When the
+    # one that takes it is this stale process, its printf succeeds -- stdout is
+    # still an open pipe to a live session -- so the id is marked read and the
+    # message is gone, delivered to a stream nobody is reading (#683).
+    #
+    # Only the lock file is read here, not the whole subscription set: losing a
+    # pair is the half a running process can detect for the price of a file
+    # read. Gaining one is the caller's job, at the point it creates the team.
+    pair_state="$(actas_lock_state "$pair_team" "$pair_agent" "$SESSION_ID" 2>/dev/null || echo free)"
+    case "$pair_state" in
+      other:*)
+        if [ -n "$ACTIVE_NAME" ]; then
+          # This watcher exists to serve exactly this role and no longer owns
+          # it. Stop -- and say so: stderr is the only place a reason survives,
+          # and a watcher that ends without one is indistinguishable from one
+          # that crashed.
+          echo "agmsg watch: ${pair_team}/${pair_agent} is now held by session ${pair_state#other:}." >&2
+          echo "agmsg watch: this watcher no longer owns that role and is stopping." >&2
+          echo "agmsg watch: messages for it stay unread and reach the session that claimed it." >&2
+          exit 0
+        fi
+        # Broad subscription: this watcher serves other roles too, so skip the
+        # pair rather than ending the process -- exiting here would take down a
+        # whole session's delivery because one of its roles moved elsewhere.
+        #
+        # Skipped FOR AS LONG AS someone else holds it, not permanently. When
+        # the holder goes away the lock reads free again and this watcher takes
+        # the pair back, which is the same rule the startup filter uses (a
+        # stale lock is free). Dropping it for good would be worse: the role is
+        # still registered to this project, so nobody would deliver for it
+        # until the session restarted.
+        #
+        # Announced on each transition, not each cycle -- a per-cycle message
+        # would bury the log, and announcing only the first time would make a
+        # second departure invisible.
+        if ! _held_elsewhere_has "${pair_team}/${pair_agent}"; then
+          HELD_ELSEWHERE="${HELD_ELSEWHERE:+$HELD_ELSEWHERE
+}${pair_team}/${pair_agent}"
+          echo "agmsg watch: ${pair_team}/${pair_agent} was claimed by session ${pair_state#other:}; not serving it while they hold it." >&2
+        fi
+        continue
+        ;;
+      *)
+        # Free or ours. If we had stepped aside for it, say that we are taking
+        # it back -- otherwise the log shows a role leaving and never returning,
+        # which reads as a permanent drop.
+        if _held_elsewhere_has "${pair_team}/${pair_agent}"; then
+          HELD_ELSEWHERE="$(_held_elsewhere_without "${pair_team}/${pair_agent}")"
+          echo "agmsg watch: ${pair_team}/${pair_agent} is unheld again; serving it here." >&2
+        fi
+        ;;
+    esac
     # Per team: with a store per team, "one team has no store yet" is a
     # normal state, and a single check outside this loop would silence
     # delivery for every OTHER team as well.
