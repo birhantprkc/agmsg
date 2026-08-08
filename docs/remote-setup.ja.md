@@ -200,8 +200,11 @@ unlockが終わらせるのは鍵の作業であって、参加ではない。�
 bash ~/.agents/skills/agmsg/scripts/remote.sh status <team>
 ```
 
-出力には `encryption:` の行が含まれる —— 暗号化されたチームなら `age-v1, key
-present`(または `local key missing`)、そうでなければ `none` となる。
+接続済みのチームであれば、出力にはそのバインディングの実際の暗号方式と鍵の
+状態を示す `encryption:` の行が含まれる(暗号化されたチームなら `age-v1, ...`、
+そうでなければ `none` または `required, no local key`)—— 2択だと決めつけず、
+その行自体を読むこと。切断済みのチームには `encryption:` の行自体が無い。
+まず再接続すること。
 
 ## リファレンス
 

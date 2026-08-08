@@ -203,8 +203,11 @@ inferring it from what you can read:
 bash ~/.agents/skills/agmsg/scripts/remote.sh status <team>
 ```
 
-The output includes an `encryption:` line — `age-v1, key present` (or `local
-key missing`) for an encrypted team, `none` otherwise.
+For a connected team, the output includes an `encryption:` line describing
+the binding's actual cipher and key state (`age-v1, ...` for an encrypted
+team; `none` or `required, no local key` otherwise) — read the line itself
+rather than assuming just two possible values. A disconnected team's status
+has no `encryption:` line at all; reconnect first.
 
 ## Reference
 
