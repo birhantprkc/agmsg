@@ -557,3 +557,39 @@ _reconcile_one_ack() {
   # The events table is still there: nothing above reached a statement.
   [ "$(agmsg_sqlite "$(agmsg_db_path demo)" "SELECT COUNT(*) FROM events;" | tr -d '\r')" -gt 0 ]
 }
+
+# The legacy `messages` table is a read interface other software still opens
+# (#689). A message that arrives from another machine lands here and nowhere
+# else, so mirroring only local sends would leave those readers seeing one side
+# of a conversation -- and the side they could not see is the reason this was
+# worth doing at all.
+@test "sync contract: a pulled message is mirrored into the legacy table, once" {
+  local remote page db
+  remote=$(jq -nc '
+    {type:"sync_pull_message",server_seq:"1",
+     id:"550e8400-e29b-41d4-a716-4466554400a1",
+     server_received_at:"2026-07-20T13:00:01.000000Z",
+     envelope:{v:1,cipher:"none",key_id:null,blob:(
+       {body:"arrived from elsewhere",created_at:"2026-07-20T13:00:01.000000Z",
+        from_agent:"carol",to_agent:"bob"}|tojson|@base64)},
+     status:"importable",policy_revision:"0",local_security_revision:"0",
+     projection:{body:"arrived from elsewhere",created_at:"2026-07-20T13:00:01.000000Z",
+                 from_agent:"carol",to_agent:"bob"}}')
+  page=$(printf '%s\n%s\n' "$remote" '{"type":"sync_pull_cursor","next_after":"1"}')
+  printf '%s\n' "$page" | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
+
+  db=$(agmsg_db_path demo)
+  # Visible to a reader of the legacy table — queried the way such a reader
+  # would, with no agmsg code in between.
+  [ "$(sqlite3 "$db" "SELECT count(*) FROM messages WHERE body='arrived from elsewhere';" | tr -d '\r')" -eq 1 ]
+  # And linked, so the readers that union the two tables see one message.
+  [ "$(sqlite3 "$db" "SELECT count(*) FROM events e JOIN messages m ON m.id=e.legacy_id WHERE e.type='message_sent' AND e.body='arrived from elsewhere';" | tr -d '\r')" -eq 1 ]
+  [ "$(storage_history demo | jq -s '[.[]|select(.body=="arrived from elsewhere")]|length')" -eq 1 ]
+  [ "$(storage_list_unread demo bob | jq -s '[.[]|select(.body=="arrived from elsewhere")]|length')" -eq 1 ]
+
+  # Re-applying the same durable page must not add a second legacy row either.
+  # The event is guarded against duplication; the mirror has to inherit that
+  # guard rather than carry its own copy of it.
+  printf '%s\n' "$page" | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
+  [ "$(sqlite3 "$db" "SELECT count(*) FROM messages WHERE body='arrived from elsewhere';" | tr -d '\r')" -eq 1 ]
+}

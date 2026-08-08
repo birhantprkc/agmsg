@@ -408,7 +408,14 @@ _sqlite_sync_project_legacy() {
         FROM messages m
        WHERE m.team='$tl'
          AND NOT EXISTS(SELECT 1 FROM events e
-                         WHERE e.seq=m.id - $_AGMSG_LEGACY_SEQ_OFFSET);
+                         WHERE e.seq=m.id - $_AGMSG_LEGACY_SEQ_OFFSET)
+         -- Never project a row this store wrote as the legacy copy of an event
+         -- it already has (#689). Every message is now written to both tables,
+         -- so without this the projection would put the mirror back into the
+         -- event log as a SECOND event -- different id, different seq, no link
+         -- to the first -- and the rewind below would push that duplicate to
+         -- the server and on to every other machine.
+         AND NOT EXISTS(SELECT 1 FROM events e2 WHERE e2.legacy_id = m.id);
     INSERT OR REPLACE INTO storage_metadata(key,value)
       VALUES('legacy_push_projected_v1','1');" >/dev/null 2>&1 || return 13
 }
@@ -900,6 +907,22 @@ storage_sync_apply_pull() {
           AND NOT EXISTS(SELECT 1 FROM sync_conflicts cx
           WHERE cx.server_instance_id='$server' AND cx.remote_team_id='$remote'
             AND cx.protocol_version=$protocol AND cx.wire_id='$wire');
+        -- Mirror into the legacy table, which other software still reads
+        -- (#689). This is the arrival path for anything sent from another
+        -- machine: mirroring only local sends would leave those readers seeing
+        -- one side of a conversation, and that is the side this exists for.
+        --
+        -- Keyed off the event actually having been inserted rather than
+        -- repeating the three-part duplicate guard above. If the event was
+        -- skipped there is no row with this id, so neither statement fires and
+        -- last_insert_rowid() is never read.
+        INSERT INTO messages(team,from_agent,to_agent,body,created_at)
+        SELECT '$tl','$(_sqlite_lit "$from")','$(_sqlite_lit "$to")',
+               '$(_sqlite_lit "$body")','$(_sqlite_lit "$at")'
+         WHERE EXISTS(SELECT 1 FROM events e
+                       WHERE e.id='$local_id' AND e.legacy_id IS NULL);
+        UPDATE events SET legacy_id=last_insert_rowid()
+         WHERE id='$local_id' AND legacy_id IS NULL;
         INSERT OR IGNORE INTO sync_messages
           (local_team,server_instance_id,remote_team_id,protocol_version,
            driver_generation,local_position,local_id,wire_id,envelope_v,cipher,
