@@ -64,9 +64,28 @@ set_disconnected_at() {
   run bash "$SCRIPTS/remote.sh" forget --yes testteam
   [ "$status" -ne 0 ]
   [[ "$output" == *"still connected"* ]]
-  [[ "$output" == *"remote.sh disconnect testteam"* ]]
+  # The command now carries its install path and quotes its team (#667), so the
+  # bare spelling is gone. `grep -q`, not `[[ ]]`: a failing `[[ ]]` mid-body is
+  # not enforced on bash 3.2 (#670), and this assertion is one that just moved.
+  printf '%s\n' "$output" | grep -q -F -- "remote.sh' disconnect 'testteam'"
   [ -f "$TEST_SKILL_DIR/teams/testteam/config.json" ]
   [ -f "$store" ]
+}
+
+@test "forget: the disconnect it tells you to run first can be run as printed" {
+  # `remote.sh` is not on PATH (#667). The refusal is only useful if the
+  # command it offers resolves — checked by existence, not by spelling, since
+  # a line naming the wrong install would satisfy a substring match.
+  #
+  # `[ ]` and `grep -q`, not `[[ ]]`: on bash 3.2 a failing `[[ ]]` in the
+  # middle of a body does not trip errexit (#670).
+  set_disconnected_at null
+  run bash "$SCRIPTS/remote.sh" forget --yes testteam
+  [ "$status" -ne 0 ]
+  printf '%s\n' "$output" | grep -q 'still connected'
+  path="$(printf '%s\n' "$output" | sed -n "s/.*bash '\([^']*remote\.sh\)'.*/\1/p" | head -1)"
+  [ -n "$path" ]
+  [ -f "$path" ]
 }
 
 @test "forget: shows its scope and rejects noninteractive deletion without --yes" {
