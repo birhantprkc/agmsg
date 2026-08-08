@@ -2009,7 +2009,24 @@ cmd_forget() {
       # Only legacy rows the event log does not already carry: every message is
       # written to both tables (#689), so counting both in full reports twice
       # the number of messages about to be deleted.
-      event_count="$((event_count + $(agmsg_sqlite "$store_path" "SELECT COUNT(*) FROM messages m WHERE NOT EXISTS (SELECT 1 FROM events e WHERE e.legacy_id = m.id);")))"
+      #
+      # The column is asked about rather than assumed. This inspects a store
+      # file directly and deliberately never initializes it, so a store written
+      # before that column existed is a state this path must survive -- and it
+      # has no mirrored rows anyway, which makes the plain count the right
+      # answer there. Naming a column that is not there fails the whole query,
+      # and an empty result then breaks the arithmetic below rather than the
+      # SQL, which is a long way from the cause.
+      legacy_dedupe=""
+      if [ "$(agmsg_sqlite "$store_path" \
+            "SELECT COUNT(*) FROM pragma_table_info('events') WHERE name='legacy_id';" \
+            2>/dev/null | tr -d '\r')" = "1" ]; then
+        legacy_dedupe=" WHERE NOT EXISTS (SELECT 1 FROM events e WHERE e.legacy_id = m.id)"
+      fi
+      legacy_count="$(agmsg_sqlite "$store_path" \
+        "SELECT COUNT(*) FROM messages m$legacy_dedupe;" 2>/dev/null | tr -d '\r')"
+      case "$legacy_count" in ''|*[!0-9]*) legacy_count=0 ;; esac
+      event_count="$((event_count + legacy_count))"
     fi
   fi
 
