@@ -567,9 +567,12 @@ _capability_endpoint() {
   # The route moved to the handoff bundle (#668); the gate still withholds it.
   # `grep -q` + status, not `[[ ]]`: a failing `[[ ]]` mid-body is not enforced
   # on bash 3.2 (#670), and these are the assertions that just moved.
-  run bash -c 'printf "%s\n" "$1" | grep -q "secret handoff bundle"' _ "$output"
+  # Captured first: `run` overwrites $output, so the second check below would
+  # otherwise grep the first grep's empty stdout and pass for that reason.
+  out="$output"
+  run bash -c 'printf "%s\n" "$1" | grep -q "secret handoff bundle"' _ "$out"
   [ "$status" -ne 0 ] || return 1
-  run bash -c 'printf "%s\n" "$1" | grep -q "key.sh"' _ "$output"
+  run bash -c 'printf "%s\n" "$1" | grep -q "key.sh"' _ "$out"
   [ "$status" -ne 0 ] || return 1
 }
 
@@ -1229,31 +1232,54 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   # The ordering point, which is the one that is expensive to learn late.
   printf '%s\n' "$output" | grep -q 'does not tell the server' || return 1
 
-  # Both routes are runnable as printed, not merely mentioned.
+  # The first route is RUN, with its placeholder replaced by a free local name.
+  # Parsing argv only shows the line survives a shell; it does not show the
+  # line goes anywhere. The previous version of this route re-ran the command
+  # that had just failed -- it parsed perfectly and returned the same refusal
+  # forever (review). A way out has to come out.
   line="$(printf '%s\n' "$output" | grep -F -- "remote.sh' pull " | head -1)"
   [ -n "$line" ] || return 1
-  # Everything up to the first placeholder. `<new-name>` and `<file>` are for
-  # the reader to replace; left in, a shell reads them as redirections and the
-  # parse dies. What must survive a shell is the part that is already complete.
-  eval "set -- ${line%%<*}"
-  [ "$1" = bash ] || return 1
-  [ -f "$2" ] || return 1
-  [ "$3" = pull ] || return 1
-  [ "$4" = --endpoint ] || return 1
-  [ "$5" = "$ENDPOINT" ] || return 1
-  [ "$6" = --team-id ] || return 1
-  [ "$7" = "$PULL_TEAM_ID" ] || return 1
-  [ "$8" = clash ] || return 1
+  run bash -c "${line%%<*}rescued"
+  [ "$status" -eq 0 ] || { echo "the printed way out did not run: $output" >&2; return 1; }
+  [ -f "$TEST_SKILL_DIR/teams/rescued/config.json" ] || return 1
+  # And the local team it refused to touch is still theirs, still its own id.
+  [ -f "$TEST_SKILL_DIR/teams/clash/config.json" ] || return 1
+  still="$(python3 -c "import json;print(json.load(open('$TEST_SKILL_DIR/teams/clash/config.json'))['team_id'])")"
+  [ "$still" != "$PULL_TEAM_ID" ] || return 1
+}
 
-  line="$(printf '%s\n' "$output" | grep -F -- "rename-team.sh' " | head -1)"
-  [ -n "$line" ] || return 1
-  # Everything up to the first placeholder. `<new-name>` and `<file>` are for
-  # the reader to replace; left in, a shell reads them as redirections and the
-  # parse dies. What must survive a shell is the part that is already complete.
-  eval "set -- ${line%%<*}"
-  [ "$1" = bash ] || return 1
-  [ -f "$2" ] || return 1
-  [ "$3" = clash ] || return 1
+@test "remote pull: a CONNECTED local team is not told to rename itself (#680)" {
+  # Only one of the two states can take the rename route, and which one is
+  # knowable here -- so it is decided here rather than handed over as a caveat.
+  # rename-team.sh is local only: it never reads or writes `remote_binding` and
+  # never tells the server, so renaming a connected team leaves the binding
+  # naming the team the server still knows by the old name.
+  bash "$SCRIPTS/join.sh" clashconn alice claude-code /tmp/project-cc >/dev/null
+  python3 - "$TEST_SKILL_DIR/teams/clashconn/config.json" <<'PY_BIND'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d['remote_binding'] = {'endpoint': 'https://elsewhere.example',
+                       'server_instance_id': '018f3f7e-9999-7000-8000-000000000000',
+                       'remote_team_id': d['team_id'],
+                       'connected_at': '2026-07-30T00:00:00Z',
+                       'disconnected_at': None}
+open(p, 'w').write(json.dumps(d) + '\n')
+PY_BIND
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" clashconn
+  [ "$status" -ne 0 ] || return 1
+  # Captured before anything else runs. `run` overwrites $output, so a second
+  # `run` used to check an ABSENCE would be greping the previous grep's empty
+  # stdout -- and passing for that reason.
+  out="$output"
+
+  # The route that still works is offered.
+  printf '%s\n' "$out" | grep -q -F -- "remote.sh' pull " || return 1
+  # The one that would break their binding is not.
+  run bash -c 'printf "%s\n" "$1" | grep -q "rename-team.sh"' _ "$out"
+  [ "$status" -ne 0 ] || { echo "a connected team was told to rename itself" >&2; return 1; }
+  # And it says why, rather than just going quiet.
+  printf '%s\n' "$out" | grep -q 'it is connected' || return 1
 }
 
 @test "remote pull: the way out survives a team with a space and a quote (#680)" {
@@ -1262,19 +1288,26 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   bash "$SCRIPTS/join.sh" "$qteam" alice claude-code /tmp/project-qc >/dev/null
   run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" "$qteam"
   [ "$status" -ne 0 ] || return 1
-  line="$(printf '%s\n' "$output" | grep -F -- "remote.sh' pull " | head -1)"
+  out="$output"
+  # The pull route no longer carries the local name -- it deliberately ends in
+  # a placeholder for a FREE one -- so what has to survive a shell there is the
+  # endpoint and the id.
+  line="$(printf '%s\n' "$out" | grep -F -- "remote.sh' pull " | head -1)"
   [ -n "$line" ] || return 1
-  # Everything up to the first placeholder. `<new-name>` and `<file>` are for
-  # the reader to replace; left in, a shell reads them as redirections and the
-  # parse dies. What must survive a shell is the part that is already complete.
+  # Everything up to the first placeholder: `<a-free-local-name>` is for the
+  # reader to replace, and a shell reads it as a redirection.
   eval "set -- ${line%%<*}"
-  [ "$8" = "$qteam" ] || return 1
-  line="$(printf '%s\n' "$output" | grep -F -- "rename-team.sh' " | head -1)"
+  [ "$1" = bash ] || return 1
+  [ -f "$2" ] || return 1
+  [ "$5" = "$ENDPOINT" ] || return 1
+  [ "$7" = "$PULL_TEAM_ID" ] || return 1
+
+  # The rename route is where the awkward name has to come back intact.
+  line="$(printf '%s\n' "$out" | grep -F -- "rename-team.sh' " | head -1)"
   [ -n "$line" ] || return 1
-  # Everything up to the first placeholder. `<new-name>` and `<file>` are for
-  # the reader to replace; left in, a shell reads them as redirections and the
-  # parse dies. What must survive a shell is the part that is already complete.
   eval "set -- ${line%%<*}"
+  [ "$1" = bash ] || return 1
+  [ -f "$2" ] || return 1
   [ "$3" = "$qteam" ] || return 1
 }
 

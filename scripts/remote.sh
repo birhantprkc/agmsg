@@ -599,7 +599,7 @@ _remote_json_array_length() {
 # roster taken from anywhere else at this moment would be a guess presented as
 # fact. It is derived by replaying the team journal.
 _remote_write_pulled_team() {
-  local team="$1" team_id="$2" endpoint="${3:-<url>}" cfg initial existing_id
+  local team="$1" team_id="$2" endpoint="${3:-<url>}" cfg initial existing_id local_connected
   cfg="$(_remote_team_config "$team")"
   mkdir -p "$TEAMS_DIR/$team"
   agmsg_lock_acquire "$TEAMS_DIR/$team" || return 1
@@ -625,20 +625,33 @@ _remote_write_pulled_team() {
         # The routes are the plain install's, so they are held back when a
         # caller owns the next step -- same split as everywhere else here.
         if agmsg_operator_guidance_is_ours; then
+          # The first route must land somewhere the collision is not (review).
+          # Re-running with --team-id and the SAME local name reproduces the
+          # command that just failed: that flag picks between same-named teams
+          # on the SERVER, and the local name is still taken either way. With a
+          # free local name it is a route that completes -- and it is the one
+          # that works even when the local team is connected and must not move.
           echo "Two ways forward:"
-          echo "  the name matched the wrong team on the server — name the right one:"
-          echo "    bash $(agmsg_shq "$SKILL_DIR/scripts/remote.sh") pull --endpoint $(agmsg_shq "$endpoint") --team-id $(agmsg_shq "$team_id") $(agmsg_shq "$team")"
-          echo "  both teams are real — rename the local one, BEFORE connecting it:"
-          echo "    bash $(agmsg_shq "$SKILL_DIR/scripts/rename-team.sh") $(agmsg_shq "$team") <new-name>"
-          # Why the ordering is worth printing at the moment of refusal rather
-          # than left for the operator to find out: rename-team.sh is local
-          # only. It never reads or writes `remote_binding` and never tells the
-          # server -- so renaming a team that is ALREADY connected leaves the
-          # binding naming the team the server still knows by the old name,
-          # and the other machine with it. Before connecting, it is one local
-          # copy and nothing to disagree with.
-          echo "  Renaming is local only: it does not tell the server, so a team renamed"
-          echo "  after it is connected keeps a binding that names the old one."
+          echo "  keep your local '$team' and take the server's team under a free name:"
+          echo "    bash $(agmsg_shq "$SKILL_DIR/scripts/remote.sh") pull --endpoint $(agmsg_shq "$endpoint") --team-id $(agmsg_shq "$team_id") <a-free-local-name>"
+          # The second route frees THIS name, and only one of the two states can
+          # take it. rename-team.sh is local only: it never reads or writes
+          # `remote_binding` and never tells the server, so renaming a team that
+          # is already connected leaves the binding naming the team the server
+          # still knows by the old name. Which state the operator is in is
+          # knowable here, so it is decided here rather than handed over as a
+          # caveat to apply themselves.
+          local_connected="$(_remote_read_config_field "$cfg" '$.remote_binding.connected_at')"
+          if [ -n "$local_connected" ] && [ "$local_connected" != null ]; then
+            echo "  renaming your local '$team' is NOT a way out: it is connected, and a"
+            echo "  rename is local only — it does not tell the server, so the binding"
+            echo "  would keep naming the team the server still knows by the old name."
+          else
+            echo "  or free this name first — your local '$team' is not connected, so:"
+            echo "    bash $(agmsg_shq "$SKILL_DIR/scripts/rename-team.sh") $(agmsg_shq "$team") <a-new-name-for-it>"
+            echo "  then pull again. Rename before connecting, never after: a rename is"
+            echo "  local only and does not tell the server."
+          fi
         fi
       } >&2
       agmsg_lock_release
