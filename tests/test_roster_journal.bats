@@ -199,3 +199,44 @@ EOF
   [ ! -d "$team_dir/.config.lock" ]
   [ "$(config_field "$config" '$.agents.alice.member_id')" = "$member_id" ]
 }
+
+# On Windows, sqlite3.exe is a native binary that cannot open an MSYS path like
+# /tmp/x/roster.jsonl. agmsg_sql_readfile_path runs `cygpath -w` first, then
+# escapes. A value escaper doubles quotes and converts nothing, so readfile()
+# returns NULL, the projection comes back empty, and join.sh exits 1 right after
+# printing that it created the team -- with nothing on stderr, because an
+# unopenable file and an empty file are the same answer at every layer (#669).
+#
+# cygpath does not exist off Windows, so the conversion has no observable effect
+# here. Stub an IDENTITY cygpath instead: it returns its argument unchanged, so
+# behaviour on this platform is exactly what it was, and it records what it was
+# asked to convert. The record is the assertion -- which paths took the
+# converted route, rather than whether this particular platform happened to
+# need it.
+_record_converted_paths() {   # $1 = dir to put the stub in, $2 = log file
+  mkdir -p "$1"
+  cat > "$1/cygpath" <<EOS
+#!/usr/bin/env bash
+# Identity conversion. Last argument is the path (\`cygpath -w <path>\`); read it
+# with a loop rather than \${@: -1} so bash 3.2 handles it too.
+last=""
+for a in "\$@"; do last="\$a"; done
+printf '%s\n' "\$last" >> "$2"
+printf '%s' "\$last"
+EOS
+  chmod +x "$1/cygpath"
+}
+
+@test "roster journal: every path it hands sqlite goes through the path converter (#669)" {
+  local bin="$BATS_TEST_TMPDIR/bin" log="$BATS_TEST_TMPDIR/converted.log"
+  _record_converted_paths "$bin" "$log"
+
+  PATH="$bin:$PATH" bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
+
+  # Both files this module reads via readfile() must appear. Asserting on the
+  # journal alone would stay green for a version that converted it and left the
+  # team config on the old route.
+  [ -f "$log" ]
+  grep -q 'roster\.jsonl$' "$log"
+  grep -q 'config\.json$' "$log"
+}
