@@ -1282,6 +1282,32 @@ PY_BIND
   printf '%s\n' "$out" | grep -q 'it is connected' || return 1
 }
 
+@test "remote pull: a DISCONNECTED local team is still offered the rename (#680)" {
+  # "has ever connected" is not "is connected". A disconnected team keeps its
+  # connected_at and gains a disconnected_at, and reading the first alone
+  # withheld a route it is entitled to (review). Its name is free to move: the
+  # binding it would leave behind is already dead.
+  bash "$SCRIPTS/join.sh" clashoff alice claude-code /tmp/project-off >/dev/null
+  python3 - "$TEST_SKILL_DIR/teams/clashoff/config.json" <<'PY_BIND'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d['remote_binding'] = {'endpoint': 'https://elsewhere.example',
+                       'server_instance_id': '018f3f7e-9999-7000-8000-000000000000',
+                       'remote_team_id': d['team_id'],
+                       'connected_at': '2026-07-30T00:00:00Z',
+                       'disconnected_at': '2026-07-31T00:00:00Z'}
+open(p, 'w').write(json.dumps(d) + '\n')
+PY_BIND
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" clashoff
+  [ "$status" -ne 0 ] || return 1
+  out="$output"
+  printf '%s\n' "$out" | grep -q -F -- "rename-team.sh' " || return 1
+  printf '%s\n' "$out" | grep -q 'not connected' || return 1
+  run bash -c 'printf "%s\n" "$1" | grep -q "it is connected"' _ "$out"
+  [ "$status" -ne 0 ] || { echo "a disconnected team was called connected" >&2; return 1; }
+}
+
 @test "remote pull: the way out survives a team with a space and a quote (#680)" {
   # The printed `pull --team-id` line carries the team name back to a shell.
   local qteam="it's a clash"

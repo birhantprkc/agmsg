@@ -599,7 +599,7 @@ _remote_json_array_length() {
 # roster taken from anywhere else at this moment would be a guess presented as
 # fact. It is derived by replaying the team journal.
 _remote_write_pulled_team() {
-  local team="$1" team_id="$2" endpoint="${3:-<url>}" cfg initial existing_id local_connected
+  local team="$1" team_id="$2" endpoint="${3:-<url>}" cfg initial existing_id local_connected local_disconnected
   cfg="$(_remote_team_config "$team")"
   mkdir -p "$TEAMS_DIR/$team"
   agmsg_lock_acquire "$TEAMS_DIR/$team" || return 1
@@ -641,8 +641,16 @@ _remote_write_pulled_team() {
           # still knows by the old name. Which state the operator is in is
           # knowable here, so it is decided here rather than handed over as a
           # caveat to apply themselves.
+          # STILL connected, which is not the same as "has ever connected"
+          # (review). A disconnected team keeps its `connected_at` and gains a
+          # `disconnected_at`, so reading the first alone calls it connected
+          # and withholds a route it is entitled to. This is the same predicate
+          # `_remote_status_one` and `connect`'s re-adoption use: a binding is
+          # live when it has a connected_at and no disconnected_at.
           local_connected="$(_remote_read_config_field "$cfg" '$.remote_binding.connected_at')"
-          if [ -n "$local_connected" ] && [ "$local_connected" != null ]; then
+          local_disconnected="$(_remote_read_config_field "$cfg" '$.remote_binding.disconnected_at')"
+          if [ -n "$local_connected" ] && [ "$local_connected" != null ] \
+            && { [ -z "$local_disconnected" ] || [ "$local_disconnected" = null ]; }; then
             echo "  renaming your local '$team' is NOT a way out: it is connected, and a"
             echo "  rename is local only — it does not tell the server, so the binding"
             echo "  would keep naming the team the server still knows by the old name."
