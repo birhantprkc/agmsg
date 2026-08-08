@@ -27,6 +27,11 @@
 # Resolve THIS lib's dir at source time (robust to later subshell/relative cwd).
 _AGMSG_DRIVER_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 
+if ! declare -F agmsg_sql_readfile_path >/dev/null 2>&1; then
+  # shellcheck disable=SC1091
+  source "$_AGMSG_DRIVER_LIB_DIR/sqlpath.sh"
+fi
+
 # <skill-root> = up two from scripts/lib/.
 _agmsg_driver_root() {
   cd "$_AGMSG_DRIVER_LIB_DIR/../.." 2>/dev/null && pwd
@@ -113,7 +118,7 @@ agmsg_driver_for_team() {
   # readfile() rather than a shell read: a config may contain any UTF-8, and
   # this mirrors how the rest of the tree reads these files.
   name="$(sqlite3 :memory: \
-    "SELECT COALESCE(json_extract(readfile('$(printf '%s' "$cfg" | sed "s/'/''/g")'), '\$.drivers.$axis'), '')" \
+    "SELECT COALESCE(json_extract(readfile('$(agmsg_sql_readfile_path "$cfg")'), '\$.drivers.$axis'), '')" \
     2>/dev/null | tr -d '\r')"
   case "$name" in ''|null) printf '%s\n' "$default" ;; *) printf '%s\n' "$name" ;; esac
 }

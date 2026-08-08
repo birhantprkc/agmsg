@@ -183,7 +183,7 @@ _key_confirmed_epoch() {
     return 1
   fi
   row="$(agmsg_sqlite_mem "
-    WITH doc(j) AS (SELECT readfile('$(_agmsg_sqlesc "$snapshot")')),
+    WITH doc(j) AS (SELECT readfile('$(agmsg_sql_readfile_path "$snapshot")')),
          tail(e) AS (
            SELECT value FROM doc, json_each(json_extract(doc.j, '\$.history'))
             ORDER BY CAST(key AS INTEGER) DESC LIMIT 1)
@@ -545,7 +545,7 @@ cmd_import() {
       fingerprint="$(_key_fingerprint_sha256 "$recipient")"
       staged_key_id=""
       if [ -f "$journal" ]; then
-        journal_sql="$(_agmsg_sqlesc "$journal")"
+        journal_sql="$(agmsg_sql_readfile_path "$journal")"
         staged_key_id="$(agmsg_sqlite_mem "
           WITH source(doc) AS (
             SELECT '[' || replace(
@@ -632,7 +632,7 @@ cmd_rotate() {
     echo "agmsg: team '$team' has no identity journal; connect or migrate it before rotating." >&2
     exit 1
   fi
-  journal_sql="$(_agmsg_sqlesc "$journal")"
+  journal_sql="$(agmsg_sql_readfile_path "$journal")"
   pending="$(agmsg_sqlite_mem "
     WITH source(doc) AS (
       SELECT '[' || replace(
