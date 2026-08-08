@@ -503,6 +503,22 @@ _capability_endpoint() {
   [[ "$output" == *"out of band"* ]]
 }
 
+@test "connect: the snapshot export it prints names a key.sh that exists" {
+  # The line is the first step of getting a second machine in, and `key.sh` is
+  # not on PATH (#667). Existence, not spelling: a path into the wrong install
+  # would match any substring check and still not run.
+  #
+  # `[ ]` and `grep -q`, not `[[ ]]`: on bash 3.2 a failing `[[ ]]` in the
+  # middle of a body does not trip errexit (#670).
+  skip_if_no_age
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q 'Export the public epoch snapshot'
+  path="$(printf '%s\n' "$output" | sed -n "s/.*bash '\([^']*key\.sh\)'.*/\1/p" | head -1)"
+  [ -n "$path" ]
+  [ -f "$path" ]
+}
+
 @test "connect: a caller that owns the guidance does not get the out-of-band line" {
   skip_if_no_age
   # Carrying the key by hand is this install's answer to adding a machine. A
@@ -607,7 +623,10 @@ _capability_endpoint() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"Connected: team 'testteam' (age-v1 encrypted)."* ]]
   [[ "$output" == *"Back this up now"* ]]
-  [[ "$output" == *"key.sh show testteam --snapshot --out <file>"* ]]
+  # The command carries its install path and quotes its team now (#667), so the
+  # bare spelling is gone. `grep -q`, not `[[ ]]`: a failing `[[ ]]` mid-body is
+  # not enforced on bash 3.2 (#670), and this assertion is one that just moved.
+  printf '%s\n' "$output" | grep -q -F -- "key.sh' show 'testteam' --snapshot --out <file>"
   sync_config="$TEST_SKILL_DIR/db/remote-sync/testteam.json"
   [ -f "$sync_config" ]
   [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$sync_config")') AS TEXT), '\$.cipher_profile');")" = "age-v1" ]

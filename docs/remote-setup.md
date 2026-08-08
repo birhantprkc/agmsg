@@ -1,5 +1,7 @@
 # Remote setup
 
+*[日本語](remote-setup.ja.md)*
+
 This walkthrough connects an existing team on machine A to the reference
 server, then pulls it into a normal agmsg install on machine B. Your local
 agents handle the client commands. This setup uses plaintext sync.
@@ -8,7 +10,7 @@ For encrypted sync, read
 
 ## Requirements
 
-- PostgreSQL 17
+- Docker with Compose — or PostgreSQL 17, if you bring your own database
 - Node.js 22 or later
 - Bash, SQLite, and curl
 - An agmsg checkout on the server host
@@ -18,31 +20,58 @@ Use HTTPS when the server is not on localhost.
 
 ## 1. Start the reference server
 
-Create an empty PostgreSQL database, then start the server from the repository
-checkout:
+The Compose stack brings up PostgreSQL and the server together. Run it from the
+`server` directory:
 
 ```sh
 cd server
-npm ci
-
-export DATABASE_URL="postgresql://<user>:<password>@127.0.0.1:5432/<db>"
-export HOST=0.0.0.0
-export PORT=8787
-npx tsx src/index.ts
+docker compose up -d --build
 ```
 
-Replace every value in angle brackets, especially `<db>`, with the real
-PostgreSQL values before running the command. The example will not work until
-you replace them.
+Nothing to fill in: the database name, user and password are in
+`server/compose.yaml`. They are development defaults — read
+[Network boundary](#network-boundary) before this server is reachable by
+anyone else.
 
-Make the server available to both machines at an HTTPS URL, then confirm it is
-ready:
+Confirm the server and database are ready. On the machine running Compose:
+
+```sh
+curl -fsS http://127.0.0.1:8787/v1/health
+```
+
+The response should contain `"status":"ok"` and `"database":"ok"`. If the
+containers are still starting, retry until it succeeds.
+
+Then make the server available to both machines at an HTTPS URL, and check it
+from there too:
 
 ```sh
 curl -fsS https://<server-url>/v1/health
 ```
 
-The response should contain `"status":"ok"` and `"database":"ok"`.
+### Using your own database instead
+
+If you already run PostgreSQL, start the server from source against it. The
+commands live in [`server/README.md` → Run from
+source](../server/README.md#run-from-source), which is the one place they are
+written down.
+
+Either way the server applies its own migrations at startup, so there is no
+schema step to run first.
+
+### Network boundary
+
+The reference profile has no authentication: reaching the server is the
+permission. Anyone who can reach it and name a team can read that team's
+remote stream. Keep it on a network you control, and use HTTPS for anything
+leaving localhost. Encrypting with `age-v1`
+([below](#extra-end-to-end-encryption)) keeps envelope contents from the
+server; it does not replace the boundary.
+
+The Compose stack publishes its port and ships a development password in
+`compose.yaml`. Change that password and terminate TLS in front of the service
+before this reaches a network you do not control — see
+[`server/README.md` → Compose configuration](../server/README.md#compose-configuration).
 
 ## 2. Connect the existing team on machine A
 
@@ -70,11 +99,40 @@ server. It must not create or join a same-named local team. If it finds an
 unconnected local team with that name, it will stop and ask you how to proceed
 instead of overwriting or combining the two teams.
 
-After pull succeeds, the team is local and works like any other local team.
-Open your agent, invoke its installed `agmsg` command, and join the team with a
-new agent name.
+After pull succeeds, the team exists on machine B. That is not the same as
+machine B being *in* it — the team arrived with machine A's roster, and the
+agents here still have no name in it. One more step, below.
 
-## 4. Send and verify
+If this team is encrypted, `pull` stops and reports the team as locked. Go to
+[Extra: end-to-end encryption](#extra-end-to-end-encryption), unlock it, and
+come back here.
+
+## 4. Join from machine B
+
+In the agent you want to put in the team, invoke the install's own command
+**with no arguments**:
+
+```text
+/agmsg
+```
+
+The command is named after the install: one made with `install.sh --cmd
+agmsg-rw` answers to `/agmsg-rw`, and that is the one to type.
+
+Bare, with nothing after it, the command notices this agent belongs to no team
+yet and lists the teams it can see — the pulled one among them. Choose it. The
+team already exists, so it reads the roster, sees which names machine A is
+already using, and offers unused ones that follow the same convention. Then it
+asks for a [delivery mode](../README.md#delivery-modes).
+
+**Take a new name.** A name is one identity in one team; two machines answering
+to the same one is what this step exists to prevent. The suggestions are
+generated against the live roster, so any of them is safe.
+
+Nothing here is remote-specific — it is the ordinary first-run join, and after
+it the team behaves like any other local team.
+
+## 5. Send and verify
 
 On machine A, ask your local agent:
 
@@ -124,6 +182,10 @@ bash ~/.agents/skills/agmsg/scripts/remote.sh unlock <team> \
 envelopes, and starts the encrypted sync engine. It is safe to repeat with the
 same confirmed bundle. The bundle contains private keys: keep it secret and
 delete the transferred copy when it is no longer needed.
+
+Unlock finishes the key work, not the membership. Machine B still has no name in
+the team, so return to [4. Join from machine B](#4-join-from-machine-b) and
+carry on from there.
 
 ## Reference
 

@@ -17,6 +17,10 @@ if ! declare -F agmsg_write_atomic >/dev/null 2>&1; then
   # shellcheck disable=SC1091
   source "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/registry-lock.sh"
 fi
+if ! declare -F agmsg_sql_readfile_path >/dev/null 2>&1; then
+  # shellcheck disable=SC1091
+  source "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/sqlpath.sh"
+fi
 
 agmsg_roster_journal_path() {
   printf '%s/roster.jsonl\n' "$1"
@@ -26,6 +30,11 @@ agmsg_roster_has_journal() {
   [ -f "$(agmsg_roster_journal_path "$1")" ]
 }
 
+# For VALUES only — a name, a member id, a timestamp. A path bound for
+# readfile() takes agmsg_sql_readfile_path instead: this doubles quotes and
+# converts nothing, so on Git Bash sqlite got an MSYS path it could not open and
+# join.sh exited 1 in silence after creating the team (#669). The two names read
+# alike and do opposite things to a path, which is how the wrong one was picked.
 _agmsg_roster_sqlesc() {
   printf '%s' "$1" | sed "s/'/''/g"
 }
@@ -103,7 +112,7 @@ agmsg_roster_name_owner() {
   local team_dir="$1" name="$2" journal journal_sql name_sql
   journal="$(agmsg_roster_journal_path "$team_dir")"
   [ -f "$journal" ] || return 0
-  journal_sql="$(_agmsg_roster_sqlesc "$journal")"
+  journal_sql="$(agmsg_sql_readfile_path "$journal")"
   name_sql="$(_agmsg_roster_sqlesc "$name")"
   sqlite3 :memory: "
     WITH source(doc) AS (
@@ -137,7 +146,7 @@ agmsg_roster_ensure() {
   journal="$(agmsg_roster_journal_path "$team_dir")"
   [ -f "$journal" ] && return 0
   [ -f "$config" ] || return 0
-  config_sql="$(_agmsg_roster_sqlesc "$config")"
+  config_sql="$(agmsg_sql_readfile_path "$config")"
   team_id="$(sqlite3 :memory: \
     "SELECT COALESCE(json_extract(CAST(readfile('$config_sql') AS TEXT), '\$.team_id'),'');" \
     2>/dev/null | tr -d '\r')"
@@ -171,8 +180,44 @@ agmsg_roster_project_config() {
   journal="$(agmsg_roster_journal_path "$team_dir")"
   [ -f "$journal" ] || return 0
   [ -f "$config" ] || return 1
-  journal_sql="$(_agmsg_roster_sqlesc "$journal")"
-  config_sql="$(_agmsg_roster_sqlesc "$config")"
+  # Readability is checked BEFORE the query, not after it comes back empty.
+  #
+  # Measured: with the journal unreadable and the config fine, this projection
+  # does not return "" -- readfile(journal) is NULL, the fold sees no events,
+  # and json_set() still builds a perfectly valid config from the readable one.
+  # The result is a plausible document with an EMPTY roster, and the write below
+  # would commit it. Diagnosing an empty result only would let that through: the
+  # dangerous case is not the one that returns nothing, it is the one that
+  # returns something believable.
+  #
+  # It costs two sqlite invocations per projection. That is the price of not
+  # having the roster silently replaced by an empty one (#669).
+  local f f_sql unreadable=0
+  for f in "$journal" "$config"; do
+    agmsg_sql_readfile_ok "$f" && continue
+    unreadable=1
+    f_sql="$(agmsg_sql_readfile_path "$f")"
+    echo "agmsg: sqlite could not read '$f'." >&2
+    # The converted form too: on Windows the difference between the two IS the
+    # bug, and a reader who cannot see what sqlite was handed cannot see it.
+    # Off Windows the two are the same string and this line is redundant --
+    # cheap, beside a failure nobody could diagnose at all before.
+    echo "agmsg: sqlite was given: $f_sql" >&2
+  done
+  if [ "$unreadable" -eq 1 ]; then
+    # `[ -f ]` passed above, so the file is there and the OPEN is what failed.
+    # Which open failure it was, this cannot say: the path form is the one that
+    # brought us here (#669), and permissions, a lock, and I/O produce the same
+    # NULL. Naming a cause the check did not establish sends the next reader
+    # somewhere the evidence does not.
+    echo "agmsg: the file is present, so the open failed, not the lookup --" >&2
+    echo "agmsg: a path form a native sqlite3 cannot open (Git Bash's /tmp/...)," >&2
+    echo "agmsg: or permissions, a lock, or an I/O error on the file itself." >&2
+    echo "agmsg: refusing to project; the roster is left as it is." >&2
+    return 1
+  fi
+  journal_sql="$(agmsg_sql_readfile_path "$journal")"
+  config_sql="$(agmsg_sql_readfile_path "$config")"
   updated="$(sqlite3 :memory: "
     WITH
     source(doc) AS (
@@ -301,6 +346,43 @@ agmsg_roster_project_config() {
                     '\$.agents',json(agents.value),
                     '\$.retired_members',json(retired.value))
       FROM agents,retired;" 2>/dev/null | tr -d '\r')" || return 1
-  [ -n "$updated" ] || return 1
+  # Empty, after the precheck above already said both files open. Before #669
+  # this line was a bare `return 1` and every way of arriving here looked the
+  # same: join.sh printed "Created team:" and exited with nothing on stderr.
+  #
+  # The precheck is not repeated here for its own sake -- it passed. It is asked
+  # again because "it opened a moment ago" and "it opens now" are different
+  # claims: a lock, a permission change, or an unmounted volume between the two
+  # would land exactly here, and that failure deserves the open-failure message
+  # rather than being reported as bad journal contents. When both still open,
+  # the contents are what is left.
+  if [ -z "$updated" ]; then
+    local f f_sql named=0
+    for f in "$journal" "$config"; do
+      agmsg_sql_readfile_ok "$f" && continue
+      named=1
+      f_sql="$(agmsg_sql_readfile_path "$f")"
+      echo "agmsg: sqlite could not read '$f'." >&2
+      # The converted form too: on Windows the difference between the two IS
+      # the bug, and a reader who cannot see what sqlite was handed cannot see
+      # it. Off Windows they are the same string and this line is redundant --
+      # cheap, next to a failure nobody could diagnose at all before.
+      echo "agmsg: sqlite was given: $f_sql" >&2
+    done
+    if [ "$named" -eq 1 ]; then
+      # It opened for the precheck and does not open now, so this is a change
+      # under us -- a lock, a mode change, a volume going away. Which one, this
+      # cannot say, and it does not guess.
+      echo "agmsg: it opened moments ago and does not now -- something changed" >&2
+      echo "agmsg: under the run: a lock, permissions, or the volume." >&2
+    else
+      # Both readable, still nothing. A different failure, and it gets its own
+      # sentence rather than borrowing the one above -- saying "could not read"
+      # about a file that was read is how the next person loses an afternoon.
+      echo "agmsg: the roster projection produced no config for '$config'." >&2
+      echo "agmsg: both files were readable, so this is the journal's contents." >&2
+    fi
+    return 1
+  fi
   agmsg_write_atomic "$config" "$updated"
 }
