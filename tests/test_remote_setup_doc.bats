@@ -70,11 +70,23 @@ heading_anchors() {
   sed -n 's/^#\{1,6\}[[:space:]]*//p' "$1" | while IFS= read -r h; do slug "$h"; done
 }
 
+# The heading of the network-boundary section, identified by what the section
+# DOES rather than what it is called: it is the one whose body points at
+# server/README.md#compose-configuration.
+#
+# Named structurally because the name is translated. The alternative — a table
+# of "Network boundary" / "ネットワーク境界" / whatever comes third — is the
+# enumeration this whole change exists to remove.
+boundary_heading() {
+  awk '/^#{1,6}[[:space:]]/{h=$0} /server\/README\.md#compose-configuration/{print h; exit}' "$1" \
+    | sed 's/^#\{1,6\}[[:space:]]*//'
+}
+
 # Everything wrong with one walkthrough, one problem per line. Empty means
 # clean. Takes its inputs so a fixture can be checked the same way the real
 # tree is — a guard that can only run against the repo cannot be shown to fail.
 check_walkthrough() {
-  local doc="$1" compose_password="$2" port="$3" readme="$4" problems="" used anchors a
+  local doc="$1" compose_password="$2" port="$3" readme="$4" problems="" used anchors a bh bslug
 
   grep -q 'docker compose up -d --build' "$doc" \
     || problems="${problems}${doc}: does not offer the Compose path
@@ -128,6 +140,22 @@ check_walkthrough() {
   done <<EOF
 $anchors
 EOF
+
+  # The route to the network-boundary warning, both halves. "Every in-page link
+  # resolves" does not cover a REQUIRED link going missing (review): deleting
+  # the boundary heading, or the link to it, leaves the other in-page links
+  # resolving perfectly. In a document that recommends a stack publishing a
+  # port with a development password, that route is load-bearing.
+  bh="$(boundary_heading "$doc")"
+  if [ -z "$bh" ]; then
+    problems="${problems}${doc}: no section carries the network-boundary warning (nothing links to server/README.md#compose-configuration)
+"
+  else
+    bslug="$(slug "$bh")"
+    grep -q -F -- "](#${bslug})" "$doc" \
+      || problems="${problems}${doc}: nothing links to its network-boundary section (#${bslug})
+"
+  fi
 
   printf '%s' "$problems"
 }
