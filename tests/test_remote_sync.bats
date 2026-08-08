@@ -557,3 +557,124 @@ _reconcile_one_ack() {
   # The events table is still there: nothing above reached a statement.
   [ "$(agmsg_sqlite "$(agmsg_db_path demo)" "SELECT COUNT(*) FROM events;" | tr -d '\r')" -gt 0 ]
 }
+
+# The legacy `messages` table is a read interface other software still opens
+# (#689). A message that arrives from another machine lands here and nowhere
+# else, so mirroring only local sends would leave those readers seeing one side
+# of a conversation -- and the side they could not see is the reason this was
+# worth doing at all.
+@test "sync contract: a pulled message is mirrored into the legacy table, once" {
+  local remote page db
+  remote=$(jq -nc '
+    {type:"sync_pull_message",server_seq:"1",
+     id:"550e8400-e29b-41d4-a716-4466554400a1",
+     server_received_at:"2026-07-20T13:00:01.000000Z",
+     envelope:{v:1,cipher:"none",key_id:null,blob:(
+       {body:"arrived from elsewhere",created_at:"2026-07-20T13:00:01.000000Z",
+        from_agent:"carol",to_agent:"bob"}|tojson|@base64)},
+     status:"importable",policy_revision:"0",local_security_revision:"0",
+     projection:{body:"arrived from elsewhere",created_at:"2026-07-20T13:00:01.000000Z",
+                 from_agent:"carol",to_agent:"bob"}}')
+  page=$(printf '%s\n%s\n' "$remote" '{"type":"sync_pull_cursor","next_after":"1"}')
+  printf '%s\n' "$page" | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
+
+  db=$(agmsg_db_path demo)
+  # Visible to a reader of the legacy table — queried the way such a reader
+  # would, with no agmsg code in between.
+  [ "$(sqlite3 "$db" "SELECT count(*) FROM messages WHERE body='arrived from elsewhere';" | tr -d '\r')" -eq 1 ]
+  # And linked, so the readers that union the two tables see one message.
+  [ "$(sqlite3 "$db" "SELECT count(*) FROM events e JOIN messages m ON m.id=e.legacy_id WHERE e.type='message_sent' AND e.body='arrived from elsewhere';" | tr -d '\r')" -eq 1 ]
+  [ "$(storage_history demo | jq -s '[.[]|select(.body=="arrived from elsewhere")]|length')" -eq 1 ]
+  [ "$(storage_list_unread demo bob | jq -s '[.[]|select(.body=="arrived from elsewhere")]|length')" -eq 1 ]
+
+  # Re-applying the same durable page must not add a second legacy row either.
+  # The event is guarded against duplication; the mirror has to inherit that
+  # guard rather than carry its own copy of it.
+  printf '%s\n' "$page" | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
+  [ "$(sqlite3 "$db" "SELECT count(*) FROM messages WHERE body='arrived from elsewhere';" | tr -d '\r')" -eq 1 ]
+}
+
+# A partial commit is the failure this batch has to be incapable of. It now
+# spans the event, its legacy mirror, the sync mapping and the transport cursor,
+# and the CLI's default is to report a statement error and keep going — so
+# without -bail a failing mirror still reaches COMMIT and leaves an event with
+# no copy, plus a cursor that says the page was applied. A non-zero exit
+# afterwards does not undo any of that.
+#
+# Success and replay tests cannot see this; only a forced failure inside the
+# batch can.
+@test "sync contract: a failure inside the apply commits nothing (#689)" {
+  local first second db before_cursor
+  db=$(agmsg_db_path demo)
+
+  # Apply one page for real first, so the sync mapping and the transport cursor
+  # hold a value that a partial commit could move. Asserting against a store
+  # where they do not exist yet cannot tell "did not advance" from "was never
+  # there".
+  first=$(jq -nc '
+    {type:"sync_pull_message",server_seq:"1",
+     id:"550e8400-e29b-41d4-a716-4466554400c1",
+     server_received_at:"2026-07-20T13:00:01.000000Z",
+     envelope:{v:1,cipher:"none",key_id:null,blob:(
+       {body:"first arrival",created_at:"2026-07-20T13:00:01.000000Z",
+        from_agent:"carol",to_agent:"bob"}|tojson|@base64)},
+     status:"importable",policy_revision:"0",local_security_revision:"0",
+     projection:{body:"first arrival",created_at:"2026-07-20T13:00:01.000000Z",
+                 from_agent:"carol",to_agent:"bob"}}')
+  printf '%s\n%s\n' "$first" '{"type":"sync_pull_cursor","next_after":"1"}' \
+    | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
+  before_cursor=$(sqlite3 "$db" "SELECT transport_cursor FROM sync_bindings WHERE local_team='demo';" | tr -d '\r')
+  [ -n "$before_cursor" ]
+
+  # Now make the mirror — and only the mirror — fail. Removing the table does
+  # not work: storage_init recreates it before the batch runs, so the mirror
+  # succeeds and the test proves nothing. A trigger survives that and aborts
+  # exactly the statement under test.
+  sqlite3 "$db" "CREATE TRIGGER block_mirror BEFORE INSERT ON messages
+                 BEGIN SELECT RAISE(ABORT,'mirror blocked for this test'); END;"
+
+  second=$(jq -nc '
+    {type:"sync_pull_message",server_seq:"2",
+     id:"550e8400-e29b-41d4-a716-4466554400c2",
+     server_received_at:"2026-07-20T13:00:02.000000Z",
+     envelope:{v:1,cipher:"none",key_id:null,blob:(
+       {body:"must not survive",created_at:"2026-07-20T13:00:02.000000Z",
+        from_agent:"carol",to_agent:"bob"}|tojson|@base64)},
+     status:"importable",policy_revision:"0",local_security_revision:"0",
+     projection:{body:"must not survive",created_at:"2026-07-20T13:00:02.000000Z",
+                 from_agent:"carol",to_agent:"bob"}}')
+  local rc=0
+  printf '%s\n%s\n' "$second" '{"type":"sync_pull_cursor","next_after":"2"}' \
+    | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null 2>&1 || rc=$?
+  [ "$rc" -ne 0 ]
+
+  # All three, not just the event. Asserting the event alone would also pass for
+  # an implementation that deleted the event afterwards and left the mapping and
+  # the cursor advanced -- which is the state that silently loses a message.
+  [ "$(sqlite3 "$db" "SELECT count(*) FROM events WHERE body='must not survive';" | tr -d '\r')" -eq 0 ]
+  [ "$(sqlite3 "$db" "SELECT count(*) FROM sync_messages WHERE wire_id='550e8400-e29b-41d4-a716-4466554400c2';" | tr -d '\r')" -eq 0 ]
+  [ "$(sqlite3 "$db" "SELECT transport_cursor FROM sync_bindings WHERE local_team='demo';" | tr -d '\r')" = "$before_cursor" ]
+}
+
+# The other direction of the same correspondence. A row that was in the legacy
+# table before any of this gets projected into the event log when a team is
+# prepared for push; if that projection does not record which legacy row it is,
+# the readers see the message from both branches and list it twice — the
+# duplicate this change exists to remove, arriving from the other side.
+@test "sync contract: a projected legacy row is not listed twice (#689)" {
+  local db
+  db=$(agmsg_db_path demo)
+  sqlite3 "$db" "INSERT INTO messages (team,from_agent,to_agent,body,created_at)
+                 VALUES ('demo','carol','bob','older than the event log','2026-07-01T00:00:00Z');"
+  local legacy_id
+  legacy_id=$(sqlite3 "$db" "SELECT id FROM messages WHERE body='older than the event log';" | tr -d '\r')
+
+  prepare_push >/dev/null
+
+  # Projected, and carrying the link back to the row it came from.
+  [ "$(sqlite3 "$db" "SELECT COALESCE(legacy_id,-1) FROM events WHERE type='message_sent' AND body='older than the event log';" | tr -d '\r')" = "$legacy_id" ]
+
+  # And therefore counted once by each reader.
+  [ "$(storage_history demo | jq -s '[.[]|select(.body=="older than the event log")]|length')" -eq 1 ]
+  [ "$(storage_list_unread demo bob | jq -s '[.[]|select(.body=="older than the event log")]|length')" -eq 1 ]
+}
