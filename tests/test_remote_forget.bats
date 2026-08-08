@@ -72,10 +72,15 @@ set_disconnected_at() {
   [ -f "$store" ]
 }
 
-@test "forget: the disconnect it tells you to run first can be run as printed" {
+@test "forget: the disconnect it tells you to run first names a remote.sh that exists" {
   # `remote.sh` is not on PATH (#667). The refusal is only useful if the
   # command it offers resolves — checked by existence, not by spelling, since
   # a line naming the wrong install would satisfy a substring match.
+  #
+  # Existence only, which is what the name says. That the line PARSES back to
+  # the original team is a separate claim and a separate fixture, because
+  # `testteam` needs no quoting: it is pinned in
+  # test_printed_command_paths.bats against a team with a space and a quote.
   #
   # `[ ]` and `grep -q`, not `[[ ]]`: on bash 3.2 a failing `[[ ]]` in the
   # middle of a body does not trip errexit (#670).
