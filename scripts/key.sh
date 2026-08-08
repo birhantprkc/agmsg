@@ -29,6 +29,10 @@ source "$SCRIPT_DIR/lib/registry-lock.sh"
 source "$SCRIPT_DIR/lib/validate.sh"
 # shellcheck source=lib/operator-guidance.sh
 source "$SCRIPT_DIR/lib/operator-guidance.sh"
+# A printed command is one someone pastes, so the team name in it has to
+# survive a shell. See lib/shquote.sh for why naive `'$var'` is not enough.
+# shellcheck source=lib/shquote.sh
+source "$SCRIPT_DIR/lib/shquote.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/roster-journal.sh"
 
@@ -291,7 +295,8 @@ cmd_generate() {
   existing="$(_key_read_config_field "$cfg" '$.remote_key.current.key_id')"
   if [ -n "$existing" ] && [ "$existing" != "null" ]; then
     agmsg_lock_release
-    echo "agmsg: team '$team' already has a key (key_id=$existing) — use 'key.sh show $team' to view it (rotation is not available in this release)." >&2
+    echo "agmsg: team '$team' already has a key (key_id=$existing); rotation is not available in this release. To view it:" >&2
+    echo "  bash $(agmsg_shq "$SKILL_DIR/scripts/key.sh") show $(agmsg_shq "$team")" >&2
     exit 1
   fi
 
@@ -341,11 +346,11 @@ cmd_generate() {
     echo "Back this up now. agmsg does not store a copy of this key anywhere,"
     echo "and there is no server-side recovery — so losing this device loses"
     echo "the key, and with it the history. Run"
-    echo "'key.sh show $team --reveal-secret' to view and save it somewhere"
-    echo "safe — a password manager entry, not a plaintext file. Do NOT copy"
-    echo "it into a dotfiles repo, a git repo of any kind, or any other"
-    echo "synced/backed-up-by-a-tool location you wouldn't also trust with a"
-    echo "production credential."
+    echo "  bash $(agmsg_shq "$SKILL_DIR/scripts/key.sh") show $(agmsg_shq "$team") --reveal-secret"
+    echo "and save what it prints somewhere safe — a password manager entry,"
+    echo "not a plaintext file. Do NOT copy it into a dotfiles repo, a git repo"
+    echo "of any kind, or any other synced/backed-up-by-a-tool location you"
+    echo "wouldn't also trust with a production credential."
   fi
 }
 
@@ -374,7 +379,9 @@ cmd_show() {
   cfg="$(_key_team_config "$team")"
   key_id="${requested_key_id:-$(_key_read_config_field "$cfg" '$.remote_key.current.key_id')}"
   if [ -z "$key_id" ] || [ "$key_id" = "null" ]; then
-    echo "agmsg: team '$team' has no key yet — run 'key.sh generate $team' or 'key.sh import $team'." >&2
+    echo "agmsg: team '$team' has no key yet — run one of:" >&2
+    echo "  bash $(agmsg_shq "$SKILL_DIR/scripts/key.sh") generate $(agmsg_shq "$team")" >&2
+    echo "  bash $(agmsg_shq "$SKILL_DIR/scripts/key.sh") import $(agmsg_shq "$team")" >&2
     exit 1
   fi
 
@@ -777,7 +784,8 @@ EOF
   echo "Generated replacement key for team '$team' (epoch=$next_epoch, key_id=$key_id)."
   echo "Recipient fingerprint: $(_key_fingerprint "$recipient")"
   echo "The private key was not written to the journal; distribute it out of band."
-  echo "Use 'key.sh show $team --key-id $key_id --reveal-secret' on an interactive terminal."
+  echo "On an interactive terminal, run:"
+  echo "  bash $(agmsg_shq "$SKILL_DIR/scripts/key.sh") show $(agmsg_shq "$team") --key-id $(agmsg_shq "$key_id") --reveal-secret"
   echo "Messages before the acknowledged rotation boundary remain readable with the old key."
 }
 
