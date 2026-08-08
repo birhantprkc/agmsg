@@ -495,15 +495,46 @@ _capability_endpoint() {
   [[ "$output" != *"scripts/remote.sh"*"unlock"* ]]
 }
 
-@test "connect: the out-of-band handoff line is printed by default" {
+@test "connect: the handoff-bundle line is printed by default" {
+  # #668: this named the snapshot pair while `pull` on the other machine asked
+  # for the bundle, so each side named the other's route. It names the bundle
+  # now -- the same artifact pull asks for.
   skip_if_no_age
   run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"Export the public epoch snapshot"* ]]
-  [[ "$output" == *"out of band"* ]]
+  [ "$status" -eq 0 ] || return 1
+  printf '%s\n' "$output" | grep -q 'secret handoff bundle' || return 1
+  # And no longer sends the reader after the artifact the other side will not
+  # accept. An absence, because both routes still exist in `unlock`: what
+  # changed is which one is advertised, and an advertisement creeping back
+  # would be invisible to a presence check.
+  run bash -c 'printf "%s\n" "$1" | grep -q -- "--snapshot"' _ "$output"
+  [ "$status" -ne 0 ] || return 1
 }
 
-@test "connect: the snapshot export it prints names a key.sh that exists" {
+@test "connect: the handoff line survives a team with a space and a quote" {
+  # The route the operator actually takes, proven the way #667 proved the
+  # others: parse the printed command with a shell and compare argv byte for
+  # byte. A substring cannot tell correct quoting from a line that merely
+  # contains the right words.
+  skip_if_no_age
+  local qteam="it's a team"
+  bash "$SCRIPTS/join.sh" "$qteam" alice claude-code /tmp/project-q >/dev/null
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee "$qteam"
+  [ "$status" -eq 0 ] || return 1
+  line="$(printf '%s\n' "$output" | grep -F -- "key.sh' handoff " | head -1)"
+  [ -n "$line" ] || return 1
+  # Everything up to the first placeholder. `<new-name>` and `<file>` are for
+  # the reader to replace; left in, a shell reads them as redirections and the
+  # parse dies. What must survive a shell is the part that is already complete.
+  eval "set -- ${line%%<*}"
+  [ "$1" = bash ] || return 1
+  [ -f "$2" ] || return 1
+  [ "$3" = handoff ] || return 1
+  [ "$4" = "$qteam" ] || return 1
+  [ "$5" = --out ] || return 1
+}
+
+@test "connect: the handoff export it prints names a key.sh that exists" {
   # The line is the first step of getting a second machine in, and `key.sh` is
   # not on PATH (#667). Existence, not spelling: a path into the wrong install
   # would match any substring check and still not run.
@@ -513,7 +544,7 @@ _capability_endpoint() {
   skip_if_no_age
   run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam
   [ "$status" -eq 0 ]
-  printf '%s\n' "$output" | grep -q 'Export the public epoch snapshot'
+  printf '%s\n' "$output" | grep -q 'secret handoff bundle'
   path="$(printf '%s\n' "$output" | sed -n "s/.*bash '\([^']*key\.sh\)'.*/\1/p" | head -1)"
   [ -n "$path" ]
   [ -f "$path" ]
@@ -533,8 +564,13 @@ _capability_endpoint() {
   [ "$status" -eq 0 ]
   # The result is still reported -- only the next step is withheld.
   [[ "$output" == *"Connected: team 'testteam'"* ]]
-  [[ "$output" != *"Export the public epoch snapshot"* ]]
-  [[ "$output" != *"out of band"* ]]
+  # The route moved to the handoff bundle (#668); the gate still withholds it.
+  # `grep -q` + status, not `[[ ]]`: a failing `[[ ]]` mid-body is not enforced
+  # on bash 3.2 (#670), and these are the assertions that just moved.
+  run bash -c 'printf "%s\n" "$1" | grep -q "secret handoff bundle"' _ "$output"
+  [ "$status" -ne 0 ] || return 1
+  run bash -c 'printf "%s\n" "$1" | grep -q "key.sh"' _ "$output"
+  [ "$status" -ne 0 ] || return 1
 }
 
 @test "connect: requires the response protocol header" {
@@ -623,10 +659,10 @@ _capability_endpoint() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"Connected: team 'testteam' (age-v1 encrypted)."* ]]
   [[ "$output" == *"Back this up now"* ]]
-  # The command carries its install path and quotes its team now (#667), so the
-  # bare spelling is gone. `grep -q`, not `[[ ]]`: a failing `[[ ]]` mid-body is
-  # not enforced on bash 3.2 (#670), and this assertion is one that just moved.
-  printf '%s\n' "$output" | grep -q -F -- "key.sh' show 'testteam' --snapshot --out <file>"
+  # The route moved from the snapshot pair to the handoff bundle (#668); the
+  # path and quoting it gained in #667 stay. `grep -q`, not `[[ ]]`: a failing
+  # `[[ ]]` mid-body is not enforced on bash 3.2 (#670).
+  printf '%s\n' "$output" | grep -q -F -- "key.sh' handoff 'testteam' --out <file>"
   sync_config="$TEST_SKILL_DIR/db/remote-sync/testteam.json"
   [ -f "$sync_config" ]
   [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$sync_config")') AS TEXT), '\$.cipher_profile');")" = "age-v1" ]
@@ -1172,6 +1208,87 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" legacyteam
   [ "$status" -ne 0 ]
   [[ "$output" == *"already has history"* ]]
+}
+
+@test "remote pull: a same-named different team is refused WITH a way out (#680)" {
+  # The refusal was right and said nothing else. An operator learned that two
+  # things disagreed -- not which, not that their own team was untouched, not
+  # that there are two ways forward.
+  #
+  # A team joined locally mints its own id, so this is the everyday collision:
+  # same name, different team, no history to trip the earlier guard.
+  bash "$SCRIPTS/join.sh" clash alice claude-code /tmp/project-clash >/dev/null
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" clash
+  [ "$status" -ne 0 ] || return 1
+
+  # Both ids, labelled, so the operator can tell which is which.
+  printf '%s\n' "$output" | grep -q 'local id:' || return 1
+  printf '%s\n' "$output" | grep -q -F -- "$PULL_TEAM_ID" || return 1
+  # And that nothing was half-done.
+  printf '%s\n' "$output" | grep -q 'Nothing local was changed' || return 1
+  # The ordering point, which is the one that is expensive to learn late.
+  printf '%s\n' "$output" | grep -q 'does not tell the server' || return 1
+
+  # Both routes are runnable as printed, not merely mentioned.
+  line="$(printf '%s\n' "$output" | grep -F -- "remote.sh' pull " | head -1)"
+  [ -n "$line" ] || return 1
+  # Everything up to the first placeholder. `<new-name>` and `<file>` are for
+  # the reader to replace; left in, a shell reads them as redirections and the
+  # parse dies. What must survive a shell is the part that is already complete.
+  eval "set -- ${line%%<*}"
+  [ "$1" = bash ] || return 1
+  [ -f "$2" ] || return 1
+  [ "$3" = pull ] || return 1
+  [ "$4" = --endpoint ] || return 1
+  [ "$5" = "$ENDPOINT" ] || return 1
+  [ "$6" = --team-id ] || return 1
+  [ "$7" = "$PULL_TEAM_ID" ] || return 1
+  [ "$8" = clash ] || return 1
+
+  line="$(printf '%s\n' "$output" | grep -F -- "rename-team.sh' " | head -1)"
+  [ -n "$line" ] || return 1
+  # Everything up to the first placeholder. `<new-name>` and `<file>` are for
+  # the reader to replace; left in, a shell reads them as redirections and the
+  # parse dies. What must survive a shell is the part that is already complete.
+  eval "set -- ${line%%<*}"
+  [ "$1" = bash ] || return 1
+  [ -f "$2" ] || return 1
+  [ "$3" = clash ] || return 1
+}
+
+@test "remote pull: the way out survives a team with a space and a quote (#680)" {
+  # The printed `pull --team-id` line carries the team name back to a shell.
+  local qteam="it's a clash"
+  bash "$SCRIPTS/join.sh" "$qteam" alice claude-code /tmp/project-qc >/dev/null
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" "$qteam"
+  [ "$status" -ne 0 ] || return 1
+  line="$(printf '%s\n' "$output" | grep -F -- "remote.sh' pull " | head -1)"
+  [ -n "$line" ] || return 1
+  # Everything up to the first placeholder. `<new-name>` and `<file>` are for
+  # the reader to replace; left in, a shell reads them as redirections and the
+  # parse dies. What must survive a shell is the part that is already complete.
+  eval "set -- ${line%%<*}"
+  [ "$8" = "$qteam" ] || return 1
+  line="$(printf '%s\n' "$output" | grep -F -- "rename-team.sh' " | head -1)"
+  [ -n "$line" ] || return 1
+  # Everything up to the first placeholder. `<new-name>` and `<file>` are for
+  # the reader to replace; left in, a shell reads them as redirections and the
+  # parse dies. What must survive a shell is the part that is already complete.
+  eval "set -- ${line%%<*}"
+  [ "$3" = "$qteam" ] || return 1
+}
+
+@test "remote pull: a caller that owns the guidance gets the ids, not the routes" {
+  # Same split as everywhere else: the facts are true however agmsg was
+  # invoked; the routes are this install's.
+  bash "$SCRIPTS/join.sh" clash2 alice claude-code /tmp/project-clash2 >/dev/null
+  AGMSG_OPERATOR_GUIDANCE=caller run bash "$SCRIPTS/remote.sh" pull \
+    --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" clash2
+  [ "$status" -ne 0 ] || return 1
+  printf '%s\n' "$output" | grep -q 'local id:' || return 1
+  printf '%s\n' "$output" | grep -q 'Nothing local was changed' || return 1
+  run bash -c 'printf "%s\n" "$1" | grep -q "Two ways forward"' _ "$output"
+  [ "$status" -ne 0 ] || return 1
 }
 
 @test "remote pull: requires an endpoint, a team id and a local name" {

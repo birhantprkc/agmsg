@@ -599,14 +599,48 @@ _remote_json_array_length() {
 # roster taken from anywhere else at this moment would be a guess presented as
 # fact. It is derived by replaying the team journal.
 _remote_write_pulled_team() {
-  local team="$1" team_id="$2" cfg initial existing_id
+  local team="$1" team_id="$2" endpoint="${3:-<url>}" cfg initial existing_id
   cfg="$(_remote_team_config "$team")"
   mkdir -p "$TEAMS_DIR/$team"
   agmsg_lock_acquire "$TEAMS_DIR/$team" || return 1
   if [ -f "$cfg" ]; then
     existing_id="$(_remote_read_config_field "$cfg" '$.team_id')"
     if [ "$existing_id" != "$team_id" ]; then
-      echo "agmsg: local team '$team' has a different team id" >&2
+      # The refusal is right and stays. What was missing is what to do next
+      # (#680): the operator learned that two things disagreed and nothing
+      # else -- not which ids, not that their own team was untouched, not that
+      # there are two ways out and which is safe when.
+      #
+      # `_remote_resolve_team_id` a few lines down already answers the same
+      # class of question this way -- print what tells the candidates apart,
+      # then name the flag that settles it -- so this is that treatment, not a
+      # new convention.
+      {
+        echo "agmsg: local team '$team' is a different team from the one on the server."
+        echo "  local id:  $existing_id"
+        echo "  server id: $team_id"
+        # A fact, so it is said either way: the worst reading of a bare refusal
+        # is that something was half-done.
+        echo "Nothing local was changed."
+        # The routes are the plain install's, so they are held back when a
+        # caller owns the next step -- same split as everywhere else here.
+        if agmsg_operator_guidance_is_ours; then
+          echo "Two ways forward:"
+          echo "  the name matched the wrong team on the server — name the right one:"
+          echo "    bash $(agmsg_shq "$SKILL_DIR/scripts/remote.sh") pull --endpoint $(agmsg_shq "$endpoint") --team-id $(agmsg_shq "$team_id") $(agmsg_shq "$team")"
+          echo "  both teams are real — rename the local one, BEFORE connecting it:"
+          echo "    bash $(agmsg_shq "$SKILL_DIR/scripts/rename-team.sh") $(agmsg_shq "$team") <new-name>"
+          # Why the ordering is worth printing at the moment of refusal rather
+          # than left for the operator to find out: rename-team.sh is local
+          # only. It never reads or writes `remote_binding` and never tells the
+          # server -- so renaming a team that is ALREADY connected leaves the
+          # binding naming the team the server still knows by the old name,
+          # and the other machine with it. Before connecting, it is one local
+          # copy and nothing to disagree with.
+          echo "  Renaming is local only: it does not tell the server, so a team renamed"
+          echo "  after it is connected keeps a binding that names the old one."
+        fi
+      } >&2
       agmsg_lock_release
       return 1
     fi
@@ -755,7 +789,10 @@ cmd_pull() {
   # The roster driver projects imported identity events into this config while
   # the bootstrap is running. Publish the empty identity-bearing shell first;
   # retries reuse it, and the successful projection is never overwritten.
-  _remote_write_pulled_team "$team" "$team_id" || exit 1
+  # The endpoint travels so the refusal above can print a `pull --team-id` line
+  # that runs, rather than one with a placeholder the operator has to fill in
+  # from memory.
+  _remote_write_pulled_team "$team" "$team_id" "$endpoint" || exit 1
 
   local result pulled_id pulled_name imported pulled_sid pulled_protocol pulled_caps \
     pulled_age_v1 pulled_cipher binding_cipher
@@ -1571,9 +1608,25 @@ cmd_connect() {
   # the thing the ceremony exists to make unnecessary. So it is said only when
   # nobody else owns the next step.
   if [ "$e2ee" -eq 1 ] && agmsg_operator_guidance_is_ours; then
-    echo "Export the public epoch snapshot with:"
-    echo "  bash $(agmsg_shq "$SKILL_DIR/scripts/key.sh") show $(agmsg_shq "$team") --snapshot --out <file>"
-    echo "Transfer that snapshot and the key out of band; the other machine must import and live-confirm them before syncing."
+    # The bundle, not the snapshot pair (#668). Both are accepted by `unlock`
+    # and that has not changed; what changed is which one this screen names.
+    #
+    # It named the snapshot, and `pull` on the other machine asks for "the
+    # secret handoff bundle you were given" -- so each side named the other's
+    # route and an operator following the screens produced the wrong artifact.
+    #
+    # The bundle wins on a measurement rather than a preference: the snapshot
+    # route needs the private key too, and the only command that hands it over
+    # is `key.sh show --reveal-secret`, which refuses without a TTY. The
+    # walkthrough that leads here tells the reader to drive this with an agent,
+    # so that route stops at its second step for the reader it is written for.
+    # `key.sh handoff` needs no terminal, is one artifact instead of two, and
+    # is the one `unlock` gates behind a confirmed digest.
+    echo "Export one secret handoff bundle for the other machine:"
+    echo "  bash $(agmsg_shq "$SKILL_DIR/scripts/key.sh") handoff $(agmsg_shq "$team") --out <file>"
+    echo "That file IS the key: transfer it only through a channel you trust, and never"
+    echo "into agent chat. Compare the snapshot digest it prints over a separate live"
+    echo "channel — the other machine's unlock refuses the bundle without it."
   fi
 }
 
