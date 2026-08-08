@@ -44,11 +44,24 @@ start_matching_engine() {
   printf '%s\n' "$ENGINE_PID" > "$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
 }
 
+# Fakes ONE question: what is this pid's argv. Everything else goes to the real
+# ps.
+#
+# The `-o args=` guard is load-bearing. Without it the fixture answers every
+# `ps -p <ENGINE_PID>` with the argv string, and liveness now asks a different
+# question through the same command -- `_agmsg_pid_alive` consults
+# `ps -o stat= -p` when kill(1) reports ESRCH, and reads any non-empty,
+# non-zombie state as alive. A killed engine then reads as running, `sync start`
+# no-ops, and the test that asserts a NEW pid fails on an assertion that names
+# neither ps nor the fixture.
+#
+# So the fixture has to be as narrow as the thing it stands in for: a fake that
+# answers questions it was never asked will answer one that matters.
 write_matching_ps_fixture() {
   local fake_bin="$TEST_SKILL_DIR/fake-bin"
   mkdir -p "$fake_bin"
   printf '%s\n' '#!/usr/bin/env bash' \
-    "if [[ \" \$* \" == *\" -p $ENGINE_PID \"* ]]; then" \
+    "if [[ \" \$* \" == *\" -p $ENGINE_PID \"* && \" \$* \" == *\" -o args= \"* ]]; then" \
     "  printf '%s\\n' 'bash $SCRIPTS/internal/remote-sync.mjs run --team testteam'" \
     '  exit 0' \
     'fi' \
@@ -85,8 +98,23 @@ write_fake_node_ps_fixture() {
   local fake_node="$1" foreign_pid="${2:-}" ready_file="${3:-}" \
     fake_bin="$TEST_SKILL_DIR/fake-node-bin"
   mkdir -p "$fake_bin"
+  # Answers the argv question only. Anything else -- notably `-o stat=`, which
+  # `_agmsg_pid_alive` consults when kill(1) reports ESRCH -- goes to the real
+  # ps.
+  #
+  # Without that guard this fixture replies to EVERY ps call, for every pid,
+  # with an argv string and exit 0. Liveness then reads that string as a process
+  # state: non-empty and not starting with `Z`, so a killed engine reads as
+  # alive, `sync start` reports "already running", and the assertion that fails
+  # is the one about the new pid -- naming neither ps nor this fixture.
   printf '%s\n' '#!/usr/bin/env bash' \
-    'pid=""' \
+    'pid=""; args=0' \
+    'for a in "$@"; do' \
+    '  case "$a" in -o) ;; args=) args=1 ;; esac' \
+    'done' \
+    'case " $* " in *" -o args= "*) args=1 ;; esac' \
+    '[ "$args" = 1 ] || exec /bin/ps "$@"' \
+    'set -- "$@"' \
     'while [ $# -gt 0 ]; do' \
     '  if [ "$1" = "-p" ]; then pid="$2"; shift 2; else shift; fi' \
     'done' \
