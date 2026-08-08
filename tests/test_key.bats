@@ -595,6 +595,56 @@ EOS
   [ "$latest_epoch" = "2" ]
 }
 
+@test "key rotate: the reveal line it prints can be run as printed" {
+  # The seventh printed command (#667). The other six are pinned in
+  # test_printed_command_paths.bats; this one needs the rotate fixture, so it
+  # lives where that fixture already is.
+  #
+  # argv, not a substring: the line carries a key_id as well as a team, and a
+  # substring check cannot tell a correctly quoted line from one that merely
+  # contains the right words. `|| return 1`, and `[ ]` rather than `[[ ]]` —
+  # on bash 3.2 a bare `[[ ]]` mid-body is not enforced (#670).
+  #
+  # The team carries a space and a single quote, both legal (validate.sh
+  # rejects empty / `.` / `..` / `/` / `\\` / a leading `-` / control
+  # characters). Without them, dropping the quoting from this line still parses
+  # to the same argv and the test passes — measured, not assumed.
+  skip_if_no_age
+  local qteam="it's a team"
+  bash "$SCRIPTS/join.sh" "$qteam" alice claude-code /tmp/project-q
+  bash "$SCRIPTS/key.sh" generate "$qteam"
+  stub_current_age_snapshot
+  config="$SCRIPTS/../teams/$qteam/config.json"
+  python3 - "$config" <<'PY_BIND'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d['remote_binding'] = {'server_instance_id': '018f3f7e-0000-7000-8000-000000000000',
+                       'remote_team_id': '018f3f7e-0000-7000-8000-000000000001'}
+open(p, 'w').write(json.dumps(d) + '\n')
+PY_BIND
+  run bash "$SCRIPTS/key.sh" rotate "$qteam"
+  [ "$status" -eq 0 ] || return 1
+  line="$(printf '%s\n' "$output" | grep -F -- "key.sh' show " | head -1)"
+  [ -n "$line" ] || return 1
+  eval "set -- $line"
+  [ "$1" = bash ] || return 1
+  [ -f "$2" ] || return 1
+  [ "$3" = show ] || return 1
+  [ "$4" = "$qteam" ] || return 1
+  [ "$5" = --key-id ] || return 1
+  # The key_id it names is the replacement this run just generated, not the
+  # retired one: the same command pointing at the wrong secret would still
+  # parse. Taken from the run's own "Generated replacement key" line rather
+  # than from the config, because a rotation that is not yet confirmed leaves
+  # `remote_key.current` on the previous key.
+  [ -n "$6" ] || return 1
+  generated="$(printf '%s\n' "$output" | sed -n 's/.*Generated replacement key .*key_id=\([^)]*\)).*/\1/p' | head -1)"
+  [ -n "$generated" ] || return 1
+  [ "$6" = "$generated" ] || return 1
+  [ "$7" = --reveal-secret ] || return 1
+}
+
 @test "key rotate: refuses a team with no current key" {
   run bash "$SCRIPTS/key.sh" rotate testteam
   [ "$status" -ne 0 ]

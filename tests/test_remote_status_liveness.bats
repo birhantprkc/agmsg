@@ -108,7 +108,10 @@ remember_engine_pid() {
   run bash "$SCRIPTS/remote.sh" status testteam
   [ "$status" -eq 0 ]
   [[ "$output" == *"connected (engine stopped"* ]]
-  [[ "$output" == *"remote.sh sync start testteam"* ]]
+  # The command carries its install path and quotes its team now (#667), so the
+  # bare spelling is gone. `grep -q`, not `[[ ]]`: a failing `[[ ]]` mid-body is
+  # not enforced on bash 3.2 (#670), and this assertion is one that just moved.
+  printf '%s\n' "$output" | grep -q -F -- "remote.sh' sync start 'testteam'"
 
   run bash "$SCRIPTS/remote.sh" status testteam --json
   [ "$status" -eq 0 ]

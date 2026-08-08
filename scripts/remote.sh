@@ -1571,7 +1571,8 @@ cmd_connect() {
   # the thing the ceremony exists to make unnecessary. So it is said only when
   # nobody else owns the next step.
   if [ "$e2ee" -eq 1 ] && agmsg_operator_guidance_is_ours; then
-    echo "Export the public epoch snapshot with: key.sh show $team --snapshot --out <file>"
+    echo "Export the public epoch snapshot with:"
+    echo "  bash $(agmsg_shq "$SKILL_DIR/scripts/key.sh") show $(agmsg_shq "$team") --snapshot --out <file>"
     echo "Transfer that snapshot and the key out of band; the other machine must import and live-confirm them before syncing."
   fi
 }
@@ -1601,7 +1602,7 @@ _remote_status_one() {
     running)
       echo "$team	connected (engine running, pid $engine_pid) since $connected_at" ;;
     stopped)
-      echo "$team	connected (engine stopped — run: remote.sh sync start $team) since $connected_at" ;;
+      echo "$team	connected (engine stopped — run: bash $(agmsg_shq "$SKILL_DIR/scripts/remote.sh") sync start $(agmsg_shq "$team")) since $connected_at" ;;
     stale)
       if [ -n "$engine_pid" ]; then
         echo "$team	connected (engine stale — pidfile $engine_pid points at a dead or foreign process) since $connected_at"
@@ -1910,7 +1911,8 @@ cmd_forget() {
     exit 1
   fi
   if [ -z "$disconnected_at" ] || [ "$disconnected_at" = "null" ]; then
-    echo "agmsg: team '$team' is still connected; run 'remote.sh disconnect $team' first" >&2
+    echo "agmsg: team '$team' is still connected; run this first:" >&2
+    echo "  bash $(agmsg_shq "$SKILL_DIR/scripts/remote.sh") disconnect $(agmsg_shq "$team")" >&2
     exit 1
   fi
 
