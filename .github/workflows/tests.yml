@@ -81,10 +81,15 @@ jobs:
             [ -z "$f" ] && continue
             case "$f" in
               # Not covered by `docs/*` below: tests/test_remote_setup_doc.bats
-              # reads this file, and a guard that skips on a change to the file
-              # it guards is off exactly when it is needed. Same reason as
+              # reads these, and a guard that skips on a change to the file it
+              # guards is off exactly when it is needed. Same reason as
               # SKILL.md further down.
-              docs/remote-setup.md) docs_only=false ;;
+              #
+              # A pattern, not a filename. This arm named `docs/remote-setup.md`
+              # for an hour, and `docs/remote-setup.ja.md` landed inside that
+              # hour carrying the same port, docs-only and unguarded. The next
+              # translation is covered without anyone remembering this line.
+              docs/remote-setup*.md) docs_only=false ;;
               docs/*) ;;
               site/*) ;;
               app/*) app_changed=true ;;
