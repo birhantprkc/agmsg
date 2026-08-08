@@ -2006,7 +2006,10 @@ cmd_forget() {
       event_count="$(agmsg_sqlite "$store_path" "SELECT COUNT(*) FROM events;")"
     fi
     if printf '%s\n' "$tables" | grep -qx messages; then
-      event_count="$((event_count + $(agmsg_sqlite "$store_path" "SELECT COUNT(*) FROM messages;")))"
+      # Only legacy rows the event log does not already carry: every message is
+      # written to both tables (#689), so counting both in full reports twice
+      # the number of messages about to be deleted.
+      event_count="$((event_count + $(agmsg_sqlite "$store_path" "SELECT COUNT(*) FROM messages m WHERE NOT EXISTS (SELECT 1 FROM events e WHERE e.legacy_id = m.id);")))"
     fi
   fi
 

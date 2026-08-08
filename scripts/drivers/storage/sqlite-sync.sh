@@ -402,9 +402,14 @@ _sqlite_sync_project_legacy() {
   fi
 
   agmsg_sqlite "$db" "
-    INSERT INTO events(seq,type,id,team,from_agent,to_agent,body,at)
+    INSERT INTO events(seq,type,id,team,from_agent,to_agent,body,at,legacy_id)
       SELECT m.id - $_AGMSG_LEGACY_SEQ_OFFSET,'message_sent',CAST(m.id AS TEXT),
-             m.team,m.from_agent,m.to_agent,m.body,m.created_at
+             m.team,m.from_agent,m.to_agent,m.body,m.created_at,
+             -- Record which legacy row this event IS. The readers dedupe on
+             -- events.legacy_id = messages.id, so a projected row without it is
+             -- returned from both branches -- the same duplicate the mirror
+             -- exists to avoid, arriving from the other direction (#689).
+             m.id
         FROM messages m
        WHERE m.team='$tl'
          AND NOT EXISTS(SELECT 1 FROM events e
@@ -943,7 +948,15 @@ storage_sync_apply_pull() {
     WHERE local_team='$tl' AND server_instance_id='$server' AND remote_team_id='$remote'
       AND protocol_version=$protocol AND driver_generation='$generation';
     COMMIT;" >> "$sql_file"
-  if ! agmsg_sqlite "$db" < "$sql_file" >/dev/null 2>&1; then
+  # -bail, for the reason the local write path already carries it: the CLI
+  # reports a statement error and keeps going, so a failure partway through this
+  # batch would still reach the sync mapping, the transport cursor and the
+  # COMMIT. A non-zero exit afterwards does not undo what was committed. The
+  # batch now spans the event, its legacy mirror and the mapping, so a partial
+  # commit is exactly the asymmetry the mirror exists to prevent — an event with
+  # no copy, or a copy nothing points at (#689). Found in the local path while
+  # building this and not carried across; a reviewer caught that.
+  if ! agmsg_sqlite -bail "$db" < "$sql_file" >/dev/null 2>&1; then
     rm -f "$sql_file"; trap - EXIT INT TERM HUP; return 13
   fi
   rm -f "$sql_file"
