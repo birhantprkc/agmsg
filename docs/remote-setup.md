@@ -187,6 +187,30 @@ Unlock finishes the key work, not the membership. Machine B still has no name in
 the team, so return to [4. Join from machine B](#4-join-from-machine-b) and
 carry on from there.
 
+### Verifying a team's encryption state
+
+Local behavior looks identical either way — `history`, `inbox`, and `send`
+read and write exactly the same regardless of whether a team is encrypted.
+**A readable local message history is not evidence that a team is
+unencrypted.** Only the server side differs: an encrypted team's server rows
+carry `cipher: age-v1` and hold sealed ciphertext, so `from`, `to`, and `body`
+are not readable there.
+
+To find out whether a given team is e2ee, ask the program rather than
+inferring it from what you can read:
+
+```sh
+bash ~/.agents/skills/agmsg/scripts/remote.sh status <team>
+```
+
+For a connected team, the output includes an `encryption:` line reflecting
+the binding's declared cipher, the server's write policy, and whether a
+local key is present — possible values include `age-v1, ...`, `none` (in
+either of its forms), or `required, no local key`. Read the line itself
+rather than assuming a two-way encrypted / not-encrypted split. A
+disconnected team's status has no `encryption:` line at all; reconnect
+first.
+
 ## Reference
 
 ### Install on machine B
