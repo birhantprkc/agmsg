@@ -518,7 +518,7 @@ _capability_endpoint() {
   # contains the right words.
   skip_if_no_age
   local qteam="it's a team"
-  bash "$SCRIPTS/join.sh" "$qteam" alice claude-code /tmp/project-q >/dev/null
+  bash "$SCRIPTS/join.sh" "$qteam" alice claude-code /tmp/project-quoted-team >/dev/null
   run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee "$qteam"
   [ "$status" -eq 0 ] || return 1
   line="$(printf '%s\n' "$output" | grep -F -- "key.sh' handoff " | head -1)"
@@ -1236,7 +1236,7 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   # Parsing argv only shows the line survives a shell; it does not show the
   # line goes anywhere. The previous version of this route re-ran the command
   # that had just failed -- it parsed perfectly and returned the same refusal
-  # forever (review). A way out has to come out.
+  # forever. A way out has to come out.
   line="$(printf '%s\n' "$output" | grep -F -- "remote.sh' pull " | head -1)"
   [ -n "$line" ] || return 1
   run bash -c "${line%%<*}rescued"
@@ -1254,7 +1254,7 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   # rename-team.sh is local only: it never reads or writes `remote_binding` and
   # never tells the server, so renaming a connected team leaves the binding
   # naming the team the server still knows by the old name.
-  bash "$SCRIPTS/join.sh" clashconn alice claude-code /tmp/project-cc >/dev/null
+  bash "$SCRIPTS/join.sh" clashconn alice claude-code /tmp/project-clash-connected >/dev/null
   python3 - "$TEST_SKILL_DIR/teams/clashconn/config.json" <<'PY_BIND'
 import json, sys
 p = sys.argv[1]
@@ -1285,9 +1285,9 @@ PY_BIND
 @test "remote pull: a DISCONNECTED local team is still offered the rename (#680)" {
   # "has ever connected" is not "is connected". A disconnected team keeps its
   # connected_at and gains a disconnected_at, and reading the first alone
-  # withheld a route it is entitled to (review). Its name is free to move: the
+  # withheld a route it is entitled to. Its name is free to move: the
   # binding it would leave behind is already dead.
-  bash "$SCRIPTS/join.sh" clashoff alice claude-code /tmp/project-off >/dev/null
+  bash "$SCRIPTS/join.sh" clashoff alice claude-code /tmp/project-clash-disconnected >/dev/null
   python3 - "$TEST_SKILL_DIR/teams/clashoff/config.json" <<'PY_BIND'
 import json, sys
 p = sys.argv[1]
@@ -1311,7 +1311,7 @@ PY_BIND
 @test "remote pull: the way out survives a team with a space and a quote (#680)" {
   # The printed `pull --team-id` line carries the team name back to a shell.
   local qteam="it's a clash"
-  bash "$SCRIPTS/join.sh" "$qteam" alice claude-code /tmp/project-qc >/dev/null
+  bash "$SCRIPTS/join.sh" "$qteam" alice claude-code /tmp/project-clash-quoted >/dev/null
   run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" "$qteam"
   [ "$status" -ne 0 ] || return 1
   out="$output"

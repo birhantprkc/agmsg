@@ -625,7 +625,7 @@ _remote_write_pulled_team() {
         # The routes are the plain install's, so they are held back when a
         # caller owns the next step -- same split as everywhere else here.
         if agmsg_operator_guidance_is_ours; then
-          # The first route must land somewhere the collision is not (review).
+          # The first route must land somewhere the collision is not.
           # Re-running with --team-id and the SAME local name reproduces the
           # command that just failed: that flag picks between same-named teams
           # on the SERVER, and the local name is still taken either way. With a
@@ -642,7 +642,7 @@ _remote_write_pulled_team() {
           # knowable here, so it is decided here rather than handed over as a
           # caveat to apply themselves.
           # STILL connected, which is not the same as "has ever connected"
-          # (review). A disconnected team keeps its `connected_at` and gains a
+          #. A disconnected team keeps its `connected_at` and gains a
           # `disconnected_at`, so reading the first alone calls it connected
           # and withholds a route it is entitled to. This is the same predicate
           # `_remote_status_one` and `connect`'s re-adoption use: a binding is
