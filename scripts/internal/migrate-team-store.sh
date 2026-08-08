@@ -231,6 +231,39 @@ if has_table read_cursors; then
     INSERT OR IGNORE INTO read_cursors(team,agent,local_position)
       SELECT team,agent,local_position FROM src.read_cursors WHERE team='$team_lit';"
 fi
+# #695: a read cursor copied above lives in the SHARED store's global
+# events.seq space -- every team's traffic advances it, not just this one's.
+# events.seq/id are copied verbatim by design (renumbering would move every
+# cursor), but sqlite_sequence is deliberately excluded from the schema copy
+# above (sqlite owns it; the AUTOINCREMENT columns "bring it back on their
+# own first insert" per the comment there) -- so the destination's high-water
+# becomes MAX(this team's OWN copied seqs), which can sit far below a cursor
+# that reflects every team's combined traffic. A new message then receives a
+# seq below the cursor and is permanently invisible to storage_list_unread /
+# storage_watch_after (delivery_tip is read from sqlite_sequence directly,
+# see sqlite.sh's _sqlite_highwater) -- production symptom: history shows the
+# read marker, inbox says nothing new, monitor and turn are both silent.
+#
+# The fix raises the floor, not the cursor: advance the destination's
+# sqlite_sequence for 'events' to at least the greatest copied cursor, so the
+# NEXT event (assigned floor+1) always sorts above every preserved cursor.
+# Not "set cursors to 0" -- that would make every already-read message look
+# unread again for a team migrating WITH real history; 0 is only correct for
+# repairing a store already caught by this bug (a separate, one-off fix, not
+# this one). Two statements because sqlite_sequence has no row for a table
+# until its first AUTOINCREMENT insert -- a team with zero copied events (the
+# empty-event case the issue calls out by name) has no existing row to
+# UPDATE, only one to INSERT.
+if has_table events && has_table read_cursors; then
+  copy="$copy
+    UPDATE sqlite_sequence SET seq = (SELECT MAX(local_position) FROM read_cursors WHERE team='$team_lit')
+      WHERE name = 'events'
+        AND seq < (SELECT MAX(local_position) FROM read_cursors WHERE team='$team_lit');
+    INSERT INTO sqlite_sequence(name, seq)
+      SELECT 'events', (SELECT MAX(local_position) FROM read_cursors WHERE team='$team_lit')
+      WHERE (SELECT MAX(local_position) FROM read_cursors WHERE team='$team_lit') IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'events');"
+fi
 if has_table storage_metadata; then
   copy="$copy
     INSERT OR IGNORE INTO storage_metadata(key,value) SELECT key,value FROM src.storage_metadata;"

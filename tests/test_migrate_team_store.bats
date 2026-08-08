@@ -471,3 +471,111 @@ stored_types() {
   # The leftover is gone from shared, because the destination has it.
   [ "$(shared_rows alpha)" -eq 0 ]
 }
+
+# --- #695: a copied cursor can land ahead of the destination's own sequence -
+
+# A read cursor in the shared store is a position in the shared store's GLOBAL
+# events.seq space -- every team's traffic advances it, not just the one being
+# migrated. seq/id are copied verbatim (by design: renumbering would move
+# every cursor), but sqlite_sequence is deliberately NOT copied -- the comment
+# above the schema copy says the AUTOINCREMENT columns "bring it back on their
+# own first insert." That first insert only sees THIS team's rows, so the
+# destination's high-water becomes MAX(this team's own copied seqs) -- which
+# can be far below a cursor that reflects every team's combined traffic. A new
+# message then receives a seq below the cursor and is permanently invisible.
+#
+# Production shape (#695): radmin-oss's cursor was 13203 (the shared store's
+# all-teams high-water); its own migrated events topped out at 11. Reproduced
+# here at a smaller scale with the same relationship: OTHER teams' traffic
+# pushes the shared high-water past what the migrating team's own events will
+# ever reach.
+@test "migrate: a new per-team message is deliverable after migration when the copied cursor exceeds the team's own event range (#695)" {
+  # alpha's own message goes FIRST, so its copied seq is the low end of the
+  # shared store's range -- beta's traffic afterward pushes the GLOBAL
+  # high-water past it, exactly the "other teams advance the shared sequence
+  # beyond the migrating team's own maximum" shape the issue asks for. (Doing
+  # this the other way around -- alpha last -- makes alpha's own event BE the
+  # current high-water, which accidentally satisfies the invariant even
+  # without the fix and proves nothing; caught by this test passing before
+  # the fix was applied, which is what sent this comment back to explain it.)
+  bash "$SCRIPTS/send.sh" alpha ann bob "alpha message 1" >/dev/null
+  bash "$SCRIPTS/send.sh" beta ann bob "beta message 1" >/dev/null
+  bash "$SCRIPTS/send.sh" beta ann bob "beta message 2" >/dev/null
+  bash "$SCRIPTS/send.sh" beta ann bob "beta message 3" >/dev/null
+
+  # bob's read cursor for alpha, set to the shared store's CURRENT global
+  # high-water -- a legitimate value in that space, since it is not scoped to
+  # one team.
+  local shared_highwater
+  shared_highwater="$(sqlite3 "$SHARED" "SELECT seq FROM sqlite_sequence WHERE name='events';")"
+  sqlite3 "$SHARED" "INSERT OR REPLACE INTO read_cursors(team,agent,local_position)
+    VALUES('alpha','bob',$shared_highwater);"
+
+  migrate alpha
+  local dest; dest="$(store_of alpha)"
+
+  # 1. The destination's own AUTOINCREMENT high-water is not behind the
+  #    copied cursor -- this is the invariant the issue names directly.
+  local dest_tip dest_cursor
+  dest_tip="$(sqlite3 "$dest" "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='events'),0);")"
+  dest_cursor="$(sqlite3 "$dest" "SELECT local_position FROM read_cursors WHERE team='alpha' AND agent='bob';")"
+  [ "$dest_tip" -ge "$dest_cursor" ]
+
+  bash "$SCRIPTS/send.sh" alpha ann bob "sent after migration" >/dev/null
+
+  # 2. The new message's own seq is above the recipient's cursor.
+  local new_seq
+  new_seq="$(sqlite3 "$dest" "SELECT seq FROM events WHERE type='message_sent' AND team='alpha' AND body='sent after migration';")"
+  [ "$new_seq" -gt "$dest_cursor" ]
+
+  # 3 + 4. Through the REAL contract functions, not just checking that the
+  # numbers line up -- proving the message is actually deliverable. Matching
+  # numbers with nothing delivered is exactly the shape production spent
+  # hours chasing tonight.
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/storage.sh"
+  agmsg_storage_load
+
+  run storage_list_unread alpha bob
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"sent after migration"* ]]
+
+  local after; after="$(storage_watch_after "$dest_cursor" alpha:bob)"
+  [[ "$after" == *"sent after migration"* ]]
+  [[ "$after" == *'"type":"cursor"'* ]]
+}
+
+# Requirement 5 from the issue: the same properties when the target team has
+# NO event rows before migration. This is the sharper case -- with zero rows
+# copied, sqlite never creates a sqlite_sequence row for 'events' at all (only
+# the first AUTOINCREMENT insert does that), so there is no existing row to
+# raise; one has to be created from nothing.
+@test "migrate: the empty-event case also gets a destination high-water that is not behind the copied cursor (#695)" {
+  bash "$SCRIPTS/join.sh" gamma carol claude-code /tmp/gamma-carol >/dev/null
+  bash "$SCRIPTS/join.sh" gamma dave  claude-code /tmp/gamma-dave  >/dev/null
+  bash "$SCRIPTS/send.sh" beta ann bob "beta message 1" >/dev/null
+  bash "$SCRIPTS/send.sh" beta ann bob "beta message 2" >/dev/null
+
+  local shared_highwater
+  shared_highwater="$(sqlite3 "$SHARED" "SELECT seq FROM sqlite_sequence WHERE name='events';")"
+  sqlite3 "$SHARED" "INSERT OR REPLACE INTO read_cursors(team,agent,local_position)
+    VALUES('gamma','dave',$shared_highwater);"
+  [ "$(shared_rows gamma)" -eq 0 ]
+
+  migrate gamma
+  local dest; dest="$(store_of gamma)"
+
+  local dest_tip dest_cursor
+  dest_tip="$(sqlite3 "$dest" "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='events'),0);")"
+  dest_cursor="$(sqlite3 "$dest" "SELECT local_position FROM read_cursors WHERE team='gamma' AND agent='dave';")"
+  [ "$dest_tip" -ge "$dest_cursor" ]
+
+  bash "$SCRIPTS/send.sh" gamma carol dave "first message ever, after migration" >/dev/null
+
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/storage.sh"
+  agmsg_storage_load
+  run storage_list_unread gamma dave
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"first message ever, after migration"* ]]
+}
