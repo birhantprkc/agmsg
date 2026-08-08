@@ -275,6 +275,10 @@ environment variables alone succeeds, and the send that is supposed to confirm
 it then reports the team as missing — the failure lands one step after the
 cause. See "Use a separate install for testing" in `docs/remote-setup.md`.
 
+**What e2ee changes, and what it doesn't.** The local store stays plaintext either way — `history`, `inbox`, and `send` read and write exactly the same regardless of a team's encryption setting. Only the SERVER side differs: an e2ee team's server rows carry `cipher: age-v1` and hold sealed ciphertext, so `from`, `to`, and `body` are not readable there; a plain team's rows are not sealed. Keys never pass through the server — moving one to another machine means carrying a handoff bundle by hand (`key handoff` above).
+
+**Readable local history is therefore not evidence that a team is unencrypted.** To state whether a given team is e2ee, ask the program — `remote status <team>` below — never infer it from what you can read locally.
+
 If argument starts with "remote unlock":
 1. Parse `<team>`, `--bundle <file>`, and `--confirm-digest <sha256>`.
 2. Run: `bash ~/.agents/skills/__SKILL_NAME__/scripts/remote.sh unlock <team> --bundle <file> --confirm-digest <sha256>`

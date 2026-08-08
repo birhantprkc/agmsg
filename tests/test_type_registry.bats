@@ -91,6 +91,30 @@ write_node_launcher_fixtures() {
   [ "$guard" -lt "$first_time" ]
 }
 
+@test "agent templates all explain that readable local history is not evidence a team is unencrypted (#682)" {
+  # scripts/drivers/types/*/template.md is nine independent copies with no
+  # shared fragment (#676's exact shape) -- a loop with `[ -f ] || continue`
+  # alone would silently pass if the glob matched fewer than nine files (a
+  # renamed/missing template), so the count is asserted explicitly rather
+  # than just "every file found had it."
+  local template count=0
+  for template in "$BATS_TEST_DIRNAME"/../scripts/drivers/types/*/template.md; do
+    [ -f "$template" ] || continue
+    count=$((count + 1))
+    grep -q "Readable local history is therefore not evidence that a team is unencrypted" "$template" \
+      || { echo "missing the e2ee-verification paragraph: $template" >&2; return 1; }
+  done
+  # agmsg-app has no template.md (spawnable=no -- it's the desktop app's own
+  # identity, not a CLI type), so nine is the whole set, not a lower bound a
+  # silently-skipped file could still satisfy.
+  [ "$count" -eq 9 ]
+}
+
+@test "the e2ee-verification explanation also appears in both remote-setup docs (#682)" {
+  grep -q "readable local message history is not evidence" "$BATS_TEST_DIRNAME/../docs/remote-setup.md"
+  grep -q "ローカルのメッセージ履歴が読めることは" "$BATS_TEST_DIRNAME/../docs/remote-setup.ja.md"
+}
+
 @test "type-registry: spawnable set is exactly eight of the ten built-ins (#277, #279)" {
   # hermes deliberately stays out (#279): no known CLI mode starts it
   # interactive with a seeded initial prompt. agmsg-app also stays out: it's
