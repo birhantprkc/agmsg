@@ -288,20 +288,21 @@ stored_types() {
 # agent had read to. Each table is asserted separately because the comparison
 # is written per table, and one of them getting it right hides the others.
 @test "migrate: a message id reused for different content is refused" {
-  # send.sh writes history to events; the messages table stays empty on this
-  # path, so the row is placed on both sides directly. The table is still copied
-  # and still deleted from the shared store, so it needs the same proof — and
-  # measuring it required checking which tables actually carry rows rather than
-  # assuming.
+  # The row is placed on both sides directly, at an id well clear of the ones a
+  # send allocates. That distance is load-bearing now: a send writes the legacy
+  # table too (#689), so this fixture's id is no longer free by default and a
+  # low one collides with the mirror rather than testing anything. The comment
+  # that used to sit here said the messages table stays empty on this path,
+  # which was true when it was written and is not now.
   bash "$SCRIPTS/send.sh" alpha ann bob "the original message" >/dev/null
   migrate alpha
   local dest; dest="$(store_of alpha)"
 
   sqlite3 "$dest" "INSERT INTO messages(id,team,from_agent,to_agent,body,created_at)
-    VALUES(1,'alpha','ann','bob','what the destination holds',
+    VALUES(9001,'alpha','ann','bob','what the destination holds',
            strftime('%Y-%m-%dT%H:%M:%SZ','now'));"
   sqlite3 "$SHARED" "INSERT INTO messages(id,team,from_agent,to_agent,body,created_at)
-    VALUES(1,'alpha','ann','bob','a different body',
+    VALUES(9001,'alpha','ann','bob','a different body',
            strftime('%Y-%m-%dT%H:%M:%SZ','now'));"
 
   run migrate alpha

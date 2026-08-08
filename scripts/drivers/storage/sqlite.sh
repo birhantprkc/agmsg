@@ -72,6 +72,15 @@ storage_store_exists() { [ -f "$(_sqlite_db "$1")" ]; }
 storage_init() {
   local db; db="$(_sqlite_db "$1")"
   mkdir -p "$(dirname "$db")" 2>/dev/null || true
+  # CREATE TABLE IF NOT EXISTS does nothing to a store that already has the
+  # table, so an existing events table never gains legacy_id from the schema
+  # below. SQLite has no ADD COLUMN IF NOT EXISTS, and a failing statement
+  # aborts the whole batch, so this runs on its own and its failure ("duplicate
+  # column name") is the expected outcome on every run after the first.
+  if [ -f "$db" ]; then
+    agmsg_sqlite "$db" "ALTER TABLE events ADD COLUMN legacy_id INTEGER;" \
+      >/dev/null 2>&1 || true
+  fi
   agmsg_sqlite "$db" "
     PRAGMA journal_mode=WAL;
     CREATE TABLE IF NOT EXISTS events (
@@ -84,7 +93,16 @@ storage_init() {
       body       TEXT,
       msg_id     TEXT,
       agent      TEXT,
-      at         TEXT NOT NULL
+      at         TEXT NOT NULL,
+      -- The rowid of this event's copy in the legacy messages table, when one
+      -- was written. That table is a read interface other software still opens,
+      -- so every message is written to both; this column is what lets a reader
+      -- tell that the two rows are one message. Without it the UNION queries
+      -- below list the same message twice, because the two tables number their
+      -- rows in different spaces (UUID vs rowid) and nothing connects them.
+      -- (#689. No backticks in here: this SQL sits inside a double-quoted shell
+      -- string, where they are command substitution, not quoting.)
+      legacy_id  INTEGER
     );
     CREATE INDEX IF NOT EXISTS events_sent ON events(type, team, to_agent, seq);
     CREATE INDEX IF NOT EXISTS events_read ON events(type, team, agent, msg_id);
@@ -147,15 +165,57 @@ storage_init() {
 
 # --- contract: messages ----------------------------------------------------
 
+# The one place a message becomes rows. Every caller that records a
+# message_sent goes through this, including the one that lands messages pulled
+# from a remote -- mirroring only what this machine sends would leave a reader
+# of the legacy table able to see half a conversation, and the half it could not
+# see is the one that made this worth doing (#689).
+#
+# WHAT THIS DOES NOT COVER. Worth stating where the code is, because "we write
+# to the legacy table" invites the reading that any external viewer will keep
+# working, and three kinds of store are outside it:
+#
+#   * A team on the jsonl driver has no legacy table to mirror into -- that
+#     table is created here and in internal/init-db.sh and nowhere else. Such a
+#     team is invisible to those readers and this cannot change that. Measured,
+#     not assumed: the jsonl driver's only `messages` references are a field of
+#     the sync pull payload.
+#   * A team moved to its own store (drivers.partition=per-team) writes to a
+#     different file. A viewer pointed at the shared store sees nothing for it,
+#     mirrored or not.
+#   * Rows that predate this are unmirrored in the other direction -- they exist
+#     only in the legacy table -- which is what the UNION in list_unread and
+#     history is still for.
+#
+# WHEN IT ENDS. Not on a date, and not "once everyone upgrades": the readers are
+# other people's software and we cannot enumerate them. It ends when someone can
+# show that nothing reads the table any more, and until someone does that work
+# this is a supported interface rather than a migration step. Written down
+# because an unbounded compatibility write with no stated exit becomes permanent
+# by default, and then nobody knows whether it is load-bearing.
+#
+# Both tables in one transaction, and the legacy rowid recorded on the event.
+# The correspondence is not bookkeeping: it is what every reader that unions the
+# two tables uses to recognise one message rather than list it twice.
+_sqlite_message_sent_sql() {
+  local team="$1" from="$2" to="$3" body="$4" id="$5" at="$6"
+  local tl fl ol bl il al
+  tl="$(_sqlite_lit "$team")"; fl="$(_sqlite_lit "$from")"; ol="$(_sqlite_lit "$to")"
+  bl="$(_sqlite_lit "$body")"; il="$(_sqlite_lit "$id")"; al="$(_sqlite_lit "$at")"
+  printf '%s\n' "
+    BEGIN IMMEDIATE;
+    INSERT INTO messages (team,from_agent,to_agent,body,created_at)
+    VALUES ('$tl','$fl','$ol','$bl','$al');
+    INSERT INTO events (type,id,team,from_agent,to_agent,body,at,legacy_id)
+    VALUES ('message_sent','$il','$tl','$fl','$ol','$bl','$al',last_insert_rowid());
+    COMMIT;
+  "
+}
+
 storage_send() {
   local team="$1" from="$2" to="$3" body="$4"
   local id at db; id="$(compat_uuid7)"; at="$(_sqlite_now)"; db="$(_sqlite_db "$team")"
-  local insert="
-    INSERT INTO events (type,id,team,from_agent,to_agent,body,at)
-    VALUES ('message_sent','$(_sqlite_lit "$id")','$(_sqlite_lit "$team")',
-            '$(_sqlite_lit "$from")','$(_sqlite_lit "$to")','$(_sqlite_lit "$body")',
-            '$(_sqlite_lit "$at")');
-  "
+  local insert; insert="$(_sqlite_message_sent_sql "$team" "$from" "$to" "$body" "$id" "$at")"
   # Try the INSERT first and only fall back to storage_init on failure (the #114
   # pattern). Running storage_init — which issues PRAGMA journal_mode=WAL and the
   # CREATE TABLE/INDEX statements — on EVERY send serializes badly under a
@@ -164,9 +224,15 @@ storage_send() {
   # Keep message bodies out of argv. Linux can impose a much smaller effective
   # argv ceiling than macOS, so a valid large local message must travel on
   # sqlite3's stdin rather than as the final command-line SQL argument.
-  if ! printf '%s\n' "$insert" | agmsg_sqlite "$db" >/dev/null 2>&1; then
+  # -bail, because this is now more than one statement. The CLI's default is to
+  # report an error and keep going, so a batch whose second INSERT fails still
+  # reaches its COMMIT and commits the first one. Measured: the retry below then
+  # inserted the message a second time, leaving one row in the legacy table that
+  # no event points at -- exactly the unlinked copy the correspondence exists to
+  # prevent.
+  if ! printf '%s\n' "$insert" | agmsg_sqlite -bail "$db" >/dev/null 2>&1; then
     storage_init "$team" >/dev/null
-    printf '%s\n' "$insert" | agmsg_sqlite "$db" >/dev/null 2>&1 || return 1
+    printf '%s\n' "$insert" | agmsg_sqlite -bail "$db" >/dev/null 2>&1 || return 1
   fi
   printf '%s\n' "$id"
 }
@@ -196,7 +262,16 @@ storage_read_cursor_consume() {
       SELECT 'message_read','$(_sqlite_lit "$(compat_uuid7)")','$tl','$al',
              '$(_sqlite_lit "$id")','$(_sqlite_lit "$at")'
        WHERE NOT EXISTS(SELECT 1 FROM events r WHERE r.type='message_read'
-         AND r.team='$tl' AND r.agent='$al' AND r.msg_id='$(_sqlite_lit "$id")');"
+         AND r.team='$tl' AND r.agent='$al' AND r.msg_id='$(_sqlite_lit "$id")');
+      -- Mirror the read into the legacy table, through the correspondence
+      -- rather than by guessing an id. Without this an external viewer shows
+      -- every message unread forever, which is a worse thing to hand someone
+      -- than the disagreement it costs (#689).
+      UPDATE messages SET read_at='$(_sqlite_lit "$at")'
+       WHERE read_at IS NULL
+         AND id = (SELECT e.legacy_id FROM events e
+                    WHERE e.type='message_sent' AND e.team='$tl'
+                      AND e.id='$(_sqlite_lit "$id")' AND e.legacy_id IS NOT NULL);"
   done
   agmsg_sqlite "$db" "BEGIN IMMEDIATE;
     $sql
@@ -244,6 +319,20 @@ storage_list_unread() {
       WHERE m.team='$tl' AND m.to_agent='$al' AND m.read_at IS NULL
         AND NOT EXISTS (SELECT 1 FROM events r WHERE r.type='message_read'
                         AND r.team=m.team AND r.agent='$al' AND r.msg_id=CAST(m.id AS TEXT))
+        -- Skip the copy of a message that is already in the event log. Every
+        -- message is written to both tables so external readers of the legacy
+        -- one keep working (#689); without this the union lists it twice, and
+        -- marking one read leaves the other behind because the two branches
+        -- number rows in different spaces.
+        --
+        -- Live space only (seq > 0). A legacy row that was PROJECTED for push
+        -- also carries an event, but at a negative seq, deliberately below every
+        -- read cursor -- so the events branch above can never return it. Skipping
+        -- the legacy row on account of that event would remove the message from
+        -- the inbox entirely while history still showed it. Measured: the first
+        -- version of this dedupe did exactly that.
+        AND NOT EXISTS (SELECT 1 FROM events e2
+                         WHERE e2.legacy_id = m.id AND e2.seq > 0)
     )
     ORDER BY ts, src, ord ${limit:+LIMIT $limit};
   "
@@ -339,6 +428,9 @@ storage_history() {
                created_at AS ts, 0 AS src, id AS ord
         FROM messages
         WHERE team='$tl' $afilter
+          -- The event log already carries the mirrored copy (#689); listing
+          -- both shows one message twice.
+          AND NOT EXISTS (SELECT 1 FROM events e2 WHERE e2.legacy_id = messages.id)
       )
       ORDER BY ts DESC, src DESC, ord DESC ${limit:+LIMIT $limit}
     )
@@ -381,15 +473,20 @@ storage_import() {
     t=$(j type); id=$(j id); team=$(j team); at=$(j at)
     if [ "$t" = message_sent ]; then
       frm=$(j from); to=$(j to); body=$(j body)
-      agmsg_sqlite "$db" "INSERT INTO events (type,id,team,from_agent,to_agent,body,at)
-        VALUES ('message_sent','$(_sqlite_lit "$id")','$(_sqlite_lit "$team")',
-                '$(_sqlite_lit "$frm")','$(_sqlite_lit "$to")','$(_sqlite_lit "$body")',
-                '$(_sqlite_lit "$at")');" >/dev/null 2>&1
+      # Same utility as a live send, so an imported store presents the same
+      # legacy view as the store it came from (#689).
+      printf '%s\n' "$(_sqlite_message_sent_sql "$team" "$frm" "$to" "$body" "$id" "$at")" \
+        | agmsg_sqlite -bail "$db" >/dev/null 2>&1
     elif [ "$t" = message_read ]; then
       agent=$(j agent); msg_id=$(j msg_id)
       agmsg_sqlite "$db" "INSERT INTO events (type,id,team,agent,msg_id,at)
         VALUES ('message_read','$(_sqlite_lit "$id")','$(_sqlite_lit "$team")',
-                '$(_sqlite_lit "$agent")','$(_sqlite_lit "$msg_id")','$(_sqlite_lit "$at")');" \
+                '$(_sqlite_lit "$agent")','$(_sqlite_lit "$msg_id")','$(_sqlite_lit "$at")');
+        UPDATE messages SET read_at='$(_sqlite_lit "$at")'
+         WHERE read_at IS NULL
+           AND id = (SELECT e.legacy_id FROM events e
+                      WHERE e.type='message_sent' AND e.team='$(_sqlite_lit "$team")'
+                        AND e.id='$(_sqlite_lit "$msg_id")' AND e.legacy_id IS NOT NULL);" \
         >/dev/null 2>&1
     fi
   done < "$file"

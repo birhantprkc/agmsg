@@ -197,3 +197,36 @@ PY
   [ "$status" -eq 0 ]
   [ -f "$trust_file" ]
 }
+
+# The gate immediately before a deletion. Reporting a count it could not compute
+# tells the operator there is less to lose than there is, at the one moment that
+# is irreversible — so a count that fails is a refusal, not a zero.
+#
+# The store here is one where the table list and the column probe both succeed
+# and only the count fails: events carries legacy_id, so the deduped form of the
+# query is chosen, and the messages table lacks the column that form joins on.
+# That isolates the statement under test; a store that failed earlier would exit
+# through the inspection guard above it and prove nothing about this branch.
+@test "forget: refuses when the message count cannot be computed (#689)" {
+  local store="$TEST_SKILL_DIR/db/teams/testteam/messages.db"
+  local cfg="$TEST_SKILL_DIR/teams/testteam/config.json"
+  [ -f "$store" ]
+
+  # This fixture builds its store directly rather than through storage_init, so
+  # the column the deduped query needs is not there yet. Add it: without it the
+  # probe picks the old-schema branch and the test would pass for the wrong
+  # reason.
+  sqlite3 "$store" "ALTER TABLE events ADD COLUMN legacy_id INTEGER;"
+  sqlite3 "$store" "ALTER TABLE messages RENAME TO messages_original;
+                    CREATE TABLE messages (team TEXT, body TEXT);"
+  # The probe must still say the column is there, or this exercises the
+  # old-schema path instead of the failure path.
+  [ "$(sqlite3 "$store" "SELECT COUNT(*) FROM pragma_table_info('events') WHERE name='legacy_id';" | tr -d '\r')" = "1" ]
+
+  run bash "$SCRIPTS/remote.sh" forget testteam --yes
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"refusing to delete it"* ]]
+  # Nothing was destroyed on the way out.
+  [ -f "$store" ]
+  [ -f "$cfg" ]
+}

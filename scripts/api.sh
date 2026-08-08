@@ -190,6 +190,11 @@ get_messages() {
       UNION ALL
       SELECT CAST(id AS TEXT) AS id, team, from_agent, to_agent, body, created_at, id AS ord
       FROM messages
+      -- Skip the copy the event log already carries. Every message is written
+      -- to both tables so external readers of the legacy one keep working
+      -- (#689); without this every message is returned twice, once under its
+      -- event id and once under the legacy rowid.
+      WHERE NOT EXISTS (SELECT 1 FROM events e2 WHERE e2.legacy_id = messages.id)
     )
     SELECT json_object(
       'type', 'message_sent',
