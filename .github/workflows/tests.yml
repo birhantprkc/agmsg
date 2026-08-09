@@ -25,6 +25,18 @@ name: tests
 # CHANGELOG, etc). SKILL.md is deliberately EXCLUDED — the suite asserts on it
 # (tests/test_install.bats checks it has no unsubstituted placeholder), so a
 # SKILL.md change must run the suite. Anything not on the allowlist runs it too.
+#
+# `docs_only` only decides the bats suite. `age-v1-contract` and
+# `storage-jsonl` are additional, narrower jobs (crypto vectors / the jsonl
+# storage driver) that used to gate on the same flag, so anything that turned
+# `docs_only` false forced both of them to run in full regardless of whether
+# the diff had anything to do with either -- concretely, a
+# `docs/remote-setup*.md`-only diff (which must flip docs_only so the suite
+# that reads it still runs, see below) also ran a ~5-minute age-v1 job and two
+# ~1-minute jsonl jobs that never touch that file (#706). `contracts_needed`
+# is the same classification MINUS that one exception: true whenever
+# `docs_only` would be false for any OTHER reason, false when the only reason
+# was `docs/remote-setup*.md`.
 
 on:
   push:
@@ -51,6 +63,7 @@ jobs:
       app_changed: ${{ steps.detect.outputs.app_changed }}
       server_changed: ${{ steps.detect.outputs.server_changed }}
       sync_changed: ${{ steps.detect.outputs.sync_changed }}
+      contracts_needed: ${{ steps.detect.outputs.contracts_needed }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -68,6 +81,7 @@ jobs:
             echo "app_changed=true" >> "$GITHUB_OUTPUT"
             echo "server_changed=true" >> "$GITHUB_OUTPUT"
             echo "sync_changed=true" >> "$GITHUB_OUTPUT"
+            echo "contracts_needed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
@@ -77,6 +91,7 @@ jobs:
           app_changed=false
           server_changed=false
           sync_changed=false
+          contracts_needed=false
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             case "$f" in
@@ -89,23 +104,29 @@ jobs:
               # for an hour, and `docs/remote-setup.ja.md` landed inside that
               # hour carrying the same port, docs-only and unguarded. The next
               # translation is covered without anyone remembering this line.
+              #
+              # contracts_needed is deliberately NOT set here (#706): a
+              # walkthrough is prose the age-v1/jsonl-storage contracts never
+              # read, so forcing the suite that does read it to run is not a
+              # reason to also run those.
               docs/remote-setup*.md) docs_only=false ;;
               docs/*) ;;
               site/*) ;;
               app/*) app_changed=true ;;
-              server/*) docs_only=false; server_changed=true ;;
-              scripts/remote*.sh|scripts/internal/*|scripts/drivers/storage/*|scripts/lib/*|tests/*sync*.*|tests/test_remote*.bats|server/test/sync-client.integration.test.ts|.github/workflows/tests.yml) docs_only=false; sync_changed=true ;;
+              server/*) docs_only=false; server_changed=true; contracts_needed=true ;;
+              scripts/remote*.sh|scripts/internal/*|scripts/drivers/storage/*|scripts/lib/*|tests/*sync*.*|tests/test_remote*.bats|server/test/sync-client.integration.test.ts|.github/workflows/tests.yml) docs_only=false; sync_changed=true; contracts_needed=true ;;
               llms.txt|llms-full.txt) ;;
               README.md|CHANGELOG.md|CONTRIBUTING.md|PRIVACY.md|ARCHITECTURE.md|RELEASING.md|LICENSE) ;;
               # NOTE: SKILL.md is intentionally not here — the suite tests it.
-              *) docs_only=false ;;
+              *) docs_only=false; contracts_needed=true ;;
             esac
           done <<< "$changed"
-          echo "Result: docs_only=$docs_only app_changed=$app_changed server_changed=$server_changed sync_changed=$sync_changed"
+          echo "Result: docs_only=$docs_only app_changed=$app_changed server_changed=$server_changed sync_changed=$sync_changed contracts_needed=$contracts_needed"
           echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
           echo "app_changed=$app_changed" >> "$GITHUB_OUTPUT"
           echo "server_changed=$server_changed" >> "$GITHUB_OUTPUT"
           echo "sync_changed=$sync_changed" >> "$GITHUB_OUTPUT"
+          echo "contracts_needed=$contracts_needed" >> "$GITHUB_OUTPUT"
 
   bats-shard:
     name: bats (${{ matrix.os }} ${{ matrix.shard }}/4)
@@ -347,16 +368,16 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Docs-only change — skipping contract
-        if: needs.changes.outputs.docs_only == 'true'
-        run: echo "Diff is documentation-only; skipping the age-v1 contract."
+        if: needs.changes.outputs.contracts_needed == 'false'
+        run: echo "Diff does not touch anything the age-v1 contract reads; skipping."
 
       - uses: actions/setup-go@v5
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.contracts_needed != 'false'
         with:
           go-version: '1.25.x'
 
       - name: Ensure SQLite and jq are available
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.contracts_needed != 'false'
         run: |
           sqlite3 --version >/dev/null 2>&1 && jq --version >/dev/null 2>&1 || {
             sudo apt-get update
@@ -364,7 +385,7 @@ jobs:
           }
 
       - name: Install pinned age implementation
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.contracts_needed != 'false'
         run: |
           go install filippo.io/age/cmd/age@v1.3.1
           go install filippo.io/age/cmd/age-keygen@v1.3.1
@@ -374,7 +395,7 @@ jobs:
           echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
 
       - name: Run age-v1 shared vectors
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.contracts_needed != 'false'
         run: |
           age_bin="$(go env GOPATH)/bin/age"
           AGMSG_AGE_BIN="$age_bin" node --test tests/sync_cipher.test.mjs
@@ -389,7 +410,7 @@ jobs:
       # age, the shards skip them for want of the binary, and this job named one
       # of them, so 30 were executed nowhere. Two of those were already red.
       - name: Run every age-gated test
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.contracts_needed != 'false'
         run: |
           command -v age >/dev/null
           command -v age-keygen >/dev/null
@@ -423,31 +444,31 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Docs-only change — skipping
-        if: needs.changes.outputs.docs_only == 'true'
-        run: echo "Diff is documentation-only; skipping the jsonl storage contract."
+        if: needs.changes.outputs.contracts_needed == 'false'
+        run: echo "Diff does not touch anything the jsonl storage contract reads; skipping."
 
       - name: Ensure jq + sqlite3 (Linux)
-        if: runner.os == 'Linux' && needs.changes.outputs.docs_only != 'true'
+        if: runner.os == 'Linux' && needs.changes.outputs.contracts_needed != 'false'
         run: |
           jq --version >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y jq; }
           sqlite3 --version >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y sqlite3; }
 
       - name: Install bats
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.contracts_needed != 'false'
         run: |
           npm config set prefix "$HOME/.npm-global"
           npm install -g bats
           echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
 
       - name: Show tool versions
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.contracts_needed != 'false'
         run: |
           jq --version
           sqlite3 --version
           bats --version
 
       - name: Run the storage contract against the jsonl driver
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.contracts_needed != 'false'
         env:
           AGMSG_STORAGE_DRIVER: jsonl
         run: bats --print-output-on-failure tests/test_storage_contract.bats
