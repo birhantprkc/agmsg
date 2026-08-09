@@ -8,6 +8,38 @@ agents handle the client commands. This setup uses plaintext sync.
 For encrypted sync, read
 [Extra: end-to-end encryption](#extra-end-to-end-encryption).
 
+## What you are about to do
+
+| Where | What |
+|---|---|
+| **Server host** | Start the reference server — step 1 |
+| **Machine A** | Connect the team you already have — step 2 |
+| **Machine B** | Install agmsg, pull the team, join it — steps 3 and 4 |
+| **Finished when** | A message sent on one machine arrives on the other — step 5 |
+
+The machines do not need a direct connection to each other for sync: both reach
+the same server URL. That URL is the only network endpoint they share. On the
+encrypted path they also agree on the key bundle and its digest — handed over
+and checked outside this connection, not through the server.
+
+```mermaid
+flowchart LR
+  A["machine A<br/>agmsg install"]
+  B["machine B<br/>agmsg install"]
+  subgraph host["server host"]
+    S["reference server<br/>&lt;server-url&gt;"]
+    P[("postgres")]
+    S --- P
+  end
+  A -->|connect, then sync| S
+  B -->|pull, then sync| S
+  A -.->|"handoff bundle: by hand, never through the server"| B
+```
+
+The dotted line is only for the encrypted path, and it is dotted for a reason:
+the key bundle is carried between the machines by you. If it went through the
+server, the server could read the messages.
+
 ## Requirements
 
 - Docker with Compose — or PostgreSQL 17, if you bring your own database
@@ -54,29 +86,12 @@ control does it need a public HTTPS URL. Then check it from there too:
 curl -fsS https://<server-url>/v1/health
 ```
 
-### Using your own database instead
+This server belongs on a network you control: it has no authentication, so
+reaching it is the permission. Before it is reachable by anyone else, read
+[Network boundary](#network-boundary).
 
-If you already run PostgreSQL, start the server from source against it. The
-commands live in [`server/README.md` → Run from
-source](../server/README.md#run-from-source), which is the one place they are
-written down.
-
-Either way the server applies its own migrations at startup, so there is no
-schema step to run first.
-
-### Network boundary
-
-The reference profile has no authentication: reaching the server is the
-permission. Anyone who can reach it and name a team can read that team's
-remote stream. Keep it on a network you control, and use HTTPS for anything
-leaving localhost. Encrypting with `age-v1`
-([below](#extra-end-to-end-encryption)) keeps envelope contents from the
-server; it does not replace the boundary.
-
-The Compose stack publishes its port and ships a development password in
-`compose.yaml`. Change that password and terminate TLS in front of the service
-before this reaches a network you do not control — see
-[`server/README.md` → Compose configuration](../server/README.md#compose-configuration).
+Already running PostgreSQL? See [Using your own database
+instead](#using-your-own-database-instead).
 
 ## 2. Connect the existing team on machine A
 
@@ -235,6 +250,30 @@ disconnected team's status has no `encryption:` line at all; reconnect
 first.
 
 ## Reference
+
+### Network boundary
+
+The reference profile has no authentication: reaching the server is the
+permission. Anyone who can reach it and name a team can read that team's
+remote stream. Keep it on a network you control, and use HTTPS for anything
+leaving localhost. Encrypting with `age-v1`
+([above](#extra-end-to-end-encryption)) keeps envelope contents from the
+server; it does not replace the boundary.
+
+The Compose stack publishes its port and ships a development password in
+`compose.yaml`. Change that password and terminate TLS in front of the service
+before this reaches a network you do not control — see
+[`server/README.md` → Compose configuration](../server/README.md#compose-configuration).
+
+### Using your own database instead
+
+If you already run PostgreSQL, start the server from source against it. The
+commands live in [`server/README.md` → Run from
+source](../server/README.md#run-from-source), which is the one place they are
+written down.
+
+Either way the server applies its own migrations at startup, so there is no
+schema step to run first.
 
 ### Install on machine B
 
