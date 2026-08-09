@@ -17,8 +17,10 @@ For encrypted sync, read
 | **Machine B** | Install agmsg, pull the team, join it — steps 3 and 4 |
 | **Finished when** | A message sent on one machine arrives on the other — step 5 |
 
-The two machines never reach each other. They both reach one server URL, and
-that URL is the only thing they have to agree on.
+The machines do not need a direct connection to each other for sync: both reach
+the same server URL. That URL is the only network endpoint they share. On the
+encrypted path they also agree on the key bundle and its digest — handed over
+and checked outside this connection, not through the server.
 
 ```mermaid
 flowchart LR
