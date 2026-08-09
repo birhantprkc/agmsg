@@ -116,8 +116,10 @@ In the agent you want to put in the team, invoke the install's own command
 /agmsg
 ```
 
-The command is named after the install: one made with `install.sh --cmd
-agmsg-rw` answers to `/agmsg-rw`, and that is the one to type.
+`npx agmsg` installs as `agmsg`, so `/agmsg` is the one to type. The command is
+named after the install, so if you gave `install.sh` a `--cmd` of your own, use
+that name instead — see [Use a separate install for
+testing](#use-a-separate-install-for-testing).
 
 Bare, with nothing after it, the command notices this agent belongs to no team
 yet and lists the teams it can see — the pulled one among them. Choose it. The
