@@ -272,7 +272,7 @@ EOF
 
   # `run bash -c`, not a `$( )` around the eval: bash 3.2 — which is what CI's
   # macOS runner has — cannot parse a `case` inside command substitution.
-  classify='f="$1"; docs_only=true; app_changed=false; server_changed=false; sync_changed=false; eval "$2"; echo "$docs_only"'
+  classify='f="$1"; docs_only=true; app_changed=false; server_changed=false; sync_changed=false; contracts_needed=false; eval "$2"; echo "$docs_only"'
 
   # Every walkthrough that exists, derived — not a list to keep in step.
   while IFS= read -r doc; do
@@ -294,4 +294,38 @@ EOF
   run bash -c "$classify" _ docs/spec/v1.md "$block"
   [ "$status" -eq 0 ] || return 1
   [ "$output" = true ] || return 1
+}
+
+@test "remote-setup: editing a walkthrough runs the suite WITHOUT also forcing the age-v1/jsonl contracts (#706)" {
+  # docs_only=false is necessary to keep the bats suite running on a
+  # walkthrough edit, but it used to be sufficient to also run age-v1-contract
+  # and storage-jsonl, which never read this file. contracts_needed is the
+  # same classifier's independent verdict for those two jobs specifically.
+  workflow="${BATS_TEST_DIRNAME}/../.github/workflows/tests.yml"
+  block="$(awk '/case ".f" in/,/^ *esac$/' "$workflow")"
+  [ -n "$block" ] || return 1
+
+  classify='f="$1"; docs_only=true; app_changed=false; server_changed=false; sync_changed=false; contracts_needed=false; eval "$2"; echo "$contracts_needed"'
+
+  while IFS= read -r doc; do
+    [ -n "$doc" ] || continue
+    rel="docs/$(basename "$doc")"
+    run bash -c "$classify" _ "$rel" "$block"
+    [ "$status" -eq 0 ] || return 1
+    [ "$output" = false ] || { echo "$rel forces the age-v1/jsonl contracts to run" >&2; return 1; }
+  done <<EOF
+$(walkthroughs "$DOCS")
+EOF
+
+  run bash -c "$classify" _ docs/remote-setup.de.md "$block"
+  [ "$status" -eq 0 ] || return 1
+  [ "$output" = false ] || { echo "a future translation forces the age-v1/jsonl contracts to run" >&2; return 1; }
+
+  # Positive control: contracts_needed must be able to become true, or the
+  # assertions above would pass just as well with a flag that is always
+  # false -- indistinguishable from a flag nothing sets. A change to the
+  # storage layer the jsonl contract actually covers must still trigger it.
+  run bash -c "$classify" _ scripts/lib/storage.sh "$block"
+  [ "$status" -eq 0 ] || return 1
+  [ "$output" = true ] || { echo "a storage-layer change no longer triggers the age-v1/jsonl contracts" >&2; return 1; }
 }
