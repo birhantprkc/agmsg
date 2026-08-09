@@ -93,6 +93,101 @@ SESSION_ID="$(agmsg_normalize_instance_id "$SESSION_ID" "$AGENT_TYPE")"
 
 RUN_DIR="$SKILL_DIR/run"
 PIDFILE="$RUN_DIR/watch.$SESSION_ID.pid"
+LOGFILE="$RUN_DIR/watch.$SESSION_ID.log"
+
+# Everything this process has to say, somewhere a person can read afterwards.
+#
+# stderr alone was not that place (#691). In the configuration this actually
+# runs in, fd2 is /dev/null: the watcher's fd1 is the socket to its session and
+# its fd2 goes nowhere. So every message explaining an otherwise invisible
+# state -- roles skipped, a claim refused, the reason a watcher stopped -- was
+# written to a file descriptor with no reader. A delivery investigation then
+# has to reconstruct from process tables and database state what the one
+# component that knew was unable to say.
+#
+# Beside the pidfile, because this process already owns that directory and the
+# pair is what a reader wants: which pid, and what it thought it was doing.
+#
+# Bounded by rotation, one generation kept: an unbounded log in a directory
+# nobody prunes is its own defect. The ceiling is stated exactly, because the
+# first version claimed one it did not deliver -- it compared the size BEFORE
+# the write, so a live log at cap-1 could take one more line and end over the
+# cap, and a live log already past the cap was moved to `.1` still oversized.
+#
+# The decision includes the bytes about to be written, so:
+#
+#   live file    never exceeds cap, EXCEPT when one record is itself larger
+#                than cap -- then the file is exactly that record, because
+#                rotating first and writing it whole is better than dropping
+#                the one line someone is looking for.
+#   `.1`         a former live file, so bounded the same way.
+#   on disk      at most 2 x max(cap, longest single record).
+#
+# A record here is one diagnostic line with a timestamp and a pid; the longest
+# realistic one is a few hundred bytes against a 128 KiB default.
+#
+# Still echoed to stderr: when someone runs watch.sh by hand, stderr IS the
+# place they are looking, and losing that to make the file work would trade one
+# silence for another.
+WATCH_LOG_MAX_BYTES="${AGMSG_WATCH_LOG_MAX_BYTES:-131072}"
+# Normalized the way INTERVAL above is. What an un-normalized value costs was
+# measured rather than assumed, because the first version of this comment named
+# a failure that does not happen here: the value never enters `$(( ))`, so it
+# cannot be read as a variable name, and this script sets `-u` but not `-e`, so
+# nothing dies.
+#
+# It reaches the right-hand side of `[ ... -gt "$WATCH_LOG_MAX_BYTES" ]`. A
+# word there makes the test error non-fatally and read as false, forever, so
+# rotation simply never fires and the log grows unbounded -- the one property
+# this design was chosen for. A cap of `0` is the opposite failure: every
+# record is over it, so each one rotates and throws the previous generation
+# away, which is the diagnostics this exists to keep.
+#
+# Anything that is not a positive integer -- empty, words, 0, negative --
+# becomes the default, so a misconfigured cap degrades to the shipped bound
+# rather than to no bound or to a one-line window.
+case "$WATCH_LOG_MAX_BYTES" in
+  ''|*[!0-9]*) WATCH_LOG_MAX_BYTES=131072 ;;
+  *) [ "$WATCH_LOG_MAX_BYTES" -gt 0 ] || WATCH_LOG_MAX_BYTES=131072 ;;
+esac
+
+# Pairs already reported as storeless, so the notice is once per process.
+NO_STORE_REPORTED=""
+
+watch_log() {
+  local msg="$*" record size=0 bytes
+  printf 'agmsg watch: %s\n' "$msg" >&2
+  mkdir -p "$RUN_DIR" 2>/dev/null || return 0
+  # Built first, so the rotation decision can weigh what is actually going to
+  # be appended rather than only what is already there.
+  record="$(printf '%s [%s] %s' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$msg")"
+  if [ -f "$LOGFILE" ]; then
+    size="$(compat_file_size "$LOGFILE" 2>/dev/null || echo 0)"
+    case "$size" in ''|*[!0-9]*) size=0 ;; esac
+    # +1 for the newline. Rotate when this write WOULD cross the cap, not once
+    # it already has.
+    #
+    # Counted in BYTES, with `wc -c`, because the cap is bytes and so is the
+    # size `stat` returns. `${#record}` counts CHARACTERS in a UTF-8 locale, and
+    # a team or agent name may legally be Unicode -- the storeless and actas
+    # diagnostics put those names in the record. A multibyte line then passes a
+    # character-count check and lands over the byte cap, which is the contract
+    # this rotation exists to hold. One extra process per diagnostic is nothing:
+    # these are emitted a handful of times per watcher, not per poll.
+    bytes="$(printf '%s' "$record" | wc -c | tr -d '[:space:]' 2>/dev/null)"
+    # If the byte count cannot be had, rotate rather than guess. Falling back
+    # to `${#record}` would reinstate the character count this just replaced --
+    # the exact wrong unit, and fail-OPEN: the bound would quietly stop holding
+    # whenever `wc` is missing or answers oddly. Rotating costs one early
+    # generation; the diagnostic itself is still written whole below.
+    case "$bytes" in ''|*[!0-9]*) bytes="$WATCH_LOG_MAX_BYTES" ;; esac
+    if [ "$(( size + bytes + 1 ))" -gt "$WATCH_LOG_MAX_BYTES" ]; then
+      mv -f "$LOGFILE" "$LOGFILE.1" 2>/dev/null || true
+    fi
+  fi
+  # Never fatal: a sandbox that cannot write here must not take delivery down.
+  printf '%s\n' "$record" >> "$LOGFILE" 2>/dev/null || true
+}
 
 # Resolve poll interval. Env var wins over config, default 5s.
 INTERVAL="${AGMSG_WATCH_INTERVAL:-}"
@@ -317,6 +412,14 @@ while true; do
   # _agmsg_pid_alive). Gated on a composite id only: a bare id (degraded, no
   # resolved agent pid) keeps the prior behavior and is not liveness-gated.
   if agmsg_instance_is_composite "$SESSION_ID" && ! agmsg_instance_alive "$SESSION_ID"; then
+    # Say which condition fired and which token it decided about (#692). The
+    # guard is right; the silence is what costs. A watcher that stops here, one
+    # that was killed, one that crashed early and one that was never started
+    # were four indistinguishable states -- and a test watcher launched with a
+    # session id that does not resolve hits this immediately, so the test then
+    # runs against no watcher at all while looking exactly like one that did.
+    # That happened twice in one investigation before anyone noticed.
+    watch_log "session $SESSION_ID is no longer alive; stopping."
     exit 0
   fi
   while IFS=$'\t' read -r pair_team pair_agent; do
@@ -345,9 +448,9 @@ while true; do
           # it. Stop -- and say so: stderr is the only place a reason survives,
           # and a watcher that ends without one is indistinguishable from one
           # that crashed.
-          echo "agmsg watch: ${pair_team}/${pair_agent} is now held by session ${pair_state#other:}." >&2
-          echo "agmsg watch: this watcher no longer owns that role and is stopping." >&2
-          echo "agmsg watch: messages for it stay unread and reach the session that claimed it." >&2
+          watch_log "${pair_team}/${pair_agent} is now held by session ${pair_state#other:}."
+          watch_log "this watcher no longer owns that role and is stopping."
+          watch_log "messages for it stay unread and reach the session that claimed it."
           exit 0
         fi
         # Broad subscription: this watcher serves other roles too, so skip the
@@ -384,7 +487,19 @@ while true; do
     # Per team: with a store per team, "one team has no store yet" is a
     # normal state, and a single check outside this loop would silence
     # delivery for every OTHER team as well.
-    storage_store_exists "$pair_team" || continue
+    # Skipped, and said once. The same "stop quietly" shape as the guard above
+    # (#692): a team with no store yet is a normal state, but a team that
+    # silently stops being delivered every cycle is not distinguishable from
+    # one that is fine. Once per pair per process -- a line every poll interval
+    # would bury the log this exists to make readable.
+    if ! storage_store_exists "$pair_team"; then
+      case " $NO_STORE_REPORTED " in
+        *" $pair_team:$pair_agent "*) ;;
+        *) NO_STORE_REPORTED="$NO_STORE_REPORTED $pair_team:$pair_agent"
+           watch_log "${pair_team}/${pair_agent}: no store yet; skipping this pair until one exists." ;;
+      esac
+      continue
+    fi
     READ_CURSOR="$(storage_read_cursor_get "$pair_team" "$pair_agent" 2>/dev/null || true)"
     [ -n "$READ_CURSOR" ] || READ_CURSOR=0
     OUT="$(storage_watch_after "$READ_CURSOR" "$pair_team:$pair_agent" 2>/dev/null || true)"
@@ -458,7 +573,7 @@ while true; do
       if [ -n "${TMUX_PANE:-}" ] && command -v tmux >/dev/null 2>&1; then
         tmux kill-pane -t "$TMUX_PANE" 2>/dev/null || true
       else
-        echo "agmsg watch: despawned '$DESPAWN_TARGET' (role dropped); close this window manually" >&2
+        watch_log "despawned '$DESPAWN_TARGET' (role dropped); close this window manually"
       fi
       exit 0
     fi

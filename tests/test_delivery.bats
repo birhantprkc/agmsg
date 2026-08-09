@@ -2634,3 +2634,314 @@ JSON
   [[ "$output" == *"Codex bridge: team/bob has no session recorded (the one loaded thread is already seated by another role)"* ]]
   [[ "$output" != *"That combination is unexpected"* ]]
 }
+
+# --- "stops quietly" is what made a delivery bug expensive (#691, #692, #694) ---
+
+@test "watch: the liveness guard says which session it decided about (#692)" {
+  # The guard is right; the silence is what costs. A watcher launched with a
+  # session id that does not resolve exits here immediately, and a test then
+  # runs against no watcher while looking exactly like one that ran against
+  # one -- twice in a row, during a real investigation.
+  #
+  # A composite id whose agent pid is dead is the shape that fires it.
+  local dead
+  dead="$(bash -c 'echo $$')"
+  wait_for_pid_exit "$dead" || true
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  # No `timeout` on macOS, and the suite's own idiom is to run it and wait for
+  # it to end on its own -- which this guard makes it do immediately.
+  bash "$SCRIPTS/watch.sh" "gone-session.$dead" "$TEST_PROJECT" claude-code \
+    >/dev/null 2>/dev/null &
+  wait $! || true
+  # Said, and readable AFTERWARDS -- stderr is /dev/null where this really runs.
+  local log="$TEST_SKILL_DIR/run/watch.gone-session.$dead.log"
+  [ -f "$log" ] || { echo "no log at $log" >&2; return 1; }
+  grep -q "no longer alive" "$log" || { cat "$log" >&2; return 1; }
+  grep -q -F -- "gone-session.$dead" "$log" || { cat "$log" >&2; return 1; }
+}
+
+@test "watch: the log is written even when stderr is discarded (#691)" {
+  # The whole point. Not "we pointed stderr somewhere" -- the process is run
+  # with fd2 closed off exactly as it is in production, and the reason still
+  # has to be readable when it is over.
+  local dead
+  dead="$(bash -c 'echo $$')"
+  wait_for_pid_exit "$dead" || true
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  run bash -c \
+    "bash '$SCRIPTS/watch.sh' 'silent-session.$dead' '$TEST_PROJECT' claude-code 2>/dev/null"
+  [ "$status" -eq 0 ] || return 1
+  # Nothing reached the caller, which is the configuration being reproduced.
+  [ -z "$output" ] || { echo "expected no output, got: $output" >&2; return 1; }
+  local log="$TEST_SKILL_DIR/run/watch.silent-session.$dead.log"
+  [ -f "$log" ] || { echo "no log at $log" >&2; return 1; }
+  grep -q "no longer alive" "$log" || { cat "$log" >&2; return 1; }
+}
+
+@test "watch: one diagnostic cannot carry the log past its cap (#691)" {
+  # The boundary, not the already-over case. A live log UNDER the cap takes one
+  # more line and must not end up over it -- the first version compared only
+  # the size already on disk, so cap-1 plus a record ended oversized and no
+  # rotation ever happened. The ceiling is the reason this design was chosen,
+  # so the ceiling is what gets measured.
+  local dead log cap=200 live rotated
+  dead="$(bash -c 'echo $$')"
+  wait_for_pid_exit "$dead" || true
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  log="$TEST_SKILL_DIR/run/watch.rot-session.$dead.log"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  # Just UNDER the cap. One diagnostic is ~60-90 bytes, so the next write
+  # crosses it.
+  head -c 190 /dev/zero | tr '\0' 'x' > "$log"
+
+  AGMSG_WATCH_LOG_MAX_BYTES=$cap bash "$SCRIPTS/watch.sh" \
+    "rot-session.$dead" "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  wait $! || true
+
+  [ -f "$log.1" ] || { echo "the boundary was crossed without rotating" >&2; return 1; }
+  live="$(bash -c ". '$SCRIPTS/lib/compat.sh'; compat_file_size '$log'")"
+  rotated="$(bash -c ". '$SCRIPTS/lib/compat.sh'; compat_file_size '$log.1'")"
+  # Every generation kept is within the ceiling, which is the documented claim.
+  [ "$live" -le "$cap" ] || { echo "live log is $live bytes, cap $cap" >&2; return 1; }
+  [ "$rotated" -le "$cap" ] || { echo "rotated log is $rotated bytes, cap $cap" >&2; return 1; }
+  # And the reason still survived the rotation rather than being dropped.
+  grep -q "no longer alive" "$log" || { cat "$log" >&2; return 1; }
+}
+
+@test "watch: the cap is bytes, not characters (#691)" {
+  # `${#record}` counts CHARACTERS in a UTF-8 locale while the cap and stat are
+  # BYTES, so a multibyte diagnostic passes a character check and lands over the
+  # byte ceiling. Team names may legally be Unicode and the storeless notice
+  # puts the name in the record, so this is reachable, not theoretical.
+  #
+  # Two attempts failed to measure it before this one, and both failed the same
+  # way -- the mutation stayed green. First the record was the liveness guard's,
+  # which is pure ASCII. Then the padding was large enough that BOTH counts
+  # crossed the cap, so the two answers agreed. The gap only shows in the window
+  # where chars fit and bytes do not, so the padding is computed from the record
+  # this fixture actually produces rather than guessed.
+  local log db record chars bytes pad cap live
+  bash "$SCRIPTS/join.sh" "境界検査のためのとても長い日本語チーム名" alice claude-code "$TEST_PROJECT" >/dev/null
+  db="$(cd "$TEST_SKILL_DIR" && bash -c '. scripts/lib/storage.sh; agmsg_db_path 境界検査のためのとても長い日本語チーム名')"
+  rm -f "$db"
+  log="$TEST_SKILL_DIR/run/watch.mb-session.log"
+  mkdir -p "$TEST_SKILL_DIR/run"
+
+  # Pass 1: an effectively unlimited cap, purely to observe the record.
+  AGMSG_WATCH_INTERVAL=1 AGMSG_WATCH_LOG_MAX_BYTES=1000000 \
+    bash "$SCRIPTS/watch.sh" mb-session "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  local wpid=$! waited=0
+  while [ "$waited" -lt 100 ]; do
+    grep -q 'no store yet' "$log" 2>/dev/null && break
+    sleep 0.1; waited=$((waited + 1))
+  done
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  record="$(grep 'no store yet' "$log" | head -1)"
+  [ -n "$record" ] || { echo "the notice naming the team never appeared" >&2; return 1; }
+  chars=${#record}
+  bytes="$(printf '%s' "$record" | wc -c | tr -d '[:space:]')"
+  # The two answers must actually differ, or this fixture proves nothing.
+  [ "$bytes" -gt "$chars" ] || { echo "record is not multibyte: $chars/$bytes" >&2; return 1; }
+
+  # Pass 2: a cap inside the window -- chars say it fits, bytes say it does not.
+  cap=$(( 120 + chars + 1 ))
+  pad=120
+  rm -f "$log" "$log.1"
+  head -c "$pad" /dev/zero | tr '\0' 'x' > "$log"
+  AGMSG_WATCH_INTERVAL=1 AGMSG_WATCH_LOG_MAX_BYTES=$cap \
+    bash "$SCRIPTS/watch.sh" mb-session "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  wpid=$!; waited=0
+  while [ "$waited" -lt 100 ]; do
+    grep -q 'no store yet' "$log" 2>/dev/null && break
+    grep -q 'no store yet' "$log.1" 2>/dev/null && break
+    sleep 0.1; waited=$((waited + 1))
+  done
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+
+  live="$(bash -c ". '$SCRIPTS/lib/compat.sh'; compat_file_size '$log'")"
+  [ "$live" -le "$cap" ] \
+    || { echo "live log is $live bytes, cap $cap (chars=$chars bytes=$bytes pad=$pad)" >&2; return 1; }
+}
+
+@test "watch: an unmeasurable record rotates rather than guessing (#691)" {
+  # The fallback used to be `${#record}` -- the character count this had just
+  # been fixed away from, and fail-OPEN: with `wc` missing, the bound quietly
+  # stopped holding. It now rotates when the size cannot be measured.
+  #
+  # The cap has to sit in the window where the character count would NOT
+  # rotate, or the two behaviours agree and the case proves nothing. Same
+  # derivation as the multibyte case: observe the record, then set the cap.
+  local log db record chars bytes cap pad live shim wpid waited
+  bash "$SCRIPTS/join.sh" "境界検査のためのとても長い日本語チーム名" alice claude-code "$TEST_PROJECT" >/dev/null
+  db="$(cd "$TEST_SKILL_DIR" && bash -c '. scripts/lib/storage.sh; agmsg_db_path 境界検査のためのとても長い日本語チーム名')"
+  rm -f "$db"
+  log="$TEST_SKILL_DIR/run/watch.nowc-session.log"
+  mkdir -p "$TEST_SKILL_DIR/run"
+
+  AGMSG_WATCH_INTERVAL=1 AGMSG_WATCH_LOG_MAX_BYTES=1000000 \
+    bash "$SCRIPTS/watch.sh" nowc-session "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  wpid=$!; waited=0
+  while [ "$waited" -lt 100 ]; do
+    grep -q 'no store yet' "$log" 2>/dev/null && break
+    sleep 0.1; waited=$((waited + 1))
+  done
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  record="$(grep 'no store yet' "$log" | head -1)"
+  [ -n "$record" ] || { echo "no record to size the fixture from" >&2; return 1; }
+  chars=${#record}
+  bytes="$(printf '%s' "$record" | wc -c | tr -d '[:space:]')"
+  [ "$bytes" -gt "$chars" ] || { echo "record is not multibyte" >&2; return 1; }
+
+  # In the window: the character count fits, the real byte count does not.
+  pad=120
+  cap=$(( pad + chars + 1 ))
+  rm -f "$log" "$log.1"
+  head -c "$pad" /dev/zero | tr '\0' 'x' > "$log"
+
+  # A `wc` that fails, first on PATH -- which is the one the watcher finds.
+  shim="$TEST_SKILL_DIR/shim"; mkdir -p "$shim"
+  printf '#!/bin/sh\nexit 1\n' > "$shim/wc"; chmod +x "$shim/wc"
+
+  PATH="$shim:$PATH" AGMSG_WATCH_INTERVAL=1 AGMSG_WATCH_LOG_MAX_BYTES=$cap \
+    bash "$SCRIPTS/watch.sh" nowc-session "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  wpid=$!; waited=0
+  while [ "$waited" -lt 100 ]; do
+    [ -f "$log.1" ] && break
+    grep -q 'no store yet' "$log" 2>/dev/null && break
+    sleep 0.1; waited=$((waited + 1))
+  done
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+
+  live="$(bash -c ". '$SCRIPTS/lib/compat.sh'; compat_file_size '$log'")"
+  [ "$live" -le "$cap" ] \
+    || { echo "live log is $live bytes, cap $cap (chars=$chars bytes=$bytes pad=$pad)" >&2; return 1; }
+  # And the diagnostic was not lost to the conservative choice.
+  grep -q 'no store yet' "$log" || { echo "the record was dropped" >&2; cat "$log" >&2; return 1; }
+}
+
+@test "watch: an invalid log cap falls back to the default, not to no bound (#691)" {
+  # `0` is the value that separates the two behaviours. Normalized, it becomes
+  # the 128 KiB default and a small log is left alone. Unnormalized, every
+  # record is "over" a cap of zero and the log rotates on every line, throwing
+  # away the previous generation each time -- the diagnostics this exists to
+  # keep.
+  #
+  # Note on the failure mode: an invalid cap does NOT kill the watcher. The
+  # value never enters `$(( ))`; it is the right-hand side of `[ -gt ]`, which
+  # errors non-fatally because this script sets `-u`, not `-e`. What it does is
+  # quietly stop the comparison from ever being true -- so the real risk is an
+  # unbounded log, and that is what is pinned here.
+  local dead log
+  dead="$(bash -c 'echo $$')"
+  wait_for_pid_exit "$dead" || true
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  log="$TEST_SKILL_DIR/run/watch.zerocap-session.$dead.log"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf 'a previous generation worth keeping\n' > "$log"
+
+  AGMSG_WATCH_LOG_MAX_BYTES=0 bash "$SCRIPTS/watch.sh" \
+    "zerocap-session.$dead" "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  wait $! || true
+
+  # Treated as the default: nothing was rotated away for a 36-byte file.
+  [ ! -f "$log.1" ] || { echo "a cap of 0 rotated a tiny log" >&2; return 1; }
+  grep -q 'a previous generation worth keeping' "$log" \
+    || { echo "the previous generation was discarded" >&2; cat "$log" >&2; return 1; }
+  # And the run still said why it stopped.
+  grep -q "no longer alive" "$log" || { cat "$log" >&2; return 1; }
+}
+
+@test "watch: a non-numeric log cap still rotates at the default (#691)" {
+  # The other half of the contract, as a case that can actually fail. The first
+  # version asserted only that a reason was still readable -- true whether or
+  # not the value is normalized, because an un-normalized word makes `[ -gt ]`
+  # error non-fatally and read as false, and the append then succeeds anyway.
+  # It passed under mutation, so it measured nothing.
+  #
+  # What separates the two: put the live log just under the SHIPPED default and
+  # write one more record. Normalized, `oops` IS the default, so this crosses it
+  # and rotates. Un-normalized, the comparison is false forever and nothing
+  # rotates however large the file gets.
+  local dead log default=131072
+  dead="$(bash -c 'echo $$')"
+  wait_for_pid_exit "$dead" || true
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  log="$TEST_SKILL_DIR/run/watch.bogus-session.$dead.log"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  # 40 bytes short of the default: any diagnostic is longer than that.
+  head -c $(( default - 40 )) /dev/zero | tr '\0' 'x' > "$log"
+
+  AGMSG_WATCH_LOG_MAX_BYTES=oops bash "$SCRIPTS/watch.sh" \
+    "bogus-session.$dead" "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  wait $! || true
+
+  [ -f "$log.1" ] \
+    || { echo "a non-numeric cap did not fall back to the default bound" >&2; return 1; }
+  local live
+  live="$(bash -c ". '$SCRIPTS/lib/compat.sh'; compat_file_size '$log'")"
+  [ "$live" -le "$default" ] || { echo "live log is $live bytes" >&2; return 1; }
+  grep -q "no longer alive" "$log" || { cat "$log" >&2; return 1; }
+}
+
+@test "watch: a record larger than the whole cap is kept, not dropped (#691)" {
+  # The stated exception. A single diagnostic bigger than the cap cannot fit
+  # under it; rotating first and writing it whole beats dropping the one line
+  # someone is looking for. Named so the behaviour is a decision, not a
+  # surprise.
+  local dead log
+  dead="$(bash -c 'echo $$')"
+  wait_for_pid_exit "$dead" || true
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  log="$TEST_SKILL_DIR/run/watch.tiny-session.$dead.log"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  AGMSG_WATCH_LOG_MAX_BYTES=1 bash "$SCRIPTS/watch.sh" \
+    "tiny-session.$dead" "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  wait $! || true
+  [ -f "$log" ] || { echo "the diagnostic was dropped entirely" >&2; return 1; }
+  grep -q "no longer alive" "$log" || { cat "$log" >&2; return 1; }
+}
+
+@test "check-inbox: a live watcher no longer stops the turn side (#694)" {
+  # The negative control for `both`. Before this, ANY live watcher pid made
+  # this hook exit 0 -- including a watcher delivering nothing, which is the
+  # one situation `both` is reached for. The watcher here is alive and does
+  # nothing at all, which is precisely the failure.
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" testteam bob claude-code "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/send.sh" testteam bob alice "delivered by neither" >/dev/null
+
+  # A watcher that is alive and delivering nothing.
+  mkdir -p "$TEST_SKILL_DIR/run"
+  sleep 60 &
+  local idle=$!
+  printf '%s\n' "$idle" > "$TEST_SKILL_DIR/run/watch.both-session.pid"
+
+  run bash -c "printf '%s' '{\"session_id\":\"both-session\"}' | bash '$SCRIPTS/check-inbox.sh' claude-code '$TEST_PROJECT'"
+  kill "$idle" 2>/dev/null || true
+  [ "$status" -eq 0 ] || return 1
+  printf '%s\n' "$output" | grep -q 'delivered by neither' \
+    || { echo "the turn side still stood down: $output" >&2; return 1; }
+}
+
+@test "check-inbox: what the watcher already took is not offered twice (#694)" {
+  # Why removing the deferral is safe, measured rather than argued. The watcher
+  # consumes through storage_read_cursor_consume, which records a message_read
+  # event per delivered id AND advances the cursor; storage_list_unread
+  # excludes both. Same state, so no duplicate.
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" testteam bob claude-code "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/send.sh" testteam bob alice "taken by the watcher" >/dev/null
+
+  # Stand in for the watcher's consume, using the same facade it calls.
+  local id
+  id="$(bash -c ". '$SCRIPTS/lib/storage.sh'; agmsg_storage_load; \
+    storage_list_unread testteam alice" | sed -n 's/.*\"id\":\"\([^\"]*\)\".*/\1/p' | head -1)"
+  [ -n "$id" ] || return 1
+  bash -c ". '$SCRIPTS/lib/storage.sh'; agmsg_storage_load; \
+    storage_read_cursor_consume testteam alice 999999 '$id'" >/dev/null
+
+  run bash -c "printf '%s' '{\"session_id\":\"dup-session\"}' | bash '$SCRIPTS/check-inbox.sh' claude-code '$TEST_PROJECT'"
+  [ "$status" -eq 0 ] || return 1
+  run bash -c "printf '%s\n' \"\$1\" | grep -q 'taken by the watcher'" _ "$output"
+  [ "$status" -ne 0 ] || { echo "the hook re-offered a consumed message" >&2; return 1; }
+}
