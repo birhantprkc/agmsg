@@ -41,11 +41,12 @@ flowchart LR
 ## 必要なもの
 
 - Docker と Compose — 自前のデータベースを使うなら PostgreSQL 17。
-  始める前に確認しておくこと: `docker compose version` を打ってバージョンが
-  出ればよい。Compose プラグインが無いと `docker compose ...` はエラーに
-  なるが、そのエラー文には「compose」の一言も出てこない（Docker が
-  `compose` を未知のコマンドとして扱い、残りの引数の解釈を誤るため）。
-  あとで原因を探すより、先に確認したほうが早い。
+  Compose の経路を使うなら、始める前に確認しておくこと:
+  `docker compose version` を打ってバージョンが出ればよい。今回の報告環境
+  では、Compose プラグインが無いと `docker compose up -d --build` が
+  `unknown shorthand flag: 'd' in -d` で失敗し、そのエラー文には
+  「compose」の一言も出てこなかった。あとで原因を探すより、先に確認した
+  ほうが早い。
 - Node.js 22 以降
 - Bash、SQLite、curl
 - サーバーホスト上の agmsg チェックアウト
