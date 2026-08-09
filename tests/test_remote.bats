@@ -1686,7 +1686,7 @@ PY_BIND
   [[ "$output" == *"imported 0 envelope(s); engine running (pid "* ]]
   second_pid="$(cat "$pidfile")"
   [ "$second_pid" != "$first_pid" ]
-  ! kill -0 "$first_pid" 2>/dev/null
+  refute kill -0 "$first_pid" 2>/dev/null
   kill -0 "$second_pid" 2>/dev/null
 
   run bash "$peer_scripts/history.sh" encrypted member-1

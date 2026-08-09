@@ -330,7 +330,7 @@ remember_engine_pid() {
   [[ "$output" == *"did not become ready"* ]]
   [ ! -e "$TEST_SKILL_DIR/run/remote-sync.testteam.pid" ]
   child_pid="$(cat "$child_pid_file")"
-  ! kill -0 "$child_pid" 2>/dev/null
+  refute kill -0 "$child_pid" 2>/dev/null
   lock="$TEST_SKILL_DIR/teams/testteam/.config.lock"
   [ ! -d "$lock" ]
 }

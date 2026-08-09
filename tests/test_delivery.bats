@@ -69,7 +69,7 @@ settings_file() {
 @test "delivery set off: removes both hooks" {
   bash "$SCRIPTS/delivery.sh" set both claude-code "$TEST_PROJECT"
   bash "$SCRIPTS/delivery.sh" set off claude-code "$TEST_PROJECT"
-  ! has_session_start "$(settings_file)"
+  refute has_session_start "$(settings_file)"
   ! has_check_inbox "$(settings_file)"
 }
 
@@ -113,7 +113,7 @@ settings_file() {
 @test "delivery: both -> off clears settings.local.json hooks" {
   bash "$SCRIPTS/delivery.sh" set both claude-code "$TEST_PROJECT"
   bash "$SCRIPTS/delivery.sh" set off  claude-code "$TEST_PROJECT"
-  ! has_session_start "$(settings_file)"
+  refute has_session_start "$(settings_file)"
   ! has_check_inbox "$(settings_file)"
 }
 
@@ -648,7 +648,7 @@ JSON
   [ -f "$TEST_SKILL_DIR/run/watch.sigterm-test.pid" ]
   kill -TERM "$pid"
   sleep 1
-  ! kill -0 "$pid" 2>/dev/null
+  refute kill -0 "$pid" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/watch.sigterm-test.pid" ]
 }
 
@@ -829,12 +829,15 @@ has_session_end() {
 
 @test "session-end.sh kills the watcher matching session_id and removes pidfile" {
   mkdir -p "$TEST_SKILL_DIR/run"
-  sleep 30 3>&- &
-  local target_pid=$!
+  # The cmdline has to look like this install's watch.sh: session-end only
+  # signals a pid that still does, so a bare `sleep` was never killed and the
+  # check for it was silent (#670).
+  local target_pid
+  spawn_decoy_with_cmdline "$SCRIPTS/watch.sh"; target_pid="$DECOY_PID"
   echo "$target_pid" > "$TEST_SKILL_DIR/run/watch.sess-A.pid"
   echo '{"session_id":"sess-A"}' | bash "$SCRIPTS/session-end.sh" claude-code "$TEST_PROJECT"
   sleep 1
-  ! kill -0 "$target_pid" 2>/dev/null
+  refute kill -0 "$target_pid" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/watch.sess-A.pid" ]
 }
 
@@ -867,8 +870,11 @@ has_session_end() {
 @test "delivery set monitor: bakes CLAUDE_CODE_SESSION_ID into the directive" {
   CLAUDE_CODE_SESSION_ID="real-uuid-1234" run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
   [[ "$output" =~ "real-uuid-1234" ]]
-  ! [[ "$output" =~ "\\\$AGMSG_SESSION_ID" ]]
-  ! [[ "$output" =~ "\\\$CLAUDE_CODE_SESSION_ID" ]]
+  # A quoted right-hand side in `[[ =~ ]]` is a literal, so `grep -F` matches
+  # the same thing -- including the backslash: what must be absent is the
+  # ESCAPED form `\$NAME`, not an expanded one. `! [[ ]]` never fired (#670).
+  refute grep -q -F -- '\$AGMSG_SESSION_ID' <<<"$output"
+  refute grep -q -F -- '\$CLAUDE_CODE_SESSION_ID' <<<"$output"
 }
 
 @test "delivery set monitor: falls back to a generated id when env is unset" {
@@ -877,7 +883,7 @@ has_session_end() {
   run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
   [[ "$output" =~ "AGMSG-DIRECTIVE" ]]
   # No placeholder leaked
-  ! [[ "$output" =~ "\\\$AGMSG_SESSION_ID" ]]
+  refute grep -q -F -- '\$AGMSG_SESSION_ID' <<<"$output"
 }
 
 # --- session-start.sh: stale watcher pidfile cleanup ---
@@ -988,7 +994,7 @@ JSON
   run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
   [[ "$output" =~ "already streaming" ]]
-  ! [[ "$output" =~ "AGMSG-DIRECTIVE" ]]
+  refute grep -q -F -- 'AGMSG-DIRECTIVE' <<<"$output"
 
   kill "$live_pid" 2>/dev/null || true
   unset CLAUDE_CODE_SESSION_ID
@@ -1018,7 +1024,7 @@ JSON
     bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
   [[ "$output" =~ "already streaming" ]]
-  ! [[ "$output" =~ "AGMSG-DIRECTIVE" ]]
+  refute grep -q -F -- 'AGMSG-DIRECTIVE' <<<"$output"
 
   kill "$live_pid" 2>/dev/null || true
   unset CLAUDE_CODE_SESSION_ID
@@ -1316,9 +1322,10 @@ JSON
   bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT" >/dev/null
   mkdir -p "$TEST_SKILL_DIR/run"
 
-  # Orphan: watcher referenced by a cc-instance.<dead-pid> file.
-  sleep 30 3>&- &
-  local orphan_pid=$!
+  # Orphan: watcher referenced by a cc-instance.<dead-pid> file. Its cmdline
+  # has to look like watch.sh or the reaper declines to signal it (#670).
+  local orphan_pid
+  spawn_decoy_with_cmdline "$SCRIPTS/watch.sh"; orphan_pid="$DECOY_PID"
   echo "$orphan_pid" > "$TEST_SKILL_DIR/run/watch.orphan-sid.pid"
   # Use a PID that's almost certainly not in use as the dead CC ancestor.
   local dead_cc_pid=999999
@@ -1333,7 +1340,7 @@ JSON
   echo "{\"session_id\":\"current-sid\"}" \
     | bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" >/dev/null
 
-  ! kill -0 "$orphan_pid" 2>/dev/null
+  refute kill -0 "$orphan_pid" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/watch.orphan-sid.pid" ]
   [ ! -f "$TEST_SKILL_DIR/run/cc-instance.$dead_cc_pid" ]
   # Untracked watcher untouched
@@ -1395,7 +1402,7 @@ JSON
   wait "$pid" 2>/dev/null || true
 
   grep -q "for-alice-static" /tmp/agmsg-static
-  ! grep -q "for-bob-static" /tmp/agmsg-static
+  refute grep -q "for-bob-static" /tmp/agmsg-static
   rm -f /tmp/agmsg-static
 }
 
@@ -1428,7 +1435,7 @@ JSON
   sleep 1
 
   # Target project A: watcher killed, pidfile removed.
-  ! kill -0 "$pid_a" 2>/dev/null
+  refute kill -0 "$pid_a" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/watch.sid-a.pid" ]
 
   # Other project B: watcher and its pidfile must survive.
@@ -1463,7 +1470,7 @@ JSON
   [ "$status" -eq 0 ]
   sleep 1
 
-  ! kill -0 "$pid_a" 2>/dev/null
+  refute kill -0 "$pid_a" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/watch.off-a.pid" ]
   kill -0 "$pid_b" 2>/dev/null
   [ -f "$TEST_SKILL_DIR/run/watch.off-b.pid" ]
@@ -1494,8 +1501,8 @@ JSON
   run bash "$SCRIPTS/delivery.sh" stop
   [[ "$output" =~ "Killed 2 watch" ]]
   sleep 1
-  ! kill -0 "$pid_a" 2>/dev/null
-  ! kill -0 "$pid_b" 2>/dev/null
+  refute kill -0 "$pid_a" 2>/dev/null
+  refute kill -0 "$pid_b" 2>/dev/null
 
   rm -rf "$proj_b"
 }
@@ -1712,7 +1719,7 @@ JSON
 
   run bash "$SCRIPTS/delivery.sh" set off claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
-  ! has_check_inbox "$(settings_file)"
+  refute has_check_inbox "$(settings_file)"
   local allow_len
   allow_len=$(sqlite_mem "SELECT json_array_length(json_extract(readfile('$(rf "$(settings_file)")'), '\$.permissions.allow'));")
   [ "$allow_len" = "600" ]
@@ -2372,7 +2379,7 @@ EOF
   [ "$status" -eq 0 ]
   [[ "$output" == *"Stopped 1 Codex bridge"* ]]
   [[ "$output" == *"shim"* ]]
-  ! kill -0 "$bpid" 2>/dev/null
+  refute kill -0 "$bpid" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid" ]
   [ ! -f "$TEST_SKILL_DIR/run/codex-bridge.team.alice.meta" ]
   [ ! -f "$TEST_SKILL_DIR/run/codex-bridge.team.alice.appserver" ]

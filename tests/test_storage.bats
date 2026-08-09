@@ -148,7 +148,7 @@ SH
   owner="$(agmsg_runtime_lock_acquire "$resource" 333 111)"
   [ "$owner" = 222 ]
   agmsg_runtime_lock_verify "$resource" 222
-  ! agmsg_runtime_lock_verify "$resource" 333
+  refute agmsg_runtime_lock_verify "$resource" 333
   agmsg_runtime_lock_release "$resource" 333
   agmsg_runtime_lock_verify "$resource" 222
   agmsg_runtime_lock_release "$resource" 222
@@ -316,7 +316,7 @@ _use_per_team() {
   [[ ! "$(storage_list_unread bravo bob)" =~ "alpha-only" ]]
 
   # Not just filtered on the way out — the bytes are in different files.
-  ! grep -q "bravo-only" "$(agmsg_db_path alpha)"
+  refute grep -q "bravo-only" "$(agmsg_db_path alpha)"
   ! grep -q "alpha-only" "$(agmsg_db_path bravo)"
 }
 
