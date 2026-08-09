@@ -62,6 +62,49 @@ src_tables="$(agmsg_sqlite "$SHARED" \
   "SELECT name FROM sqlite_master WHERE type='table';" 2>/dev/null || true)"
 has_table() { printf '%s\n' "$src_tables" | grep -qx "$1"; }
 
+# Every column of events that moves, ASKED OF THE STORE rather than listed
+# here. The copy and the containment check below both use this, and they have to
+# agree: a column carried by one and not the other is either a row that compares
+# equal while differing, or a row the check reports missing forever.
+#
+# A hand-written list is what went wrong. It omitted legacy_id -- the column
+# that links an event to its row in the legacy messages table (#689) -- so every
+# moved message arrived unlinked. That is not a cosmetic loss: the two readers
+# that UNION the two tables list it twice, and the legacy projection in
+# sqlite-sync, whose entire guard is `events.legacy_id = messages.id`, matches
+# nothing and projects the message a SECOND time, which is then pushed to the
+# server and on to every other machine (#710). The containment check carried the
+# same omission, so both sides compared equal and the migration verified clean
+# while dropping the column.
+#
+# Deriving it means the next column added to events is carried without anyone
+# remembering to come here. The destination schema is replayed from this store's
+# own sqlite_master further down, so both stores always have exactly this set --
+# including a shared store old enough to predate legacy_id, which then has no
+# column to lose.
+#
+# Empty is a failure, not "no columns": PRAGMA answering nothing for a table
+# sqlite_master lists means the schema could not be read, and continuing would
+# copy nothing, compare nothing, find nothing missing, and delete the originals.
+#
+# The names are quoted as identifiers before they are interpolated. Nothing in
+# this schema needs it -- agmsg creates the table -- but a name that did would
+# otherwise land in the statement as syntax. `PRAGMA ... | cut -d'|'` is the
+# extraction this repo already uses (drivers/storage/sqlite-sync.sh); a name
+# containing the separator would survive it as two fragments, and quoting turns
+# that into a "no such column" error instead of a statement that means something
+# else.
+EVENT_COLS=""
+if has_table events; then
+  EVENT_COLS="$(agmsg_sqlite "$SHARED" "PRAGMA table_info(events);" \
+    | cut -d'|' -f2 | tr -d '\r' \
+    | sed 's/"/""/g; s/^/"/; s/$/"/' | paste -sd, -)"
+  [ -n "$EVENT_COLS" ] || {
+    echo "team store: could not read the events schema in the shared store" >&2
+    exit 1
+  }
+fi
+
 # Every row of this team that the shared store holds, compared by VALUE.
 #
 # Not a count: equal totals can be different rows. Not a key either: the same
@@ -88,10 +131,10 @@ _missing_from_dest() {
     # destination may be someone else's row, and deleting the shared original on
     # the strength of a matching number would lose it.
     case "$t" in
-      events)   sql="SELECT seq,type,id,team,from_agent,to_agent,body,msg_id,agent,at
+      events)   sql="SELECT $EVENT_COLS
                        FROM $t WHERE team='$lit'
                      EXCEPT
-                     SELECT seq,type,id,team,from_agent,to_agent,body,msg_id,agent,at
+                     SELECT $EVENT_COLS
                        FROM dst.$t WHERE team='$lit';" ;;
       messages) sql="SELECT id,team,from_agent,to_agent,body,created_at,read_at
                        FROM $t WHERE team='$lit'
@@ -242,8 +285,8 @@ team_lit="$(agmsg_sqlesc "$TEAM")"
 copy="BEGIN;"
 if has_table events; then
   copy="$copy
-    INSERT OR IGNORE INTO events(seq,type,id,team,from_agent,to_agent,body,msg_id,agent,at)
-      SELECT seq,type,id,team,from_agent,to_agent,body,msg_id,agent,at
+    INSERT OR IGNORE INTO events($EVENT_COLS)
+      SELECT $EVENT_COLS
         FROM src.events WHERE team='$team_lit';"
 fi
 if has_table messages; then
