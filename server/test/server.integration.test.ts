@@ -181,6 +181,45 @@ describeDatabase("remote storage HTTP API v1", () => {
     expect(malformed.statusCode).toBe(400);
   });
 
+  it("reports database unavailable only when the connection itself fails, not for a failure after connecting (#705)", async () => {
+    // Negative control, both directions -- proving the two are actually told
+    // apart, not that one of them merely happens to be untested.
+
+    // Direction 1: the database really is unreachable.
+    const unreachablePool = new Pool({
+      host: "127.0.0.1",
+      port: 1, // nothing listens here
+      connectionTimeoutMillis: 500,
+    });
+    const unreachableApp = createApp(unreachablePool, config);
+    await unreachableApp.ready();
+    try {
+      const response = await unreachableApp.inject({ method: "GET", url: "/v1/health" });
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toMatchObject({
+        status: "unavailable",
+        database: "unavailable",
+      });
+    } finally {
+      await unreachableApp.close();
+      await unreachablePool.end();
+    }
+
+    // Direction 2: the connection succeeds, but the query behind it fails --
+    // a real, non-hypothetical instance of "something else went wrong". This
+    // must not be reported as the database being unavailable; the connection
+    // worked fine.
+    await pool.query(`ALTER TABLE server_metadata RENAME TO server_metadata_moved`);
+    try {
+      const response = await app.inject({ method: "GET", url: "/v1/health" });
+      expect(response.statusCode).toBe(500);
+      expect(response.json()).not.toHaveProperty("database");
+      expect(response.json()).toMatchObject({ error: { code: "internal-error" } });
+    } finally {
+      await pool.query(`ALTER TABLE server_metadata_moved RENAME TO server_metadata`);
+    }
+  });
+
   it("answers a name lookup, and refuses more names than it can disambiguate", async () => {
     const lookupName = "lookup-by-name";
     const ids = Array.from({ length: 17 }, (_, index) =>

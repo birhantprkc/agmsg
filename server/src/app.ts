@@ -7,7 +7,7 @@ import * as duplicateKeyJson from "json-dup-key-validator";
 import type { Pool } from "pg";
 import { ZodError, z } from "zod";
 import type { Config } from "./config.js";
-import { errorBody, ProtocolError } from "./errors.js";
+import { errorBody, DatabaseUnavailableError, ProtocolError } from "./errors.js";
 import {
   MAX_REQUEST_BYTES,
   connectSchema,
@@ -211,7 +211,16 @@ async function dataPlaneRoutes(
       // staying 200 — this route is also how "is the server up" is asked, and a
       // 404 would be indistinguishable from "no such route".
       return await health(pool, teamId);
-    } catch {
+    } catch (error) {
+      // Narrowed on purpose: this response claims the DATABASE is
+      // unreachable, so only a DatabaseUnavailableError -- thrown solely when
+      // pool.connect() itself failed -- may produce it. Anything else (a
+      // routing bug, a validation failure, a query-level error after a
+      // connection was already established) is a different problem and must
+      // not be reported as the database being down; rethrowing lets the
+      // plugin's own error handler classify and log it instead.
+      if (!(error instanceof DatabaseUnavailableError)) throw error;
+      requestLog(reply, error);
       return reply.status(503).send({
         status: "unavailable",
         protocol: { supported_versions: [1] },

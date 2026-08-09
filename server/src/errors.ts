@@ -1,3 +1,16 @@
+// Thrown only when the connection to the database itself could not be
+// established -- never for a failure that happened after a connection was
+// already in hand (a query bug, an unexpected value, routing, validation).
+// Those are real failures too, but they are not evidence the database is
+// unreachable, and reporting them as `database: "unavailable"` overwrites the
+// one signal a caller has for telling the two apart.
+export class DatabaseUnavailableError extends Error {
+  constructor(cause: unknown) {
+    super("database connection failed", { cause });
+    this.name = "DatabaseUnavailableError";
+  }
+}
+
 export class ProtocolError extends Error {
   constructor(
     readonly statusCode: number,

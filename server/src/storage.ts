@@ -1,5 +1,5 @@
 import type { Pool, PoolClient } from "pg";
-import { ProtocolError } from "./errors.js";
+import { DatabaseUnavailableError, ProtocolError } from "./errors.js";
 import {
   MAX_SEQUENCE,
   type ConnectInput,
@@ -1083,7 +1083,15 @@ export async function health(
   database: "ok";
   team_id?: string;
 }> {
-  const client = await pool.connect();
+  // Only a failure HERE means the database is actually unreachable. Anything
+  // that goes wrong after a client is in hand -- a query bug, an unexpected
+  // row shape -- had a working connection, so it is not this.
+  let client: PoolClient;
+  try {
+    client = await pool.connect();
+  } catch (error) {
+    throw new DatabaseUnavailableError(error);
+  }
   try {
     const serverId = await serverInstanceId(client);
     const base = {
