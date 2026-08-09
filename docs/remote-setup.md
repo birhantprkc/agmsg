@@ -42,8 +42,13 @@ curl -fsS http://127.0.0.1:8787/v1/health
 The response should contain `"status":"ok"` and `"database":"ok"`. If the
 containers are still starting, retry until it succeeds.
 
-Then make the server available to both machines at an HTTPS URL, and check it
-from there too:
+**That address is the endpoint** for every command below — write
+`http://127.0.0.1:8787` wherever this document says `<server-url>`, as long as
+both machines can reach it. Two accounts on one host can; so can two machines on
+a network you control, using the host's address rather than `127.0.0.1`.
+
+Only when the second machine reaches the server over a network you do not
+control does it need a public HTTPS URL. Then check it from there too:
 
 ```sh
 curl -fsS https://<server-url>/v1/health
@@ -87,6 +92,22 @@ Connect moves this team from the shared database into a per-team store. If an
 external tool reads the database file directly, resolve the team's new path
 instead of continuing to use the shared database path. Ask the agent for the
 team's store path, or use the command in [Reference](#reference).
+
+**If you connected with `--e2ee`, export the handoff bundle now**, while you are
+still on the machine that holds the key:
+
+```sh
+bash ~/.agents/skills/agmsg/scripts/key.sh handoff <team> --out <bundle-file>
+```
+
+It prints a snapshot digest. Keep it — machine B has to be given it separately
+from the bundle, and comparing the two is the check.
+
+Do this here rather than later. Machine B's `pull` will tell you the team is
+locked and to unlock it "with the bundle you were given", as though one exists;
+nothing on either machine says to create it. Details of what the bundle is and
+how to carry it are in
+[Extra: end-to-end encryption](#extra-end-to-end-encryption).
 
 ## 3. Install and pull on machine B
 
