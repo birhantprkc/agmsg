@@ -91,6 +91,9 @@ check_walkthrough() {
   grep -q 'docker compose up -d --build' "$doc" \
     || problems="${problems}${doc}: does not offer the Compose path
 "
+  grep -q 'docker compose version' "$doc" \
+    || problems="${problems}${doc}: does not tell the reader how to confirm Compose is actually present (#704)
+"
   grep -q '/v1/health' "$doc" \
     || problems="${problems}${doc}: never reaches the health check
 "

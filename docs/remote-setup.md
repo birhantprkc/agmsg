@@ -42,7 +42,13 @@ server, the server could read the messages.
 
 ## Requirements
 
-- Docker with Compose — or PostgreSQL 17, if you bring your own database
+- Docker with Compose — or PostgreSQL 17, if you bring your own database.
+  If you use the Compose path, confirm it before starting:
+  `docker compose version` should print a version, not an error. On the
+  setup this was reported from, a missing Compose plugin surfaced only as
+  `docker compose up -d --build` failing with `unknown shorthand flag: 'd'
+  in -d` — an error that never mentioned "compose" — so this is worth
+  checking up front rather than debugging later.
 - Node.js 22 or later
 - Bash, SQLite, and curl
 - An agmsg checkout on the server host
