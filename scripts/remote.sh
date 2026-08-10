@@ -2166,29 +2166,53 @@ cmd_forget() {
   echo "Forgot '$team' on this machine. The server copy was not changed."
 }
 
-# _remote_ensure_binding_revision <team> <cfg> -> prints the numeric revision
+# _remote_snapshot_binding_for_update <team> <cfg>
+# Prints one tab-separated line:
+#   endpoint  server_instance_id  remote_team_id  cipher_profile
+#   connected_at  disconnected_at  binding_revision
 #
-# A binding written before revisions existed has no binding_revision, and both
-# CAS functions (_remote_write_binding, _remote_local_disconnect) skip their
-# comparison entirely for an empty/null expected value -- which silently
-# disables the lifecycle guard for exactly those legacy teams. cmd_forget
-# already carries the compat move for this input (initialize to 1, under the
-# lock); this is that same move, hoisted so a CAS caller can rely on a real
-# number existing before it snapshots one. Initialized and re-read inside the
-# lock, so the number printed is the number on disk.
-_remote_ensure_binding_revision() {
-  local team="$1" cfg="$2" escaped revision updated
+# ONE lock acquisition covers both the legacy-revision initialization and the
+# reads, so every field describes the same generation of the binding and the
+# revision printed is the revision that generation really has. Read outside a
+# single lock, the pieces can straddle a concurrent write: the caller judges
+# "connected" from one generation and then snapshots the NEXT generation's
+# revision -- at which point its CAS validates a write against a state it
+# never examined, and a disconnect landing in the gap is silently undone
+# (#739 review, round 5).
+#
+# The revision initialization is cmd_forget's compat move, hoisted: a binding
+# written before revisions existed has none, and both CAS functions skip their
+# comparison entirely for an empty expected value -- which would disable the
+# lifecycle guard for exactly those legacy teams.
+_remote_snapshot_binding_for_update() {
+  local team="$1" cfg="$2" escaped updated revision endpoint server_instance \
+    remote_team_id cipher connected_at disconnected_at
   agmsg_lock_acquire "$TEAMS_DIR/$team" || return 1
-  revision="$(_remote_read_config_field "$cfg" '$.remote_binding.binding_revision')"
-  if [ -z "$revision" ] || [ "$revision" = "null" ]; then
-    escaped="$(sed "s/'/''/g" "$cfg")"
-    updated="$(agmsg_sqlite_mem \
-      "SELECT json_set('$escaped', '\$.remote_binding.binding_revision', 1);")"
-    agmsg_write_atomic "$cfg" "$updated"
-    revision=1
+  endpoint="$(_remote_read_config_field "$cfg" '$.remote_binding.endpoint')"
+  if [ -n "$endpoint" ] && [ "$endpoint" != "null" ]; then
+    revision="$(_remote_read_config_field "$cfg" '$.remote_binding.binding_revision')"
+    if [ -z "$revision" ] || [ "$revision" = "null" ]; then
+      escaped="$(sed "s/'/''/g" "$cfg")"
+      updated="$(agmsg_sqlite_mem \
+        "SELECT json_set('$escaped', '\$.remote_binding.binding_revision', 1);")"
+      agmsg_write_atomic "$cfg" "$updated"
+      revision=1
+    fi
+  else
+    revision=""
   fi
+  server_instance="$(_remote_read_config_field "$cfg" '$.remote_binding.server_instance_id')"
+  remote_team_id="$(_remote_read_config_field "$cfg" '$.remote_binding.remote_team_id')"
+  cipher="$(_remote_read_config_field "$cfg" '$.remote_binding.cipher_profile')"
+  connected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.connected_at')"
+  disconnected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.disconnected_at')"
   agmsg_lock_release
-  printf '%s\n' "$revision"
+  # Unit separator, NOT tab: several of these fields are legitimately empty
+  # (a JSON null reads back as ""), and tab is IFS whitespace -- `read`
+  # collapses consecutive whitespace delimiters, shifting every later field
+  # left. A non-whitespace separator keeps empty fields empty.
+  printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\n' "$endpoint" "$server_instance" \
+    "$remote_team_id" "$cipher" "$connected_at" "$disconnected_at" "$revision"
 }
 
 # --- set-endpoint ----------------------------------------------------------
@@ -2230,12 +2254,17 @@ cmd_set_endpoint() {
     engine_state engine_pid end_state end_pid was_running=0
   cfg="$(_remote_team_config "$team")"
   [ -f "$cfg" ] || { echo "agmsg: team '$team' is not a local team" >&2; exit 1; }
-  old_endpoint="$(_remote_read_config_field "$cfg" '$.remote_binding.endpoint')"
-  server_instance="$(_remote_read_config_field "$cfg" '$.remote_binding.server_instance_id')"
-  remote_team_id="$(_remote_read_config_field "$cfg" '$.remote_binding.remote_team_id')"
-  binding_cipher="$(_remote_read_config_field "$cfg" '$.remote_binding.cipher_profile')"
-  connected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.connected_at')"
-  disconnected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.disconnected_at')"
+  # One atomic snapshot: the fields this command JUDGES from (connected,
+  # disconnected, identity) and the revision its CAS will later verify all
+  # come from the same generation of the binding, read under one lock hold.
+  # Any change after this point -- a disconnect included -- advances the
+  # revision past this snapshot and the write refuses.
+  IFS=$'\037' read -r old_endpoint server_instance remote_team_id binding_cipher \
+    connected_at disconnected_at binding_revision \
+    < <(_remote_snapshot_binding_for_update "$team" "$cfg") || {
+    echo "agmsg: could not snapshot team '$team' state for the update" >&2
+    exit 1
+  }
   if [ -z "$connected_at" ] || [ "$connected_at" = "null" ] \
     || [ -z "$server_instance" ] || [ "$server_instance" = "null" ]; then
     echo "agmsg: team '$team' has no remote binding; there is no endpoint to move. Connect or pull it first." >&2
@@ -2266,13 +2295,6 @@ cmd_set_endpoint() {
     fi
     exit 0
   fi
-
-  # The CAS below needs a revision that actually exists: a legacy binding has
-  # none, and an empty expected value makes _remote_write_binding skip the
-  # comparison entirely -- the guard this command depends on would be disabled
-  # for exactly those teams. Initialize it (under the lock, cmd_forget's compat
-  # move) and snapshot the number that is really on disk.
-  binding_revision="$(_remote_ensure_binding_revision "$team" "$cfg")" || exit 1
 
   # Test seam: a two-file barrier that lets the lifecycle-race regressions
   # land a concurrent disconnect / sync start deterministically between this
