@@ -251,6 +251,34 @@ _binding_field() {  # $1 = team, $2 = json path under remote_binding
 # refused with both ids named, and there is no path that writes an unverified
 # address.
 
+# NOT COVERED, measured rather than assumed (#730): "set-endpoint reports a
+# failed engine restart instead of claiming one".
+#
+# The capture is in cmd_set_endpoint because the helper can now return non-zero
+# and a bare call would abort the command under `set -e`. No test drives it,
+# and not for want of trying:
+#
+#   read-only pidfile  -- cmd_set_endpoint calls _remote_sync_engine_stop itself
+#                         (remote.sh, inside cmd_set_endpoint) before the
+#                         restart, and that ends in `rm -f "$pidfile"`, which
+#                         succeeds in a writable run dir. Observed: the file
+#                         went -r--r--r-- -> -rw-r--r-- across the command and
+#                         the restart claimed success.
+#   directory at that   -- survives the rm, but `[ -f ]` is then false when
+#   path                  was_running is captured a few lines earlier, so the
+#                         restart branch is never entered at all.
+#   unwritable run dir  -- the stop's own `rm -f` fails first and the command
+#                         exits on that instead.
+#
+# Reaching it needs the run dir to become unwritable BETWEEN the stop and the
+# start. What was measured is narrower than "impossible": these three injections
+# do not reach it, and the code as it stands offers no seam between the stop and
+# the start for a test to drive. A dedicated barrier or hook in that gap would
+# stage it deterministically -- not proposed here, and said plainly so the limit
+# reads as the current shape of the code rather than a law. Left uncovered and
+# said so, rather than shipping a test that passes against the bare call -- the
+# mutation reverting this call site reds nothing today.
+
 @test "set-endpoint: moves a connected team with history to a new address of the same server (#718)" {
   # bob joins BEFORE connect so the server roster matches the local one: the
   # identity re-check compares rosters, and this test is about the address.
@@ -1527,6 +1555,62 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   fi
 }
 
+# The three callers changed by #730, each with a start refusal injected.
+#
+# The refusal itself is covered in tests/test_remote_engine_start_refusal.bats,
+# but only through `sync start`. Without these, the four-path asymmetry that
+# change is about -- unlock fails, pull and connect report and carry on -- is
+# only prose in the commit message. Found in review.
+#
+# The injection is a read-only pidfile rather than an unwritable run dir: the
+# rest of connect and pull write under run/ too, and taking the whole directory
+# away would stop them for reasons that have nothing to do with the engine.
+_deny_engine_pidfile() {
+  # Two statements, not one. `local a="$1" b="…$a…"` builds b before a is
+  # visible, so the pidfile came out as `remote-sync..pid` and the injection
+  # silently missed -- the test then measured an ordinary pull and reported the
+  # claim it was written to catch.
+  local team="$1"
+  local pidfile="$TEST_SKILL_DIR/run/remote-sync.$team.pid"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf '%s\n' 2147483647 > "$pidfile"
+  chmod a-w "$pidfile"
+}
+
+@test "remote pull: a start refusal is reported, and the pull still succeeds (#730)" {
+  [ "$(id -u)" -ne 0 ] || skip "chmod does not restrict root"
+  MOCK_TEAM_CIPHER_PROFILE=none
+  restart_mock_server
+  _deny_engine_pidfile cloned
+
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" cloned
+  chmod u+w "$TEST_SKILL_DIR/run/remote-sync.cloned.pid" 2>/dev/null || true
+  # Pull's purpose is to bring the team here, and it did.
+  [ "$status" -eq 0 ]
+  grep -qF "Pulled" <<<"$output"
+  # But it must not claim an engine it could not start.
+  refute grep -qF "Sync engine start requested" <<<"$output"
+  grep -qF "The sync engine did not start" <<<"$output"
+  grep -qF "could not start the sync engine" <<<"$output"
+}
+
+@test "remote connect: a start refusal is reported, and the binding still stands (#730)" {
+  [ "$(id -u)" -ne 0 ] || skip "chmod does not restrict root"
+  MOCK_TEAM_CIPHER_PROFILE=none
+  restart_mock_server
+  bash "$SCRIPTS/join.sh" bound alice claude-code /tmp/project-bound >/dev/null
+  _deny_engine_pidfile bound
+
+  run bash "$SCRIPTS/remote.sh" connect bound --endpoint "$ENDPOINT"
+  chmod u+w "$TEST_SKILL_DIR/run/remote-sync.bound.pid" 2>/dev/null || true
+  # Connect's purpose is the binding, and it is written by this point.
+  [ "$status" -eq 0 ]
+  grep -qF "Connected:" <<<"$output"
+  refute grep -qF "Sync engine start requested" <<<"$output"
+  grep -qF "The sync engine did not start" <<<"$output"
+  grep -qF "could not start the sync engine" <<<"$output"
+}
+
 @test "remote pull: starts a background sync engine that disconnect stops" {
   # This team is a PLAIN one: say so. The fixture's default declaration is
   # age-v1, and the engine now follows the declaration rather than the
@@ -1541,7 +1625,9 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   # engine. A pulled team that only cloned would report a send as "Sent" and
   # stay local while status answered "connected"; pin the engine running and the
   # binding it continues against. This is what a green 56/0 slipped past.
-  [[ "$output" == *"Sync engine running."* ]]
+  # "start requested", not "running": this path spawns the engine and records
+  # its pid, and does not wait to see it come up (#730).
+  [[ "$output" == *"Sync engine start requested"* ]]
   local pidfile="$SCRIPTS/../run/remote-sync.cloned.pid"
   wait_for_file "$pidfile"
   local cfg="$TEST_SKILL_DIR/teams/cloned/config.json"
@@ -1832,7 +1918,7 @@ PY_BIND
 
   run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" encrypted
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Sync engine running"* ]]
+  [[ "$output" == *"Sync engine start requested"* ]]
   [[ "$output" == *"holds the key for its current epoch"* ]]
   [[ "$output" != *"does not hold the key"* ]]
   [[ "$output" != *"local but locked"* ]]
@@ -1966,6 +2052,94 @@ PY_BIND
     '{name:"keyed", remote_key:{current:{key_id:$k, recipient:$r}}}' > "$cfg"
   run bash "$probe" "$SCRIPTS" "$TEST_SKILL_DIR" "$cfg"
   [ "$status" -ne 0 ]
+}
+
+# unlock, with a start refusal injected (#730). advisor ruled this had to be
+# pinned rather than described: unlock is the only caller that discards the
+# helper's status with `|| true` and converts it, through
+# REMOTE_SYNC_ENGINE_PID and the readiness loop, into its own failure. A
+# regression that drops the `|| true` or unhooks the readiness handler passes
+# every sync-start, pull and connect test in the tree.
+#
+# The injection is a DIRECTORY at the pidfile path, not a read-only file.
+# unlock runs `_remote_sync_engine_stop` first, which ends in
+# `rm -f "$pidfile"` -- that succeeds on a read-only file in a writable
+# directory and clears the injection before the start it was meant to reach.
+# A directory survives: `[ -f ]` is false so stop returns 0 without touching
+# it, `rm -f` cannot remove it, and `: > "$pidfile"` fails. Measured.
+#
+# The fixture is this test's own rather than one lifted out of the two unlock
+# tests above. They look alike and are not the same: different bundle and
+# envelope paths, a different snapshot export, different ciphertext. Turning
+# them into one parameterised helper is a change to two passing tests in a file
+# that already flakes under load, and it is not what this PR is about.
+@test "remote unlock: a start refusal fails the unlock, and says why (#730)" {
+  skip_if_no_age
+
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam >/dev/null
+  local source_cfg snapshot bundle key_id recipient identity team_id envelope digest
+  source_cfg="$TEST_SKILL_DIR/teams/testteam/config.json"
+  snapshot="$TEST_SKILL_DIR/handed-snapshot.json"
+  bundle="$TEST_SKILL_DIR/handed-bundle.json"
+  envelope="$TEST_SKILL_DIR/handed-envelope.json"
+  bash "$SCRIPTS/key.sh" show testteam --snapshot --out "$snapshot" 2>/dev/null
+  bash "$SCRIPTS/key.sh" handoff testteam --out "$bundle" >/dev/null 2>&1
+  key_id="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.remote_key.current.key_id');")"
+  recipient="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.remote_key.current.recipient');")"
+  team_id="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.team_id');")"
+  identity="$TEST_SKILL_DIR/run/remote-credentials/testteam/keys/$key_id.key"
+  jq -nc \
+    --arg key_id "$key_id" \
+    --arg recipient "$recipient" \
+    --arg team_id "$team_id" \
+    '{
+      type:"sync_seal", envelope_v:1, cipher:"age-v1",
+      key_id:$key_id, recipients:[$recipient], max_blob_bytes:1048576,
+      wire_id:"20000000-0000-4000-8000-000000000001",
+      team_id:$team_id, protocol_version:1,
+      projection:{
+        body:"handed ciphertext", created_at:"2026-01-02T00:00:00.000000Z",
+        from_agent:"member-1", to_agent:"member-1"
+      }
+    }' | node "$SCRIPTS/internal/sync-cipher.mjs" seal > "$envelope"
+  bash "$SCRIPTS/remote.sh" disconnect testteam >/dev/null 2>&1 || true
+
+  MOCK_PULL_AGE=1
+  MOCK_PULL_AGE_ENVELOPE_FILE="$envelope"
+  MOCK_PULL_TEAM_ID="$team_id"
+  restart_mock_server
+
+  # Machine B gets an independent install root. Reusing Machine A's root would
+  # reuse its retained checkpoint and would not test a first trust import.
+  PEER_SKILL_DIR="$(mktemp -d)"
+  export PEER_SKILL_DIR
+  mkdir -p "$PEER_SKILL_DIR"/{scripts,db,teams}
+  cp -R "$BATS_TEST_DIRNAME"/../scripts/. "$PEER_SKILL_DIR/scripts/"
+  chmod +x "$PEER_SKILL_DIR/scripts/"*.sh
+  chmod +x "$PEER_SKILL_DIR/scripts/"*.js 2>/dev/null || true
+  chmod +x "$PEER_SKILL_DIR/scripts/drivers/types/codex/"*.sh 2>/dev/null || true
+  bash "$PEER_SKILL_DIR/scripts/internal/init-db.sh"
+  local peer_scripts="$PEER_SKILL_DIR/scripts"
+
+  run bash "$peer_scripts/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$team_id" encrypted
+  [ "$status" -eq 0 ]
+
+  digest="$(shasum -a 256 "$snapshot" | awk '{print $1}')"
+  mkdir -p "$PEER_SKILL_DIR/run/remote-sync.encrypted.pid"
+
+  run bash "$peer_scripts/remote.sh" unlock encrypted \
+    --bundle "$bundle" --confirm-digest "$digest"
+  rmdir "$PEER_SKILL_DIR/run/remote-sync.encrypted.pid" 2>/dev/null || true
+
+  # unlock's purpose IS to start syncing the team, so unlike pull and connect it
+  # fails rather than reporting.
+  [ "$status" -ne 0 ]
+  # The cause, from the refusal ...
+  grep -qF "could not start the sync engine" <<<"$output"
+  # ... and the outcome, from unlock's own handler. Both, not one: they are
+  # different facts and collapsing them is what this change is about.
+  grep -qF "did not become ready" <<<"$output"
+  refute grep -qF "ready for normal use" <<<"$output"
 }
 
 @test "remote unlock: confirms handed authority, reprocesses, and resumes age-v1 sync" {
