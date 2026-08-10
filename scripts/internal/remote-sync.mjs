@@ -2,7 +2,7 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { spawn } from "node:child_process";
-import { appendFile, lstat, mkdir, open, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { appendFile, lstat, mkdir, open, readFile, rename, rmdir, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import process from "node:process";
 import { realpathSync } from "node:fs";
@@ -40,6 +40,7 @@ function usage() {
   remote-sync.sh reprocess --team NAME [--limit N]
   remote-sync.sh resync --team NAME --accept-floor SEQUENCE
   remote-sync.sh unblock-read --team NAME --member-id UUID
+  remote-sync.sh set-endpoint --team NAME
 
 Run remote.sh connect first. The engine reads that team's connection binding
 directly; the remote-sync data plane carries no per-request credential — see
@@ -3102,12 +3103,102 @@ async function publicSnapshot(serverUrl, teamId) {
   return body;
 }
 
+// The same per-team registry lock remote.sh takes around every binding write
+// (scripts/lib/registry-lock.sh): mkdir on teams/<team>/.config.lock is the
+// primitive, so the two sides of the connection pair -- the shell writing the
+// binding, this file writing the stored sync config -- serialize against each
+// other, not just against themselves. Spin bounded the same way (~10s).
+async function withTeamConfigLock(team, fn) {
+  const lockDir = join(dirname(teamConfigPath(team)), ".config.lock");
+  for (let attempt = 0; ; attempt += 1) {
+    try { await mkdir(lockDir); break; }
+    catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      // Same exit as the shell side (registry-lock.sh): a holder that died
+      // without its release trap (SIGKILL, power loss) leaves the directory,
+      // and the way out is bounded failure that NAMES it -- never an
+      // unbounded wait. Nothing sweeps stale locks anywhere in this tree;
+      // matching the existing contract rather than inventing liveness
+      // detection on one side of a shared primitive.
+      if (attempt >= 1000) {
+        throw new Error(`timed out acquiring the team registry lock at ${lockDir}; ` +
+          "if no agmsg command is running against this team, remove that directory and re-run");
+      }
+      await new Promise((resolveSleep) => setTimeout(resolveSleep, 10));
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    await rmdir(lockDir).catch(() => {});
+  }
+}
+
+// Align the stored sync configuration's server_url with the binding's endpoint
+// after remote.sh has moved it. Only the ADDRESS moves: the identity triple
+// (server_instance_id, remote_team_id, protocol_version) must match between the
+// stored config and the binding, or this is not the same connection and nothing
+// is written. The new address is then verified end-to-end -- request() checks
+// the protocol header and validateBinding compares the response's identity
+// against this config -- before the config is replaced. Without this step, an
+// endpoint change would strand any team with a stored sync config: loadConfig
+// refuses a config whose server_url differs from the binding, and configure
+// refuses to replace an existing binding at all.
+//
+// One invariant covers both halves of the pair: EITHER file is written only
+// under the team registry lock, and only against a binding_revision the writer
+// verified. Binding writes (remote.sh) advance the revision under that lock;
+// this write requires it unchanged, re-read under the same lock. Without the
+// re-check, two concurrent set-endpoints interleave so that the slower
+// alignment -- verified against a binding that has since moved again -- lands
+// its stale config over the faster one's completed pair (#739 review). The
+// network verification stays OUTSIDE the lock: holding a spin lock across a
+// 15s-timeout request would starve every concurrent lifecycle command.
+export async function setEndpoint(args) {
+  const team = requireName(args.team, "team");
+  const binding = await readConnectedBinding(team);
+  let value;
+  try {
+    value = await readStoredSyncConfig(team);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+    // Plain teams may have no stored sync config: loadConfig synthesizes one
+    // from the binding on every start, so the moved endpoint is already the
+    // one the engine will use. Nothing to write.
+    await event("endpoint.aligned", { team, stored_config: false });
+    return;
+  }
+  if (value.local_team !== team ||
+      value.server_instance_id !== binding.server_instance_id ||
+      value.remote_team_id !== binding.remote_team_id ||
+      value.protocol_version !== binding.protocol_version) {
+    throw new Error("stored sync configuration does not belong to this team's binding");
+  }
+  if (value.server_url === binding.endpoint) {
+    await event("endpoint.aligned", { team, stored_config: true, changed: false });
+    return;
+  }
+  const candidate = { ...value, server_url: binding.endpoint };
+  const capabilities = await request(candidate, "/v1/capabilities");
+  validateCapabilities(candidate, capabilities);
+  await withTeamConfigLock(team, async () => {
+    const current = await readConnectedBinding(team);
+    if (current.endpoint !== binding.endpoint ||
+        current.binding_revision !== binding.binding_revision) {
+      throw new Error(
+        "the team's binding moved while this alignment was verifying; nothing was written -- the newer set-endpoint owns the stored configuration now");
+    }
+    await writeConfig(configPath(team), candidate);
+  });
+  await event("endpoint.aligned", { team, stored_config: true, changed: true });
+}
+
 async function main() {
   const [command, ...rest] = process.argv.slice(2);
   const args = options(rest);
   if (!["configure", "export-age-snapshot", "verify-age-snapshot", "export-age-handoff",
         "verify-age-handoff", "once", "run", "reprocess", "resync",
-        "unblock-read", "pull-bootstrap", "resolve-team"].includes(command)) {
+        "unblock-read", "pull-bootstrap", "resolve-team", "set-endpoint"].includes(command)) {
     throw new Error(usage());
   }
   if (command === "configure") { await configure(args); return; }
@@ -3118,6 +3209,9 @@ async function main() {
   // Before any local team exists, so neither can go through loadConfig.
   if (command === "resolve-team") { await resolveTeam(args); return; }
   if (command === "pull-bootstrap") { await pullBootstrap(args); return; }
+  // Before loadConfig: mid-change, the stored config's server_url still names
+  // the old address, and loadConfig refuses exactly that mismatch.
+  if (command === "set-endpoint") { await setEndpoint(args); return; }
   const team = requireName(args.team, "team");
   const limit = Number(args.limit ?? 100);
   if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new Error("limit must be 1..1000");
