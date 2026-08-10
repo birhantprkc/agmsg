@@ -544,6 +544,21 @@ _capability_endpoint() {
     [[ "$output" != *"MARKER-INJECTED"* ]]
 }
 
+@test "pull: a malformed (non-JSON) answer does not leak its raw bytes either (#726/#728)" {
+  # A fourth case, and a different mechanism from the one above: not a
+  # well-formed body with a bad field, but a body that is not JSON at all.
+  # Node's own JSON.parse SyntaxError can quote a fragment of the offending
+  # input in its message, which would carry the same marker straight to the
+  # terminal through a path the error.code sanitization above does not
+  # touch -- the parse never gets that far.
+  MOCK_LOOKUP_BAD=malformed_json restart_mock_server
+
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" newteam
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"HTTP 200"*"invalid JSON"* ]] &&
+    [[ "$output" != *"MARKER-INJECTED"* ]]
+}
+
 @test "connect: the handoff-bundle line is printed by default" {
   # #668: this named the snapshot pair while `pull` on the other machine asked
   # for the bundle, so each side named the other's route. It names the bundle

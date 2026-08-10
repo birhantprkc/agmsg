@@ -2987,7 +2987,22 @@ async function publicGet(serverUrl, path) {
   if (response.headers.get("agmsg-protocol-version") !== PROTOCOL) {
     throw new Error("response protocol version mismatch");
   }
-  const body = await response.json();
+  // Parsed from the raw text and the parse failure collapsed to a fixed
+  // message, for the same reason the error code below is validated: a
+  // malformed JSON body from an untrusted server reaches Node's own
+  // SyntaxError.message as a fragment of the actual input, and that would
+  // put raw response bytes on the operator's terminal now that this call's
+  // stderr is not redirected away. send() below already avoids this shape
+  // for the authenticated path; the public one needs the same boundary.
+  let text;
+  try { text = await response.text(); } catch (error) {
+    error.retryable = true;
+    throw error;
+  }
+  let body;
+  try { body = JSON.parse(text); } catch {
+    throw new Error(`HTTP ${response.status} returned invalid JSON`);
+  }
   if (!response.ok) {
     // This message is no longer only for a log: the resolve-team CLI
     // subcommand's stderr now reaches the operator's terminal directly, and

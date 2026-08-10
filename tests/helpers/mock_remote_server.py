@@ -396,6 +396,16 @@ class Handler(BaseHTTPRequestHandler):
                     # operator, but the raw marker must not.
                     self._send_json(503, {"error": {"code": "server-error" + poison}})
                     return
+                if bad == "malformed_json":
+                    # Not a well-formed body with a bad field -- not JSON at
+                    # all. Node's own JSON.parse SyntaxError can quote a
+                    # fragment of the input in its message, which is a
+                    # second, independent way an untrusted server's raw bytes
+                    # could reach a terminal once resolve-team's stderr is no
+                    # longer redirected away (#726/#728) -- distinct from the
+                    # error.code path the other cases above exercise.
+                    self._send_raw(200, "{not json " + poison)
+                    return
                 good = {"team_id": PULL_TEAM_ID, "team_name": wanted,
                         "registered_at": "2026-07-29T00:00:00.000000Z",
                         "current_seq": "2"}
