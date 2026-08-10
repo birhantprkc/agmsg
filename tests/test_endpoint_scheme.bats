@@ -108,14 +108,18 @@ both() {
 @test "endpoint: the refusal says what to do instead, and says why truthfully (#717)" {
   run python3 "$SCRIPTS/internal/validate-endpoint.py" "http://example.com:8787"
   [ "$status" -ne 0 ]
+  # Plain commands and `refute`, not `[[ ]]`: a non-last `[[ ]]` cannot fail a
+  # test on bash 3.2, which is what CI's macOS legs run (#670, #716). Every one
+  # of these is non-last, so as `[[ ]]` they would have asserted nothing there.
+  #
   # The old message blamed a "token/credential" being sent unencrypted. The
   # client sends no Authorization header at all, so that was never the risk;
   # the risk is the message bodies of a team synced without encryption.
-  [[ "$output" != *"credential"* ]]
-  [[ "$output" == *"message bodies"* ]]
+  refute grep -qF 'credential' <<<"$output"
+  grep -qF 'message bodies' <<<"$output"
   # And a refusal that does not say what to do instead leaves the operator to
   # find a tunnel on their own, which is what happened.
-  [[ "$output" == *"https://"* ]]
-  [[ "$output" == *"LAN IP"* ]]
-  [[ "$output" == *"--e2ee"* ]]
+  grep -qF 'https://' <<<"$output"
+  grep -qF 'LAN IP' <<<"$output"
+  grep -qF -- '--e2ee' <<<"$output"
 }
