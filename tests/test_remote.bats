@@ -499,9 +499,18 @@ _capability_endpoint() {
   # Direction 1 of the negative control: nothing listens on this port, so
   # resolve-team's child process fails before ever reaching a server. name
   # resolution runs because no --team-id is given.
+  #
+  # Asserting the wrapper's own line is not enough on its own: that line is
+  # printed on ANY non-zero exit, including the old redirected one, so it
+  # cannot tell "the fix works" apart from "the fix was reverted". The
+  # child's own transport-specific message (what fetch() actually reports
+  # for a refused connection, node's "fetch failed") is what only reaches
+  # the operator because the redirect is gone -- that is the actual claim
+  # this PR makes, so it is what has to be pinned.
   run bash "$SCRIPTS/remote.sh" pull --endpoint "http://127.0.0.1:1" newteam
   [ "$status" -ne 0 ]
-  [[ "$output" == *"could not look up 'newteam'"* ]]
+  [[ "$output" == *"fetch failed"* ]] &&
+    [[ "$output" == *"could not look up 'newteam'"* ]]
 }
 
 @test "pull: a reachable server whose lookup answer fails validation names that reason, not \"unreachable\" (#726)" {
@@ -516,6 +525,23 @@ _capability_endpoint() {
   [ "$status" -ne 0 ]
   [[ "$output" == *"team lookup answer is not a lookup result"* ]] &&
     [[ "$output" != *"unreachable"* ]]
+}
+
+@test "pull: an untrusted server's raw error text does not reach the terminal (#726/#728)" {
+  # A third case, neither transport failure nor a malformed-but-200 body: the
+  # server answers with a real HTTP error whose error.code is server-supplied
+  # text with no format guarantee. Now that resolve-team's stderr is no
+  # longer redirected away, that text is one un-sanitized field away from
+  # reaching the operator's terminal raw -- the same class of risk
+  # resolveTeam's own validation path already guards against for a 200
+  # ("messages quote no server value"). The status and a safe reason still
+  # have to get through; the injected marker must not.
+  MOCK_LOOKUP_BAD=http_error restart_mock_server
+
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" newteam
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"HTTP 503"* ]] &&
+    [[ "$output" != *"MARKER-INJECTED"* ]]
 }
 
 @test "connect: the handoff-bundle line is printed by default" {

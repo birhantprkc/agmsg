@@ -2989,7 +2989,20 @@ async function publicGet(serverUrl, path) {
   }
   const body = await response.json();
   if (!response.ok) {
-    const error = new Error(`HTTP ${response.status} ${errorCode(body)}`);
+    // This message is no longer only for a log: the resolve-team CLI
+    // subcommand's stderr now reaches the operator's terminal directly, and
+    // this call runs before any local team or credential exists, so the
+    // server answering is not trusted. errorCode(body) returns whatever the
+    // server put there with no format guarantee -- that is correct for its
+    // other callers, but here it would let raw server bytes (control
+    // characters, terminal escapes) reach a real terminal. Only a code
+    // shaped like this protocol's own (lowercase kebab-case, the same shape
+    // as every code this project actually defines) is echoed; anything else
+    // collapses to the same fixed word errorCode() itself already falls
+    // back to when no code was given at all.
+    const code = errorCode(body);
+    const safeCode = /^[a-z][a-z0-9-]{0,63}$/.test(code) ? code : "unknown-error";
+    const error = new Error(`HTTP ${response.status} ${safeCode}`);
     error.status = response.status;
     throw error;
   }

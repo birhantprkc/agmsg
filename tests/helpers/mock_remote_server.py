@@ -387,6 +387,15 @@ class Handler(BaseHTTPRequestHandler):
             bad = os.environ.get("MOCK_LOOKUP_BAD", "")
             if bad and wanted:
                 poison = "\x1b[2K\rMARKER-INJECTED"
+                if bad == "http_error":
+                    # Not a 200 with a bad body -- a non-2xx answer whose
+                    # error.code itself carries the marker. The negative
+                    # control for whether resolve-team's HTTP-error path can
+                    # be made to write untrusted server bytes to a terminal
+                    # (#726/#728): the status/reason must still reach the
+                    # operator, but the raw marker must not.
+                    self._send_json(503, {"error": {"code": "server-error" + poison}})
+                    return
                 good = {"team_id": PULL_TEAM_ID, "team_name": wanted,
                         "registered_at": "2026-07-29T00:00:00.000000Z",
                         "current_seq": "2"}
