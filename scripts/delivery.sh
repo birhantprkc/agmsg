@@ -199,27 +199,76 @@ agmsg_delivery_status_default() {
   local type="$1" project="$2"
   local hf
   hf=$(resolve_hooks_file "$type" "$project")
-  local has_ss=0 has_st=0
+  local has_ss=0 has_st=0 hf_readable=0
   if [ -f "$hf" ]; then
     local sql_hf
     sql_hf=$(agmsg_sql_readfile_path "$hf")
-    has_ss=$(agmsg_sqlite_mem "
-      SELECT EXISTS(
-        SELECT 1 FROM json_each(json_extract(readfile('$sql_hf'), '\$.hooks.SessionStart')) AS s,
-          json_each(json_extract(s.value, '\$.hooks')) AS h
-        WHERE instr(json_extract(h.value, '\$.command'), '$SKILL_NAME') > 0
-      );" 2>/dev/null || echo 0)
-    has_st=$(agmsg_sqlite_mem "
-      SELECT EXISTS(
-        SELECT 1 FROM json_each(json_extract(readfile('$sql_hf'), '\$.hooks.Stop')) AS s,
-          json_each(json_extract(s.value, '\$.hooks')) AS h
-        WHERE instr(json_extract(h.value, '\$.command'), '$SKILL_NAME') > 0
-      );" 2>/dev/null || echo 0)
+    # Checked BEFORE trusting has_ss/has_st below: those two queries default
+    # to 0 on ANY failure (`2>/dev/null || echo 0`), not only "genuinely zero
+    # agmsg entries" -- malformed JSON, a readfile() that can't open the
+    # file, or json_extract() choking on the shape all collapse to the same
+    # 0 a real, deliberate off produces. Without this check a corrupt
+    # settings file would report bare "mode: off", the same silent-deliberate
+    # reading #687 is about, just from a different cause than a missing
+    # file (review).
+    local valid
+    valid=$(agmsg_sqlite_mem "SELECT json_valid(readfile('$sql_hf'));" 2>/dev/null || echo "")
+    if [ "$valid" = "1" ]; then
+      hf_readable=1
+      has_ss=$(agmsg_sqlite_mem "
+        SELECT EXISTS(
+          SELECT 1 FROM json_each(json_extract(readfile('$sql_hf'), '\$.hooks.SessionStart')) AS s,
+            json_each(json_extract(s.value, '\$.hooks')) AS h
+          WHERE instr(json_extract(h.value, '\$.command'), '$SKILL_NAME') > 0
+        );" 2>/dev/null || echo 0)
+      has_st=$(agmsg_sqlite_mem "
+        SELECT EXISTS(
+          SELECT 1 FROM json_each(json_extract(readfile('$sql_hf'), '\$.hooks.Stop')) AS s,
+            json_each(json_extract(s.value, '\$.hooks')) AS h
+          WHERE instr(json_extract(h.value, '\$.command'), '$SKILL_NAME') > 0
+        );" 2>/dev/null || echo 0)
+    fi
   fi
-  local mode="off"
+  # "off" never claims deliberateness (review, 3rd round): apply_default's
+  # off path only strips agmsg's own hook entries -- it writes no marker
+  # recording that `set off` ran. So a settings file with zero agmsg entries
+  # is byte-for-byte identical whether someone ran `set off` or the project
+  # simply never had agmsg configured. The CLI cannot tell those apart, so
+  # the wording says only what it can observe: hooks are absent, not that
+  # absence was chosen. Same reasoning is why `actas`/`drop` must not treat
+  # this as safe-to-stay-silent either -- see template.md.
+  local mode="off (no agmsg delivery hooks installed for this project)"
   if [ "$has_ss" = "1" ] && [ "$has_st" = "1" ]; then mode="both"
   elif [ "$has_ss" = "1" ]; then mode="monitor"
   elif [ "$has_st" = "1" ]; then mode="turn"
+  elif [ ! -f "$hf" ] || [ "$hf_readable" != "1" ]; then
+    # A settings file that does not exist and one that could not be read or
+    # parsed as JSON both fall through to here with has_ss=has_st=0, but
+    # neither means delivery.sh actually confirmed this project's state:
+    # missing, most often because the caller passed the wrong path; or
+    # unreadable/malformed, a corrupt or hand-edited settings file (#687
+    # review round 1). These used to print the bare word "off" -- same as a
+    # genuinely no-hooks-installed project -- so a reader (or `actas`,
+    # whose own rule is "off means don't start delivery") could not tell
+    # "I don't know" from "there's nothing to start". This is what deceived
+    # a seat during #684 recovery: `mode: off` and `mode: monitor` were both
+    # true, for the same project, because one reader's path resolved and the
+    # other's did not. Distinguishing here, in the FIRST line rather than a
+    # secondary one, is what #687 asks for -- a reader (or a caller only
+    # capturing the first line) sees the difference without reading further.
+    # No consumer matches "mode: off" exactly (re-checked for this string,
+    # review round 3): the only exact-match consumers key on
+    # "monitor"/"both"/"turn", so this string never being exactly "off" is
+    # safe.
+    if [ ! -f "$hf" ]; then
+      if [ -n "$hf" ]; then
+        mode="off (unrecognized: no settings file found at $hf -- this project may not be registered)"
+      else
+        mode="off (unrecognized: could not resolve a settings file for this project/type)"
+      fi
+    else
+      mode="off (unrecognized: settings file at $hf could not be read as valid JSON)"
+    fi
   fi
   echo "mode: $mode"
 

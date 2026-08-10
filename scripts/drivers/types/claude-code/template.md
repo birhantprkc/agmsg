@@ -169,11 +169,14 @@ If argument starts with "actas" followed by an agent name (e.g. "actas alice"):
    a. Run TaskList. Find any task whose description begins with "agmsg inbox stream".
    b. **If a matching task is found**: TaskStop it.
    c. **If no matching task is found** (typical when /__SKILL_NAME__ actas runs as the first command of a fresh session — SessionStart hasn't fired the Monitor directive yet, or you're invoking actas before the agent acted on it): skip TaskStop entirely. There is no Monitor to stop. Do NOT attempt TaskStop with a guessed or empty task_id — it will fail with "Invalid tool parameters" and confuse the flow.
-   d. **Only if the project's delivery mode is `monitor` or `both`** (check via `~/.agents/skills/__SKILL_NAME__/scripts/delivery.sh status claude-code "$(pwd)"`), invoke a fresh Monitor, regardless of whether step b or c applied:
-      - command: `~/.agents/skills/__SKILL_NAME__/scripts/watch.sh $CLAUDE_CODE_SESSION_ID "$(pwd)" claude-code <name>`
-      - description: `agmsg inbox stream (acting as <name>)`
-      - persistent: true
-      Otherwise (mode `turn` or `off`), leave it stopped — `actas` must not start automatic delivery a project wasn't configured for.
+   d. Run `~/.agents/skills/__SKILL_NAME__/scripts/delivery.sh status claude-code "$(pwd)"` and read its **first line**.
+      - **`mode: monitor` or `mode: both`**: invoke a fresh Monitor, regardless of whether step b or c applied:
+        - command: `~/.agents/skills/__SKILL_NAME__/scripts/watch.sh $CLAUDE_CODE_SESSION_ID "$(pwd)" claude-code <name>`
+        - description: `agmsg inbox stream (acting as <name>)`
+        - persistent: true
+      - **`mode: turn`**: leave it stopped, silently. `has_st=1` is the one case `delivery.sh` can actually confirm was a deliberate choice — someone configured turn-based delivery for this project — so `actas` starting nothing here needs no explanation.
+      - **`mode: off (no agmsg delivery hooks installed for this project)`**: leave it stopped (`actas` must not start automatic delivery a project wasn't configured for), but **do not treat this as silently deliberate**. `delivery.sh` cannot tell whether someone ran `mode off` here or this project was simply never configured — both leave the exact same settings file (#687 review round 3). **Tell the user** — e.g. "agmsg delivery hooks are not installed for this project; automatic delivery remains stopped. Run `/__SKILL_NAME__ mode <choice>` if you want to configure it." Keep it matter-of-fact, not a warning. Do not report `actas` as complete without saying this.
+      - **`mode: off (unrecognized: ...)`**: leave it stopped too (same rule — do not guess a mode), but this is a stronger case than the no-hooks-installed one above: `delivery.sh` could not even find or read a settings file for this project, most often because the working directory does not match how the project was actually registered. **Tell the user explicitly** — e.g. "agmsg could not find a delivery configuration for this project at `<path from the message>` — delivery is stopped, but this may mean the project isn't registered here rather than that it was deliberately turned off. Check the path, or run `/__SKILL_NAME__ mode <choice>` to configure it explicitly." Do not report `actas` as complete without saying this — a silent stop here is indistinguishable from the other off cases and is what let this go unnoticed before (#687).
    The 4th argument to `watch.sh` restricts the subscription to messages addressed to `<name>` only — other roles' inbound messages stop reaching this session until another `actas` or session end.
 6. Set the session's active FROM to `<name>` — use `<name>` in every `send.sh` call for the rest of this session.
 7. Tell the user: "Now acting as `<name>`. Sends use `<name>` as from; receive restricted to `<name>` only."
@@ -186,11 +189,14 @@ If argument starts with "drop" followed by an agent name (e.g. "drop alice"):
    a. Run TaskList. Find any task whose description begins with "agmsg inbox stream".
    b. **If a matching task is found**: TaskStop it.
    c. **If no matching task is found**: skip TaskStop. Do NOT attempt TaskStop with a guessed or empty task_id.
-   d. **Only if the project's delivery mode is `monitor` or `both`** (check via `~/.agents/skills/__SKILL_NAME__/scripts/delivery.sh status claude-code "$(pwd)"`), invoke a fresh Monitor with the default subscription (no `actas` name filter — receives every (team, agent) pair currently registered for this project that isn't held by another session):
-      - command: `~/.agents/skills/__SKILL_NAME__/scripts/watch.sh $CLAUDE_CODE_SESSION_ID "$(pwd)" claude-code`
-      - description: `agmsg inbox stream`
-      - persistent: true
-      Otherwise (mode `turn` or `off`), leave it stopped.
+   d. Run `~/.agents/skills/__SKILL_NAME__/scripts/delivery.sh status claude-code "$(pwd)"` and read its **first line**.
+      - **`mode: monitor` or `mode: both`**: invoke a fresh Monitor with the default subscription (no `actas` name filter — receives every (team, agent) pair currently registered for this project that isn't held by another session):
+        - command: `~/.agents/skills/__SKILL_NAME__/scripts/watch.sh $CLAUDE_CODE_SESSION_ID "$(pwd)" claude-code`
+        - description: `agmsg inbox stream`
+        - persistent: true
+      - **`mode: turn`**: leave it stopped, silently — the one case `delivery.sh` can confirm was deliberate.
+      - **`mode: off (no agmsg delivery hooks installed for this project)`**: leave it stopped, but say so — same reasoning as the `actas` step this mirrors: this state is indistinguishable from "never configured" (#687 review round 3), so do not report it as deliberate. Do not report the drop as complete without mentioning it.
+      - **`mode: off (unrecognized: ...)`**: leave it stopped, but say so with the stronger diagnostic — same reasoning as the `actas` step this mirrors (#687). Do not report the drop as complete without mentioning it.
 4. Tell the user: "Dropped role `<name>` from this project."
 
 If argument starts with "spawn" (e.g. "spawn codex reviewer", "spawn claude-code alice --window"):

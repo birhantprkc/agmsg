@@ -222,9 +222,53 @@ eperm_pid() {
   [[ "$output" =~ "mode: turn" ]]
 }
 
-@test "delivery status: derives 'off' from settings with no agmsg hooks" {
+@test "delivery status: a settings file with zero agmsg hooks reads as 'no hooks installed', not asserted-deliberate (#687 review round 3)" {
+  # $TEST_PROJECT's settings file exists and is real, just empty of agmsg
+  # entries -- but `set off`'s apply_default only STRIPS agmsg's own hook
+  # entries, it writes no marker recording that `set off` ran. So this exact
+  # byte state is reachable two ways: someone ran `set off`, or this project
+  # simply never had agmsg configured. delivery.sh cannot tell those apart,
+  # so the wording must not claim "deliberate" -- it states only what's
+  # observable (hooks absent), distinct from the "(unrecognized: ...)" family
+  # the next two tests check for, which means delivery.sh couldn't even read
+  # a settings file at all.
+  bash "$SCRIPTS/delivery.sh" set off claude-code "$TEST_PROJECT" >/dev/null
   run bash "$SCRIPTS/delivery.sh" status claude-code "$TEST_PROJECT"
-  [[ "$output" =~ "mode: off" ]]
+  [[ "$output" == "mode: off (no agmsg delivery hooks installed for this project)"$'\n'* ]] || { echo "expected the first line to be exactly 'mode: off (no agmsg delivery hooks installed for this project)', got: $output" >&2; return 1; }
+  [[ "$output" != *"unrecognized"* ]]
+}
+
+@test "delivery status: an unrecognized project is distinguishable from a deliberately off one (#687)" {
+  # No `set` call at all: $TEST_PROJECT is a bare mktemp -d, so no settings
+  # file exists at the resolved path -- the actual #684 failure mode, where
+  # a settings file could not be found (most often because the caller's
+  # $(pwd) did not match how the project was actually registered) and that
+  # was reported as indistinguishable from a real, deliberate "off". Both
+  # used to print the bare word "off"; the FIRST line has to differ now, not
+  # just a later one, because a reader (or actas) that only looks at the
+  # first line must still be able to tell.
+  run bash "$SCRIPTS/delivery.sh" status claude-code "$TEST_PROJECT"
+  [[ "$output" == "mode: off ("*")"$'\n'* || "$output" == "mode: off ("*")" ]] \
+    || { echo "expected the first line to read 'mode: off (...)', got: $output" >&2; return 1; }
+  [[ "$output" == *"unrecognized"* ]] &&
+    [[ "$output" == *"$TEST_PROJECT"* ]]
+}
+
+@test "delivery status: a settings file that exists but is not valid JSON is also unrecognized, not deliberate off (review)" {
+  # A third way has_ss/has_st both land on 0: not "missing" and not "genuinely
+  # empty of agmsg entries" but unreadable/malformed, which the has_ss/has_st
+  # queries collapse to the same 0 a real off produces (`2>/dev/null ||
+  # echo 0`) -- checking only file EXISTENCE, as the first #687 fix did,
+  # missed this: a corrupt settings file still read as a deliberate,
+  # confirmed off. Reproducing what a hand-edited or partially-written
+  # settings.local.json looks like.
+  mkdir -p "$TEST_PROJECT/.claude"
+  printf '{not valid json' > "$TEST_PROJECT/.claude/settings.local.json"
+  run bash "$SCRIPTS/delivery.sh" status claude-code "$TEST_PROJECT"
+  [[ "$output" == "mode: off ("*")"$'\n'* || "$output" == "mode: off ("*")" ]] \
+    || { echo "expected the first line to read 'mode: off (...)', got: $output" >&2; return 1; }
+  [[ "$output" == *"unrecognized"* ]] &&
+    [[ "$output" == *"could not be read as valid JSON"* ]]
 }
 
 # --- rejects unknown mode ---
