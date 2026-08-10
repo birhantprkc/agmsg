@@ -268,8 +268,8 @@ _binding_field() {  # $1 = team, $2 = json path under remote_binding
 
   run bash "$SCRIPTS/remote.sh" set-endpoint --endpoint "http://localhost:$MOCK_PORT" testteam
   [ "$status" -eq 0 ]
-  [[ "$output" == *"moved: http://127.0.0.1:$MOCK_PORT -> http://localhost:$MOCK_PORT"* ]]
-  [[ "$output" == *"Sync engine restarted"* ]]
+  grep -Fq "moved: http://127.0.0.1:$MOCK_PORT -> http://localhost:$MOCK_PORT" <<<"$output"
+  grep -Fq "Sync engine restarted" <<<"$output"
   [ "$(_binding_field testteam endpoint)" = "http://localhost:$MOCK_PORT" ]
   # The ADDRESS moved; the identity did not, and the write was versioned.
   [ "$(_binding_field testteam server_instance_id)" = "$anchored" ]
@@ -279,7 +279,7 @@ _binding_field() {  # $1 = team, $2 = json path under remote_binding
   revision_before="$(_binding_field testteam binding_revision)"
   run bash "$SCRIPTS/remote.sh" set-endpoint --endpoint "http://localhost:$MOCK_PORT" testteam
   [ "$status" -eq 0 ]
-  [[ "$output" == *"nothing to change"* ]]
+  grep -Fq "nothing to change" <<<"$output"
   [ "$(_binding_field testteam binding_revision)" = "$revision_before" ]
 }
 
@@ -298,12 +298,84 @@ _binding_field() {  # $1 = team, $2 = json path under remote_binding
   run bash "$SCRIPTS/remote.sh" set-endpoint --endpoint "http://localhost:$MOCK_PORT" testteam
   [ "$status" -ne 0 ]
   # What differed is SAID, both sides of it -- not a bare "refused".
-  [[ "$output" == *"is now server instance 018f3f7e-2222-7000-8000-0000000000ff"* ]]
-  [[ "$output" == *"bound to $anchored"* ]]
-  [[ "$output" == *"Refusing to re-anchor"* ]]
+  grep -Fq "is now server instance 018f3f7e-2222-7000-8000-0000000000ff" <<<"$output"
+  grep -Fq "bound to $anchored" <<<"$output"
+  grep -Fq "Refusing to re-anchor" <<<"$output"
   # And nothing was written: the binding still names the verified address.
   [ "$(_binding_field testteam endpoint)" = "$ENDPOINT" ]
   [ "$(_binding_field testteam server_instance_id)" = "$anchored" ]
+}
+
+@test "set-endpoint: re-running from the partial state repairs the stored sync config (#739 P1-1)" {
+  # The partial state a failure between the two writes leaves behind:
+  # binding=new address, stored sync config=old address. The printed remedy is
+  # to re-run set-endpoint, so the same-address path must repair the stored
+  # config rather than return on the binding comparison alone.
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -eq 0 ]
+  local sid tid stored="$TEST_SKILL_DIR/db/remote-sync/testteam.json"
+  sid="$(_binding_field testteam server_instance_id)"
+  tid="$(_binding_field testteam remote_team_id)"
+  mkdir -p "$TEST_SKILL_DIR/db/remote-sync"
+  printf '%s\n' "{\"format_version\":1,\"local_team\":\"testteam\",\"server_url\":\"http://127.0.0.1:9\",\"server_instance_id\":\"$sid\",\"remote_team_id\":\"$tid\",\"protocol_version\":1,\"cipher_profile\":\"none\",\"local_security_history\":[{\"local_security_revision\":\"0\",\"effective_from_seq\":\"1\",\"minimum_security_mode\":\"plaintext-allowed\"}]}" > "$stored"
+
+  # Same address as the binding: before the fix this exited "nothing to
+  # change" without ever looking at the stored config.
+  run bash "$SCRIPTS/remote.sh" set-endpoint --endpoint "$ENDPOINT" testteam
+  [ "$status" -eq 0 ]
+  grep -Fq "aligned" <<<"$output"
+  [ "$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$stored")') AS TEXT), '\$.server_url');")" = "$ENDPOINT" ]
+}
+
+@test "set-endpoint: a concurrent disconnect is not overwritten by the verified write (#739 P1-2)" {
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -eq 0 ]
+  local barrier="$TEST_SKILL_DIR/se-barrier" se_rc=0
+  AGMSG_TEST_SET_ENDPOINT_BARRIER="$barrier" \
+    bash "$SCRIPTS/remote.sh" set-endpoint --endpoint "http://localhost:$MOCK_PORT" testteam \
+    > "$TEST_SKILL_DIR/se.out" 2>&1 3>&- &
+  local se_pid=$!
+  wait_for_file "$barrier.reached"
+  # The race: the operator disconnects while set-endpoint is verifying. The
+  # disconnect advances binding_revision, so the verified write must refuse
+  # rather than land disconnected_at:null over the newer state.
+  run bash "$SCRIPTS/remote.sh" disconnect testteam
+  [ "$status" -eq 0 ]
+  : > "$barrier.release"
+  wait "$se_pid" || se_rc=$?
+  [ "$se_rc" -ne 0 ]
+  grep -Fq "changed while this command was running" "$TEST_SKILL_DIR/se.out"
+  # The disconnect survived, and the address did not move.
+  [ "$(_binding_field testteam disconnected_at)" != "" ]
+  [ "$(_binding_field testteam disconnected_at)" != "null" ]
+  [ "$(_binding_field testteam endpoint)" = "$ENDPOINT" ]
+}
+
+@test "set-endpoint: an engine started while it runs ends up running on the new address (#739 P1-2)" {
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -eq 0 ]
+  # Put the engine into the stopped state first, so the concurrent start is
+  # the only thing that makes it run.
+  local pidfile="$TEST_SKILL_DIR/run/remote-sync.testteam.pid" engine_pid
+  engine_pid="$(cat "$pidfile")"
+  kill "$engine_pid"
+  wait_for_pid_exit "$engine_pid"
+  local barrier="$TEST_SKILL_DIR/se-barrier2" se_rc=0
+  AGMSG_TEST_SET_ENDPOINT_BARRIER="$barrier" \
+    bash "$SCRIPTS/remote.sh" set-endpoint --endpoint "http://localhost:$MOCK_PORT" testteam \
+    > "$TEST_SKILL_DIR/se2.out" 2>&1 3>&- &
+  local se_pid=$!
+  wait_for_file "$barrier.reached"
+  run bash "$SCRIPTS/remote.sh" sync start testteam
+  [ "$status" -eq 0 ]
+  : > "$barrier.release"
+  wait "$se_pid" || se_rc=$?
+  [ "$se_rc" -eq 0 ]
+  grep -Fq "Sync engine restarted" "$TEST_SKILL_DIR/se2.out"
+  [ "$(_binding_field testteam endpoint)" = "http://localhost:$MOCK_PORT" ]
+  # The operator's engine is not silently gone: one is alive at the end.
+  engine_pid="$(cat "$pidfile")"
+  kill -0 "$engine_pid"
 }
 
 @test "set-endpoint: refuses a disconnected team and names connect as the deliberate move (#718)" {
@@ -313,8 +385,8 @@ _binding_field() {  # $1 = team, $2 = json path under remote_binding
   [ "$status" -eq 0 ]
   run bash "$SCRIPTS/remote.sh" set-endpoint --endpoint "http://localhost:$MOCK_PORT" testteam
   [ "$status" -ne 0 ]
-  [[ "$output" == *"disconnected"* ]]
-  [[ "$output" == *"connect with the new endpoint"* ]]
+  grep -Fq "disconnected" <<<"$output"
+  grep -Fq "connect with the new endpoint" <<<"$output"
   [ "$(_binding_field testteam endpoint)" = "$ENDPOINT" ]
 }
 

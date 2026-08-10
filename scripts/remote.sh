@@ -346,9 +346,11 @@ _remote_http_get_json() {
 # ONE writer for both the first connect and the adopt path below. Two copies of
 # this object would drift, and the second copy is the one nobody re-reads.
 _remote_write_binding() {
-  local cfg="$1" endpoint="$2" binding_cipher="$3" resp_file="$4"
+  local cfg="$1" endpoint="$2" binding_cipher="$3" resp_file="$4" \
+    expected_binding_revision="${5:-}"
   local resp_escaped cfg_escaped connected_at updated \
-    server_instance_id remote_team_id remote_team_name protocol_version
+    server_instance_id remote_team_id remote_team_name protocol_version \
+    current_binding_revision
   resp_escaped="$(sed "s/'/''/g" "$resp_file")"
   {
     IFS= read -r server_instance_id
@@ -362,6 +364,20 @@ _remote_write_binding() {
        SELECT json_extract('$resp_escaped', '\$.protocol_version');")
   connected_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   agmsg_lock_acquire "$(dirname "$cfg")" || return 1
+  # Optional compare-and-swap, same contract as _remote_local_disconnect: the
+  # caller snapshotted the binding at revision N, verified against that
+  # snapshot, and must not have its write land on a binding someone else moved
+  # in between -- a concurrent disconnect would otherwise be silently undone
+  # by this write's disconnected_at:null. Checked INSIDE the lock, against the
+  # file as it is now, not as it was read.
+  if [ -n "$expected_binding_revision" ] && [ "$expected_binding_revision" != "null" ]; then
+    current_binding_revision="$(_remote_read_config_field "$cfg" '$.remote_binding.binding_revision')"
+    if [ "$current_binding_revision" != "$expected_binding_revision" ]; then
+      agmsg_lock_release
+      echo "agmsg: the team's binding changed while this command was running (revision is now $current_binding_revision, this command verified revision $expected_binding_revision); nothing was written. Check 'remote status' and re-run." >&2
+      return 2
+    fi
+  fi
   cfg_escaped="$(sed "s/'/''/g" "$cfg")"
   updated=$(agmsg_sqlite_mem \
     "SELECT json_set('$cfg_escaped', '\$.remote_binding', json_object(
@@ -411,7 +427,7 @@ _remote_write_binding() {
 # leaves no recorded id, and there the first fetch IS the anchor.
 _remote_adopt_registration() {
   local team="$1" cfg="$2" endpoint="$3" team_id="$4" binding_cipher="$5" \
-    expected_server_instance="${6:-}"
+    expected_server_instance="${6:-}" expected_binding_revision="${7:-}"
   local caps_file members_file http_code remote_team_name local_team_name \
     local_ids remote_ids cfg_escaped members_escaped \
     fetched_server_instance declared_cipher
@@ -517,7 +533,8 @@ _remote_adopt_registration() {
   esac
 
   echo "Team '$team' is already registered on $(_remote_endpoint_display "$endpoint"); adopting that registration and continuing." >&2
-  _remote_write_binding "$cfg" "$endpoint" "$binding_cipher" "$caps_file" || {
+  _remote_write_binding "$cfg" "$endpoint" "$binding_cipher" "$caps_file" \
+    "$expected_binding_revision" || {
     rm -f "$caps_file" "$members_file"; trap - EXIT INT TERM
     return 1
   }
@@ -2184,7 +2201,8 @@ cmd_set_endpoint() {
   agmsg_validate_team_name "$team" || exit 1
 
   local cfg old_endpoint server_instance remote_team_id binding_cipher \
-    connected_at disconnected_at engine_state engine_pid was_running=0
+    connected_at disconnected_at binding_revision align_out \
+    engine_state engine_pid end_state end_pid was_running=0
   cfg="$(_remote_team_config "$team")"
   [ -f "$cfg" ] || { echo "agmsg: team '$team' is not a local team" >&2; exit 1; }
   old_endpoint="$(_remote_read_config_field "$cfg" '$.remote_binding.endpoint')"
@@ -2193,6 +2211,7 @@ cmd_set_endpoint() {
   binding_cipher="$(_remote_read_config_field "$cfg" '$.remote_binding.cipher_profile')"
   connected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.connected_at')"
   disconnected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.disconnected_at')"
+  binding_revision="$(_remote_read_config_field "$cfg" '$.remote_binding.binding_revision')"
   if [ -z "$connected_at" ] || [ "$connected_at" = "null" ] \
     || [ -z "$server_instance" ] || [ "$server_instance" = "null" ]; then
     echo "agmsg: team '$team' has no remote binding; there is no endpoint to move. Connect or pull it first." >&2
@@ -2203,8 +2222,38 @@ cmd_set_endpoint() {
     exit 1
   fi
   if [ "$old_endpoint" = "$endpoint" ]; then
-    echo "Team '$team' already uses $(_remote_endpoint_display "$endpoint"); nothing to change."
+    # The binding already names this address -- but the binding is only ONE of
+    # the two places that pin it. A failure between the binding write below
+    # and the stored-config alignment leaves binding=new / stored config=old,
+    # and the remedy this command prints for that state is to re-run itself.
+    # So this path must REPAIR, not return on the binding comparison alone
+    # (#739 review): the alignment runs, fixing a mismatched stored config and
+    # recording a no-op when the two already agree. An engine cannot be
+    # running against a mismatched stored config (loadConfig refuses the
+    # pair), so there is nothing to stop here.
+    align_out="$(bash "$SCRIPT_DIR/remote-sync.sh" set-endpoint --team "$team")" || {
+      echo "agmsg: the stored sync configuration could not be aligned with the binding; the sync engine stays stopped until it is. Fix what the message above names, then re-run set-endpoint." >&2
+      exit 1
+    }
+    if printf '%s' "$align_out" | grep -Fq '"changed":true'; then
+      echo "Team '$team' already had its binding on $(_remote_endpoint_display "$endpoint"); the stored sync configuration has now been aligned to it. Restart sync with: remote.sh sync start $(agmsg_shq "$team")"
+    else
+      echo "Team '$team' already uses $(_remote_endpoint_display "$endpoint"); nothing to change."
+    fi
     exit 0
+  fi
+
+  # Test seam: a two-file barrier that lets the lifecycle-race regressions
+  # land a concurrent disconnect / sync start deterministically between this
+  # command's state snapshot and its write. No-op unless set.
+  if [ -n "${AGMSG_TEST_SET_ENDPOINT_BARRIER:-}" ]; then
+    : > "$AGMSG_TEST_SET_ENDPOINT_BARRIER.reached"
+    _agmsg_barrier_waited=0
+    while [ ! -e "$AGMSG_TEST_SET_ENDPOINT_BARRIER.release" ]; do
+      sleep 0.05
+      _agmsg_barrier_waited=$((_agmsg_barrier_waited + 1))
+      [ "$_agmsg_barrier_waited" -ge 200 ] && break # 10s safety cap
+    done
   fi
 
   IFS=$'\t' read -r engine_state engine_pid < <(_remote_sync_engine_status "$team")
@@ -2214,21 +2263,32 @@ cmd_set_endpoint() {
     exit 1
   }
 
+  # The write is compare-and-swap on the snapshotted binding_revision: a
+  # concurrent disconnect (or any other binding writer) advances the revision,
+  # and this write must refuse rather than overwrite that newer state -- the
+  # adopt path rewrites the whole binding, disconnected_at:null included.
   _remote_adopt_registration "$team" "$cfg" "$endpoint" "$remote_team_id" \
-    "$binding_cipher" "$server_instance" || exit 1
+    "$binding_cipher" "$server_instance" "$binding_revision" || exit 1
 
   # Two places pin the address: the binding (moved above) and the stored sync
   # config, whose server_url loadConfig requires to match the binding. The
   # engine-side subcommand aligns the latter after re-verifying the identity
   # end to end; a plain team with no stored config is a recorded no-op. On
   # failure the engine stays stopped and the next start says exactly which
-  # two things disagree -- loud, and repaired by re-running set-endpoint.
+  # two things disagree -- and re-running set-endpoint reaches the repair
+  # path above, which retries this alignment.
   bash "$SCRIPT_DIR/remote-sync.sh" set-endpoint --team "$team" >/dev/null || {
     echo "agmsg: the binding now names $(_remote_endpoint_display "$endpoint") but the stored sync configuration still names the old address; re-run set-endpoint (the sync engine stays stopped until both agree)" >&2
     exit 1
   }
 
-  if [ "$was_running" -eq 1 ]; then
+  # Decide from BOTH the snapshot and the present: an engine that was running
+  # at the snapshot is restarted, and an engine somebody started while this
+  # command ran is restarted too (never silently left stopped, and a restart
+  # is what hands it the moved address -- a running engine keeps its old
+  # config in memory). _remote_sync_engine_start kills a live engine first.
+  IFS=$'\t' read -r end_state end_pid < <(_remote_sync_engine_status "$team")
+  if [ "$was_running" -eq 1 ] || [ "$end_state" = "running" ]; then
     _remote_sync_engine_start "$team"
     echo "Endpoint for '$team' moved: $(_remote_endpoint_display "$old_endpoint") -> $(_remote_endpoint_display "$endpoint") (same server instance). Sync engine restarted."
   else
