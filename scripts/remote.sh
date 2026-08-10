@@ -972,15 +972,26 @@ cmd_pull() {
     echo "Pulled '$pulled_name' into local team '$team' ($imported message(s))."
     echo "This team is encrypted and this machine does not hold the key for its current epoch, so its sync engine is halted."
   else
-    _remote_sync_engine_start "$team"
+    # Whether a start failure should end the command depends on what the command
+    # was for: if the engine IS the purpose, not having one means the purpose was
+    # not served and the command fails; if it is a side effect, the command
+    # reports and returns. Pull's purpose is to bring the team here, and it has.
+    # So this reports. (cmd_unlock exits 1 on the same failure for the opposite
+    # reason -- its purpose is to make the team readable AND start syncing it.
+    # The three are deliberately not uniform; making them uniform would be the
+    # error.)
+    local engine_started=1
+    _remote_sync_engine_start "$team" || engine_started=0
+    local engine_note=" Sync engine running."
+    [ "$engine_started" -eq 1 ] || engine_note=" The sync engine did not start (above)."
     if [ "$needs_key" -eq 1 ]; then
       # Says what was checked, and stops there. The identity for the current
       # epoch is here; messages sealed to an earlier key are a different
       # question and this did not ask it.
-      echo "Pulled '$pulled_name' into local team '$team' ($imported message(s)). Sync engine running."
+      echo "Pulled '$pulled_name' into local team '$team' ($imported message(s)).$engine_note"
       echo "This team is encrypted; this machine holds the key for its current epoch."
     else
-      echo "Pulled '$pulled_name' into local team '$team' ($imported message(s)). Sync engine running."
+      echo "Pulled '$pulled_name' into local team '$team' ($imported message(s)).$engine_note"
     fi
   fi
   if [ "$cannot_read" -ne 0 ]; then
@@ -1246,7 +1257,17 @@ EOF
   local engine_log="$CONNECTION_ROOT/run/remote-sync.$team.log" log_offset=1
   [ -f "$engine_log" ] &&
     log_offset=$(( $(wc -c < "$engine_log" | tr -d ' ') + 1 ))
-  _remote_sync_engine_start "$team"
+  # A refusal leaves REMOTE_SYNC_ENGINE_PID empty, which the readiness check
+  # below already treats as "did not become ready" and reports with unlock's own
+  # message. Tolerated here only because that handler exists.
+  #
+  # Detection is the handler's; the EXPLANATION is the refusal's, and it is
+  # already on stderr by the time this runs -- `|| true` discards the status,
+  # not the output, so the operator sees both the cause and the outcome. That
+  # only holds while the refusal is printed BEFORE the return: move it after and
+  # the two causes collapse into one message, which is the failure this whole
+  # change is about.
+  _remote_sync_engine_start "$team" || true
   local pid="${REMOTE_SYNC_ENGINE_PID:-}" ready=0 attempts=0
   while [ "$attempts" -lt 50 ]; do
     if [ -z "$pid" ] || ! _agmsg_pid_alive "$pid"; then
@@ -1314,17 +1335,66 @@ _remote_holds_current_key() {
   [ -n "$derived" ] && [ "$derived" = "$recipient" ]
 }
 
+# Why a start failure has to be spoken here rather than left to the caller.
+#
+# This function used to end in `disown … || true`, so it always returned 0. It
+# is called as `if ! _remote_sync_engine_start …` in one place, and `set -e` is
+# suspended inside an `if` condition — so a failed `echo > "$pidfile"` two lines
+# from the end was stepped over, the function reported success, and the command
+# died further down at `cat "$pidfile"` having printed nothing of its own. The
+# three other call sites do not look at the return value at all. Measured with
+# the run dir made unwritable: the caller saw success, then exit 1, silent.
+#
+# The tolerant `mkdir … || true` was half of it. Tolerating the directory and
+# then writing into it unguarded moves the failure to a line that cannot
+# explain itself. Both halves are checked below, and the writability of the
+# pidfile is proven BEFORE the engine is spawned — a spawn whose pidfile cannot
+# be written produces an engine no `status` can see and no `stop` can reach.
+_remote_sync_engine_start_refused() {
+  local team="$1" path="$2" why="$3"
+  {
+    echo "agmsg: could not start the sync engine for '$team': $why"
+    echo "  $path"
+    echo "  Nothing is syncing for this team: messages written here will not"
+    echo "  reach the server, and new ones will not arrive, until an engine runs."
+    echo "  If this machine sandboxes the agent (Codex does), that directory has"
+    echo "  to be writable by it. Then run:"
+    echo "    remote.sh sync start $(agmsg_shq "$team")"
+  } >&2
+}
+
 _remote_sync_engine_start() {
-  local team="$1" startup_nonce="${2:-}" pidfile logfile old_pid old_state
+  local team="$1" startup_nonce="${2:-}" pidfile logfile old_pid old_state rundir
   pidfile="$(_remote_sync_engine_pidfile "$team")"
   logfile="$CONNECTION_ROOT/run/remote-sync.$team.log"
-  mkdir -p "$CONNECTION_ROOT/run" 2>/dev/null || true
+  rundir="$CONNECTION_ROOT/run"
+  # Cleared first: this is a global, and the early returns below happen before
+  # any spawn. Left alone, a caller that reads it after a refusal would get the
+  # pid of whatever this function started the previous time it was called.
+  REMOTE_SYNC_ENGINE_PID=""
+  if ! mkdir -p "$rundir" 2>/dev/null; then
+    _remote_sync_engine_start_refused "$team" "$rundir" \
+      "its run directory could not be created"
+    return 1
+  fi
   # Stop only an engine whose argv proves that it owns this team. A stale
   # pidfile may point at a recycled, unrelated process and must never authorize
   # signalling that process.
   IFS=$'\t' read -r old_state old_pid < <(_remote_sync_engine_status "$team")
   if [ "$old_state" = "running" ]; then
     kill "$old_pid" 2>/dev/null || true
+  fi
+  # Writability proven before the spawn -- but AFTER the block above, not before
+  # it. Truncating the pidfile first destroys the pid that _remote_sync_engine_status
+  # reads to decide whether an old engine owns this team, so the old one is never
+  # signalled and survives the restart: the orphan this guard exists to prevent,
+  # manufactured by the guard. Caught by test_remote.bats "remote unlock … resumes
+  # age-v1 sync"; by this point the previous engine has already been identified
+  # and killed, so the truncation costs nothing.
+  if ! : > "$pidfile" 2>/dev/null; then
+    _remote_sync_engine_start_refused "$team" "$pidfile" \
+      "its pidfile could not be written"
+    return 1
   fi
   # nohup so the engine outlives this connect; remote-sync.sh execs node, so $!
   # stays the engine's own pid and is exactly what _remote_sync_engine_stop signals.
@@ -1335,7 +1405,16 @@ _remote_sync_engine_start() {
   AGMSG_SYNC_START_NONCE="$startup_nonce" \
     nohup bash "$SCRIPT_DIR/remote-sync.sh" run --team "$team" >> "$logfile" 2>&1 3>&- 4>&- &
   REMOTE_SYNC_ENGINE_PID=$!
-  echo "$REMOTE_SYNC_ENGINE_PID" > "$pidfile"
+  if ! echo "$REMOTE_SYNC_ENGINE_PID" > "$pidfile" 2>/dev/null; then
+    # The engine is already running at this point. Leaving it without a pidfile
+    # is the orphan state: invisible to status, and _remote_sync_engine_stop
+    # returns 0 without looking for it. Take it back down rather than create one.
+    kill "$REMOTE_SYNC_ENGINE_PID" 2>/dev/null || true
+    REMOTE_SYNC_ENGINE_PID=""
+    _remote_sync_engine_start_refused "$team" "$pidfile" \
+      "its pidfile could not be written, so the engine was stopped again"
+    return 1
+  fi
   disown 2>/dev/null || true
 }
 
@@ -1640,7 +1719,14 @@ cmd_connect() {
   # Start the polling engine in the background: it pushes what we have, pulls
   # anything already there, and keeps running so new messages flow both ways as
   # they are written. Stop it with 'remote.sh disconnect <team>'.
-  _remote_sync_engine_start "$team"
+  #
+  # Connect's purpose is the binding, and the binding is written by this point,
+  # so a start failure reports rather than fails the command -- same rule as
+  # cmd_pull, opposite of cmd_unlock, and the note there explains why the three
+  # differ. What it must not do is end by saying the engine runs: the line below
+  # made that claim unconditionally, from a function that could not fail.
+  local engine_started=1
+  _remote_sync_engine_start "$team" || engine_started=0
 
   local connection_security="plain"
   [ "$binding_cipher" = "age-v1" ] && connection_security="age-v1 encrypted"
@@ -1658,7 +1744,9 @@ cmd_connect() {
   if [ -n "$remote_team_name" ] && [ "$remote_team_name" != "$team" ]; then
     server_side=" (on the server: '$remote_team_name')"
   fi
-  echo "Connected: team '$team'$server_side ($connection_security). Sync engine running."
+  local engine_note=" Sync engine running."
+  [ "$engine_started" -eq 1 ] || engine_note=" The sync engine did not start (above)."
+  echo "Connected: team '$team'$server_side ($connection_security).$engine_note"
   # Carrying the snapshot and key by hand is the plain install's answer to
   # getting a second machine in. A larger tool may have a ceremony for exactly
   # that, and this line would talk its operator out of it -- into doing by hand
