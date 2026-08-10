@@ -13,7 +13,7 @@
 {"endpoint": "http://[fd00::1]:8787", "verdict": "allow", "why": "fc00::/7 unique local"}
 {"endpoint": "http://[fc00::1]:8787", "verdict": "allow", "why": "fc00::/7, low edge"}
 {"endpoint": "http://[fdff::1]:8787", "verdict": "allow", "why": "fc00::/7, high edge"}
-{"endpoint": "http://[fe80::1]:8787", "verdict": "allow", "why": "fe80::/10 link-local, low edge"}
+{"endpoint": "http://[fe80::1]:8787", "verdict": "allow", "why": "fe80::/10 link-local, low edge. Kept allowed deliberately, with the zone-index rows below refused: a host with one interface reaches this without a zone, and removing the range would buy no safety. Recorded because 'allowed but unusable' should not sit here unexplained"}
 {"endpoint": "http://[FE80::1]:8787", "verdict": "allow", "why": "an IPv6 literal is not case-sensitive either"}
 {"endpoint": "http://[febf::1]:8787", "verdict": "allow", "why": "fe80::/10, high edge"}
 {"endpoint": "https://example.com", "verdict": "allow", "why": "https is unaffected by any of this"}
@@ -53,5 +53,6 @@
 {"endpoint": "http://[fe80::1%eth0]:8787", "verdict": "deny", "why": "a zone index names an interface on the machine reading the URL, not part of the address; the endpoint is stored in the binding and re-read by a later process, where eth0 means something else. WHATWG URL has no host zone ID either, so Node cannot parse it at all"}
 {"endpoint": "http://[fe80::1%25eth0]:8787", "verdict": "deny", "why": "the percent-encoded spelling of the same thing; both spellings are in the table so that normalising one into the other cannot open a gap"}
 {"endpoint": "http://[fd00::1%25eth0]:8787", "verdict": "deny", "why": "a zone index on a unique-local literal, refused for the same reason"}
+{"endpoint": "http://[2001:4860::1%eth0]:8787", "verdict": "deny", "why": "a public literal carrying a zone index: refused twice over. Here so that a change loosening the zone rule cannot pass by also breaking the range check — with only private literals carrying zones, allowing zones and breaking the ranges look the same from outside"}
 {"endpoint": "ftp://192.168.1.1", "verdict": "deny", "why": "neither http nor https"}
 {"endpoint": "not-a-url", "verdict": "deny", "why": "not a URL at all"}
