@@ -341,8 +341,16 @@ stored_types() {
 
   run migrate alpha
   [ "$status" -eq 0 ]
-  # And the shared copy is gone, because the destination already had it.
+  # The shared copy is gone, because the destination already had it.
   [ "$(sqlite3 "$SHARED" "SELECT COUNT(*) FROM messages WHERE team='alpha';")" -eq 0 ]
+  # And the destination still holds it. Without this, a regression that removed
+  # the rows from BOTH stores would satisfy everything above -- status 0, shared
+  # empty -- while destroying the data the move exists to preserve. Found in
+  # review; the shared-side count alone cannot tell "carried across" from "gone".
+  #
+  # Every compared column, not COUNT(*): a count survives the row being replaced
+  # with different content, which is the failure the test above is about.
+  [ "$(sqlite3 "$dest" "SELECT id||'|'||team||'|'||from_agent||'|'||to_agent||'|'||body||'|'||created_at||'|'||COALESCE(read_at,'-') FROM messages WHERE id=9001;")" = "9001|alpha|ann|bob|what both sides hold|$at|-" ]
 }
 
 @test "migrate: a cursor at a different position is refused" {
