@@ -57,3 +57,9 @@
 {"endpoint": "ftp://192.168.1.1", "verdict": "deny", "why": "neither http nor https"}
 {"endpoint": "not-a-url", "verdict": "deny", "why": "not a URL at all"}
 {"endpoint": "http://192.168.01.1:8787", "verdict": "deny", "why": "leading-zero octet: reads as 192.168.1.1 after Number(), which is a decoding step, and the rule is that the address is readable as written. Also how the octal forms are spelled."}
+{"endpoint": "http://192.168.1.1:99999", "verdict": "deny", "why": "port out of range: urlsplit does not validate it, new URL refuses it — the divergence this row exists to pin"}
+{"endpoint": "http://192.168.1.1:abc", "verdict": "deny", "why": "port is not a number"}
+{"endpoint": "http://192.168.1.1:65536", "verdict": "deny", "why": "one past the top of the range"}
+{"endpoint": "http://192.168.1.1:+80", "verdict": "deny", "why": "a sign is not part of a port"}
+{"endpoint": "http://192.168.1.1:65535", "verdict": "allow", "why": "the top of the range is a valid port"}
+{"endpoint": "http://192.168.1.1:", "verdict": "allow", "why": "empty port means the scheme default; both parsers accept it"}

@@ -57,29 +57,35 @@ js_ok() {
   "
 }
 
-# Assert both implementations agree with the expectation AND with each other.
-both() {
-  local url="$1" want="$2"
-  if py_ok "$url"; then local py=allow; else local py=deny; fi
-  if js_ok "$url"; then local js=allow; else local js=deny; fi
-  [ "$py" = "$want" ] || { echo "validator: $url -> $py, wanted $want"; return 1; }
-  [ "$js" = "$want" ] || { echo "sync check: $url -> $js, wanted $want"; return 1; }
+# Do the two implementations give the SAME answer? No expectation of what that
+# answer is — that is the table's job, and the difference is the point.
+#
+# The previous version of this helper checked each side against a hardcoded
+# expectation, which made it a smaller copy of the table rather than a check on
+# consistency, and the claim in its comment was simply false. A reviewer caught
+# that. With no expectation, a wrong row in the table cannot make this fail, and
+# a divergence cannot make it pass.
+agree() {
+  local url="$1" py js
+  if py_ok "$url"; then py=allow; else py=deny; fi
+  if js_ok "$url"; then js=allow; else js=deny; fi
+  [ "$py" = "$js" ] || { echo "$url: validator says $py, sync check says $js"; return 1; }
 }
 
-@test "endpoint: the two implementations agree, without consulting the table (#717)" {
-  # The exhaustive cases live in tests/fixtures/endpoint-verdicts.jsonl and are
-  # run against both implementations by the two table harnesses. This is not a
-  # smaller copy of that: the table asks "does each side match the expected
-  # verdict", and this asks "do the two sides match EACH OTHER". A wrong row in
-  # the table makes both harnesses fail in the same direction and reads like a
-  # code defect; this one keeps working, because it has no expectation to be
-  # wrong about.
-  #
-  # One case per direction is enough for that job — coverage is the table's.
-  both "http://192.168.191.205:8787" allow
-  both "http://127.0.0.1:8787" allow
-  both "http://8.8.8.8:8787" deny
-  both "http://127.0.0.1.evil.com" deny
+@test "endpoint: the two implementations agree, whatever the answer is (#717)" {
+  # Every divergence this PR fixed was found by comparing the two, not by
+  # checking either against an expectation: address notations, IPv6 spelling,
+  # leading-zero octets, zone indexes, and port syntax. This asserts only that
+  # they still agree — so it keeps working when a table row is wrong, which is
+  # exactly when an expectation-based test misleads.
+  agree "http://192.168.191.205:8787"
+  agree "http://127.0.0.1:8787"
+  agree "http://8.8.8.8:8787"
+  agree "http://127.0.0.1.evil.com"
+  agree "http://2130706433/"
+  agree "http://[fe80::1%eth0]:8787"
+  agree "http://192.168.1.1:99999"
+  agree "http://192.168.1.1:abc"
 }
 
 @test "endpoint: the userinfo trick is still refused (#717)" {

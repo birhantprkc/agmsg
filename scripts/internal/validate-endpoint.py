@@ -95,6 +95,16 @@ def main():
         fail("--endpoint could not be parsed as a URL")
         return
 
+    # urlsplit does not validate the port; `parts.port` is what raises. Reading
+    # only `hostname` therefore accepted `:99999`, `:abc` and `:+80`, all of
+    # which the Node side refuses at parse time — the same class of divergence
+    # as the address notations, one component to the right (found in review).
+    try:
+        parts.port
+    except ValueError:
+        fail("--endpoint has an invalid port (must be a number from 0 to 65535)")
+        return
+
     if parts.scheme == "https":
         if not parts.hostname:
             fail("--endpoint has no host")
