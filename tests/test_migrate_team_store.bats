@@ -298,17 +298,59 @@ stored_types() {
   migrate alpha
   local dest; dest="$(store_of alpha)"
 
+  # ONE timestamp, used by both sides. The containment check compares
+  # created_at, so evaluating strftime('now') twice let the two rows differ by a
+  # second -- and then `refused` was satisfied by the timestamps rather than by
+  # the body. Measured: with both bodies made identical, this test failed when
+  # the two inserts shared a second and PASSED when they straddled one. It was
+  # green either way, so nothing ever asked to look at it (#723).
+  local at; at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   sqlite3 "$dest" "INSERT INTO messages(id,team,from_agent,to_agent,body,created_at)
-    VALUES(9001,'alpha','ann','bob','what the destination holds',
-           strftime('%Y-%m-%dT%H:%M:%SZ','now'));"
+    VALUES(9001,'alpha','ann','bob','what the destination holds','$at');"
   sqlite3 "$SHARED" "INSERT INTO messages(id,team,from_agent,to_agent,body,created_at)
-    VALUES(9001,'alpha','ann','bob','a different body',
-           strftime('%Y-%m-%dT%H:%M:%SZ','now'));"
+    VALUES(9001,'alpha','ann','bob','a different body','$at');"
 
   run migrate alpha
   [ "$status" -ne 0 ]
   [[ "$output" =~ "missing rows" ]]
   [ "$(sqlite3 "$SHARED" "SELECT COUNT(*) FROM messages WHERE team='alpha';")" -eq 1 ]
+}
+
+# The negative control for the test above, and the reason it cannot quietly
+# stop meaning anything again.
+#
+# The test above is green whether it refuses for the right reason or the wrong
+# one, so nothing in it can report that the fixture drifted. This one is red the
+# moment the two sides stop being identical -- which is exactly what a second
+# strftime('now') would do. Reintroduce one and this fails; the test above would
+# not (#723).
+#
+# It is also the behaviour re-entry depends on: a row already carried across is
+# not a conflict, or an interrupted run could never be resumed.
+@test "migrate: a message id reused for the SAME content is not refused" {
+  bash "$SCRIPTS/send.sh" alpha ann bob "the original message" >/dev/null
+  migrate alpha
+  local dest; dest="$(store_of alpha)"
+
+  # Byte-identical on both sides, timestamp included.
+  local at; at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  sqlite3 "$dest" "INSERT INTO messages(id,team,from_agent,to_agent,body,created_at)
+    VALUES(9001,'alpha','ann','bob','what both sides hold','$at');"
+  sqlite3 "$SHARED" "INSERT INTO messages(id,team,from_agent,to_agent,body,created_at)
+    VALUES(9001,'alpha','ann','bob','what both sides hold','$at');"
+
+  run migrate alpha
+  [ "$status" -eq 0 ]
+  # The shared copy is gone, because the destination already had it.
+  [ "$(sqlite3 "$SHARED" "SELECT COUNT(*) FROM messages WHERE team='alpha';")" -eq 0 ]
+  # And the destination still holds it. Without this, a regression that removed
+  # the rows from BOTH stores would satisfy everything above -- status 0, shared
+  # empty -- while destroying the data the move exists to preserve. Found in
+  # review; the shared-side count alone cannot tell "carried across" from "gone".
+  #
+  # Every compared column, not COUNT(*): a count survives the row being replaced
+  # with different content, which is the failure the test above is about.
+  [ "$(sqlite3 "$dest" "SELECT id||'|'||team||'|'||from_agent||'|'||to_agent||'|'||body||'|'||created_at||'|'||COALESCE(read_at,'-') FROM messages WHERE id=9001;")" = "9001|alpha|ann|bob|what both sides hold|$at|-" ]
 }
 
 @test "migrate: a cursor at a different position is refused" {
@@ -459,12 +501,16 @@ stored_types() {
   # And a leftover in the shared store, which is what re-entry is for. Copied
   # into the destination as an interrupted run would have done.
   local dest; dest="$(store_of alpha)"
+  # ONE timestamp, used by both sides -- this is meant to be the SAME row on
+  # both, and the containment check compares `at`. Evaluating strftime('now')
+  # once per statement made it two different rows whenever the pair straddled a
+  # second, which is the intermittent `missing rows (events)` CI saw. Forcing
+  # the boundary with a sleep reproduces that message exactly (#723).
+  local at; at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   sqlite3 "$SHARED" "INSERT INTO events(seq,type,id,team,from_agent,to_agent,body,at)
-    VALUES(9001,'message_sent','leftover','alpha','ann','bob','left behind',
-           strftime('%Y-%m-%dT%H:%M:%SZ','now'));"
+    VALUES(9001,'message_sent','leftover','alpha','ann','bob','left behind','$at');"
   sqlite3 "$dest" "INSERT INTO events(seq,type,id,team,from_agent,to_agent,body,at)
-    VALUES(9001,'message_sent','leftover','alpha','ann','bob','left behind',
-           strftime('%Y-%m-%dT%H:%M:%SZ','now'));"
+    VALUES(9001,'message_sent','leftover','alpha','ann','bob','left behind','$at');"
 
   run migrate alpha
   [ "$status" -eq 0 ]
