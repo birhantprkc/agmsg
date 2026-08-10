@@ -246,7 +246,7 @@ _wait_for_file_contains() {
   _wait_for_missing "$pf" || { kill "$w" 2>/dev/null || true; false; }
   run kill -0 "$w"; [ "$status" -ne 0 ]
   [ "$(_read_cursor team alice)" = "$first_cursor" ]
-  ! grep -q "M2-undelivered" "$out"
+  refute grep -q "M2-undelivered" "$out"
   run_watcher_for "after-liveness" "$TEST_SKILL_DIR/liveness-redelivery.log" 2
   grep -q "M2-undelivered" "$TEST_SKILL_DIR/liveness-redelivery.log"
 }

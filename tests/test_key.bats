@@ -520,7 +520,7 @@ EOS
   [ "$(python3 -c "import json; d=json.load(open('$cfg_json')); print(d['remote_key']['current']['key_id'])")" != "$key_id" ]
   [ "$(python3 -c "import json; d=json.load(open('$cfg_json')); print(d['remote_key']['epochs'][-1]['key_id'])")" = "$key_id" ]
   [ "$(python3 -c "import json; d=json.load(open('$cfg_json')); print(len(d['remote_key']['epochs']))")" -eq 2 ]
-  ! grep -q 'AGE-SECRET-KEY\\|age1' "$journal"
+  refute grep -q 'AGE-SECRET-KEY\\|age1' "$journal"
   run bash "$SCRIPTS/key.sh" show testteam --key-id "$key_id"
   [ "$status" -eq 0 ]
   [[ "$output" == *"Public recipient: age1"* ]]
