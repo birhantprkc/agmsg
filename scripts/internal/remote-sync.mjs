@@ -205,6 +205,46 @@ export async function activateKeyRotations(config) {
   config.age_v1_runtime_history = runtime;
 }
 
+// Whether an http:// endpoint with this hostname is acceptable. Must agree with
+// scripts/internal/validate-endpoint.py, which decides the same question at
+// connect/pull time — the two are checked against each other by
+// tests/test_endpoint_scheme.bats, because a rule enforced in one of them only
+// lets a team connect and then fail on its next sync.
+//
+// The rule is "IP literal in a private range", not "loopback". What the strict
+// parsing exists to stop is a NAME dressed as a safe host —
+// `127.0.0.1.evil.com` reads like loopback and resolves wherever its owner
+// points it. A literal has no such gap: what is written is where the
+// connection goes. So names stay https-only (`localhost` excepted) and a LAN
+// address over http is allowed, because two machines on a network you control
+// talking over http is ordinary and should not require a tunnel.
+export function allowsPlaintext(hostname) {
+  if (hostname === "localhost") return true;
+  // Node keeps IPv6 literals bracketed in URL.hostname.
+  const host = hostname.startsWith("[") && hostname.endsWith("]")
+    ? hostname.slice(1, -1).toLowerCase()
+    : hostname.toLowerCase();
+
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (v4) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])];
+    if (v4.slice(1).some((o) => Number(o) > 255)) return false;
+    if (a === 127) return true;                        // 127/8 loopback
+    if (a === 10) return true;                         // 10/8
+    if (a === 172 && b >= 16 && b <= 31) return true;  // 172.16/12
+    if (a === 192 && b === 168) return true;           // 192.168/16
+    if (a === 169 && b === 254) return true;           // 169.254/16 link-local
+    return false;
+  }
+
+  if (!host.includes(":")) return false;               // not an IP literal at all
+  if (host === "::1") return true;                     // loopback
+  const head = host.split(":")[0];
+  if (/^f[cd][0-9a-f]{0,2}$/.test(head)) return true;  // fc00::/7 unique local
+  if (/^fe[89ab][0-9a-f]?$/.test(head)) return true;   // fe80::/10 link-local
+  return false;
+}
+
 function connectedBinding(value, team) {
   const binding = value?.remote_binding;
   if (value?.name !== team || !binding || typeof binding !== "object" ||
@@ -220,8 +260,10 @@ function connectedBinding(value, team) {
   const connectedEndpoint = new URL(binding.endpoint);
   if (connectedEndpoint.protocol !== "https:" &&
       (connectedEndpoint.protocol !== "http:" ||
-       !["127.0.0.1", "localhost", "[::1]"].includes(connectedEndpoint.hostname))) {
-    throw new Error("connected team endpoint must use HTTPS or exact loopback HTTP");
+       !allowsPlaintext(connectedEndpoint.hostname))) {
+    throw new Error(
+      "connected team endpoint must use HTTPS, or HTTP to a private IP address " +
+      "(10/8, 172.16/12, 192.168/16, 169.254/16, 127/8, ::1, fc00::/7)");
   }
   endpoint(binding.endpoint, "/v1/health");
   return binding;

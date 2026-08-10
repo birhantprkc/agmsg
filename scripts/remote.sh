@@ -100,14 +100,24 @@ _remote_ensure_team() {
   agmsg_lock_release
 }
 
-# Reject a non-HTTPS endpoint (token/credential would cross the wire in
-# plaintext) except for loopback, which self-host/dev setups need without a
-# cert (remote-connect review findings B6/R2). Delegates to a real URL parser —
-# a shell glob/prefix check here was bypassable by
-# http://127.0.0.1.evil.com, http://localhost.evil.com, and the userinfo
-# trick http://localhost@evil.com, all of which matched a naive
-# `http://127.0.0.1*`/`http://localhost*` case pattern while actually
-# pointing at a different host.
+# Decide whether an endpoint may be spoken to over plaintext http. Delegates to
+# a real URL parser — a shell glob/prefix check here was bypassable by
+# http://127.0.0.1.evil.com, http://localhost.evil.com, and the userinfo trick
+# http://localhost@evil.com, all of which matched a naive
+# `http://127.0.0.1*`/`http://localhost*` case pattern while actually pointing
+# at a different host (remote-connect review findings B6/R2).
+#
+# The rule is "IP literal in a private range", not "loopback" (#717). The
+# bypasses above are all NAMES that read like a safe host; a literal is the
+# address itself, so a LAN address over http is allowed and does not need a
+# tunnel to a loopback port. The same rule is enforced per-sync in
+# internal/remote-sync.mjs, because a check only here lets a team connect and
+# then fail on its next sync; tests/test_endpoint_scheme.bats asserts both.
+#
+# What plaintext costs, stated where it is decided: the client sends no
+# credential (there is no Authorization header), so what crosses in the clear
+# is the message bodies of a team synced with cipher `none`. Under --e2ee the
+# contents are sealed before they leave the machine.
 _remote_validate_endpoint() {
   python3 "$SCRIPT_DIR/internal/validate-endpoint.py" "$1"
 }
