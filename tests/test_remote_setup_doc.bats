@@ -293,6 +293,12 @@ EOF
   [ "$status" -eq 0 ] || return 1
   [ "$output" = false ] || { echo "a future translation is treated as docs-only" >&2; return 1; }
 
+  # The guard test itself: editing this file has to run the suite too, same
+  # as editing what it guards.
+  run bash -c "$classify" _ tests/test_remote_setup_doc.bats "$block"
+  [ "$status" -eq 0 ] || return 1
+  [ "$output" = false ] || { echo "tests/test_remote_setup_doc.bats is treated as docs-only" >&2; return 1; }
+
   # Still an exception, not a hole through the docs tree.
   run bash -c "$classify" _ docs/spec/v1.md "$block"
   [ "$status" -eq 0 ] || return 1
@@ -323,6 +329,15 @@ EOF
   run bash -c "$classify" _ docs/remote-setup.de.md "$block"
   [ "$status" -eq 0 ] || return 1
   [ "$output" = false ] || { echo "a future translation forces the age-v1/jsonl contracts to run" >&2; return 1; }
+
+  # The bug this test file's own name almost recreated: test_remote_setup_doc
+  # .bats starts with the same "test_remote" prefix as test_remote.bats (a
+  # real sync-engine test), so a name-matching pattern for the latter can
+  # catch the former by coincidence. It reads none of what these contracts
+  # cover any more than the walkthroughs it guards do.
+  run bash -c "$classify" _ tests/test_remote_setup_doc.bats "$block"
+  [ "$status" -eq 0 ] || return 1
+  [ "$output" = false ] || { echo "tests/test_remote_setup_doc.bats forces the age-v1/jsonl contracts to run" >&2; return 1; }
 
   # Positive control: contracts_needed must be able to become true, or the
   # assertions above would pass just as well with a flag that is always

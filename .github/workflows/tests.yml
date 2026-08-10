@@ -34,9 +34,13 @@ name: tests
 # `docs/remote-setup*.md`-only diff (which must flip docs_only so the suite
 # that reads it still runs, see below) also ran a ~5-minute age-v1 job and two
 # ~1-minute jsonl jobs that never touch that file (#706). `contracts_needed`
-# is the same classification MINUS that one exception: true whenever
-# `docs_only` would be false for any OTHER reason, false when the only reason
-# was `docs/remote-setup*.md`.
+# is the same classification MINUS that exception: true whenever `docs_only`
+# would be false for any OTHER reason, false when the only reason was
+# `docs/remote-setup*.md` or its own guard test,
+# `tests/test_remote_setup_doc.bats` -- which needs the same exception for
+# the same reason, and initially did not have it: its name happens to start
+# the same way `test_remote.bats` (a real sync-engine test) does, so it fell
+# through into that pattern by coincidence rather than by relevance.
 
 on:
   push:
@@ -109,7 +113,17 @@ jobs:
               # walkthrough is prose the age-v1/jsonl-storage contracts never
               # read, so forcing the suite that does read it to run is not a
               # reason to also run those.
-              docs/remote-setup*.md) docs_only=false ;;
+              #
+              # tests/test_remote_setup_doc.bats belongs in this arm for the
+              # same reason, not the sync-engine one below: it is the guard
+              # for the walkthroughs, not a test of the sync engine, and it
+              # reads none of what age-v1/jsonl-storage cover either. Without
+              # this line it fell through to the broader `test_remote*.bats`
+              # pattern purely because its name happens to start the same way
+              # test_remote.bats's does -- a glob doing name-matching, not
+              # relevance-matching, is exactly how #706 partially recurred
+              # after being fixed once.
+              docs/remote-setup*.md|tests/test_remote_setup_doc.bats) docs_only=false ;;
               docs/*) ;;
               site/*) ;;
               app/*) app_changed=true ;;
