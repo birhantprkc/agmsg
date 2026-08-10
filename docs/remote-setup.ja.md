@@ -257,6 +257,16 @@ Composeスタックはポートを公開し、`compose.yaml` に開発用パス�
 の手前でTLSを終端すること — [`server/README.md` → Compose
 configuration](../server/README.md#compose-configuration) を参照。
 
+### プライベートCAでTLSを終端する場合
+
+手前のリバースプロキシの証明書が公開CA発行でない場合（自己署名や自前CA）、
+`remote.sh` を呼ぶすべてのコマンドに `CURL_CA_BUNDLE=<ca.pemのパス>` を渡す
+こと。`connect` 自体の通信はcurl経由でこの変数をそのまま読む。常駐する同期
+エンジンと`pull`のチーム解決はNodeプロセスで、`remote-sync.sh`経由で起動
+される — `NODE_EXTRA_CA_CERTS`が未設定なら、同じ`CURL_CA_BUNDLE`の値を
+そちらにも渡す。`CURL_CA_BUNDLE`を一度設定すれば両方に効き、curlと異なる
+信頼をNodeに持たせたい場合だけ`NODE_EXTRA_CA_CERTS`を別途指定する。
+
 ### 自前のデータベースを使う場合
 
 すでにPostgreSQLを動かしているなら、それに対してソースからサーバーを起動する。

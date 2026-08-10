@@ -15,6 +15,18 @@ export AGMSG_SYNC_DRIVER="$SCRIPT_DIR/internal/storage-sync-driver.sh"
 NODE_BIN="$(agmsg_resolve_node)"
 export AGMSG_SYNC_NODE_BIN="$NODE_BIN"
 export AGMSG_SYNC_CIPHER_HELPER="$SCRIPT_DIR/internal/sync-cipher.mjs"
+# curl (used by remote.sh's own one-shot connect/pull requests) and Node
+# (used here, and by everything this script execs into) trust a custom CA
+# through two different, unrelated env vars. A user who points --endpoint at
+# a server with a private/self-signed cert and sets only CURL_CA_BUNDLE gets
+# a working `connect`, then a sync engine that fails every cycle forever
+# with no indication why (#744). Node has no equivalent of CURL_CA_BUNDLE, so
+# bridge it: if the caller already trusted curl with a CA bundle and never
+# set Node's own variable, hand Node the same file. An explicit
+# NODE_EXTRA_CA_CERTS is left untouched.
+if [ -z "${NODE_EXTRA_CA_CERTS:-}" ] && [ -n "${CURL_CA_BUNDLE:-}" ]; then
+  export NODE_EXTRA_CA_CERTS="$CURL_CA_BUNDLE"
+fi
 # The engine outlives the command that starts it, so whatever it inherits it
 # holds for as long as it runs — including a descriptor internal to bats,
 # which then waits for an EOF that cannot arrive. Closing 3 and 4 by name

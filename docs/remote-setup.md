@@ -265,6 +265,19 @@ The Compose stack publishes its port and ships a development password in
 before this reaches a network you do not control — see
 [`server/README.md` → Compose configuration](../server/README.md#compose-configuration).
 
+### Terminating TLS with a private CA
+
+If the reverse proxy in front of the server carries a certificate from a CA
+that is not publicly trusted (a self-signed cert, or a CA of your own),
+point every `remote.sh` invocation at it with `CURL_CA_BUNDLE=<path-to-ca.pem>`.
+`connect`'s own request goes through curl, which reads that variable
+directly; the persistent sync engine and `pull`'s team lookup are Node
+processes started through `remote-sync.sh`, which passes the same
+`CURL_CA_BUNDLE` value on to Node as `NODE_EXTRA_CA_CERTS` when Node's own
+variable is not already set. Setting `CURL_CA_BUNDLE` is enough for both;
+set `NODE_EXTRA_CA_CERTS` yourself only if Node needs to trust something
+curl does not.
+
 ### Using your own database instead
 
 If you already run PostgreSQL, start the server from source against it. The
