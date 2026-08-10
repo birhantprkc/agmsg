@@ -270,12 +270,12 @@ EOF
   # The workflow's own `case` is lifted out and RUN: order is only one of the
   # ways an arm can stop working, and the classifier is what actually decides.
   workflow="${BATS_TEST_DIRNAME}/../.github/workflows/tests.yml"
-  block="$(awk '/case ".f" in/,/^ *esac$/' "$workflow")"
+  block="$(awk '/contract_test_files=/,/^ *done <<< "\$changed"$/' "$workflow")"
   [ -n "$block" ] || return 1
 
   # `run bash -c`, not a `$( )` around the eval: bash 3.2 — which is what CI's
   # macOS runner has — cannot parse a `case` inside command substitution.
-  classify='f="$1"; docs_only=true; app_changed=false; server_changed=false; sync_changed=false; contracts_needed=false; eval "$2"; echo "$docs_only"'
+  classify='changed="$1"; docs_only=true; app_changed=false; server_changed=false; sync_changed=false; contracts_needed=false; eval "$2"; echo "$docs_only"'
 
   # Every walkthrough that exists, derived — not a list to keep in step.
   while IFS= read -r doc; do
@@ -311,10 +311,10 @@ EOF
   # and storage-jsonl, which never read this file. contracts_needed is the
   # same classifier's independent verdict for those two jobs specifically.
   workflow="${BATS_TEST_DIRNAME}/../.github/workflows/tests.yml"
-  block="$(awk '/case ".f" in/,/^ *esac$/' "$workflow")"
+  block="$(awk '/contract_test_files=/,/^ *done <<< "\$changed"$/' "$workflow")"
   [ -n "$block" ] || return 1
 
-  classify='f="$1"; docs_only=true; app_changed=false; server_changed=false; sync_changed=false; contracts_needed=false; eval "$2"; echo "$contracts_needed"'
+  classify='changed="$1"; docs_only=true; app_changed=false; server_changed=false; sync_changed=false; contracts_needed=false; eval "$2"; echo "$contracts_needed"'
 
   while IFS= read -r doc; do
     [ -n "$doc" ] || continue
@@ -330,19 +330,36 @@ EOF
   [ "$status" -eq 0 ] || return 1
   [ "$output" = false ] || { echo "a future translation forces the age-v1/jsonl contracts to run" >&2; return 1; }
 
-  # The bug this test file's own name almost recreated: test_remote_setup_doc
-  # .bats starts with the same "test_remote" prefix as test_remote.bats (a
-  # real sync-engine test), so a name-matching pattern for the latter can
-  # catch the former by coincidence. It reads none of what these contracts
-  # cover any more than the walkthroughs it guards do.
-  run bash -c "$classify" _ tests/test_remote_setup_doc.bats "$block"
-  [ "$status" -eq 0 ] || return 1
-  [ "$output" = false ] || { echo "tests/test_remote_setup_doc.bats forces the age-v1/jsonl contracts to run" >&2; return 1; }
+  # The bug `tests/test_remote_setup_doc.bats` alone exposed, and the bug an
+  # earlier fix here left standing for these four: `tests/test_remote*.bats`
+  # matches all five by name, and only test_remote.bats (checked below) is
+  # a file either contract actually reads. Naming test_remote_setup_doc.bats
+  # as its own exception fixed one of five and left the other four
+  # unmeasured -- checking only "one representative passes" is how that
+  # went unnoticed the first time, so every non-contract file this glob
+  # matches is asserted here, not a sample of them.
+  for f in tests/test_remote_setup_doc.bats tests/test_remote_forget.bats \
+    tests/test_remote_status_liveness.bats tests/test_remote_sync.bats \
+    tests/test_remote_sync_engine.bats; do
+    run bash -c "$classify" _ "$f" "$block"
+    [ "$status" -eq 0 ] || return 1
+    [ "$output" = false ] || { echo "$f forces the age-v1/jsonl contracts to run" >&2; return 1; }
+  done
 
-  # Positive control: contracts_needed must be able to become true, or the
-  # assertions above would pass just as well with a flag that is always
-  # false -- indistinguishable from a flag nothing sets. A change to the
-  # storage layer the jsonl contract actually covers must still trigger it.
+  # Positive control, part 1: contracts_needed must be able to become true
+  # for a file the derived set actually holds, or the assertions above would
+  # pass just as well with a flag that is always false. test_remote.bats is
+  # the sixth file this SAME glob matches, and the one real reason the glob
+  # cannot simply be deleted -- it has age-gated tests and must keep being
+  # discovered as one. (Its own marker string is not spelled out here on
+  # purpose: this file would then match the very derivation it is testing.)
+  run bash -c "$classify" _ tests/test_remote.bats "$block"
+  [ "$status" -eq 0 ] || return 1
+  [ "$output" = true ] || { echo "tests/test_remote.bats no longer triggers the age-v1/jsonl contracts" >&2; return 1; }
+
+  # Positive control, part 2: a change entirely outside the test_remote*.bats
+  # glob, through the separate scripts/* arm, must still trigger it too --
+  # that arm is untouched by this fix and this proves it stayed that way.
   run bash -c "$classify" _ scripts/lib/storage.sh "$block"
   [ "$status" -eq 0 ] || return 1
   [ "$output" = true ] || { echo "a storage-layer change no longer triggers the age-v1/jsonl contracts" >&2; return 1; }
