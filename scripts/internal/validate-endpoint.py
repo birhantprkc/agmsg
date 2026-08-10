@@ -111,12 +111,24 @@ def main():
         # Authorization header at all, so that was not the risk. The risk is
         # the message bodies: on a team synced with cipher `none` the envelope
         # contents cross the network in the clear.
+        # Someone who wrote a zone index HAS given a private address, so the
+        # general message would answer a question they did not ask and leave
+        # them with nowhere to go. Say what is actually wrong.
+        if "%" in host:
+            fail(
+                "--endpoint cannot carry an IPv6 zone index "
+                f"(the '%...' part of '{host}'). Write the address without the "
+                "zone (http://[fe80::1]:8787), or use another address. The "
+                "zone names an interface on this machine, and the URL parser "
+                "the sync engine uses rejects it outright — accepting it here "
+                "would let the team connect and then fail on every sync."
+            )
         fail(
             "--endpoint must be https://, or http:// to a private IP address "
-            "(10/8, 172.16/12, 192.168/16, 169.254/16, 127/8, ::1, fc00::/7). "
-            "Over plaintext http the message bodies of a team synced without "
-            "encryption cross the network in the clear. Either use https://, "
-            "or give the LAN IP of the server instead of a name "
+            "(10/8, 172.16/12, 192.168/16, 169.254/16, 127/8, ::1, fc00::/7, "
+            "fe80::/10). Over plaintext http the message bodies of a team "
+            "synced without encryption cross the network in the clear. Either "
+            "use https://, or give the LAN IP of the server instead of a name "
             "(http://192.168.1.10:8787), or connect with --e2ee so the "
             "contents are sealed before they leave this machine."
         )

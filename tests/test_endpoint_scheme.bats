@@ -201,3 +201,25 @@ both() {
   # not about link-local.
   both "http://[fe80::1]:8787" allow
 }
+
+@test "endpoint: the refusal names the zone, and the list names what is allowed (#717)" {
+  # Two gaps found by the seat building the table, and the second is the
+  # quieter one. Someone who wrote a zone index HAS given a private address —
+  # answering them with "use a private IP" is a dead end, so the zone gets its
+  # own message naming the part that is wrong and a form that works.
+  run python3 "$SCRIPTS/internal/validate-endpoint.py" "http://[fe80::1%eth0]:8787"
+  [ "$status" -ne 0 ]
+  grep -qF 'zone index' <<<"$output"
+  grep -qF 'fe80::1' <<<"$output"
+
+  # And the general refusal lists fe80::/10, which is accepted. Allowing
+  # something without saying so is worse than the dead end: nobody hits an
+  # error, so nobody reports that link-local works.
+  run python3 "$SCRIPTS/internal/validate-endpoint.py" "http://example.com:8787"
+  [ "$status" -ne 0 ]
+  grep -qF 'fe80::/10' <<<"$output"
+
+  # The claim above is only worth anything if it is true.
+  run python3 "$SCRIPTS/internal/validate-endpoint.py" "http://[fe80::1]:8787"
+  [ "$status" -eq 0 ]
+}
