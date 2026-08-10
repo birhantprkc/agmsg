@@ -1148,6 +1148,54 @@ _truncate_team_config() {  # $1 = team -> replaces its config.json with malforme
   [[ "$output" == *"could not be read"* ]] && [[ "$output" != *"has never been connected"* ]]
 }
 
+@test "status <team> [--json]: the human and --json forms classify every config shape identically (#650 review)" {
+  # co2's finding: _remote_config_malformed checked json_valid but not the
+  # top-level TYPE, so [] / null / 42 / "text" -- valid JSON, not an object
+  # -- passed it, then fell through to json_extract-returns-null same as a
+  # genuinely empty binding: rc=1 "never connected". The --json path's
+  # python isinstance(dict) check already rejected these (rc=2), so the
+  # same file classified differently on the two paths.
+  #
+  # Fixing the bash side alone (tightening its check to match python's)
+  # would leave two independent implementations of one question, the exact
+  # shape that produced this gap in the first place -- the same structural
+  # mistake as #722 (also fixed by collapsing to one implementation both
+  # callers use). This test pins that AGREEMENT, not just each side's own
+  # correctness: it fails if either side's classifier ever changes without
+  # the other, even though _remote_config_shape_ok is now the single
+  # implementation both call, in case a future edit reintroduces a
+  # divergent path.
+  bash "$SCRIPTS/join.sh" beta dave claude-code /tmp/project-beta
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" beta
+  local cfg="$TEST_SKILL_DIR/teams/beta/config.json"
+  local valid_cfg
+  valid_cfg="$(cat "$cfg")"
+
+  local shape content expect
+  for shape in valid never_connected array null number string truncated; do
+    case "$shape" in
+      valid)           content="$valid_cfg"; expect=0 ;;
+      never_connected) content='{}'; expect=1 ;;
+      array)           content='[]'; expect=2 ;;
+      null)            content='null'; expect=2 ;;
+      number)          content='42'; expect=2 ;;
+      string)          content='"text"'; expect=2 ;;
+      truncated)       content='{"remote_binding": {"connected_at": "2026-01-01T00:00'; expect=2 ;;
+    esac
+    printf '%s' "$content" > "$cfg"
+
+    run bash "$SCRIPTS/remote.sh" status beta
+    local human_status="$status"
+    run bash "$SCRIPTS/remote.sh" status beta --json
+    local json_status="$status"
+
+    [ "$human_status" -eq "$expect" ] \
+      || { echo "shape=$shape: human form expected exit $expect, got $human_status" >&2; false; }
+    [ "$json_status" -eq "$expect" ] \
+      || { echo "shape=$shape: --json form expected exit $expect, got $json_status" >&2; false; }
+  done
+}
+
 
 
 

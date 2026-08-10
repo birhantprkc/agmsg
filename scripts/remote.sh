@@ -1672,20 +1672,52 @@ cmd_connect() {
 
 # --- status --------------------------------------------------------------
 
-# _remote_config_malformed <cfg> -> true (0) when the file EXISTS but does not
-# parse as a JSON object; false (1) when it's missing (the ordinary "never
-# connected" case _remote_read_config_field already answers with "null") or
-# genuinely valid. #650: a config that exists but cannot be read is a
-# FAILURE, not the same answer as "there is nothing to read" -- callers below
-# must check this before treating field-read results as meaningful, or a
-# parse failure quietly reads as "no binding" (and, via _remote_read_config_field,
-# leaks a raw sqlite error line onto stdout/stderr first).
+# _remote_config_shape_ok <content> -> true (0) if <content> parses as a
+# JSON OBJECT; false (1) for invalid JSON, or valid JSON that isn't an
+# object (`[]`, `null`, `42`, `"text"`). The ONE predicate both status
+# forms call for this question (review): a first version of this fix put
+# an equivalent check only on the human-text path (as bash+sqlite), while
+# _remote_status_json_one kept its own separate python
+# `isinstance(cfg, dict)` check. Two implementations of one question drift
+# -- exactly what happened here: tightening the --json side's check left
+# the human side still falling through to json_extract-returns-null,
+# rc=1 "never connected", for the same file the --json side correctly
+# called unreadable. Same structural mistake as #722 (two independent
+# implementations of one endpoint-validity question), fixed the same way:
+# collapse to one function, both callers use its answer.
+#
+# Takes CONTENT, not a path, on purpose: _remote_status_json_one already
+# does one locked read of the file for its own strict-ABI reasons (see its
+# header comment) and must not read it a second time here, unlocked --
+# that would reopen exactly the TOCTOU race that single read exists to
+# close. Callers that only have a path (the human-text side) read the
+# file themselves and pass the content in.
+#
+# `json_type` only runs inside the CASE branch taken when json_valid is
+# true (SQLite's CASE WHEN is lazy per-branch), specifically so it is
+# never asked to type a string that failed to parse at all -- evaluating
+# it unconditionally would risk erroring on the same invalid input this
+# function exists to classify, rather than answering false.
+_remote_config_shape_ok() {
+  local content="$1" escaped top_type
+  escaped=$(printf '%s' "$content" | sed "s/'/''/g")
+  top_type=$(agmsg_sqlite_mem "SELECT CASE WHEN json_valid('$escaped') THEN json_type('$escaped') ELSE 'invalid' END;" 2>/dev/null || echo "")
+  [ "$top_type" = "object" ]
+}
+
+# _remote_config_malformed <cfg> -> true (0) when the file EXISTS but its
+# content does not satisfy _remote_config_shape_ok; false (1) when it's
+# missing (the ordinary "never connected" case _remote_read_config_field
+# already answers with "null") or genuinely a valid object. #650: a config
+# that exists but cannot be read is a FAILURE, not the same answer as
+# "there is nothing to read" -- callers below must check this before
+# treating field-read results as meaningful, or a parse failure quietly
+# reads as "no binding" (and, via _remote_read_config_field, leaks a raw
+# sqlite error line onto stdout/stderr first).
 _remote_config_malformed() {
-  local cfg="$1" escaped valid
+  local cfg="$1"
   [ -f "$cfg" ] || return 1
-  escaped=$(sed "s/'/''/g" "$cfg")
-  valid=$(agmsg_sqlite_mem "SELECT json_valid('$escaped');" 2>/dev/null || echo "")
-  [ "$valid" = "1" ] && return 1
+  _remote_config_shape_ok "$(cat "$cfg" 2>/dev/null)" && return 1
   return 0
 }
 
@@ -1782,6 +1814,15 @@ _remote_status_json_one() {
   agmsg_lock_acquire "$TEAMS_DIR/$team" || return 2
   raw="$(cat "$cfg" 2>/dev/null)"
   agmsg_lock_release
+
+  # Authoritative shape gate (review, #650): the same _remote_config_shape_ok
+  # the human-text path uses, called here against the already-locked-read
+  # $raw rather than re-reading the file. Python's own json.loads/isinstance
+  # below stays as defensive-only belt-and-suspenders after this -- it should
+  # never actually trigger once this has passed, but a shell string escape
+  # and a SQLite JSON parser are not literally the same implementation as
+  # Python's, so it stays rather than assuming they can never disagree.
+  _remote_config_shape_ok "$raw" || return 2
 
   IFS=$'\t' read -r engine_state engine_pid < <(_remote_sync_engine_status "$team")
   printf '%s' "$raw" | python3 -c '
