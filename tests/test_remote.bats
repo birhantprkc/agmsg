@@ -2026,6 +2026,94 @@ PY_BIND
   [ "$status" -ne 0 ]
 }
 
+# unlock, with a start refusal injected (#730). advisor ruled this had to be
+# pinned rather than described: unlock is the only caller that discards the
+# helper's status with `|| true` and converts it, through
+# REMOTE_SYNC_ENGINE_PID and the readiness loop, into its own failure. A
+# regression that drops the `|| true` or unhooks the readiness handler passes
+# every sync-start, pull and connect test in the tree.
+#
+# The injection is a DIRECTORY at the pidfile path, not a read-only file.
+# unlock runs `_remote_sync_engine_stop` first, which ends in
+# `rm -f "$pidfile"` -- that succeeds on a read-only file in a writable
+# directory and clears the injection before the start it was meant to reach.
+# A directory survives: `[ -f ]` is false so stop returns 0 without touching
+# it, `rm -f` cannot remove it, and `: > "$pidfile"` fails. Measured.
+#
+# The fixture is this test's own rather than one lifted out of the two unlock
+# tests above. They look alike and are not the same: different bundle and
+# envelope paths, a different snapshot export, different ciphertext. Turning
+# them into one parameterised helper is a change to two passing tests in a file
+# that already flakes under load, and it is not what this PR is about.
+@test "remote unlock: a start refusal fails the unlock, and says why (#730)" {
+  skip_if_no_age
+
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" --e2ee testteam >/dev/null
+  local source_cfg snapshot bundle key_id recipient identity team_id envelope digest
+  source_cfg="$TEST_SKILL_DIR/teams/testteam/config.json"
+  snapshot="$TEST_SKILL_DIR/handed-snapshot.json"
+  bundle="$TEST_SKILL_DIR/handed-bundle.json"
+  envelope="$TEST_SKILL_DIR/handed-envelope.json"
+  bash "$SCRIPTS/key.sh" show testteam --snapshot --out "$snapshot" 2>/dev/null
+  bash "$SCRIPTS/key.sh" handoff testteam --out "$bundle" >/dev/null 2>&1
+  key_id="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.remote_key.current.key_id');")"
+  recipient="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.remote_key.current.recipient');")"
+  team_id="$(sqlite_mem "SELECT json_extract(CAST(readfile('$(rf "$source_cfg")') AS TEXT), '\$.team_id');")"
+  identity="$TEST_SKILL_DIR/run/remote-credentials/testteam/keys/$key_id.key"
+  jq -nc \
+    --arg key_id "$key_id" \
+    --arg recipient "$recipient" \
+    --arg team_id "$team_id" \
+    '{
+      type:"sync_seal", envelope_v:1, cipher:"age-v1",
+      key_id:$key_id, recipients:[$recipient], max_blob_bytes:1048576,
+      wire_id:"20000000-0000-4000-8000-000000000001",
+      team_id:$team_id, protocol_version:1,
+      projection:{
+        body:"handed ciphertext", created_at:"2026-01-02T00:00:00.000000Z",
+        from_agent:"member-1", to_agent:"member-1"
+      }
+    }' | node "$SCRIPTS/internal/sync-cipher.mjs" seal > "$envelope"
+  bash "$SCRIPTS/remote.sh" disconnect testteam >/dev/null 2>&1 || true
+
+  MOCK_PULL_AGE=1
+  MOCK_PULL_AGE_ENVELOPE_FILE="$envelope"
+  MOCK_PULL_TEAM_ID="$team_id"
+  restart_mock_server
+
+  # Machine B gets an independent install root. Reusing Machine A's root would
+  # reuse its retained checkpoint and would not test a first trust import.
+  PEER_SKILL_DIR="$(mktemp -d)"
+  export PEER_SKILL_DIR
+  mkdir -p "$PEER_SKILL_DIR"/{scripts,db,teams}
+  cp -R "$BATS_TEST_DIRNAME"/../scripts/. "$PEER_SKILL_DIR/scripts/"
+  chmod +x "$PEER_SKILL_DIR/scripts/"*.sh
+  chmod +x "$PEER_SKILL_DIR/scripts/"*.js 2>/dev/null || true
+  chmod +x "$PEER_SKILL_DIR/scripts/drivers/types/codex/"*.sh 2>/dev/null || true
+  bash "$PEER_SKILL_DIR/scripts/internal/init-db.sh"
+  local peer_scripts="$PEER_SKILL_DIR/scripts"
+
+  run bash "$peer_scripts/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$team_id" encrypted
+  [ "$status" -eq 0 ]
+
+  digest="$(shasum -a 256 "$snapshot" | awk '{print $1}')"
+  mkdir -p "$PEER_SKILL_DIR/run/remote-sync.encrypted.pid"
+
+  run bash "$peer_scripts/remote.sh" unlock encrypted \
+    --bundle "$bundle" --confirm-digest "$digest"
+  rmdir "$PEER_SKILL_DIR/run/remote-sync.encrypted.pid" 2>/dev/null || true
+
+  # unlock's purpose IS to start syncing the team, so unlike pull and connect it
+  # fails rather than reporting.
+  [ "$status" -ne 0 ]
+  # The cause, from the refusal ...
+  grep -qF "could not start the sync engine" <<<"$output"
+  # ... and the outcome, from unlock's own handler. Both, not one: they are
+  # different facts and collapsing them is what this change is about.
+  grep -qF "did not become ready" <<<"$output"
+  refute grep -qF "ready for normal use" <<<"$output"
+}
+
 @test "remote unlock: confirms handed authority, reprocesses, and resumes age-v1 sync" {
   skip_if_no_age
 
