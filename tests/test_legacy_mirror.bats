@@ -43,9 +43,12 @@ legacy_read_at() {
 }
 
 @test "legacy mirror: reading a message marks it read for a reader of the legacy table (#689)" {
-  # koit's call, against my initial recommendation: mirror read state too.
-  # Without it an old viewer shows every message unread forever, which is worse
-  # than the disagreement it was avoiding.
+  # Read state is mirrored as well as the message, and that is the harder half
+  # to argue for: mirroring it means two copies of the same fact, which can
+  # disagree. Not mirroring it is worse. An old viewer reads read_at from the
+  # legacy table, so leaving it null shows every message as unread forever --
+  # a permanent wrong answer, against a disagreement that only appears if the
+  # two writes come apart.
   bash "$SCRIPTS/send.sh" mteam bob alice "read state travels"
   [ -z "$(legacy_read_at 'read state travels')" ]
 
