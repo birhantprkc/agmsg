@@ -1067,6 +1067,135 @@ PY
   [ "$(sqlite_mem "SELECT json_extract('$(echo "$output" | sed "s/'/''/g")', '\$.local_team');")" = "$team" ]
 }
 
+_truncate_team_config() {  # $1 = team -> replaces its config.json with malformed JSON
+  local cfg="$TEST_SKILL_DIR/teams/$1/config.json"
+  [ -f "$cfg" ] || { echo "no config.json for $1 to truncate" >&2; return 1; }
+  printf '{"remote_binding": {"connected_at": "2026-01-01T00:00' > "$cfg"
+}
+
+@test "status --json (aggregate): a team whose config could not be read gets an explicit line, not silence (#650)" {
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  bash "$SCRIPTS/join.sh" beta dave claude-code /tmp/project-beta
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" beta
+  _truncate_team_config beta
+  bash "$SCRIPTS/join.sh" gamma erin claude-code /tmp/project-gamma  # joined, never connected
+
+  run bash "$SCRIPTS/remote.sh" status --json
+  [ "$status" -eq 0 ]
+  [ "$(echo "$output" | wc -l | tr -d ' ')" -eq 2 ]
+  local testteam_line beta_line
+  testteam_line="$(echo "$output" | grep testteam)"
+  beta_line="$(echo "$output" | grep beta)"
+  [ -n "$testteam_line" ]
+  [ -n "$beta_line" ]
+  [ "$(sqlite_mem "SELECT json_extract('$(echo "$beta_line" | sed "s/'/''/g")', '\$.local_team');")" = "beta" ]
+  [ "$(sqlite_mem "SELECT json_extract('$(echo "$beta_line" | sed "s/'/''/g")', '\$.state');")" = "unreadable" ]
+  # gamma was joined but never connected -- ordinary, stays silent. Its
+  # absence here is the OTHER half of #650: a line must not be manufactured
+  # for a team that was genuinely never bound, only for one that failed to
+  # read.
+  [[ "$output" != *"gamma"* ]]
+}
+
+@test "status <team> --json: an unreadable config is distinguishable from a genuinely unconnected team (#650)" {
+  bash "$SCRIPTS/join.sh" beta dave claude-code /tmp/project-beta
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" beta
+  _truncate_team_config beta
+
+  run bash "$SCRIPTS/remote.sh" status beta --json
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"could not be read"* ]] && [[ "$output" != *"has never been connected"* ]]
+
+  run bash "$SCRIPTS/remote.sh" status ghostteam --json
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"has never been connected"* ]] && [[ "$output" != *"could not be read"* ]]
+}
+
+@test "status <team>: the text form distinguishes unreadable from unconnected too, with no leaked sqlite error (#650)" {
+  bash "$SCRIPTS/join.sh" beta dave claude-code /tmp/project-beta
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" beta
+  _truncate_team_config beta
+
+  run bash "$SCRIPTS/remote.sh" status beta
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"could not be read"* ]] && [[ "$output" != *"has never been connected"* ]]
+  # The pre-fix leak: a raw sqlite parse error reached stdout/stderr before
+  # the (wrong) "has never been connected" line. The malformed check now
+  # short-circuits before any field read is attempted.
+  [[ "$output" != *"Error: stepping"* ]]
+}
+
+@test "status (aggregate, text): an unreadable team is reported and suppresses the false-reassuring 'No teams are connected' (#650)" {
+  bash "$SCRIPTS/join.sh" beta dave claude-code /tmp/project-beta
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" beta
+  _truncate_team_config beta
+
+  run bash "$SCRIPTS/remote.sh" status
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"beta"* ]] && [[ "$output" == *"could not be read"* ]]
+  [[ "$output" != *"No teams are connected."* ]]
+}
+
+@test "status <team> --json: a lock that cannot be acquired is reported as unreadable, not never-connected (#650)" {
+  bash "$SCRIPTS/join.sh" beta dave claude-code /tmp/project-beta
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" beta
+  local lock="$TEST_SKILL_DIR/teams/beta/.config.lock"
+  mkdir "$lock"
+
+  run env AGMSG_LOCK_TRIES=2 bash "$SCRIPTS/remote.sh" status beta --json
+  rmdir "$lock"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"could not be read"* ]] && [[ "$output" != *"has never been connected"* ]]
+}
+
+@test "status <team> [--json]: the human and --json forms classify every config shape identically (#650 review)" {
+  # co2's finding: _remote_config_malformed checked json_valid but not the
+  # top-level TYPE, so [] / null / 42 / "text" -- valid JSON, not an object
+  # -- passed it, then fell through to json_extract-returns-null same as a
+  # genuinely empty binding: rc=1 "never connected". The --json path's
+  # python isinstance(dict) check already rejected these (rc=2), so the
+  # same file classified differently on the two paths.
+  #
+  # Fixing the bash side alone (tightening its check to match python's)
+  # would leave two independent implementations of one question, the exact
+  # shape that produced this gap in the first place -- the same structural
+  # mistake as #722 (also fixed by collapsing to one implementation both
+  # callers use). This test pins that AGREEMENT, not just each side's own
+  # correctness: it fails if either side's classifier ever changes without
+  # the other, even though _remote_config_shape_ok is now the single
+  # implementation both call, in case a future edit reintroduces a
+  # divergent path.
+  bash "$SCRIPTS/join.sh" beta dave claude-code /tmp/project-beta
+  bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" beta
+  local cfg="$TEST_SKILL_DIR/teams/beta/config.json"
+  local valid_cfg
+  valid_cfg="$(cat "$cfg")"
+
+  local shape content expect
+  for shape in valid never_connected array null number string truncated; do
+    case "$shape" in
+      valid)           content="$valid_cfg"; expect=0 ;;
+      never_connected) content='{}'; expect=1 ;;
+      array)           content='[]'; expect=2 ;;
+      null)            content='null'; expect=2 ;;
+      number)          content='42'; expect=2 ;;
+      string)          content='"text"'; expect=2 ;;
+      truncated)       content='{"remote_binding": {"connected_at": "2026-01-01T00:00'; expect=2 ;;
+    esac
+    printf '%s' "$content" > "$cfg"
+
+    run bash "$SCRIPTS/remote.sh" status beta
+    local human_status="$status"
+    run bash "$SCRIPTS/remote.sh" status beta --json
+    local json_status="$status"
+
+    [ "$human_status" -eq "$expect" ] \
+      || { echo "shape=$shape: human form expected exit $expect, got $human_status" >&2; false; }
+    [ "$json_status" -eq "$expect" ] \
+      || { echo "shape=$shape: --json form expected exit $expect, got $json_status" >&2; false; }
+  done
+}
+
 
 
 
