@@ -1672,10 +1672,30 @@ cmd_connect() {
 
 # --- status --------------------------------------------------------------
 
+# _remote_config_malformed <cfg> -> true (0) when the file EXISTS but does not
+# parse as a JSON object; false (1) when it's missing (the ordinary "never
+# connected" case _remote_read_config_field already answers with "null") or
+# genuinely valid. #650: a config that exists but cannot be read is a
+# FAILURE, not the same answer as "there is nothing to read" -- callers below
+# must check this before treating field-read results as meaningful, or a
+# parse failure quietly reads as "no binding" (and, via _remote_read_config_field,
+# leaks a raw sqlite error line onto stdout/stderr first).
+_remote_config_malformed() {
+  local cfg="$1" escaped valid
+  [ -f "$cfg" ] || return 1
+  escaped=$(sed "s/'/''/g" "$cfg")
+  valid=$(agmsg_sqlite_mem "SELECT json_valid('$escaped');" 2>/dev/null || echo "")
+  [ "$valid" = "1" ] && return 1
+  return 0
+}
+
 _remote_status_one() {
   local team="$1" cfg connected_at disconnected_at write_allowed_ciphers key_id \
     binding_cipher engine_state engine_pid
   cfg="$(_remote_team_config "$team")"
+  if _remote_config_malformed "$cfg"; then
+    return 2
+  fi
   connected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.connected_at')"
   disconnected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.disconnected_at')"
   if [ -z "$connected_at" ] || [ "$connected_at" = "null" ]; then
@@ -1720,9 +1740,14 @@ _remote_status_one() {
 }
 
 # _remote_status_json_one <team> — prints one JSONL object for <team>'s
-# binding, or returns 1 (no output) if the team has never been connected,
-# matching _remote_status_one's own gate exactly (same "never connected"
-# definition for both surfaces).
+# binding. Return code carries which of two different answers a caller got
+# (#650): 1 means the team has never been connected (no config, or a valid
+# config with no remote_binding) -- ordinary, matches _remote_status_one's
+# own gate. 2 means the team's config could not actually be read (its lock
+# could not be acquired, or its file exists but is not parseable JSON) --
+# a FAILURE distinct from "never connected", because a caller enumerating
+# every locally-known team (e.g. deciding what to back up) must not treat a
+# team it failed to read as identical to one that was genuinely never bound.
 #
 # Strict, machine-consumed ABI (ADR 0007 addendum): a cloud/self-hosted
 # driver correlates this against its own operation-status record to decide
@@ -1754,7 +1779,7 @@ _remote_status_json_one() {
   cfg="$(_remote_team_config "$team")"
   [ -f "$cfg" ] || return 1
 
-  agmsg_lock_acquire "$TEAMS_DIR/$team" || return 1
+  agmsg_lock_acquire "$TEAMS_DIR/$team" || return 2
   raw="$(cat "$cfg" 2>/dev/null)"
   agmsg_lock_release
 
@@ -1765,9 +1790,9 @@ team, engine_state, engine_pid_text = sys.argv[1:4]
 try:
     cfg = json.loads(sys.stdin.read())
 except Exception:
-    sys.exit(1)
+    sys.exit(2)
 if not isinstance(cfg, dict):
-    sys.exit(1)
+    sys.exit(2)
 binding = cfg.get("remote_binding")
 if not isinstance(binding, dict) or not binding.get("connected_at"):
     sys.exit(1)
@@ -1800,11 +1825,17 @@ cmd_status() {
 
   if [ -n "$team" ]; then
     agmsg_validate_team_name "$team" || exit 1
+    local rc=0
     if [ "$json" -eq 1 ]; then
-      _remote_status_json_one "$team" || { echo "agmsg: team '$team' has never been connected" >&2; exit 1; }
+      _remote_status_json_one "$team" || rc=$?
     else
-      _remote_status_one "$team" || { echo "agmsg: team '$team' has never been connected" >&2; exit 1; }
+      _remote_status_one "$team" || rc=$?
     fi
+    case "$rc" in
+      0) : ;;
+      2) echo "agmsg: team '$team' could not be read -- its config exists but could not be parsed (or its lock could not be acquired); connection state is unknown, not confirmed unconnected (#650)" >&2; exit 2 ;;
+      *) echo "agmsg: team '$team' has never been connected" >&2; exit 1 ;;
+    esac
     return
   fi
 
@@ -1813,17 +1844,27 @@ cmd_status() {
     [ "$json" -eq 1 ] || echo "No teams found."
     return
   fi
+  local rc
   for t in "$TEAMS_DIR"/*/; do
     [ -d "$t" ] || continue
     t="$(basename "$t")"
     if [ "$json" -eq 1 ]; then
-      if _remote_status_json_one "$t"; then
-        any=1
-      fi
+      rc=0; _remote_status_json_one "$t" || rc=$?
+      case "$rc" in
+        0) any=1 ;;
+        # #650: absence of a line must mean "never connected", nothing else --
+        # a team whose config could not be read gets an explicit line instead
+        # of silently vanishing from what a caller treats as the full set.
+        2) python3 -c 'import json, sys; print(json.dumps({"local_team": sys.argv[1], "state": "unreadable"}))' "$t"
+           any=1 ;;
+      esac
     else
-      if _remote_status_one "$t"; then
-        any=1
-      fi
+      rc=0; _remote_status_one "$t" || rc=$?
+      case "$rc" in
+        0) any=1 ;;
+        2) echo "$t	could not be read (config exists but could not be parsed) (#650)"
+           any=1 ;;
+      esac
     fi
   done
   if [ "$any" -ne 1 ] && [ "$json" -ne 1 ]; then
