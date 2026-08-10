@@ -2166,6 +2166,31 @@ cmd_forget() {
   echo "Forgot '$team' on this machine. The server copy was not changed."
 }
 
+# _remote_ensure_binding_revision <team> <cfg> -> prints the numeric revision
+#
+# A binding written before revisions existed has no binding_revision, and both
+# CAS functions (_remote_write_binding, _remote_local_disconnect) skip their
+# comparison entirely for an empty/null expected value -- which silently
+# disables the lifecycle guard for exactly those legacy teams. cmd_forget
+# already carries the compat move for this input (initialize to 1, under the
+# lock); this is that same move, hoisted so a CAS caller can rely on a real
+# number existing before it snapshots one. Initialized and re-read inside the
+# lock, so the number printed is the number on disk.
+_remote_ensure_binding_revision() {
+  local team="$1" cfg="$2" escaped revision updated
+  agmsg_lock_acquire "$TEAMS_DIR/$team" || return 1
+  revision="$(_remote_read_config_field "$cfg" '$.remote_binding.binding_revision')"
+  if [ -z "$revision" ] || [ "$revision" = "null" ]; then
+    escaped="$(sed "s/'/''/g" "$cfg")"
+    updated="$(agmsg_sqlite_mem \
+      "SELECT json_set('$escaped', '\$.remote_binding.binding_revision', 1);")"
+    agmsg_write_atomic "$cfg" "$updated"
+    revision=1
+  fi
+  agmsg_lock_release
+  printf '%s\n' "$revision"
+}
+
 # --- set-endpoint ----------------------------------------------------------
 #
 # Move a connected team's binding to a new address. Only the ADDRESS moves:
@@ -2211,7 +2236,6 @@ cmd_set_endpoint() {
   binding_cipher="$(_remote_read_config_field "$cfg" '$.remote_binding.cipher_profile')"
   connected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.connected_at')"
   disconnected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.disconnected_at')"
-  binding_revision="$(_remote_read_config_field "$cfg" '$.remote_binding.binding_revision')"
   if [ -z "$connected_at" ] || [ "$connected_at" = "null" ] \
     || [ -z "$server_instance" ] || [ "$server_instance" = "null" ]; then
     echo "agmsg: team '$team' has no remote binding; there is no endpoint to move. Connect or pull it first." >&2
@@ -2242,6 +2266,13 @@ cmd_set_endpoint() {
     fi
     exit 0
   fi
+
+  # The CAS below needs a revision that actually exists: a legacy binding has
+  # none, and an empty expected value makes _remote_write_binding skip the
+  # comparison entirely -- the guard this command depends on would be disabled
+  # for exactly those teams. Initialize it (under the lock, cmd_forget's compat
+  # move) and snapshot the number that is really on disk.
+  binding_revision="$(_remote_ensure_binding_revision "$team" "$cfg")" || exit 1
 
   # Test seam: a two-file barrier that lets the lifecycle-race regressions
   # land a concurrent disconnect / sync start deterministically between this

@@ -356,6 +356,35 @@ _binding_field() {  # $1 = team, $2 = json path under remote_binding
   [ "$(_binding_field testteam endpoint)" = "$ENDPOINT" ]
 }
 
+@test "set-endpoint: a legacy binding without a revision still cannot overwrite a concurrent disconnect (#739)" {
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -eq 0 ]
+  # Make the binding legacy: bindings written before revisions existed carry
+  # none, and an empty expected revision made both CAS functions skip their
+  # comparison -- disabling the lifecycle guard for exactly these teams.
+  local cfg="$TEST_SKILL_DIR/teams/testteam/config.json"
+  sqlite_mem "SELECT json_remove(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.remote_binding.binding_revision');" > "$cfg.tmp"
+  mv "$cfg.tmp" "$cfg"
+  [ "$(_binding_field testteam binding_revision)" = "" ]
+
+  local barrier="$TEST_SKILL_DIR/se-barrier3" se_rc=0
+  AGMSG_TEST_SET_ENDPOINT_BARRIER="$barrier" \
+    bash "$SCRIPTS/remote.sh" set-endpoint --endpoint "http://localhost:$MOCK_PORT" testteam \
+    > "$TEST_SKILL_DIR/se3.out" 2>&1 3>&- &
+  local se_pid=$!
+  for _ in $(seq 1 300); do [ -e "$barrier.reached" ] && break; sleep 0.1; done
+  [ -e "$barrier.reached" ]
+  run bash "$SCRIPTS/remote.sh" disconnect testteam
+  [ "$status" -eq 0 ]
+  : > "$barrier.release"
+  wait "$se_pid" || se_rc=$?
+  [ "$se_rc" -ne 0 ]
+  grep -Fq "changed while this command was running" "$TEST_SKILL_DIR/se3.out"
+  [ "$(_binding_field testteam disconnected_at)" != "" ]
+  [ "$(_binding_field testteam disconnected_at)" != "null" ]
+  [ "$(_binding_field testteam endpoint)" = "$ENDPOINT" ]
+}
+
 @test "set-endpoint: an engine started while it runs ends up running on the new address (#739 P1-2)" {
   run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
   [ "$status" -eq 0 ]
