@@ -1527,6 +1527,62 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   fi
 }
 
+# The three callers changed by #730, each with a start refusal injected.
+#
+# The refusal itself is covered in tests/test_remote_engine_start_refusal.bats,
+# but only through `sync start`. Without these, the four-path asymmetry that
+# change is about -- unlock fails, pull and connect report and carry on -- is
+# only prose in the commit message. Found in review.
+#
+# The injection is a read-only pidfile rather than an unwritable run dir: the
+# rest of connect and pull write under run/ too, and taking the whole directory
+# away would stop them for reasons that have nothing to do with the engine.
+_deny_engine_pidfile() {
+  # Two statements, not one. `local a="$1" b="…$a…"` builds b before a is
+  # visible, so the pidfile came out as `remote-sync..pid` and the injection
+  # silently missed -- the test then measured an ordinary pull and reported the
+  # claim it was written to catch.
+  local team="$1"
+  local pidfile="$TEST_SKILL_DIR/run/remote-sync.$team.pid"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf '%s\n' 2147483647 > "$pidfile"
+  chmod a-w "$pidfile"
+}
+
+@test "remote pull: a start refusal is reported, and the pull still succeeds (#730)" {
+  [ "$(id -u)" -ne 0 ] || skip "chmod does not restrict root"
+  MOCK_TEAM_CIPHER_PROFILE=none
+  restart_mock_server
+  _deny_engine_pidfile cloned
+
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" cloned
+  chmod u+w "$TEST_SKILL_DIR/run/remote-sync.cloned.pid" 2>/dev/null || true
+  # Pull's purpose is to bring the team here, and it did.
+  [ "$status" -eq 0 ]
+  grep -qF "Pulled" <<<"$output"
+  # But it must not claim an engine it could not start.
+  refute grep -qF "Sync engine start requested" <<<"$output"
+  grep -qF "The sync engine did not start" <<<"$output"
+  grep -qF "could not start the sync engine" <<<"$output"
+}
+
+@test "remote connect: a start refusal is reported, and the binding still stands (#730)" {
+  [ "$(id -u)" -ne 0 ] || skip "chmod does not restrict root"
+  MOCK_TEAM_CIPHER_PROFILE=none
+  restart_mock_server
+  bash "$SCRIPTS/join.sh" bound alice claude-code /tmp/project-bound >/dev/null
+  _deny_engine_pidfile bound
+
+  run bash "$SCRIPTS/remote.sh" connect bound --endpoint "$ENDPOINT"
+  chmod u+w "$TEST_SKILL_DIR/run/remote-sync.bound.pid" 2>/dev/null || true
+  # Connect's purpose is the binding, and it is written by this point.
+  [ "$status" -eq 0 ]
+  grep -qF "Connected:" <<<"$output"
+  refute grep -qF "Sync engine start requested" <<<"$output"
+  grep -qF "The sync engine did not start" <<<"$output"
+  grep -qF "could not start the sync engine" <<<"$output"
+}
+
 @test "remote pull: starts a background sync engine that disconnect stops" {
   # This team is a PLAIN one: say so. The fixture's default declaration is
   # age-v1, and the engine now follows the declaration rather than the
@@ -1541,7 +1597,9 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   # engine. A pulled team that only cloned would report a send as "Sent" and
   # stay local while status answered "connected"; pin the engine running and the
   # binding it continues against. This is what a green 56/0 slipped past.
-  [[ "$output" == *"Sync engine running."* ]]
+  # "start requested", not "running": this path spawns the engine and records
+  # its pid, and does not wait to see it come up (#730).
+  [[ "$output" == *"Sync engine start requested"* ]]
   local pidfile="$SCRIPTS/../run/remote-sync.cloned.pid"
   wait_for_file "$pidfile"
   local cfg="$TEST_SKILL_DIR/teams/cloned/config.json"
@@ -1832,7 +1890,7 @@ PY_BIND
 
   run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" encrypted
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Sync engine running"* ]]
+  [[ "$output" == *"Sync engine start requested"* ]]
   [[ "$output" == *"holds the key for its current epoch"* ]]
   [[ "$output" != *"does not hold the key"* ]]
   [[ "$output" != *"local but locked"* ]]

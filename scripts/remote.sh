@@ -982,7 +982,7 @@ cmd_pull() {
     # error.)
     local engine_started=1
     _remote_sync_engine_start "$team" || engine_started=0
-    local engine_note=" Sync engine running."
+    local engine_note=" Sync engine start requested (remote.sh status $team confirms)."
     [ "$engine_started" -eq 1 ] || engine_note=" The sync engine did not start; the reason is on stderr."
     if [ "$needs_key" -eq 1 ]; then
       # Says what was checked, and stops there. The identity for the current
@@ -1744,11 +1744,20 @@ cmd_connect() {
   if [ -n "$remote_team_name" ] && [ "$remote_team_name" != "$team" ]; then
     server_side=" (on the server: '$remote_team_name')"
   fi
+  # "start requested", not "running": all this path knows is that the engine was
+  # spawned and its pid recorded. The child can still die on its own -- a log
+  # redirection it cannot make, a Node that will not start -- and nothing here
+  # waits to find out. Confirming would mean a readiness wait of up to 16s in a
+  # command whose purpose is the binding, not the engine; the sentence is
+  # narrowed instead, and points at the command that does check. Saying
+  # "running" from a check that only proves "spawned" is the defect this change
+  # exists to remove, one step smaller. Found in review.
+  #
   # Names the stream, not a position. The refusal goes to stderr and this line
   # to stdout, so "above" is only true on a terminal that interleaves them --
   # `remote.sh connect … | tee log` puts them in different places, and a note
   # that points at nothing is the kind of sentence this change exists to remove.
-  local engine_note=" Sync engine running."
+  local engine_note=" Sync engine start requested (remote.sh status $team confirms)."
   [ "$engine_started" -eq 1 ] || engine_note=" The sync engine did not start; the reason is on stderr."
   echo "Connected: team '$team'$server_side ($connection_security).$engine_note"
   # Carrying the snapshot and key by hand is the plain install's answer to
