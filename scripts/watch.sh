@@ -246,9 +246,36 @@ cleanup() {
       [ "$_owner" = "$SESSION_ID" ] && rm -f "$_rf" 2>/dev/null || true
     done <<< "$READY_FILES"
   fi
+  [ -n "${INSTALL_STAMP:-}" ] && rm -f "$INSTALL_STAMP" 2>/dev/null || true
 }
 trap cleanup EXIT
 trap 'exit 0' INT TERM HUP
+
+# A resident process keeps executing the code it was started with. An update
+# rewrites the scripts in place (same inode -- confirmed with lsof, #684), so
+# after one this watcher is running code from before it while everything it
+# talks to has moved on. Measured on the reported pair: a 1.1.13 watcher, after
+# `npx agmsg@1.2.0-rc.1 install` landed under it, stayed ALIVE and stopped
+# delivering -- the message was never printed and never marked read, and
+# nothing was written to stderr. Liveness is exactly what made it invisible.
+#
+# The guard is a timestamp rather than a version comparison, so it does not
+# only catch the table that moved this time. ANY file under scripts/ being
+# newer than this watcher's start means the code it is running is no longer the
+# code on disk, whatever changed -- which is the class, not the instance.
+#
+# `run/` is deliberately outside the watched tree: pidfiles and readiness
+# sentinels are written by watchers themselves and would trip it immediately.
+INSTALL_STAMP="$RUN_DIR/.watch-start.$SESSION_ID"
+: > "$INSTALL_STAMP" 2>/dev/null || true
+
+# True when anything under scripts/ was written after this watcher started.
+# `-print -quit` stops at the first hit, so the common case is one stat-walk
+# that exits early rather than a full tree scan every cycle.
+_install_changed() {
+  [ -f "$INSTALL_STAMP" ] || return 1
+  [ -n "$(find "$SCRIPT_DIR" -newer "$INSTALL_STAMP" -print -quit 2>/dev/null)" ]
+}
 
 # Resolve subscription set.
 PAIRS="$("$SCRIPT_DIR/identities.sh" "$PROJECT_PATH" "$AGENT_TYPE")"
@@ -402,6 +429,15 @@ _held_elsewhere_without() {
 }
 
 while true; do
+  # The installation changed under us (#684). Say it on STDOUT, not stderr:
+  # stdout is the delivery channel the session is reading, and this watcher's
+  # stderr goes to /dev/null in every launcher we ship, which is why the
+  # original failure was silent for hours. Then exit, so "the monitor stopped"
+  # is what the session sees instead of a live process delivering nothing.
+  if _install_changed; then
+    printf 'agmsg watch: the agmsg installation was updated while this watcher was running, so it is still executing the code from before the update. Exiting rather than appearing to work. Restart this session (or run /agmsg actas <name>) to resume delivery.\n'
+    exit 0
+  fi
   # Liveness guard (#67): exit promptly once the originating agent session is
   # gone. A plain pipe gives no portable way to notice a *downstream* consumer
   # that closed silently — printf '' raises no EPIPE, and macOS buffers a final
