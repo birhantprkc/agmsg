@@ -624,3 +624,29 @@ stored_types() {
   # rather than say anything about whether a per-team file got created.
   [ ! -e "$TEST_SKILL_DIR/db/teams/alpha/messages.db" ]
 }
+
+@test "migrate: the link between an event and its legacy row survives the move (#710)" {
+  # #689 records the legacy rowid on the event so that the two rows other code
+  # UNIONs -- the event log and the legacy messages table -- can be recognised
+  # as one message. The copy here carries whole rows, so it has to carry that
+  # column too: without it every moved message arrives unlinked, and the same
+  # two readers #689 measured list it twice again. The projection in
+  # sqlite-sync then pushes a second copy of each one to the server, which is
+  # how it reaches the other machine.
+  bash "$SCRIPTS/send.sh" alpha ann bob "one message" >/dev/null
+  migrate alpha
+
+  run bash "$SCRIPTS/history.sh" alpha bob
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s\n' "$output" | grep -c 'one message')" -eq 1 ]
+
+  # The column that makes that true. Asserted separately because the reader
+  # above can be right for the wrong reason -- a dedupe that guessed from the
+  # body would pass it and still leave the projection with nothing to match.
+  db="$(store_of alpha)"
+  [ "$(sqlite3 "$db" "SELECT COUNT(*) FROM events
+        WHERE team='alpha' AND type='message_sent' AND legacy_id IS NULL;" | tr -d '\r')" -eq 0 ]
+  [ "$(sqlite3 "$db" "SELECT legacy_id FROM events
+        WHERE team='alpha' AND type='message_sent';" | tr -d '\r')" \
+    = "$(sqlite3 "$db" "SELECT id FROM messages WHERE team='alpha';" | tr -d '\r')" ]
+}
