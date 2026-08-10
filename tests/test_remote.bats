@@ -495,6 +495,29 @@ _capability_endpoint() {
   [[ "$output" != *"scripts/remote.sh"*"unlock"* ]]
 }
 
+@test "pull: a truly unreachable server is reported as such (#726)" {
+  # Direction 1 of the negative control: nothing listens on this port, so
+  # resolve-team's child process fails before ever reaching a server. name
+  # resolution runs because no --team-id is given.
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "http://127.0.0.1:1" newteam
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"could not look up 'newteam'"* ]]
+}
+
+@test "pull: a reachable server whose lookup answer fails validation names that reason, not \"unreachable\" (#726)" {
+  # Direction 2: the mock server answers (HTTP 200, protocol_version wrong),
+  # so this is not a transport failure -- it is the OTHER cause the old
+  # message collapsed into the same sentence as "unreachable". The specific
+  # reason has to surface, and the collapsed wording must not appear at all,
+  # or this is indistinguishable from before the fix.
+  MOCK_LOOKUP_BAD=protocol restart_mock_server
+
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" newteam
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"team lookup answer is not a lookup result"* ]]
+  [[ "$output" != *"unreachable"* ]]
+}
+
 @test "connect: the handoff-bundle line is printed by default" {
   # #668: this named the snapshot pair while `pull` on the other machine asked
   # for the bundle, so each side named the other's route. It names the bundle
@@ -2022,7 +2045,7 @@ assert_lookup_rejected() {
   MOCK_LOOKUP_BAD="$mode" restart_mock_server
   run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" pulled-team
   [ "$status" -ne 0 ]
-  [[ "$output" == *"its answer was rejected"* ]]
+  [[ "$output" == *"could not look up 'pulled-team'"* ]]
   [[ "$output" != *"MARKER-INJECTED"* ]]
   [ ! -d "$TEST_SKILL_DIR/teams/pulled-team" ]
 }

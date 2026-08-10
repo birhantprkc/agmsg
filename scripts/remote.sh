@@ -700,11 +700,18 @@ _remote_resolve_team_id() {
   # stay distinguishable from a name that simply matched nothing. Collapsing
   # those into one message is how a rejected answer would get read as "no such
   # team" -- the wrong conclusion to hand an operator about their own team.
+  #
+  # stderr is NOT redirected here, on purpose (same as pull-bootstrap below):
+  # the engine's own top-level handler already writes a specific message for
+  # whatever actually went wrong -- a fetch failure, a protocol mismatch, a
+  # malformed candidate -- and it needs to reach the operator, not get
+  # replaced by a single line that names two different causes at once and
+  # lets the reader guess which one happened.
   out="$("$SCRIPT_DIR/remote-sync.sh" resolve-team \
-    --endpoint "$endpoint" --name "$name" 2>/dev/null)"
+    --endpoint "$endpoint" --name "$name")"
   status=$?
   if [ "$status" -ne 0 ]; then
-    echo "agmsg: could not look up '$name': the server was unreachable, or its answer was rejected" >&2
+    echo "agmsg: could not look up '$name'" >&2
     return 1
   fi
   result="$(printf '%s\n' "$out" | grep '"team_lookup_result"' | tail -1)" || true
