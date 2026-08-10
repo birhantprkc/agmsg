@@ -85,6 +85,14 @@ containers are still starting, retry until it succeeds.
 both machines can reach it. Two accounts on one host can; so can two machines on
 a network you control, using the host's address rather than `127.0.0.1`.
 
+The address is not permanent: a connected team can be moved to a new address of
+the **same** server later — a port-forward replaced by the LAN address, a tunnel
+replaced by a stable name — with `remote.sh set-endpoint --endpoint <new-url>
+<team>`. It verifies the new address answers as the same server instance before
+anything changes, and refuses (naming both ids) when it does not. Only the
+address can move this way; pointing a team at a *different* server is
+deliberately not possible without disconnecting first.
+
 Only when the second machine reaches the server over a network you do not
 control does it need a public HTTPS URL. Then check it from there too:
 

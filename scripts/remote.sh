@@ -2149,6 +2149,93 @@ cmd_forget() {
   echo "Forgot '$team' on this machine. The server copy was not changed."
 }
 
+# --- set-endpoint ----------------------------------------------------------
+#
+# Move a connected team's binding to a new address. Only the ADDRESS moves:
+# what the team is bound TO is the identity triple (server_instance_id,
+# remote_team_id, protocol_version), and the server answering at the new
+# address must prove it is that same identity before anything is written.
+# _remote_adopt_registration is both the proof and the only writer: it fetches
+# the new address's capabilities, refuses unless the server instance matches
+# the recorded one (naming both ids when it does not), re-checks that the
+# registration is this team's (name and roster), and only then rewrites the
+# binding -- endpoint included, binding_revision advanced. There is
+# deliberately no unverified path to the write.
+#
+# A disconnected team is refused: disconnect is the operator renouncing the
+# anchor, and `connect --endpoint <new>` is the deliberate re-anchoring move
+# for that state. set-endpoint exists for the live team whose address was
+# never meant to be permanent -- a port-forward, a tunnel, a machine that
+# later got a stable name (#718).
+cmd_set_endpoint() {
+  local endpoint="" team="" positional=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --endpoint) endpoint="${2:?--endpoint requires a value}"; shift 2 ;;
+      --endpoint=*) endpoint="${1#--endpoint=}"; shift ;;
+      *) positional+=("$1"); shift ;;
+    esac
+  done
+  : "${endpoint:?Usage: remote.sh set-endpoint --endpoint <url> <team>}"
+  _remote_validate_endpoint "$endpoint" || exit 1
+  endpoint="${endpoint%/}"
+  team="${positional[0]:-}"
+  [ -n "$team" ] || { echo "agmsg: set-endpoint requires a team: remote.sh set-endpoint --endpoint <url> <team>" >&2; exit 1; }
+  agmsg_validate_team_name "$team" || exit 1
+
+  local cfg old_endpoint server_instance remote_team_id binding_cipher \
+    connected_at disconnected_at engine_state engine_pid was_running=0
+  cfg="$(_remote_team_config "$team")"
+  [ -f "$cfg" ] || { echo "agmsg: team '$team' is not a local team" >&2; exit 1; }
+  old_endpoint="$(_remote_read_config_field "$cfg" '$.remote_binding.endpoint')"
+  server_instance="$(_remote_read_config_field "$cfg" '$.remote_binding.server_instance_id')"
+  remote_team_id="$(_remote_read_config_field "$cfg" '$.remote_binding.remote_team_id')"
+  binding_cipher="$(_remote_read_config_field "$cfg" '$.remote_binding.cipher_profile')"
+  connected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.connected_at')"
+  disconnected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.disconnected_at')"
+  if [ -z "$connected_at" ] || [ "$connected_at" = "null" ] \
+    || [ -z "$server_instance" ] || [ "$server_instance" = "null" ]; then
+    echo "agmsg: team '$team' has no remote binding; there is no endpoint to move. Connect or pull it first." >&2
+    exit 1
+  fi
+  if [ -n "$disconnected_at" ] && [ "$disconnected_at" != "null" ]; then
+    echo "agmsg: team '$team' is disconnected; set-endpoint moves a live binding only. To re-anchor it deliberately, run connect with the new endpoint." >&2
+    exit 1
+  fi
+  if [ "$old_endpoint" = "$endpoint" ]; then
+    echo "Team '$team' already uses $(_remote_endpoint_display "$endpoint"); nothing to change."
+    exit 0
+  fi
+
+  IFS=$'\t' read -r engine_state engine_pid < <(_remote_sync_engine_status "$team")
+  [ "$engine_state" = "running" ] && was_running=1
+  _remote_sync_engine_stop "$team" || {
+    echo "agmsg: the sync engine did not stop; refusing to move the endpoint under it" >&2
+    exit 1
+  }
+
+  _remote_adopt_registration "$team" "$cfg" "$endpoint" "$remote_team_id" \
+    "$binding_cipher" "$server_instance" || exit 1
+
+  # Two places pin the address: the binding (moved above) and the stored sync
+  # config, whose server_url loadConfig requires to match the binding. The
+  # engine-side subcommand aligns the latter after re-verifying the identity
+  # end to end; a plain team with no stored config is a recorded no-op. On
+  # failure the engine stays stopped and the next start says exactly which
+  # two things disagree -- loud, and repaired by re-running set-endpoint.
+  bash "$SCRIPT_DIR/remote-sync.sh" set-endpoint --team "$team" >/dev/null || {
+    echo "agmsg: the binding now names $(_remote_endpoint_display "$endpoint") but the stored sync configuration still names the old address; re-run set-endpoint (the sync engine stays stopped until both agree)" >&2
+    exit 1
+  }
+
+  if [ "$was_running" -eq 1 ]; then
+    _remote_sync_engine_start "$team"
+    echo "Endpoint for '$team' moved: $(_remote_endpoint_display "$old_endpoint") -> $(_remote_endpoint_display "$endpoint") (same server instance). Sync engine restarted."
+  else
+    echo "Endpoint for '$team' moved: $(_remote_endpoint_display "$old_endpoint") -> $(_remote_endpoint_display "$endpoint") (same server instance)."
+  fi
+}
+
 case "${1:-}" in
   connect) shift; agmsg_require_python3 "remote connect" || exit 1; cmd_connect "$@" ;;
   pull) shift; agmsg_require_python3 "remote pull" || exit 1; cmd_pull "$@" ;;
@@ -2156,9 +2243,10 @@ case "${1:-}" in
   status) shift; agmsg_require_python3 "remote status" || exit 1; cmd_status "$@" ;;
   sync) shift; cmd_sync "$@" ;;
   disconnect) shift; agmsg_require_python3 "remote disconnect" || exit 1; cmd_disconnect "$@" ;;
+  set-endpoint) shift; agmsg_require_python3 "remote set-endpoint" || exit 1; cmd_set_endpoint "$@" ;;
   forget) shift; agmsg_require_python3 "remote forget" || exit 1; cmd_forget "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;
   *)
-    echo "Usage: remote.sh <connect|pull|unlock|status|sync|disconnect|forget|doctor> ..." >&2
+    echo "Usage: remote.sh <connect|pull|unlock|status|sync|set-endpoint|disconnect|forget|doctor> ..." >&2
     exit 1 ;;
 esac

@@ -242,6 +242,82 @@ _binding_field() {  # $1 = team, $2 = json path under remote_binding
   [ "$(_binding_field testteam cipher_profile)" = "age-v1" ]
 }
 
+# --- set-endpoint: move a live binding's address (#718) --------------------
+#
+# The binding's identity is (server_instance_id, remote_team_id,
+# protocol_version); the endpoint is the address used to reach it. These tests
+# pin the three properties the address move must have: same-identity moves
+# succeed (history and all), a different server instance at the new address is
+# refused with both ids named, and there is no path that writes an unverified
+# address.
+
+@test "set-endpoint: moves a connected team with history to a new address of the same server (#718)" {
+  # bob joins BEFORE connect so the server roster matches the local one: the
+  # identity re-check compares rosters, and this test is about the address.
+  run bash "$SCRIPTS/join.sh" testteam bob claude-code /tmp/project-a
+  [ "$status" -eq 0 ]
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -eq 0 ]
+  # History is exactly what makes the disconnect-then-pull workaround refuse
+  # (#718's dead end), so the team here has some: the move must not care.
+  run bash "$SCRIPTS/send.sh" testteam alice bob "history row"
+  [ "$status" -eq 0 ]
+  local anchored revision_before
+  anchored="$(_binding_field testteam server_instance_id)"
+  revision_before="$(_binding_field testteam binding_revision)"
+
+  run bash "$SCRIPTS/remote.sh" set-endpoint --endpoint "http://localhost:$MOCK_PORT" testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"moved: http://127.0.0.1:$MOCK_PORT -> http://localhost:$MOCK_PORT"* ]]
+  [[ "$output" == *"Sync engine restarted"* ]]
+  [ "$(_binding_field testteam endpoint)" = "http://localhost:$MOCK_PORT" ]
+  # The ADDRESS moved; the identity did not, and the write was versioned.
+  [ "$(_binding_field testteam server_instance_id)" = "$anchored" ]
+  [ "$(_binding_field testteam binding_revision)" -gt "$revision_before" ]
+
+  # Same address again: a recorded no-op, not an error and not a rewrite.
+  revision_before="$(_binding_field testteam binding_revision)"
+  run bash "$SCRIPTS/remote.sh" set-endpoint --endpoint "http://localhost:$MOCK_PORT" testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"nothing to change"* ]]
+  [ "$(_binding_field testteam binding_revision)" = "$revision_before" ]
+}
+
+@test "set-endpoint: refuses a different server instance at the new address, naming both ids (#718)" {
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -eq 0 ]
+  local anchored
+  anchored="$(_binding_field testteam server_instance_id)"
+  [ -n "$anchored" ]
+
+  # Same address family, different server: registrations survive the rotation,
+  # so the recorded instance id is the only thing that can tell them apart.
+  run curl -sS "$ENDPOINT/_test/rotate-server-id"
+  [ "$status" -eq 0 ]
+
+  run bash "$SCRIPTS/remote.sh" set-endpoint --endpoint "http://localhost:$MOCK_PORT" testteam
+  [ "$status" -ne 0 ]
+  # What differed is SAID, both sides of it -- not a bare "refused".
+  [[ "$output" == *"is now server instance 018f3f7e-2222-7000-8000-0000000000ff"* ]]
+  [[ "$output" == *"bound to $anchored"* ]]
+  [[ "$output" == *"Refusing to re-anchor"* ]]
+  # And nothing was written: the binding still names the verified address.
+  [ "$(_binding_field testteam endpoint)" = "$ENDPOINT" ]
+  [ "$(_binding_field testteam server_instance_id)" = "$anchored" ]
+}
+
+@test "set-endpoint: refuses a disconnected team and names connect as the deliberate move (#718)" {
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -eq 0 ]
+  run bash "$SCRIPTS/remote.sh" disconnect testteam
+  [ "$status" -eq 0 ]
+  run bash "$SCRIPTS/remote.sh" set-endpoint --endpoint "http://localhost:$MOCK_PORT" testteam
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"disconnected"* ]]
+  [[ "$output" == *"connect with the new endpoint"* ]]
+  [ "$(_binding_field testteam endpoint)" = "$ENDPOINT" ]
+}
+
 @test "connect: the printed recovery command is shell-safe for a hostile team name (#143)" {
   # This asserts the CALL SITE, not the helper. tests/test_shquote.bats pins
   # what agmsg_shq does; nothing there stops remote.sh from going back to a
