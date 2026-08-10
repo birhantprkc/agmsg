@@ -1,10 +1,10 @@
 #!/usr/bin/env bats
 
-# The per-sync check for an already-connected team, driven from the SAME table
-# that tests/test_endpoint_table_py.bats drives the connect/pull validator from.
-# See that file for why the cases live in one place; the short form is that the
-# two implementations disagreed on five inputs before #717, and a case list
-# written out twice is how that happened.
+# The endpoint specification, driven through the continued-sync call site.
+# Connect and pull use the same validateEndpoint() implementation through its
+# CLI adapter, so there is no second verdict to compare. Keeping an agreement
+# test after deleting the second implementation would make a test that cannot
+# fail look like coverage.
 #
 # Driven through connectedBinding(), not through the rule function it calls.
 # Testing the helper directly would leave the call site unbound: reverting
@@ -16,7 +16,11 @@ load test_helper
 
 setup() {
   SCRIPTS="$(cd "$BATS_TEST_DIRNAME/../scripts" && pwd)"
-  TABLE="${AGMSG_ENDPOINT_TABLE:-$BATS_TEST_DIRNAME/fixtures/endpoint-verdicts.jsonl}"
+  TABLE="$(endpoint_table_path)"
+}
+
+endpoint_table_path() {
+  printf '%s\n' "${AGMSG_ENDPOINT_TABLE:-$BATS_TEST_DIRNAME/fixtures/endpoint-verdicts.jsonl}"
 }
 
 @test "endpoint table: the per-sync check answers every row as the table says (#717)" {
@@ -80,6 +84,11 @@ setup() {
   echo "$output"
   [ "$status" -eq 0 ]
   # A driver that read no rows exits 1 above, but assert the count here too:
-  # this is the number the py harness must also have walked.
+  # it also pins the number of specification rows this harness actually walked.
   grep -qF "checked=$(grep -c . "$TABLE") disagreed=0" <<<"$output"
+}
+
+@test "endpoint table: the default resolves to the shipped fixture (#722)" {
+  unset AGMSG_ENDPOINT_TABLE
+  [ "$(endpoint_table_path)" = "$BATS_TEST_DIRNAME/fixtures/endpoint-verdicts.jsonl" ]
 }

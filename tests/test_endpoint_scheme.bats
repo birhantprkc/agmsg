@@ -8,11 +8,8 @@
 # no such gap: what is written is where the connection goes. So names stay
 # https-only (`localhost` excepted) and a LAN address over http is allowed.
 #
-# TWO implementations decide this, and a rule that holds in only one of them is
-# worse than no rule: connect and pull go through validate-endpoint.py, every
-# later sync of an already-connected team goes through remote-sync.mjs. Enforce
-# it in the first only and a team connects happily and then dies on its next
-# sync. So every case below is asserted against BOTH.
+# One implementation decides this. Connect and pull invoke its CLI adapter;
+# continued sync calls the same exported function through connectedBinding().
 
 load test_helper
 
@@ -23,72 +20,9 @@ setup() {
   SCRIPTS="$(cd "$BATS_TEST_DIRNAME/../scripts" && pwd)"
 }
 
-# Accepted by the connect/pull validator?
-py_ok() {
-  python3 "$SCRIPTS/internal/validate-endpoint.py" "$1" 2>/dev/null
-}
-
-# Accepted by the per-sync check for an already-connected team?
-#
-# Driven through connectedBinding(), which is what continued sync calls — not
-# through the rule function it uses. Calling the helper directly would leave the
-# call site unbound: reverting connectedBinding to its old inline loopback list
-# keeps the helper correct and every such test green, while continued sync goes
-# back to refusing LAN addresses. That is precisely the "pull works, sync dies"
-# failure this change exists to prevent (found by review, not by me).
-js_ok() {
-  AGMSG_TEST_URL="$1" node --input-type=module -e "
-    import { connectedBinding } from '$SCRIPTS/internal/remote-sync.mjs';
-    const endpoint = process.env.AGMSG_TEST_URL;
-    const value = {
-      name: 'demo',
-      remote_binding: {
-        endpoint,
-        server_instance_id: '018f3f7e-0000-7000-8000-000000000000',
-        remote_team_id: '018f3f7e-0000-7000-8000-000000000001',
-        protocol_version: 1,
-        connected_at: '2026-07-20T13:00:00.000Z',
-        disconnected_at: null,
-        capabilities: { write_allowed_ciphers: ['none'] },
-      },
-    };
-    try { connectedBinding(value, 'demo'); process.exit(0); }
-    catch { process.exit(1); }
-  "
-}
-
-# Do the two implementations give the SAME answer? No expectation of what that
-# answer is — that is the table's job, and the difference is the point.
-#
-# The previous version of this helper checked each side against a hardcoded
-# expectation, which made it a smaller copy of the table rather than a check on
-# consistency, and the claim in its comment was simply false. A reviewer caught
-# that. With no expectation, a wrong row in the table cannot make this fail, and
-# a divergence cannot make it pass.
-agree() {
-  local url="$1" py js
-  if py_ok "$url"; then py=allow; else py=deny; fi
-  if js_ok "$url"; then js=allow; else js=deny; fi
-  [ "$py" = "$js" ] || { echo "$url: validator says $py, sync check says $js"; return 1; }
-}
-
-@test "endpoint: the two implementations agree, whatever the answer is (#717)" {
-  # Every divergence this PR fixed was found by comparing the two, not by
-  # checking either against an expectation: address notations, IPv6 spelling,
-  # leading-zero octets, zone indexes, and port syntax. This asserts only that
-  # they still agree — so it keeps working when a table row is wrong, which is
-  # exactly when an expectation-based test misleads.
-  agree "http://192.168.191.205:8787"
-  agree "http://127.0.0.1:8787"
-  agree "http://8.8.8.8:8787"
-  agree "http://127.0.0.1.evil.com"
-  agree "http://2130706433/"
-  agree "http://[fe80::1%eth0]:8787"
-  agree "http://192.168.1.1:99999"
-  agree "http://192.168.1.1:abc"
-  agree "https://exa mple.com"
-  agree "https://%zz"
-  agree "https://日本.example"
+@test "endpoint: the connect/pull adapter accepts a private LAN IP over http (#717/#722)" {
+  run node "$SCRIPTS/internal/validate-endpoint.mjs" "http://192.168.191.205:8787"
+  [ "$status" -eq 0 ]
 }
 
 @test "endpoint: the userinfo trick is still refused (#717)" {
@@ -96,13 +30,13 @@ agree() {
   # userinfo outright rather than relying on the host check behind it, and the
   # message says which part was the problem — neither of which a verdict column
   # can express.
-  run python3 "$SCRIPTS/internal/validate-endpoint.py" "http://localhost@evil.com"
+  run node "$SCRIPTS/internal/validate-endpoint.mjs" "http://localhost@evil.com"
   [ "$status" -ne 0 ]
   grep -qF 'userinfo' <<<"$output"
 }
 
 @test "endpoint: the refusal says what to do instead, and says why truthfully (#717)" {
-  run python3 "$SCRIPTS/internal/validate-endpoint.py" "http://example.com:8787"
+  run node "$SCRIPTS/internal/validate-endpoint.mjs" "http://example.com:8787"
   [ "$status" -ne 0 ]
   # Plain commands and `refute`, not `[[ ]]`: a non-last `[[ ]]` cannot fail a
   # test on bash 3.2, which is what CI's macOS legs run (#670, #716). Every one
@@ -125,7 +59,7 @@ agree() {
   # quieter one. Someone who wrote a zone index HAS given a private address —
   # answering them with "use a private IP" is a dead end, so the zone gets its
   # own message naming the part that is wrong and a form that works.
-  run python3 "$SCRIPTS/internal/validate-endpoint.py" "http://[fe80::1%eth0]:8787"
+  run node "$SCRIPTS/internal/validate-endpoint.mjs" "http://[fe80::1%eth0]:8787"
   [ "$status" -ne 0 ]
   grep -qF 'zone index' <<<"$output"
   grep -qF 'fe80::1' <<<"$output"
@@ -133,11 +67,11 @@ agree() {
   # And the general refusal lists fe80::/10, which is accepted. Allowing
   # something without saying so is worse than the dead end: nobody hits an
   # error, so nobody reports that link-local works.
-  run python3 "$SCRIPTS/internal/validate-endpoint.py" "http://example.com:8787"
+  run node "$SCRIPTS/internal/validate-endpoint.mjs" "http://example.com:8787"
   [ "$status" -ne 0 ]
   grep -qF 'fe80::/10' <<<"$output"
 
   # The claim above is only worth anything if it is true.
-  run python3 "$SCRIPTS/internal/validate-endpoint.py" "http://[fe80::1]:8787"
+  run node "$SCRIPTS/internal/validate-endpoint.mjs" "http://[fe80::1]:8787"
   [ "$status" -eq 0 ]
 }
