@@ -170,3 +170,16 @@ both() {
   # userinfo, refused on both sides rather than left to the host check behind it
   both "http://evil.com@192.168.1.1/" deny
 }
+
+@test "endpoint: an octet with a leading zero is not an address as written (#717)" {
+  # Found in review. `\d{1,3}` accepted `01` and Number() read it as 1, so
+  # `192.168.01.1` passed the Node side and was refused by the Python side,
+  # which rejects leading zeros outright. A leading zero is also how the octal
+  # forms are spelled, and the rule is that the address is readable as written.
+  both "http://192.168.01.1:8787" deny
+  both "http://010.0.0.1:8787" deny
+  both "http://192.168.1.01:8787" deny
+  # The zero octet itself is still an ordinary address.
+  both "http://10.0.0.1:8787" allow
+  both "http://192.168.0.1:8787" allow
+}

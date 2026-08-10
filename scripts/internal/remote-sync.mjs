@@ -253,7 +253,13 @@ export function allowsPlaintextEndpoint(rawEndpoint) {
     host = authority.slice(1, end).toLowerCase();
   } else {
     host = authority.split(":")[0].toLowerCase();
-    const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+    // Each octet is a bare decimal with NO leading zero. `\d{1,3}` would take
+    // `192.168.01.1` and Number() would read `01` as 1, so it would pass here
+    // and be refused by the Python side, which rejects leading zeros outright
+    // (found in review). A leading zero is also how the octal forms are
+    // written, and the point of this rule is that the address is readable as
+    // written — `01` is not.
+    const v4 = /^(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})$/.exec(host);
     if (host === "localhost") return true;
     if (!v4) return false;                     // a name, or a form needing decoding
     const octets = v4.slice(1).map(Number);
