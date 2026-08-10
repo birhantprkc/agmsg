@@ -664,6 +664,157 @@ PY
   [ ! -e "$FAKE_HOME/.agents/bin/codex" ]
 }
 
+# #553: a second install under a different --cmd name used to silently
+# rewrite ~/.agents/bin/codex to point at itself, so every Codex launch on the
+# machine (through the shim) started dispatching into the second install's
+# drivers/storage instead of the production one -- with no warning, printed
+# as if it were a routine "refreshed" no-op.
+
+@test "install: a second, differently-named install does NOT clobber the first's Codex shim (#553)" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type codex
+  HOME="$FAKE_HOME" bash "$SK/scripts/drivers/types/codex/codex-shim-install.sh" install >/dev/null
+  local shim="$FAKE_HOME/.agents/bin/codex"
+  [ -f "$shim" ]
+  # Positive control: pin exactly which install owns it before touching
+  # anything else, byte for byte -- if this does not already say "agmsg",
+  # the rest of the test proves nothing.
+  local before; before="$(grep AGMSG_CODEX_SHIM_SCRIPT_DIR "$shim")"
+  printf '%s' "$before" | grep -qF "/skills/agmsg/"
+
+  local sk2="$FAKE_HOME/.agents/skills/agmsg-dfr"
+  run env HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg-dfr --agent-type codex
+  [ "$status" -eq 0 ]
+  printf '%s' "$output" | grep -qF "owned by a different install"
+
+  # The shim's bytes must be completely unchanged, not just "still valid" --
+  # comparing the whole recorded line rather than only the owning dir catches
+  # a partial/malformed rewrite too.
+  local after; after="$(grep AGMSG_CODEX_SHIM_SCRIPT_DIR "$shim")"
+  [ "$before" = "$after" ]
+  [ -d "$sk2" ]  # the second install itself still succeeded
+}
+
+@test "install: --update --cmd can reclaim a Codex shim owned by a different install (#553)" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type codex
+  HOME="$FAKE_HOME" bash "$SK/scripts/drivers/types/codex/codex-shim-install.sh" install >/dev/null
+  local shim="$FAKE_HOME/.agents/bin/codex"
+
+  local sk2="$FAKE_HOME/.agents/skills/agmsg-dfr"
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg-dfr --agent-type codex >/dev/null
+  grep -q "/skills/agmsg/" "$shim"  # still the first install's, per the test above
+
+  # --update --cmd names a specific, already-registered install explicitly --
+  # that explicit targeting is the documented recovery path, so it is allowed
+  # to reclaim the shim rather than being blocked like the fresh install above.
+  run env HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg-dfr --update
+  [ "$status" -eq 0 ]
+  printf '%s' "$output" | grep -qF "refreshed Codex monitor shim"
+  grep -q "/skills/agmsg-dfr/" "$shim"
+}
+
+@test "install: bare --update (no --cmd) does NOT force-steal a Codex shim owned by a different install (#553)" {
+  # Unlike --update --cmd <name>, a bare --update resolves its target by
+  # scanning for an existing install rather than the caller naming one --- and
+  # on this base (#599's fail-closed fix, PR #659, is not yet merged here),
+  # that resolution does not even fail closed when more than one install is
+  # present. Forcing the shim reclaim unconditionally for bare --update would
+  # let whichever install a glob happens to land on steal the shim from
+  # another one the caller never named at all (review finding). This pins
+  # that a shim already owned by a DIFFERENT install survives a bare --update
+  # of the install that does NOT own it.
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type codex
+  HOME="$FAKE_HOME" bash "$SK/scripts/drivers/types/codex/codex-shim-install.sh" install >/dev/null
+  local shim="$FAKE_HOME/.agents/bin/codex"
+  local before; before="$(grep AGMSG_CODEX_SHIM_SCRIPT_DIR "$shim")"
+  printf '%s' "$before" | grep -qF "/skills/agmsg/"
+
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg-dfr --agent-type codex >/dev/null
+  grep -q "/skills/agmsg/" "$shim"  # still the first install's, per the earlier tests
+
+  # Bare --update, no --cmd: this base's ambiguous-candidate handling means
+  # which of the two real installs it lands on isn't the point of this test
+  # (that's #599 / #659's concern) -- what matters here is that whichever one
+  # it is, it must not walk away with a shim it was never explicitly told to
+  # claim.
+  run env HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
+  [ "$status" -eq 0 ]
+  local after; after="$(grep AGMSG_CODEX_SHIM_SCRIPT_DIR "$shim")"
+  [ "$before" = "$after" ]
+}
+
+@test "install: bare --update migrates this machine's own pre-#553 (owner-unknown) Codex shim (#553)" {
+  # The two fixes above -- fail closed on an owner-unknown shim, and bare
+  # --update no longer forcing -- are each correct alone but combined to
+  # block the single-install upgrade they were never meant to touch: nearly
+  # every real machine's shim predates ownership tracking, has no owner
+  # comment, and a routine `install.sh --update` with no --cmd (the normal
+  # way a single-install user upgrades) must still be able to refresh it
+  # (review finding). Provably only one agmsg install existing at all is what
+  # makes that safe without needing --cmd or --force: there is no other
+  # install the shim could actually belong to.
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type codex
+  local shim="$FAKE_HOME/.agents/bin/codex"
+  mkdir -p "$FAKE_HOME/.agents/bin"
+  # A legacy shim: real marker, but written before this PR added the owner
+  # comment -- exactly what every pre-existing production shim looks like.
+  cat > "$shim" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+# Optional Codex entrypoint shim for agmsg monitor mode.
+# Generated by agmsg. Dispatches to the installed skill script.
+export AGMSG_CODEX_SHIM_WRAPPER=1
+export AGMSG_CODEX_SHIM_SCRIPT_DIR=/some/stale/pre-move/path
+exec /some/stale/pre-move/path/codex-shim.sh "$@"
+EOF
+  chmod +x "$shim"
+  refute grep -q "agmsg-shim-owner" "$shim"
+
+  run env HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
+  [ "$status" -eq 0 ]
+  printf '%s' "$output" | grep -qF "refreshed Codex monitor shim"
+  grep -q "agmsg-shim-owner" "$shim"
+  grep -q "/skills/agmsg/scripts/drivers/types/codex" "$shim"
+  refute grep -q "/some/stale/pre-move/path" "$shim"
+}
+
+@test "install: a second, differently-named FRESH install does NOT silently claim a pre-existing legacy shim (#553 review)" {
+  # Review finding: install.sh checks/refreshes the Codex shim (~line 436)
+  # BEFORE it touches this install's own .agmsg marker (~line 452). So when a
+  # second, differently-named install's fresh `install.sh --cmd` run reaches
+  # the shim step, agmsg_only_one_install sees only the FIRST install's
+  # marker on disk -- its own marker does not exist yet -- and (wrongly)
+  # concludes only one install exists anywhere, which is exactly the
+  # condition meant to let ONLY a genuinely sole install claim an
+  # owner-unknown legacy shim without --force. This pins that a second,
+  # differently-named install must not benefit from that allowance just
+  # because its own marker hasn't been written yet.
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type codex
+  local shim="$FAKE_HOME/.agents/bin/codex"
+  mkdir -p "$FAKE_HOME/.agents/bin"
+  # A legacy shim: real marker, but no owner comment -- same shape as any
+  # shim written before this PR, and the same fixture the bare-`--update`
+  # migration test above uses.
+  cat > "$shim" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+# Optional Codex entrypoint shim for agmsg monitor mode.
+# Generated by agmsg. Dispatches to the installed skill script.
+export AGMSG_CODEX_SHIM_WRAPPER=1
+export AGMSG_CODEX_SHIM_SCRIPT_DIR=/some/stale/pre-move/path
+exec /some/stale/pre-move/path/codex-shim.sh "$@"
+EOF
+  chmod +x "$shim"
+  local before; before="$(cat "$shim")"
+
+  # A second, DIFFERENT, freshly-created install -- not --update, so this
+  # install's own .agmsg marker genuinely does not exist until after the
+  # shim step runs.
+  run env HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg-dfr --agent-type codex
+  [ "$status" -eq 0 ]
+
+  [ "$(cat "$shim")" = "$before" ]  # byte-for-byte unchanged, not silently claimed
+}
+
 # --- grok-build skill (~/.grok/skills/<name>/SKILL.md) ---
 
 @test "install: drops a Grok Build SKILL.md when ~/.grok exists" {
