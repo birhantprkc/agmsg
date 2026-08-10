@@ -514,8 +514,8 @@ _capability_endpoint() {
 
   run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" newteam
   [ "$status" -ne 0 ]
-  [[ "$output" == *"team lookup answer is not a lookup result"* ]]
-  [[ "$output" != *"unreachable"* ]]
+  [[ "$output" == *"team lookup answer is not a lookup result"* ]] &&
+    [[ "$output" != *"unreachable"* ]]
 }
 
 @test "connect: the handoff-bundle line is printed by default" {
