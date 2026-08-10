@@ -66,6 +66,16 @@ def private_ip_literal(host):
     "the address is written in the URL" from "a name resolves to whatever its
     owner decides".
     """
+    # A zone index (`fe80::1%eth0`) names an INTERFACE on the machine reading
+    # the URL, not part of the address. ipaddress accepts it and the Node side's
+    # parser does not, so the two disagreed on it (found while building the
+    # shared table). Refused on both rather than accepted on both: an endpoint
+    # is stored and later re-read by whatever process syncs next, and a scope
+    # that only means something on one host is not a thing to persist in a
+    # binding. Nothing needs it — a server reachable over a link-local address
+    # with an explicit zone is not the case this rule was widened for.
+    if "%" in host:
+        return False
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:

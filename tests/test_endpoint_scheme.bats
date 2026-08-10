@@ -183,3 +183,21 @@ both() {
   both "http://10.0.0.1:8787" allow
   both "http://192.168.0.1:8787" allow
 }
+
+@test "endpoint: a zone index is refused, and plain link-local still is not (#717)" {
+  # A zone index names an INTERFACE on the machine reading the URL, not part of
+  # the address. Python's parser accepts it and Node's does not, so the two
+  # disagreed — found by the seat building the shared table, which is what a
+  # second reader is for.
+  #
+  # Refused on both rather than accepted on both: an endpoint is stored in a
+  # binding and re-read later by whatever process syncs next, and a scope that
+  # only means something on one host is not a thing to persist. Nothing needs
+  # it either — a server reached over link-local with an explicit zone is not
+  # the case this rule was widened for.
+  both "http://[fe80::1%25eth0]:8787" deny
+  both "http://[fe80::1%eth0]:8787" deny
+  # And the plain form is untouched, so the refusal above is about the zone and
+  # not about link-local.
+  both "http://[fe80::1]:8787" allow
+}
