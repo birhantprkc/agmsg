@@ -56,3 +56,4 @@
 {"endpoint": "http://[2001:4860::1%eth0]:8787", "verdict": "deny", "why": "a public literal carrying a zone index: refused twice over. Here so that a change loosening the zone rule cannot pass by also breaking the range check — with only private literals carrying zones, allowing zones and breaking the ranges look the same from outside"}
 {"endpoint": "ftp://192.168.1.1", "verdict": "deny", "why": "neither http nor https"}
 {"endpoint": "not-a-url", "verdict": "deny", "why": "not a URL at all"}
+{"endpoint": "http://192.168.01.1:8787", "verdict": "deny", "why": "leading-zero octet: reads as 192.168.1.1 after Number(), which is a decoding step, and the rule is that the address is readable as written. Also how the octal forms are spelled."}
