@@ -28,19 +28,32 @@ py_ok() {
   python3 "$SCRIPTS/internal/validate-endpoint.py" "$1" 2>/dev/null
 }
 
-# Accepted by the per-sync check for an already-connected team? Takes a URL and
-# reduces it to the same question the module asks: the hostname as `new URL`
-# reports it (IPv6 stays bracketed there, which is exactly the shape the module
-# has to cope with).
+# Accepted by the per-sync check for an already-connected team?
+#
+# Driven through connectedBinding(), which is what continued sync calls — not
+# through the rule function it uses. Calling the helper directly would leave the
+# call site unbound: reverting connectedBinding to its old inline loopback list
+# keeps the helper correct and every such test green, while continued sync goes
+# back to refusing LAN addresses. That is precisely the "pull works, sync dies"
+# failure this change exists to prevent (found by review, not by me).
 js_ok() {
-  # The URL travels in the environment, not in argv: with `node -e` the user
-  # arguments do not land where a script's would, and the first attempt at this
-  # helper had node trying to import the URL as a module. It failed loudly, but
-  # a version that failed quietly would have made every case read "deny".
   AGMSG_TEST_URL="$1" node --input-type=module -e "
-    import { allowsPlaintext } from '$SCRIPTS/internal/remote-sync.mjs';
-    const u = new URL(process.env.AGMSG_TEST_URL);
-    process.exit(u.protocol === 'https:' || allowsPlaintext(u.hostname) ? 0 : 1);
+    import { connectedBinding } from '$SCRIPTS/internal/remote-sync.mjs';
+    const endpoint = process.env.AGMSG_TEST_URL;
+    const value = {
+      name: 'demo',
+      remote_binding: {
+        endpoint,
+        server_instance_id: '018f3f7e-0000-7000-8000-000000000000',
+        remote_team_id: '018f3f7e-0000-7000-8000-000000000001',
+        protocol_version: 1,
+        connected_at: '2026-07-20T13:00:00.000Z',
+        disconnected_at: null,
+        capabilities: { write_allowed_ciphers: ['none'] },
+      },
+    };
+    try { connectedBinding(value, 'demo'); process.exit(0); }
+    catch { process.exit(1); }
   "
 }
 
@@ -122,4 +135,38 @@ both() {
   grep -qF 'https://' <<<"$output"
   grep -qF 'LAN IP' <<<"$output"
   grep -qF -- '--e2ee' <<<"$output"
+}
+
+@test "endpoint: the IPv6 ranges are numeric, not a spelling (#717)" {
+  # Found by review. The first version compared the leading characters of the
+  # hostname, so `fc::1` — whose first group is 0x00fc, nowhere near fc00::/7 —
+  # read like a unique-local address and was allowed. Node hands the short form
+  # through unchanged, so the misreading survives all the way in.
+  both "http://[fc::1]:8787" deny
+  both "http://[fe8::1]:8787" deny
+  # The boundaries themselves, on both sides of each edge.
+  both "http://[fbff::1]:8787" deny
+  both "http://[fc00::1]:8787" allow
+  both "http://[fdff::1]:8787" allow
+  both "http://[fe00::1]:8787" deny
+  both "http://[fe7f::1]:8787" deny
+  both "http://[fe80::1]:8787" allow
+  both "http://[febf::1]:8787" allow
+  both "http://[fec0::1]:8787" deny
+}
+
+@test "endpoint: a form that has to be decoded first is not an IP literal (#717)" {
+  # Also found by review, and it is the premise of the whole rule that was at
+  # stake: "what is written in the URL is where the connection goes". Node
+  # rewrites decimal, hex and zero-padded octal into dotted quads, so a check on
+  # the PARSED host accepts spellings no reader would recognise as an address —
+  # and the Python side, which has no such normalisation, refused them. The two
+  # disagreed on five inputs before this; now both read the raw text.
+  both "http://2130706433/" deny
+  both "http://0x7f000001/" deny
+  both "http://0177.0.0.1/" deny
+  both "http://192.168.1.1./" deny
+  both "http://[::ffff:192.168.1.1]:8787" deny
+  # userinfo, refused on both sides rather than left to the host check behind it
+  both "http://evil.com@192.168.1.1/" deny
 }

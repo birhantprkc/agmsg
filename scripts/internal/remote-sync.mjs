@@ -205,11 +205,11 @@ export async function activateKeyRotations(config) {
   config.age_v1_runtime_history = runtime;
 }
 
-// Whether an http:// endpoint with this hostname is acceptable. Must agree with
+// Whether this endpoint may be spoken to over plaintext http. Must agree with
 // scripts/internal/validate-endpoint.py, which decides the same question at
-// connect/pull time — the two are checked against each other by
-// tests/test_endpoint_scheme.bats, because a rule enforced in one of them only
-// lets a team connect and then fail on its next sync.
+// connect/pull time — tests/test_endpoint_scheme.bats runs every case through
+// both, because a rule enforced in one of them only lets a team connect and
+// then fail on its next sync.
 //
 // The rule is "IP literal in a private range", not "loopback". What the strict
 // parsing exists to stop is a NAME dressed as a safe host —
@@ -218,17 +218,47 @@ export async function activateKeyRotations(config) {
 // connection goes. So names stay https-only (`localhost` excepted) and a LAN
 // address over http is allowed, because two machines on a network you control
 // talking over http is ordinary and should not require a tunnel.
-export function allowsPlaintext(hostname) {
-  if (hostname === "localhost") return true;
-  // Node keeps IPv6 literals bracketed in URL.hostname.
-  const host = hostname.startsWith("[") && hostname.endsWith("]")
-    ? hostname.slice(1, -1).toLowerCase()
-    : hostname.toLowerCase();
+//
+// It takes the RAW endpoint, not a parsed hostname, and that is the whole
+// difficulty. `new URL("http://2130706433/").hostname` is "127.0.0.1" — the
+// platform helpfully rewrites decimal, hex and zero-padded octal forms into
+// dotted quads, so a check on the parsed host accepts spellings a reader would
+// never recognise as an address, and the Python side (which has no such
+// normalisation) rejects them. Measured: five forms disagreed between the two
+// before this took the raw text.
+//
+// The premise of the whole rule is "what is written in the URL is where the
+// connection goes". A form that has to be decoded first is not that.
+export function allowsPlaintextEndpoint(rawEndpoint) {
+  let url;
+  try {
+    url = new URL(rawEndpoint);
+  } catch {
+    return false;
+  }
+  if (url.protocol === "https:") return true;
+  if (url.protocol !== "http:") return false;
+  // `http://evil.com@192.168.1.1/` parses with host 192.168.1.1; the userinfo
+  // is what a reader's eye lands on. The connect-time validator refuses these
+  // outright and so does this, rather than relying on the host check behind it.
+  if (url.username || url.password) return false;
 
-  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
-  if (v4) {
-    const [a, b] = [Number(v4[1]), Number(v4[2])];
-    if (v4.slice(1).some((o) => Number(o) > 255)) return false;
+  const authority = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i.exec(rawEndpoint)?.[1];
+  if (authority === undefined || authority.includes("@")) return false;
+
+  let host;
+  if (authority.startsWith("[")) {
+    const end = authority.indexOf("]");
+    if (end < 0) return false;
+    host = authority.slice(1, end).toLowerCase();
+  } else {
+    host = authority.split(":")[0].toLowerCase();
+    const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+    if (host === "localhost") return true;
+    if (!v4) return false;                     // a name, or a form needing decoding
+    const octets = v4.slice(1).map(Number);
+    if (octets.some((o) => o > 255)) return false;
+    const [a, b] = octets;
     if (a === 127) return true;                        // 127/8 loopback
     if (a === 10) return true;                         // 10/8
     if (a === 172 && b >= 16 && b <= 31) return true;  // 172.16/12
@@ -237,15 +267,53 @@ export function allowsPlaintext(hostname) {
     return false;
   }
 
-  if (!host.includes(":")) return false;               // not an IP literal at all
-  if (host === "::1") return true;                     // loopback
-  const head = host.split(":")[0];
-  if (/^f[cd][0-9a-f]{0,2}$/.test(head)) return true;  // fc00::/7 unique local
-  if (/^fe[89ab][0-9a-f]?$/.test(head)) return true;   // fe80::/10 link-local
+  const groups = ipv6Groups(host);
+  if (groups === null) return false;
+  // ::1
+  if (groups.slice(0, 7).every((g) => g === 0) && groups[7] === 1) return true;
+  const first = groups[0];
+  if (first >= 0xfc00 && first <= 0xfdff) return true;  // fc00::/7 unique local
+  if (first >= 0xfe80 && first <= 0xfebf) return true;  // fe80::/10 link-local
   return false;
 }
 
-function connectedBinding(value, team) {
+// An IPv6 literal as eight numeric groups, or null when it is not one.
+//
+// Numeric, because the prefixes here are numeric ranges and the spelling does
+// not track them: `fc::1` starts with the group 0x00fc, which is nowhere near
+// fc00::/7, yet reads like it. A check on the leading characters accepts it —
+// measured, that is what the first version of this did, and Node hands the
+// short form through unchanged. `fe8::1` is the same trap against fe80::/10.
+//
+// Forms carrying an embedded IPv4 (`::ffff:192.168.1.1`) contain dots, fail the
+// character test, and are refused. That matches the Python side, which does not
+// treat them as private either.
+function ipv6Groups(host) {
+  if (!/^[0-9a-f:]+$/.test(host)) return null;
+  const halves = host.split("::");
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 ? (halves[1] ? halves[1].split(":") : []) : null;
+  let groups;
+  if (tail === null) {
+    groups = head;
+    if (groups.length !== 8) return null;
+  } else {
+    const fill = 8 - head.length - tail.length;
+    if (fill < 0) return null;
+    groups = [...head, ...new Array(fill).fill("0"), ...tail];
+  }
+  if (groups.some((g) => !/^[0-9a-f]{1,4}$/.test(g))) return null;
+  return groups.map((g) => parseInt(g, 16));
+}
+
+// Exported so the endpoint rule can be exercised through the path production
+// actually takes. A test that calls the helper directly leaves the CALL SITE
+// unbound: revert this function to its old inline loopback list and every such
+// test stays green while continued sync refuses LAN addresses again. That is
+// the failure this whole change exists to prevent, so the test drives it from
+// here (#717, co1 review).
+export function connectedBinding(value, team) {
   const binding = value?.remote_binding;
   if (value?.name !== team || !binding || typeof binding !== "object" ||
       typeof binding.endpoint !== "string" || binding.endpoint.length < 1 ||
@@ -257,10 +325,7 @@ function connectedBinding(value, team) {
       binding.capabilities.write_allowed_ciphers.some((cipher) => typeof cipher !== "string")) {
     throw new Error("connected team binding is invalid or disconnected");
   }
-  const connectedEndpoint = new URL(binding.endpoint);
-  if (connectedEndpoint.protocol !== "https:" &&
-      (connectedEndpoint.protocol !== "http:" ||
-       !allowsPlaintext(connectedEndpoint.hostname))) {
+  if (!allowsPlaintextEndpoint(binding.endpoint)) {
     throw new Error(
       "connected team endpoint must use HTTPS, or HTTP to a private IP address " +
       "(10/8, 172.16/12, 192.168/16, 169.254/16, 127/8, ::1, fc00::/7)");
