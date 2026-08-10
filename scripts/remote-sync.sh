@@ -24,7 +24,7 @@ export AGMSG_SYNC_CIPHER_HELPER="$SCRIPT_DIR/internal/sync-cipher.mjs"
 # bridge it: if the caller already trusted curl with a CA bundle and never
 # set Node's own variable, hand Node the same file. An explicit
 # NODE_EXTRA_CA_CERTS is left untouched.
-if [ -z "${NODE_EXTRA_CA_CERTS:-}" ] && [ -n "${CURL_CA_BUNDLE:-}" ]; then
+if [ -z "${NODE_EXTRA_CA_CERTS+x}" ] && [ -n "${CURL_CA_BUNDLE:-}" ]; then
   export NODE_EXTRA_CA_CERTS="$CURL_CA_BUNDLE"
 fi
 # The engine outlives the command that starts it, so whatever it inherits it

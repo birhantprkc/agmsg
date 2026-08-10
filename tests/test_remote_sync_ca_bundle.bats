@@ -47,3 +47,11 @@ teardown() { teardown_test_env; }
   [ "$status" -eq 0 ]
   [ "$output" = "NODE_EXTRA_CA_CERTS=<unset>" ]
 }
+
+@test "an explicitly empty NODE_EXTRA_CA_CERTS counts as set and is left untouched" {
+  export CURL_CA_BUNDLE="/tmp/my-ca.pem"
+  export NODE_EXTRA_CA_CERTS=""
+  run bash "$SCRIPTS/remote-sync.sh" status
+  [ "$status" -eq 0 ]
+  [ "$output" = "NODE_EXTRA_CA_CERTS=" ]
+}
