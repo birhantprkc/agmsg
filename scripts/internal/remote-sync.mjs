@@ -2,7 +2,7 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { spawn } from "node:child_process";
-import { appendFile, lstat, mkdir, open, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { appendFile, lstat, mkdir, open, readFile, rename, rmdir, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import process from "node:process";
 import { realpathSync } from "node:fs";
@@ -3103,6 +3103,37 @@ async function publicSnapshot(serverUrl, teamId) {
   return body;
 }
 
+// The same per-team registry lock remote.sh takes around every binding write
+// (scripts/lib/registry-lock.sh): mkdir on teams/<team>/.config.lock is the
+// primitive, so the two sides of the connection pair -- the shell writing the
+// binding, this file writing the stored sync config -- serialize against each
+// other, not just against themselves. Spin bounded the same way (~10s).
+async function withTeamConfigLock(team, fn) {
+  const lockDir = join(dirname(teamConfigPath(team)), ".config.lock");
+  for (let attempt = 0; ; attempt += 1) {
+    try { await mkdir(lockDir); break; }
+    catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      // Same exit as the shell side (registry-lock.sh): a holder that died
+      // without its release trap (SIGKILL, power loss) leaves the directory,
+      // and the way out is bounded failure that NAMES it -- never an
+      // unbounded wait. Nothing sweeps stale locks anywhere in this tree;
+      // matching the existing contract rather than inventing liveness
+      // detection on one side of a shared primitive.
+      if (attempt >= 1000) {
+        throw new Error(`timed out acquiring the team registry lock at ${lockDir}; ` +
+          "if no agmsg command is running against this team, remove that directory and re-run");
+      }
+      await new Promise((resolveSleep) => setTimeout(resolveSleep, 10));
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    await rmdir(lockDir).catch(() => {});
+  }
+}
+
 // Align the stored sync configuration's server_url with the binding's endpoint
 // after remote.sh has moved it. Only the ADDRESS moves: the identity triple
 // (server_instance_id, remote_team_id, protocol_version) must match between the
@@ -3113,6 +3144,16 @@ async function publicSnapshot(serverUrl, teamId) {
 // endpoint change would strand any team with a stored sync config: loadConfig
 // refuses a config whose server_url differs from the binding, and configure
 // refuses to replace an existing binding at all.
+//
+// One invariant covers both halves of the pair: EITHER file is written only
+// under the team registry lock, and only against a binding_revision the writer
+// verified. Binding writes (remote.sh) advance the revision under that lock;
+// this write requires it unchanged, re-read under the same lock. Without the
+// re-check, two concurrent set-endpoints interleave so that the slower
+// alignment -- verified against a binding that has since moved again -- lands
+// its stale config over the faster one's completed pair (#739 review). The
+// network verification stays OUTSIDE the lock: holding a spin lock across a
+// 15s-timeout request would starve every concurrent lifecycle command.
 export async function setEndpoint(args) {
   const team = requireName(args.team, "team");
   const binding = await readConnectedBinding(team);
@@ -3140,7 +3181,15 @@ export async function setEndpoint(args) {
   const candidate = { ...value, server_url: binding.endpoint };
   const capabilities = await request(candidate, "/v1/capabilities");
   validateCapabilities(candidate, capabilities);
-  await writeConfig(configPath(team), candidate);
+  await withTeamConfigLock(team, async () => {
+    const current = await readConnectedBinding(team);
+    if (current.endpoint !== binding.endpoint ||
+        current.binding_revision !== binding.binding_revision) {
+      throw new Error(
+        "the team's binding moved while this alignment was verifying; nothing was written -- the newer set-endpoint owns the stored configuration now");
+    }
+    await writeConfig(configPath(team), candidate);
+  });
   await event("endpoint.aligned", { team, stored_config: true, changed: true });
 }
 

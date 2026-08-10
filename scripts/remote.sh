@@ -2252,7 +2252,7 @@ cmd_set_endpoint() {
     while [ ! -e "$AGMSG_TEST_SET_ENDPOINT_BARRIER.release" ]; do
       sleep 0.05
       _agmsg_barrier_waited=$((_agmsg_barrier_waited + 1))
-      [ "$_agmsg_barrier_waited" -ge 200 ] && break # 10s safety cap
+      [ "$_agmsg_barrier_waited" -ge 1200 ] && break # 60s safety cap
     done
   fi
 

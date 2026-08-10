@@ -1377,6 +1377,77 @@ test("set-endpoint aligns the stored sync config's server_url with the moved bin
   }
 });
 
+test("set-endpoint cannot land a stale alignment over a newer move (#739 interleave)", async () => {
+  // The review's interleave: A verifies a move to X and stalls in the
+  // capabilities request; B moves the binding on to Y (revision advanced) and
+  // completes its own alignment; A resumes. A's write must refuse -- the
+  // binding it verified is no longer the binding -- and B's completed pair
+  // must survive. The guard is the lock-held re-read of endpoint+revision.
+  const root = await mkdtemp(join(tmpdir(), "agmsg-set-endpoint-race-"));
+  const saved = { connection: process.env.AGMSG_SYNC_CONNECTION_DIR,
+    storage: process.env.AGMSG_SYNC_STORAGE_DIR };
+  const previousFetch = globalThis.fetch;
+  const storedPath = join(root, "store", "remote-sync", "demo.json");
+  const teamCfgPath = join(root, "teams", "demo", "config.json");
+  const bindingFor = (endpoint, revision) => ({ name: "demo", remote_binding: {
+    endpoint, server_instance_id: config.server_instance_id,
+    remote_team_id: config.remote_team_id, protocol_version: 1,
+    capabilities: { write_allowed_ciphers: ["none"] }, cipher_profile: "none",
+    connected_at: "2026-07-29T00:00:00Z", disconnected_at: null,
+    binding_revision: revision } });
+  try {
+    process.env.AGMSG_SYNC_CONNECTION_DIR = root;
+    process.env.AGMSG_SYNC_STORAGE_DIR = join(root, "store");
+    await mkdir(join(root, "teams", "demo"), { recursive: true });
+    await mkdir(join(root, "store", "remote-sync"), { recursive: true });
+    await writeFile(teamCfgPath, `${JSON.stringify(bindingFor("https://x.example", 2))}\n`);
+    const stored = { format_version: 1, local_team: "demo",
+      server_url: "https://o.example",
+      server_instance_id: config.server_instance_id,
+      remote_team_id: config.remote_team_id, protocol_version: 1,
+      cipher_profile: "none",
+      local_security_history: [{ local_security_revision: "0",
+        effective_from_seq: "1", minimum_security_mode: "plaintext-allowed" }] };
+    await writeFile(storedPath, JSON.stringify(stored));
+    const capabilities = { protocol_version: 1,
+      server_instance_id: config.server_instance_id,
+      team_id: config.remote_team_id, team_name: "demo", min_available_seq: "0",
+      current_seq: "0", next_sequence_boundary: "1", accepted_envelope_versions: [1],
+      write_allowed_ciphers: ["none"], policy_revision: "0", effective_from_seq: "1",
+      max_blob_bytes: "1048576", policy_history: [{ policy_revision: "0",
+        effective_from_seq: "1", accepted_envelope_versions: [1],
+        write_allowed_ciphers: ["none"] }] };
+    const respond = () => new Response(JSON.stringify(capabilities), { status: 200,
+      headers: { "Agmsg-Protocol-Version": "1" } });
+    let releaseFetch = null;
+    globalThis.fetch = () => new Promise((resolveFetch) => {
+      releaseFetch = () => resolveFetch(respond());
+    });
+    const stale = setEndpoint({ team: "demo" }); // A: verifying the move to X
+    const staleOutcome = stale.catch((error) => error);
+    while (releaseFetch === null) await new Promise((r) => setTimeout(r, 5));
+    // B: moves the binding on to Y and completes its own alignment.
+    await writeFile(teamCfgPath, `${JSON.stringify(bindingFor("https://y.example", 3))}\n`);
+    await writeFile(storedPath, JSON.stringify({ ...stored, server_url: "https://y.example" }));
+    releaseFetch();
+    const outcome = await staleOutcome;
+    assert.match(String(outcome?.message), /moved while this alignment was verifying/u);
+    // B's completed pair survived A's stale write attempt.
+    assert.equal(JSON.parse(await readFile(storedPath, "utf8")).server_url, "https://y.example");
+    // And the lock was released on the refusal path: a fresh run against the
+    // current binding completes (stored already matches -> recorded no-op).
+    globalThis.fetch = async () => respond();
+    await setEndpoint({ team: "demo" });
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (saved.connection === undefined) delete process.env.AGMSG_SYNC_CONNECTION_DIR;
+    else process.env.AGMSG_SYNC_CONNECTION_DIR = saved.connection;
+    if (saved.storage === undefined) delete process.env.AGMSG_SYNC_STORAGE_DIR;
+    else process.env.AGMSG_SYNC_STORAGE_DIR = saved.storage;
+    await rm(root, { recursive: true });
+  }
+});
+
 test("request distinguishes config errors from response transport loss", async () => {
   const previousFetch = globalThis.fetch;
   let fetchCalled = false;

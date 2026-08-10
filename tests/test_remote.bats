@@ -335,7 +335,12 @@ _binding_field() {  # $1 = team, $2 = json path under remote_binding
     bash "$SCRIPTS/remote.sh" set-endpoint --endpoint "http://localhost:$MOCK_PORT" testteam \
     > "$TEST_SKILL_DIR/se.out" 2>&1 3>&- &
   local se_pid=$!
-  wait_for_file "$barrier.reached"
+  # A wider ceiling than wait_for_file's 10s: under full-suite load the
+  # background command's cold start (node endpoint validation, sqlite reads)
+  # has been measured past 10s, and a barrier miss here fails the test for
+  # timing, not behavior.
+  for _ in $(seq 1 300); do [ -e "$barrier.reached" ] && break; sleep 0.1; done
+  [ -e "$barrier.reached" ]
   # The race: the operator disconnects while set-endpoint is verifying. The
   # disconnect advances binding_revision, so the verified write must refuse
   # rather than land disconnected_at:null over the newer state.
@@ -365,7 +370,9 @@ _binding_field() {  # $1 = team, $2 = json path under remote_binding
     bash "$SCRIPTS/remote.sh" set-endpoint --endpoint "http://localhost:$MOCK_PORT" testteam \
     > "$TEST_SKILL_DIR/se2.out" 2>&1 3>&- &
   local se_pid=$!
-  wait_for_file "$barrier.reached"
+  # Same wider ceiling as the disconnect-race test above.
+  for _ in $(seq 1 300); do [ -e "$barrier.reached" ] && break; sleep 0.1; done
+  [ -e "$barrier.reached" ]
   run bash "$SCRIPTS/remote.sh" sync start testteam
   [ "$status" -eq 0 ]
   : > "$barrier.release"
