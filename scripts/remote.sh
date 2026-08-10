@@ -2525,8 +2525,17 @@ cmd_set_endpoint() {
   # config in memory). _remote_sync_engine_start kills a live engine first.
   IFS=$'\t' read -r end_state end_pid < <(_remote_sync_engine_status "$team")
   if [ "$was_running" -eq 1 ] || [ "$end_state" = "running" ]; then
-    _remote_sync_engine_start "$team"
-    echo "Endpoint for '$team' moved: $(_remote_endpoint_display "$old_endpoint") -> $(_remote_endpoint_display "$endpoint") (same server instance). Sync engine restarted."
+    # Same rule as cmd_pull and cmd_connect: the move is this command's purpose
+    # and it is done by here, so a start failure reports rather than fails --
+    # and, unlike before, does not end the line by claiming a restart that did
+    # not happen. This call site arrived while #730 was in review; without the
+    # capture the bare call would abort here under `set -e`, because the helper
+    # can now return non-zero.
+    local engine_restarted=1
+    _remote_sync_engine_start "$team" || engine_restarted=0
+    local engine_note=" Sync engine restarted."
+    [ "$engine_restarted" -eq 1 ] || engine_note=" The sync engine did not restart; the reason is on stderr."
+    echo "Endpoint for '$team' moved: $(_remote_endpoint_display "$old_endpoint") -> $(_remote_endpoint_display "$endpoint") (same server instance).$engine_note"
   else
     echo "Endpoint for '$team' moved: $(_remote_endpoint_display "$old_endpoint") -> $(_remote_endpoint_display "$endpoint") (same server instance)."
   fi
