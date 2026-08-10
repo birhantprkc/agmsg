@@ -983,7 +983,7 @@ cmd_pull() {
     local engine_started=1
     _remote_sync_engine_start "$team" || engine_started=0
     local engine_note=" Sync engine running."
-    [ "$engine_started" -eq 1 ] || engine_note=" The sync engine did not start (above)."
+    [ "$engine_started" -eq 1 ] || engine_note=" The sync engine did not start; the reason is on stderr."
     if [ "$needs_key" -eq 1 ]; then
       # Says what was checked, and stops there. The identity for the current
       # epoch is here; messages sealed to an earlier key are a different
@@ -1744,8 +1744,12 @@ cmd_connect() {
   if [ -n "$remote_team_name" ] && [ "$remote_team_name" != "$team" ]; then
     server_side=" (on the server: '$remote_team_name')"
   fi
+  # Names the stream, not a position. The refusal goes to stderr and this line
+  # to stdout, so "above" is only true on a terminal that interleaves them --
+  # `remote.sh connect … | tee log` puts them in different places, and a note
+  # that points at nothing is the kind of sentence this change exists to remove.
   local engine_note=" Sync engine running."
-  [ "$engine_started" -eq 1 ] || engine_note=" The sync engine did not start (above)."
+  [ "$engine_started" -eq 1 ] || engine_note=" The sync engine did not start; the reason is on stderr."
   echo "Connected: team '$team'$server_side ($connection_security).$engine_note"
   # Carrying the snapshot and key by hand is the plain install's answer to
   # getting a second machine in. A larger tool may have a ceremony for exactly
