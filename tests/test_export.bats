@@ -165,6 +165,10 @@ STUB
   # (O_EXCL + random name), never a predictable "$OUT.tmp.$$" opened with plain >,
   # and its cleanup trap must cover signal exits as well as EXIT.
   grep -q 'mktemp "\$out_dir/\.export-XXXXXX"' "$SCRIPTS/export.sh"
-  ! grep -qE '\.tmp\.\$\$|\$OUT\.tmp' "$SCRIPTS/export.sh"
+  # Non-comment lines only. The pattern otherwise matches export.sh's own
+  # comment, which names the forbidden form in order to warn against it -- the
+  # check would be firing on its own documentation. `! grep` hid that: the
+  # assertion has been false since the comment was written (#670).
+  refute grep -qE '^[^#]*(\.tmp\.\$\$|\$OUT\.tmp)' "$SCRIPTS/export.sh"
   grep -q "trap 'rm -f \"\$tmp\"' EXIT HUP INT TERM" "$SCRIPTS/export.sh"
 }
