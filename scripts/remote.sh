@@ -1337,13 +1337,29 @@ _remote_holds_current_key() {
 
 # Why a start failure has to be spoken here rather than left to the caller.
 #
-# This function used to end in `disown … || true`, so it always returned 0. It
-# is called as `if ! _remote_sync_engine_start …` in one place, and `set -e` is
-# suspended inside an `if` condition — so a failed `echo > "$pidfile"` two lines
-# from the end was stepped over, the function reported success, and the command
-# died further down at `cat "$pidfile"` having printed nothing of its own. The
-# three other call sites do not look at the return value at all. Measured with
-# the run dir made unwritable: the caller saw success, then exit 1, silent.
+# This function used to end in `disown … || true`, so it always returned 0, and
+# every caller was written around that. `cmd_sync_start` called it as
+# `if ! _remote_sync_engine_start …`, where `set -e` is suspended — so a failed
+# `echo > "$pidfile"` two lines from the end was stepped over, the function
+# reported success, and the command died further down at `cat "$pidfile"` having
+# printed nothing of its own. The others did not look at the return value at
+# all. Measured with the run dir made unwritable: the caller saw success, then
+# exit 1, silent.
+#
+# Five callers now, and they are deliberately not uniform — the rule is whether
+# the engine is what the command was FOR:
+#
+#   cmd_sync_start    `if ! …`     the engine is the purpose; the command fails
+#   cmd_unlock        `|| true`    same, but its own readiness handler converts
+#                                  the empty pid into unlock's failure, and the
+#                                  refusal is already on stderr by then
+#   cmd_pull          capture      purpose already served; reports
+#   cmd_connect       capture      purpose already served; reports
+#   cmd_set_endpoint  capture      purpose already served; reports
+#
+# Derive the set before trusting it: `grep -n '_remote_sync_engine_start "'`.
+# set-endpoint arrived while this change was in review, as a bare call, and the
+# rebase that brought it did not conflict.
 #
 # The tolerant `mkdir … || true` was half of it. Tolerating the directory and
 # then writing into it unguarded moves the failure to a line that cannot

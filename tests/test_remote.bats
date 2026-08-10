@@ -271,9 +271,13 @@ _binding_field() {  # $1 = team, $2 = json path under remote_binding
 #                         exits on that instead.
 #
 # Reaching it needs the run dir to become unwritable BETWEEN the stop and the
-# start, which is a race a test cannot stage. Left uncovered and said so, rather
-# than shipping a test that passes against the bare call -- the mutation
-# reverting this call site reds nothing today.
+# start. What was measured is narrower than "impossible": these three injections
+# do not reach it, and the code as it stands offers no seam between the stop and
+# the start for a test to drive. A dedicated barrier or hook in that gap would
+# stage it deterministically -- not proposed here, and said plainly so the limit
+# reads as the current shape of the code rather than a law. Left uncovered and
+# said so, rather than shipping a test that passes against the bare call -- the
+# mutation reverting this call site reds nothing today.
 
 @test "set-endpoint: moves a connected team with history to a new address of the same server (#718)" {
   # bob joins BEFORE connect so the server roster matches the local one: the
