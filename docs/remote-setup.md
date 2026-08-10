@@ -271,12 +271,18 @@ If the reverse proxy in front of the server carries a certificate from a CA
 that is not publicly trusted (a self-signed cert, or a CA of your own),
 point every `remote.sh` invocation at it with `CURL_CA_BUNDLE=<path-to-ca.pem>`.
 `connect`'s own request goes through curl, which reads that variable
-directly; the persistent sync engine and `pull`'s team lookup are Node
-processes started through `remote-sync.sh`, which passes the same
-`CURL_CA_BUNDLE` value on to Node as `NODE_EXTRA_CA_CERTS` when Node's own
-variable is not already set. Setting `CURL_CA_BUNDLE` is enough for both;
-set `NODE_EXTRA_CA_CERTS` yourself only if Node needs to trust something
-curl does not.
+directly; the persistent sync engine, `pull`'s team lookup, and pull's own
+message-page fetching are all Node processes started through
+`remote-sync.sh`, which passes the same `CURL_CA_BUNDLE` value on to Node
+as `NODE_EXTRA_CA_CERTS` when Node's own variable is not already set.
+Setting `CURL_CA_BUNDLE` is enough for all of these; set
+`NODE_EXTRA_CA_CERTS` yourself only if Node needs to trust something curl
+does not.
+
+This is per-invocation, not remembered by the team's remote binding:
+`CURL_CA_BUNDLE` needs to be set in whatever shell runs `remote.sh`,
+including a later `remote.sh sync start <team>` after the engine crashes or
+the machine reboots — not only the shell that ran the original `connect`.
 
 ### Using your own database instead
 

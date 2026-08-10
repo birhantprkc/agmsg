@@ -24,6 +24,13 @@ export AGMSG_SYNC_CIPHER_HELPER="$SCRIPT_DIR/internal/sync-cipher.mjs"
 # bridge it: if the caller already trusted curl with a CA bundle and never
 # set Node's own variable, hand Node the same file. An explicit
 # NODE_EXTRA_CA_CERTS is left untouched.
+#
+# This is per-invocation, not persisted with the team's remote binding: it
+# only helps when CURL_CA_BUNDLE is set in the environment that runs THIS
+# script, which includes `connect`'s own engine start but not a later
+# `remote.sh sync start <team>` run from a shell that never re-exported it.
+# Restarting the engine after a crash still needs CURL_CA_BUNDLE set again in
+# that shell — nothing here writes the CA path anywhere durable.
 if [ -z "${NODE_EXTRA_CA_CERTS+x}" ] && [ -n "${CURL_CA_BUNDLE:-}" ]; then
   export NODE_EXTRA_CA_CERTS="$CURL_CA_BUNDLE"
 fi
