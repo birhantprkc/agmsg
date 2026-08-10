@@ -31,6 +31,7 @@ Exits 0 (silent) if <endpoint> (argv[1]) is acceptable; exits 1 with a
 one-line reason on stderr otherwise.
 """
 import ipaddress
+import re
 import sys
 from urllib.parse import urlsplit
 
@@ -52,6 +53,39 @@ PRIVATE_NETS = [
 # loopback address by universal convention, and every self-host walkthrough
 # starts with it.
 ALLOWED_HTTP_NAMES = {"localhost"}
+
+
+def host_is_wellformed(host):
+    """Reject hosts the WHATWG parser refuses but urlsplit hands back anyway.
+
+    Fourth instance of one shape: urlsplit does not validate what it returns, so
+    every value taken from it without asking is somewhere the two sides can
+    disagree. It was the host notations, then the IPv6 zone, then the port, and
+    this is the https host. Measured, exactly two forms diverged — a space in
+    the host and a malformed percent-escape — while IDN, doubled dots and a
+    leading hyphen are accepted by both and are left alone.
+
+    Deliberately not a hostname grammar: tightening beyond what Node refuses
+    would create the divergence in the other direction, which is the same
+    defect wearing the opposite sign.
+    """
+    if host != host.strip() or any(c.isspace() for c in host):
+        return False
+    # Every % must introduce a valid escape.
+    return re.fullmatch(r"(?:[^%]|%[0-9A-Fa-f]{2})*", host) is not None
+
+
+def zone_refusal(host):
+    """The refusal a zone index gets, kept in one place: two call sites reach
+    it now, and two copies of a message drift."""
+    fail(
+        "--endpoint cannot carry an IPv6 zone index "
+        f"(the '%...' part of '{host}'). Write the address without the zone "
+        "(http://[fe80::1]:8787), or use another address. The zone names an "
+        "interface on this machine, and the URL parser the sync engine uses "
+        "rejects it outright — accepting it here would let the team connect "
+        "and then fail on every sync."
+    )
 
 
 def fail(msg):
@@ -108,12 +142,22 @@ def main():
     if parts.scheme == "https":
         if not parts.hostname:
             fail("--endpoint has no host")
+        if not host_is_wellformed(parts.hostname):
+            fail("--endpoint has a malformed host")
         return
 
     if parts.scheme == "http":
         if parts.username is not None or parts.password is not None:
             fail("--endpoint must not contain userinfo (user@ or user:pass@)")
         host = parts.hostname or ""
+        # A zone index fails the well-formedness test too — `%et` is not a valid
+        # escape — so it has to be recognised first or the generic "malformed
+        # host" replaces the one message that tells the reader what to write
+        # instead. Both refuse; the order decides which explanation is printed.
+        if "%" in host:
+            zone_refusal(host)
+        if not host_is_wellformed(host):
+            fail("--endpoint has a malformed host")
         if host in ALLOWED_HTTP_NAMES or private_ip_literal(host):
             return
         # What this costs, stated accurately. The old wording said a
@@ -124,15 +168,6 @@ def main():
         # Someone who wrote a zone index HAS given a private address, so the
         # general message would answer a question they did not ask and leave
         # them with nowhere to go. Say what is actually wrong.
-        if "%" in host:
-            fail(
-                "--endpoint cannot carry an IPv6 zone index "
-                f"(the '%...' part of '{host}'). Write the address without the "
-                "zone (http://[fe80::1]:8787), or use another address. The "
-                "zone names an interface on this machine, and the URL parser "
-                "the sync engine uses rejects it outright — accepting it here "
-                "would let the team connect and then fail on every sync."
-            )
         fail(
             "--endpoint must be https://, or http:// to a private IP address "
             "(10/8, 172.16/12, 192.168/16, 169.254/16, 127/8, ::1, fc00::/7, "

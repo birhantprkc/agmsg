@@ -63,3 +63,9 @@
 {"endpoint": "http://192.168.1.1:+80", "verdict": "deny", "why": "a sign is not part of a port"}
 {"endpoint": "http://192.168.1.1:65535", "verdict": "allow", "why": "the top of the range is a valid port"}
 {"endpoint": "http://192.168.1.1:", "verdict": "allow", "why": "empty port means the scheme default; both parsers accept it"}
+{"endpoint": "https://exa mple.com", "verdict": "deny", "why": "a space in the host: urlsplit hands it back, the WHATWG parser refuses it"}
+{"endpoint": "https://%zz", "verdict": "deny", "why": "malformed percent-escape in the host"}
+{"endpoint": "http://exa mple.com", "verdict": "deny", "why": "same malformed host on the http branch"}
+{"endpoint": "https://example.com", "verdict": "allow", "why": "an ordinary name over https"}
+{"endpoint": "https://ex..ample.com", "verdict": "allow", "why": "doubled dot: odd, but both parsers accept it — not tightened beyond Node"}
+{"endpoint": "https://xn--wgv71a.example", "verdict": "allow", "why": "punycode name over https"}

@@ -86,6 +86,9 @@ agree() {
   agree "http://[fe80::1%eth0]:8787"
   agree "http://192.168.1.1:99999"
   agree "http://192.168.1.1:abc"
+  agree "https://exa mple.com"
+  agree "https://%zz"
+  agree "https://日本.example"
 }
 
 @test "endpoint: the userinfo trick is still refused (#717)" {
