@@ -110,16 +110,18 @@ _remote_ensure_team() {
 # The rule is "IP literal in a private range", not "loopback" (#717). The
 # bypasses above are all NAMES that read like a safe host; a literal is the
 # address itself, so a LAN address over http is allowed and does not need a
-# tunnel to a loopback port. The same rule is enforced per-sync in
-# internal/remote-sync.mjs, because a check only here lets a team connect and
-# then fail on its next sync; tests/test_endpoint_scheme.bats asserts both.
+# tunnel to a loopback port. This adapter calls the same implementation that
+# continued sync uses; keeping a second parser here caused the two paths to
+# disagree on five URL forms (#722).
 #
 # What plaintext costs, stated where it is decided: the client sends no
 # credential (there is no Authorization header), so what crosses in the clear
 # is the message bodies of a team synced with cipher `none`. Under --e2ee the
 # contents are sealed before they leave the machine.
 _remote_validate_endpoint() {
-  python3 "$SCRIPT_DIR/internal/validate-endpoint.py" "$1"
+  local node
+  node="$(agmsg_resolve_node)"
+  "$node" "$SCRIPT_DIR/internal/validate-endpoint.mjs" "$1"
 }
 
 # An endpoint, safe to print. Keeps the scheme, host and port; DROPS everything

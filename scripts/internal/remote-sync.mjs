@@ -205,11 +205,10 @@ export async function activateKeyRotations(config) {
   config.age_v1_runtime_history = runtime;
 }
 
-// Whether this endpoint may be spoken to over plaintext http. Must agree with
-// scripts/internal/validate-endpoint.py, which decides the same question at
-// connect/pull time — tests/test_endpoint_scheme.bats runs every case through
-// both, because a rule enforced in one of them only lets a team connect and
-// then fail on its next sync.
+// Whether this endpoint may be used, with the operator-facing reason when it
+// may not. Connect, pull and continued sync all call this implementation; a
+// second parser used to approximate it and disagreed in five separate ways
+// (#722).
 //
 // The rule is "IP literal in a private range", not "loopback". What the strict
 // parsing exists to stop is a NAME dressed as a safe host —
@@ -223,64 +222,124 @@ export async function activateKeyRotations(config) {
 // difficulty. `new URL("http://2130706433/").hostname` is "127.0.0.1" — the
 // platform helpfully rewrites decimal, hex and zero-padded octal forms into
 // dotted quads, so a check on the parsed host accepts spellings a reader would
-// never recognise as an address, and the Python side (which has no such
-// normalisation) rejects them. Measured: five forms disagreed between the two
-// before this took the raw text.
+// never recognise as an address. The former Python entry validator rejected
+// those spellings while Node accepted them. Measured: five forms disagreed
+// before both call sites were moved to this raw-input implementation.
 //
 // The premise of the whole rule is "what is written in the URL is where the
 // connection goes". A form that has to be decoded first is not that.
-export function allowsPlaintextEndpoint(rawEndpoint) {
+const GENERAL_HTTP_REFUSAL =
+  "--endpoint must be https://, or http:// to a private IP address " +
+  "(10/8, 172.16/12, 192.168/16, 169.254/16, 127/8, ::1, fc00::/7, " +
+  "fe80::/10). Over plaintext http the message bodies of a team synced " +
+  "without encryption cross the network in the clear. Either use https://, " +
+  "or give the LAN IP of the server instead of a name " +
+  "(http://192.168.1.10:8787), or connect with --e2ee so the contents are " +
+  "sealed before they leave this machine.";
+
+function rejected(message) {
+  return { ok: false, message };
+}
+
+function rawAuthority(rawEndpoint) {
+  return /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i.exec(rawEndpoint)?.[1];
+}
+
+function rawZoneHost(authority) {
+  if (!authority?.startsWith("[")) return null;
+  const end = authority.indexOf("]");
+  if (end < 0) return null;
+  const host = authority.slice(1, end);
+  return host.includes("%") ? host : null;
+}
+
+function zoneRefusal(host) {
+  return rejected(
+    "--endpoint cannot carry an IPv6 zone index " +
+    `(the '%...' part of '${host}'). Write the address without the zone ` +
+    "(http://[fe80::1]:8787), or use another address. The zone names an " +
+    "interface on this machine, and the URL parser the sync engine uses " +
+    "rejects it outright — accepting it here would let the team connect " +
+    "and then fail on every sync.",
+  );
+}
+
+export function validateEndpoint(rawEndpoint) {
+  const authority = rawAuthority(rawEndpoint);
+  if (authority === undefined) {
+    return rejected("--endpoint must start with https:// (or http:// to a private IP address)");
+  }
+  const zoneHost = rawZoneHost(authority);
+  if (zoneHost !== null) return zoneRefusal(zoneHost);
+
   let url;
   try {
     url = new URL(rawEndpoint);
   } catch {
-    return false;
+    if (authority !== undefined) {
+      const hostPort = authority.includes("@") ? authority.slice(authority.lastIndexOf("@") + 1) : authority;
+      const port = hostPort.startsWith("[")
+        ? hostPort.slice(hostPort.indexOf("]") + 1)
+        : hostPort.includes(":") ? hostPort.slice(hostPort.lastIndexOf(":")) : "";
+      if (port.startsWith(":") && port.length > 1) {
+        return rejected("--endpoint has an invalid port (must be a number from 0 to 65535)");
+      }
+      if (/\s|%(?![0-9a-f]{2})/i.test(hostPort)) {
+        return rejected("--endpoint has a malformed host");
+      }
+    }
+    return rejected("--endpoint could not be parsed as a URL");
   }
-  if (url.protocol === "https:") return true;
-  if (url.protocol !== "http:") return false;
+  if (url.protocol === "https:") return { ok: true };
+  if (url.protocol !== "http:") {
+    return rejected("--endpoint must start with https:// (or http:// to a private IP address)");
+  }
   // `http://evil.com@192.168.1.1/` parses with host 192.168.1.1; the userinfo
   // is what a reader's eye lands on. The connect-time validator refuses these
   // outright and so does this, rather than relying on the host check behind it.
-  if (url.username || url.password) return false;
+  if (url.username || url.password) {
+    return rejected("--endpoint must not contain userinfo (user@ or user:pass@)");
+  }
 
-  const authority = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i.exec(rawEndpoint)?.[1];
-  if (authority === undefined || authority.includes("@")) return false;
+  if (authority === undefined || authority.includes("@")) {
+    return rejected("--endpoint must not contain userinfo (user@ or user:pass@)");
+  }
 
   let host;
   if (authority.startsWith("[")) {
     const end = authority.indexOf("]");
-    if (end < 0) return false;
+    if (end < 0) return rejected("--endpoint could not be parsed as a URL");
     host = authority.slice(1, end).toLowerCase();
   } else {
     host = authority.split(":")[0].toLowerCase();
     // Each octet is a bare decimal with NO leading zero. `\d{1,3}` would take
     // `192.168.01.1` and Number() would read `01` as 1, so it would pass here
-    // and be refused by the Python side, which rejects leading zeros outright
-    // (found in review). A leading zero is also how the octal forms are
+    // while the former Python entry validator rejected it (found in review).
+    // A leading zero is also how the octal forms are
     // written, and the point of this rule is that the address is readable as
     // written — `01` is not.
     const v4 = /^(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})$/.exec(host);
-    if (host === "localhost") return true;
-    if (!v4) return false;                     // a name, or a form needing decoding
+    if (host === "localhost") return { ok: true };
+    if (!v4) return rejected(GENERAL_HTTP_REFUSAL); // a name, or a form needing decoding
     const octets = v4.slice(1).map(Number);
-    if (octets.some((o) => o > 255)) return false;
+    if (octets.some((o) => o > 255)) return rejected(GENERAL_HTTP_REFUSAL);
     const [a, b] = octets;
-    if (a === 127) return true;                        // 127/8 loopback
-    if (a === 10) return true;                         // 10/8
-    if (a === 172 && b >= 16 && b <= 31) return true;  // 172.16/12
-    if (a === 192 && b === 168) return true;           // 192.168/16
-    if (a === 169 && b === 254) return true;           // 169.254/16 link-local
-    return false;
+    if (a === 127) return { ok: true };                        // 127/8 loopback
+    if (a === 10) return { ok: true };                         // 10/8
+    if (a === 172 && b >= 16 && b <= 31) return { ok: true };  // 172.16/12
+    if (a === 192 && b === 168) return { ok: true };           // 192.168/16
+    if (a === 169 && b === 254) return { ok: true };           // 169.254/16 link-local
+    return rejected(GENERAL_HTTP_REFUSAL);
   }
 
   const groups = ipv6Groups(host);
-  if (groups === null) return false;
+  if (groups === null) return rejected(GENERAL_HTTP_REFUSAL);
   // ::1
-  if (groups.slice(0, 7).every((g) => g === 0) && groups[7] === 1) return true;
+  if (groups.slice(0, 7).every((g) => g === 0) && groups[7] === 1) return { ok: true };
   const first = groups[0];
-  if (first >= 0xfc00 && first <= 0xfdff) return true;  // fc00::/7 unique local
-  if (first >= 0xfe80 && first <= 0xfebf) return true;  // fe80::/10 link-local
-  return false;
+  if (first >= 0xfc00 && first <= 0xfdff) return { ok: true };  // fc00::/7 unique local
+  if (first >= 0xfe80 && first <= 0xfebf) return { ok: true };  // fe80::/10 link-local
+  return rejected(GENERAL_HTTP_REFUSAL);
 }
 
 // An IPv6 literal as eight numeric groups, or null when it is not one.
@@ -292,8 +351,7 @@ export function allowsPlaintextEndpoint(rawEndpoint) {
 // short form through unchanged. `fe8::1` is the same trap against fe80::/10.
 //
 // Forms carrying an embedded IPv4 (`::ffff:192.168.1.1`) contain dots, fail the
-// character test, and are refused. That matches the Python side, which does not
-// treat them as private either.
+// character test, and are refused.
 function ipv6Groups(host) {
   if (!/^[0-9a-f:]+$/.test(host)) return null;
   const halves = host.split("::");
@@ -331,7 +389,7 @@ export function connectedBinding(value, team) {
       binding.capabilities.write_allowed_ciphers.some((cipher) => typeof cipher !== "string")) {
     throw new Error("connected team binding is invalid or disconnected");
   }
-  if (!allowsPlaintextEndpoint(binding.endpoint)) {
+  if (!validateEndpoint(binding.endpoint).ok) {
     throw new Error(
       "connected team endpoint must use HTTPS, or HTTP to a private IP address " +
       "(10/8, 172.16/12, 192.168/16, 169.254/16, 127/8, ::1, fc00::/7)");
