@@ -1222,7 +1222,19 @@ async function send(config, path, init, authHeaders) {
   if (!response.ok) {
     validateErrorBinding(config, response.status, body);
     const code = errorCode(body);
-    const error = new Error(`HTTP ${response.status} ${code}`);
+    // The same boundary publicGet() draws (#726/#728), for the message ONLY.
+    // This message reaches raw, unescaping sinks: main()'s stderr write lands
+    // it unescaped in the daemon's logfile (`run >> logfile 2>&1`) and on the
+    // operator's live terminal for the foreground subcommands -- one collapse
+    // at this composition point covers both readers, because the allowed
+    // alphabet is safe for the stricter of them (a terminal). error.code and
+    // error.body keep the server's actual value: their only sinks are the
+    // JSON-escaped event lines (cycle.error/fatal, push.oversized detail),
+    // and collapsing them too would erase the hosted edge's snake_case codes
+    // -- re-creating the "sync stopped with no reason in the log" failure the
+    // errorCode() bridge exists to prevent.
+    const safeCode = /^[a-z][a-z0-9-]{0,63}$/.test(code) ? code : "unknown-error";
+    const error = new Error(`HTTP ${response.status} ${safeCode}`);
     error.status = response.status; error.code = code; error.body = body;
     throw error;
   }

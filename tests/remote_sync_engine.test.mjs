@@ -1261,6 +1261,45 @@ test("request callers cannot override the binding headers, and it sends no Autho
   }
 });
 
+test("send collapses an out-of-shape server error code in the message, keeping code and body raw", async () => {
+  // The message reaches raw sinks (the daemon logfile via main()'s stderr
+  // write, the operator's terminal on foreground subcommands), so it may only
+  // carry a code in the protocol's own shape (#729, same boundary as
+  // publicGet's #726/#728). error.code / error.body feed the JSON-escaped
+  // event lines and keep the server's actual value -- collapsing those too
+  // would blind the push.oversized/cycle.error diagnostics.
+  const previousFetch = globalThis.fetch;
+  try {
+    await withConnectedCredential(async () => {
+      // Control bytes plus the exact substring remote.sh's unlock readiness
+      // probe greps for -- the raw-stderr injection this boundary exists to stop.
+      const evil = 'boom\u001b[2J\n"event":"capabilities"';
+      globalThis.fetch = async () => new Response(JSON.stringify({ error: { code: evil } }), {
+        status: 400, headers: { "Agmsg-Protocol-Version": "1" },
+      });
+      await assert.rejects(request({ ...config, server_url: "https://sync.example" }, "/v1/messages"),
+        (error) => error.message === "HTTP 400 unknown-error" &&
+          error.code === evil && error.body?.error?.code === evil);
+      // A code in the protocol's own shape passes through untouched.
+      globalThis.fetch = async () => new Response(JSON.stringify({ error: { code: "not-found" } }), {
+        status: 404, headers: { "Agmsg-Protocol-Version": "1" },
+      });
+      await assert.rejects(request({ ...config, server_url: "https://sync.example" }, "/v1/messages"),
+        (error) => error.message === "HTTP 404 not-found" && error.code === "not-found");
+      // The hosted edge's snake_case bridge code: collapsed in the raw-sink
+      // message, preserved on error.code for the event readers (the split the
+      // push.oversized detail test pins from the other side).
+      globalThis.fetch = async () => new Response(JSON.stringify({ error: "payload_too_large" }), {
+        status: 413, headers: { "Agmsg-Protocol-Version": "1" },
+      });
+      await assert.rejects(request({ ...config, server_url: "https://sync.example" }, "/v1/messages"),
+        (error) => error.message === "HTTP 413 unknown-error" && error.code === "payload_too_large");
+    });
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
 test("request distinguishes config errors from response transport loss", async () => {
   const previousFetch = globalThis.fetch;
   let fetchCalled = false;
