@@ -251,6 +251,30 @@ _binding_field() {  # $1 = team, $2 = json path under remote_binding
 # refused with both ids named, and there is no path that writes an unverified
 # address.
 
+# NOT COVERED, measured rather than assumed (#730): "set-endpoint reports a
+# failed engine restart instead of claiming one".
+#
+# The capture is in cmd_set_endpoint because the helper can now return non-zero
+# and a bare call would abort the command under `set -e`. No test drives it,
+# and not for want of trying:
+#
+#   read-only pidfile  -- cmd_set_endpoint calls _remote_sync_engine_stop itself
+#                         (remote.sh, inside cmd_set_endpoint) before the
+#                         restart, and that ends in `rm -f "$pidfile"`, which
+#                         succeeds in a writable run dir. Observed: the file
+#                         went -r--r--r-- -> -rw-r--r-- across the command and
+#                         the restart claimed success.
+#   directory at that   -- survives the rm, but `[ -f ]` is then false when
+#   path                  was_running is captured a few lines earlier, so the
+#                         restart branch is never entered at all.
+#   unwritable run dir  -- the stop's own `rm -f` fails first and the command
+#                         exits on that instead.
+#
+# Reaching it needs the run dir to become unwritable BETWEEN the stop and the
+# start, which is a race a test cannot stage. Left uncovered and said so, rather
+# than shipping a test that passes against the bare call -- the mutation
+# reverting this call site reds nothing today.
+
 @test "set-endpoint: moves a connected team with history to a new address of the same server (#718)" {
   # bob joins BEFORE connect so the server roster matches the local one: the
   # identity re-check compares rosters, and this test is about the address.
