@@ -2214,6 +2214,35 @@ export async function readStateCycle(config, limit, dependencies = {}) {
     config, initialCapabilities, requestCall,
   );
   const localAgents = await localAgentsCall(config.local_team);
+  // Say when the server knows members this machine's roster does not.
+  //
+  // Both numbers are already here: `members` is the server's membership, and
+  // `localAgents` is the same `config.json` `agents` map that `team.sh` prints
+  // from. Nothing else in this loop compares them, and until it did, a freshly
+  // pulled machine reported `0 member(s)` with no indication that anything was
+  // outstanding -- while this very cycle logged
+  // `read-state.applied ... "member_count":3` every few seconds (#743).
+  //
+  // That line is about read cursors for three members, not a roster of three,
+  // and it is the most convincing wrong thing in the log: the reporter and the
+  // first person to trace this both read it as the roster arriving. The
+  // correction is not to hide it but to put the other number beside it.
+  //
+  // A roster materialises from `member_joined` events in the MESSAGE stream, so
+  // it cannot arrive until a connected machine's engine has pushed them. That
+  // is a wait, not a fault, and the names are what make it actionable -- an
+  // agent about to pick its own name needs to know which ones are taken, which
+  // is the whole reason `docs/remote-setup.md` step 4 exists.
+  const unmaterialised = members
+    .filter((member) => !localAgents.includes(member.name))
+    .map((member) => member.name);
+  if (unmaterialised.length > 0) {
+    await eventCall("roster.incomplete", {
+      server_members: members.length,
+      local_members: localAgents.length,
+      missing: unmaterialised,
+    });
+  }
   const prepared = await driverCall("read-prepare", config, [{ type: "sync_read_context",
     min_available_seq: capabilities.min_available_seq, current_seq: capabilities.current_seq,
     members, local_agents: localAgents }]);

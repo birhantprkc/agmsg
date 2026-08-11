@@ -60,6 +60,20 @@ CRED_ROOT="$CONNECTION_ROOT/run/remote-credentials"
 
 _agmsg_sqlesc() { printf %s "$1" | sed "s/'/''/g"; }
 
+# How many members this machine can actually name.
+#
+# The same `$.agents` map `team.sh` prints from, counted rather than listed. A
+# roster materialises from `member_joined` events in the message stream, so on a
+# machine that pulled before any connected engine pushed them this is 0 while
+# the server's membership is not (#743).
+_remote_local_roster_count() {
+  local cfg="$1" escaped
+  [ -f "$cfg" ] || { echo 0; return; }
+  escaped=$(sed "s/'/''/g" "$cfg")
+  agmsg_sqlite_mem "SELECT COALESCE((SELECT count(*) FROM
+    json_each(json_extract('$escaped', '\$.agents'))), 0);"
+}
+
 _remote_team_config() { printf '%s' "$TEAMS_DIR/$1/config.json"; }
 _remote_sync_config_file() {
   local encoded
@@ -1016,8 +1030,33 @@ cmd_pull() {
       echo "  bash $(agmsg_shq "$SKILL_DIR/scripts/remote.sh") unlock $(agmsg_shq "$team") --bundle <file> --confirm-digest <sha256>"
     fi
   else
-    echo "This team is now local and ready for normal use."
-    echo "Open your agent and invoke its installed '$cmd_name' command, then join with a new agent name."
+    # The next instruction is "join with a new agent name", and the way an agent
+    # picks a free one is by reading the roster. When the roster is empty that
+    # instruction is worse than useless: every name looks available, including
+    # the ones already answering on the other machine -- the exact collision
+    # step 4 of docs/remote-setup.md exists to prevent (#743).
+    #
+    # Emptiness here is not a fault to be fixed by waiting longer in this
+    # command. The roster arrives as messages, so it cannot exist until a
+    # connected machine's engine has pushed them, and that machine may not be
+    # running one yet. What this can do is stop implying otherwise.
+    #
+    # "ready for normal use" is withheld in that case rather than printed and
+    # then qualified. It was the sentence the report quoted: a pull that says
+    # ready, followed by a roster that says nobody, reads as a working team.
+    if [ "$(_remote_local_roster_count "$(_remote_team_config "$team")")" -eq 0 ]; then
+      echo "This team is local, but not yet usable for joining."
+      echo "No members are known here yet. The roster travels as messages, so it"
+      echo "appears once a connected machine's sync engine has pushed it -- not at"
+      echo "the moment of this pull, and not from this machine's own effort."
+      echo "Until then '$cmd_name' cannot tell you which names are taken, and a name"
+      echo "you pick may already answer on the other machine. Re-run:"
+      echo "  bash $(agmsg_shq "$SKILL_DIR/scripts/team.sh") $(agmsg_shq "$team")"
+      echo "and join once it lists the members you expect."
+    else
+      echo "This team is now local and ready for normal use."
+      echo "Open your agent and invoke its installed '$cmd_name' command, then join with a new agent name."
+    fi
   fi
 }
 
@@ -1890,6 +1929,20 @@ _remote_status_one() {
       fi
       ;;
   esac
+  # Connected, and unable to name anybody.
+  #
+  # `status` could say "engine running" indefinitely while `team.sh` said
+  # `0 member(s)`, and neither line was wrong -- the process was alive and the
+  # roster was empty. What was missing was anything connecting the two, so the
+  # state read as a working team with no members rather than as a wait (#743).
+  #
+  # Only the empty case is reported, because it is the only one this can
+  # establish without asking the server: a partial roster is indistinguishable
+  # from a complete small one from here. The engine, which holds both numbers,
+  # logs `roster.incomplete` with the missing names.
+  if [ "$(_remote_local_roster_count "$cfg")" -eq 0 ]; then
+    echo "		roster: no members known here yet — it arrives from a connected machine's engine"
+  fi
   if [ "$binding_cipher" = "age-v1" ]; then
     if [ -n "$key_id" ] && [ "$key_id" != "null" ]; then
       echo "		encryption: age-v1, key present"
