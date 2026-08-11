@@ -1536,10 +1536,12 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   # roster: every name looks free, including the ones already answering
   # elsewhere (#743). The pull is still a success; what it may not do is call
   # the team ready.
-  [[ "$output" == *"This team is local, but not yet usable for joining."* ]]
-  [[ "$output" == *"No members are known here yet."* ]]
-  [[ "$output" != *"This team is now local and ready for normal use."* ]]
-  [[ "$output" != *"then join with a new agent name"* ]]
+  # `grep`/`refute`, not `[[ ]]`: a non-last `[[ ]]` cannot fail the test on
+  # bash 3.2, so on macOS these would be decoration (#670).
+  printf '%s\n' "$output" | grep -q -F -- "This team is local, but not yet usable for joining."
+  printf '%s\n' "$output" | grep -q -F -- "No members are known here yet."
+  refute grep -qF -- "This team is now local and ready for normal use." <<<"$output"
+  refute grep -qF -- "then join with a new agent name" <<<"$output"
   # And NOT the locked branch's guidance. Asserting only that the right line is
   # present would pass for an output carrying both, which is what a reader
   # cannot reconcile -- the shape reported in #147.
@@ -1886,10 +1888,11 @@ PY_BIND
 
   local cmd_name
   cmd_name="$(basename "$TEST_SKILL_DIR")"
-  [[ "$output" == *"This team is now local and ready for normal use."* ]]
-  [[ "$output" == *"Open your agent and invoke its installed '$cmd_name' command, then join with a new agent name."* ]]
-  [[ "$output" != *"No members are known here yet."* ]]
-  [[ "$output" != *"not yet usable for joining"* ]]
+  printf '%s\n' "$output" | grep -q -F -- "This team is now local and ready for normal use."
+  printf '%s\n' "$output" | grep -q -F -- \
+    "Open your agent and invoke its installed '$cmd_name' command, then join with a new agent name."
+  refute grep -qF -- "No members are known here yet." <<<"$output"
+  refute grep -qF -- "not yet usable for joining" <<<"$output"
 }
 
 @test "remote pull: an encrypted team with NO messages is still recorded as encrypted" {

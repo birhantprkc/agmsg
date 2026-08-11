@@ -144,7 +144,7 @@ remember_engine_pid() {
   # pass just as well for a line printed unconditionally.
   run bash "$SCRIPTS/remote.sh" status testteam
   [ "$status" -eq 0 ]
-  [[ "$output" != *"roster: no members known here yet"* ]]
+  refute grep -qF -- "roster: no members known here yet" <<<"$output"
 
   escaped="$(sed "s/'/''/g" "$cfg")"
   sqlite_mem "SELECT json_set('$escaped', '\$.agents', json_object());" > "$cfg"
@@ -155,7 +155,7 @@ remember_engine_pid() {
 
   run bash "$SCRIPTS/remote.sh" status testteam
   [ "$status" -eq 0 ]
-  [[ "$output" == *"connected ("* ]]
+  printf '%s\n' "$output" | grep -q -F -- "connected ("
   printf '%s\n' "$output" | grep -q -F -- "roster: no members known here yet"
 }
 
