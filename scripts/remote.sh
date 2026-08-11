@@ -1342,6 +1342,9 @@ EOF
 # pidfile lifecycle in two places (here and watch.sh); factoring it into a shared
 # lib is intentionally deferred, not overlooked.
 _remote_sync_engine_pidfile() { printf '%s' "$CONNECTION_ROOT/run/remote-sync.$1.pid"; }
+# Written by the engine after a cycle completes (#756). Derived here the same way
+# the pidfile is, because it has the same lifetime and the same owner.
+_remote_sync_engine_cycle_stamp() { printf '%s' "$CONNECTION_ROOT/run/remote-sync.$1.cycles.json"; }
 
 # _remote_holds_current_key <team> -> 0 when this machine holds the identity
 # for the team's CURRENT epoch, 1 otherwise.
@@ -1485,6 +1488,10 @@ _remote_sync_engine_stop() {
     fi
   fi
   rm -f "$pidfile"
+  # The cycle record goes with the engine that made it. Left behind, the NEXT
+  # engine's first `status` would report a predecessor's success as its own --
+  # which is the exact claim this record was added to stop anyone making (#756).
+  rm -f "$(_remote_sync_engine_cycle_stamp "$team")"
 }
 
 # Print "<state>\t<pid>", where pid is empty when no valid pid is available.
@@ -1943,6 +1950,30 @@ _remote_status_one() {
   if [ "$(_remote_local_roster_count "$cfg")" -eq 0 ]; then
     echo "		roster: no members known here yet — it arrives from a connected machine's engine"
   fi
+  # Whether anything has actually synced, as opposed to whether a process is up.
+  #
+  # `engine running` says the process is alive, which is true and is not the
+  # question. An engine that has never completed a cycle and one that completed a
+  # cycle four seconds ago were indistinguishable here, and in #744's report the
+  # first case ran for an entire session while this line said `running` (#756).
+  #
+  # Only for a running engine: for a stopped one the line above already says the
+  # useful thing, and "no cycles" beside "engine stopped" reads as a second fault
+  # rather than the same one.
+  if [ "$engine_state" = "running" ]; then
+    local stamp last_cycle
+    stamp="$(_remote_sync_engine_cycle_stamp "$team")"
+    last_cycle="$(_remote_read_config_field "$stamp" '$.last_success_at')"
+    if [ -z "$last_cycle" ] || [ "$last_cycle" = "null" ]; then
+      # Absence of the record, not evidence of failure: an engine started seconds
+      # ago has not had time, and one whose run directory is unwritable syncs fine
+      # while recording nothing. Both are "cannot say", and saying more than that
+      # would invent the thing this line exists to prevent.
+      echo "		cycles: none recorded since this engine started — nothing has synced yet"
+    else
+      echo "		cycles: last successful sync $last_cycle"
+    fi
+  fi
   if [ "$binding_cipher" = "age-v1" ]; then
     if [ -n "$key_id" ] && [ "$key_id" != "null" ]; then
       echo "		encryption: age-v1, key present"
@@ -2155,6 +2186,7 @@ cmd_sync_start() {
   if [ "$ready" -ne 1 ]; then
     if _remote_sync_engine_reap_owned "$team" "$started_pid"; then
       rm -f "$(_remote_sync_engine_pidfile "$team")"
+      rm -f "$(_remote_sync_engine_cycle_stamp "$team")"   # same reason as in _remote_sync_engine_stop
       agmsg_lock_release
       echo "agmsg: sync engine for '$team' did not become ready" >&2
       return 1

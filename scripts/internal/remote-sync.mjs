@@ -104,6 +104,44 @@ function rosterJournalPath(team) {
   return join(dirname(teamConfigPath(team)), "roster.jsonl");
 }
 
+// Where the engine records that a cycle has actually completed.
+//
+// `status` could report `connected (engine running, pid N)` forever while every
+// cycle failed, because a live process is all it could see. The engine knows the
+// difference and had nowhere to put it: the fact existed only in the log, and
+// `status` deliberately does not read the log for state -- the one place it does
+// is the start handshake, which is bounded and immediate. A rolling log is the
+// wrong source for a durable claim (#756).
+//
+// It sits beside the pidfile, in the same run directory and derived the same
+// way, because it has the same lifetime: both describe this engine, and both are
+// meaningless once it is gone.
+function cycleStampPath(team) {
+  const connectionRoot = process.env.AGMSG_SYNC_CONNECTION_DIR ?? process.env.SKILL_DIR;
+  if (!connectionRoot) throw new Error("sync connection root is unavailable");
+  return join(connectionRoot, "run", `remote-sync.${team}.cycles.json`);
+}
+
+// Written after a cycle returns, which is the only place a cycle is known to
+// have completed. Best-effort on purpose: an unwritable run directory must not
+// take down syncing, which is the thing that is working. The cost of failing to
+// write is that `status` under-reports -- it says "no cycle recorded" when one
+// happened -- and that direction is the safe one. Claiming a success that did
+// not happen is the failure this exists to prevent.
+async function recordCycleSuccess(team, at, writeFileCall = writeFile) {
+  try {
+    const path = cycleStampPath(team);
+    let first = at;
+    try {
+      const existing = JSON.parse(await readFile(path, "utf8"));
+      if (typeof existing?.first_success_at === "string") first = existing.first_success_at;
+    } catch { /* no stamp yet, or unreadable: this cycle is the first we can name */ }
+    await writeFileCall(path, `${JSON.stringify({
+      type: "sync_cycle_stamp", first_success_at: first, last_success_at: at,
+    })}\n`);
+  } catch { /* best-effort: never fail a working cycle over its own bookkeeping */ }
+}
+
 // What actually went wrong, when the thing that threw is a wrapper.
 //
 // `fetch` rejects with a bare `TypeError: fetch failed` whose own `code` is
@@ -2683,6 +2721,8 @@ export async function runLoop(config, options, dependencies = {}) {
   const sleepCall = dependencies.sleepCall ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const eventCall = dependencies.eventCall ?? event;
   const isRetryableCall = dependencies.isRetryableCall ?? isRetryable;
+  const recordCycleCall = dependencies.recordCycleCall ?? recordCycleSuccess;
+  const nowCall = dependencies.nowCall ?? (() => new Date().toISOString());
 
   // An explicit --limit is a ceiling for BOTH push and pull (request size /
   // memory / slow-link timeout); only the default lets the loop go large.
@@ -2701,6 +2741,17 @@ export async function runLoop(config, options, dependencies = {}) {
     try {
       const result = await cycleCall(config, { pushLimit, pullLimit }, dependencies);
       consecutiveFailures = 0;
+      // Here, and nowhere earlier: this is the one point at which a cycle is
+      // known to have finished rather than to have been attempted.
+      //
+      // Guarded HERE, not only inside the writer. The writer swallows its own
+      // I/O errors, but that is the writer's promise, not this loop's guarantee
+      // -- and a promise kept in the callee is one a future callee can break.
+      // The loop's rule is that nothing about recording a success may cost the
+      // success. Same shape as the `cycle.error` logging below.
+      try {
+        await recordCycleCall(config.local_team, nowCall());
+      } catch { /* bookkeeping is best-effort; the cycle already succeeded */ }
       catchUp = result?.pushSaturated === true;
       // catch-up removes the wait ONLY between successful, progress-making
       // cycles; steady keeps the interval. --interval never applies in

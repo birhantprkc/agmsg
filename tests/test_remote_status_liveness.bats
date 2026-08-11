@@ -132,6 +132,55 @@ remember_engine_pid() {
   ENGINE_PIDS="${ENGINE_PIDS:+$ENGINE_PIDS }$ENGINE_PID"
 }
 
+@test "status: a running engine that has never completed a cycle says so (#756)" {
+  # `engine running` reports that a process is alive, which is true and is not
+  # the question an operator has. In #744's report an engine failed every cycle
+  # for an entire session while this line said `running` the whole time.
+  start_matching_engine
+  local fake_bin stamp
+  fake_bin="$(write_matching_ps_fixture)"
+  stamp="$TEST_SKILL_DIR/run/remote-sync.testteam.cycles.json"
+
+  # Negative side first, on the state a just-started engine is actually in: no
+  # record yet. Asserting only the populated case would pass for a line printed
+  # unconditionally.
+  [ ! -e "$stamp" ]
+  run env PATH="$fake_bin:$PATH" bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "connected (engine running"
+  printf '%s\n' "$output" | grep -q -F -- "cycles: none recorded since this engine started"
+
+  printf '%s\n' '{"type":"sync_cycle_stamp","first_success_at":"2026-08-11T20:00:00.000Z","last_success_at":"2026-08-11T20:34:56.000Z"}' > "$stamp"
+  run env PATH="$fake_bin:$PATH" bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  # The LAST success, not the first: "it worked once at some point" is the claim
+  # that made the original report hard to read.
+  printf '%s\n' "$output" | grep -q -F -- "cycles: last successful sync 2026-08-11T20:34:56.000Z"
+  refute grep -qF -- "none recorded" <<<"$output"
+}
+
+@test "status: a stopped engine does not also report zero cycles (#756)" {
+  # Two lines for one fault reads as two faults. The stopped line above already
+  # says the useful thing and names the command that fixes it.
+  run bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "connected (engine stopped"
+  refute grep -qF -- "cycles:" <<<"$output"
+}
+
+@test "stopping an engine takes its cycle record with it (#756)" {
+  # Left behind, the NEXT engine's first `status` would report a predecessor's
+  # success as its own -- the exact claim this record exists to prevent.
+  start_matching_engine
+  local stamp="$TEST_SKILL_DIR/run/remote-sync.testteam.cycles.json"
+  printf '%s\n' '{"type":"sync_cycle_stamp","first_success_at":"2026-08-11T20:00:00.000Z","last_success_at":"2026-08-11T20:00:00.000Z"}' > "$stamp"
+  [ -e "$stamp" ]
+
+  run bash "$SCRIPTS/remote.sh" disconnect testteam
+  [ "$status" -eq 0 ]
+  [ ! -e "$stamp" ]
+}
+
 @test "status: a connected team that can name nobody says so (#743)" {
   # `connected (engine running)` and `0 member(s)` were both true at once and
   # nothing joined them, so the state read as a working team that happened to be

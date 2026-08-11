@@ -2343,6 +2343,57 @@ const cycleErrorFor = async (error) => {
   return logged[0];
 };
 
+// `status` could say `engine running` forever while every cycle failed. The
+// engine knows the difference; it had nowhere to put it (#756).
+const cycleRecordRun = async (script) => {
+  const recorded = [];
+  let i = 0;
+  await assert.rejects(() => runLoop(config, {}, {
+    cycleCall: async () => {
+      const step = script[i++];
+      if (step === undefined) { const stop = new Error("stop"); stop.retryable = false; throw stop; }
+      if (step === "fail") { const net = new Error("net"); net.retryable = true; throw net; }
+      return {};
+    },
+    sleepCall: async () => {},
+    isRetryableCall: (error) => error.retryable === true,
+    eventCall: async () => {},
+    nowCall: () => `T${recorded.length + 1}`,
+    recordCycleCall: async (team, at) => { recorded.push([team, at]); },
+  }), /stop/);
+  return recorded;
+};
+
+test("runLoop: a completed cycle is recorded, a failed one is not", async () => {
+  // The whole value of the record is that it cannot be written by an attempt.
+  assert.deepEqual(await cycleRecordRun(["fail", "fail"]), []);
+  assert.deepEqual(await cycleRecordRun(["ok"]), [[config.local_team, "T1"]]);
+  // And a failure after a success does not retract the success -- "it worked
+  // once and then stopped" is a different state from "it never worked", and
+  // `status` needs to be able to tell them apart.
+  assert.deepEqual(await cycleRecordRun(["ok", "fail"]), [[config.local_team, "T1"]]);
+});
+
+test("runLoop: bookkeeping that throws does not take down a working cycle", async () => {
+  // Best-effort by design: an unwritable run directory must not stop syncing,
+  // which is the part that is working. Under-reporting is the safe direction --
+  // `status` says "nothing recorded" when something happened, rather than
+  // claiming a success that did not.
+  let cycles = 0;
+  await assert.rejects(() => runLoop(config, {}, {
+    cycleCall: async () => {
+      cycles += 1;
+      if (cycles > 2) { const stop = new Error("stop"); stop.retryable = false; throw stop; }
+      return {};
+    },
+    sleepCall: async () => {},
+    isRetryableCall: (error) => error.retryable === true,
+    eventCall: async () => {},
+    recordCycleCall: async () => { throw new Error("run directory is unwritable"); },
+  }), /stop/);
+  assert.equal(cycles, 3, "a failing record must not stop the loop from cycling");
+});
+
 test("runLoop: cycle.error reports the code from the cause, not the wrapper's own empty one", async () => {
   const wrapper = new TypeError("fetch failed");
   wrapper.cause = Object.assign(new Error("self-signed certificate"),
