@@ -1122,6 +1122,101 @@ test("Stage-2 isolates a limit offender and continues read-only synchronization"
   assert.ok(operations.includes("read-apply"));
 });
 
+// A freshly pulled machine says `0 member(s)` and cannot say it is waiting.
+//
+// The roster arrives as `member_joined` events in the message stream, so a
+// machine that pulled before any connected engine pushed them has an empty
+// roster and no way to know one is outstanding. Meanwhile this same loop logs
+// `read-state.applied ... "member_count":3` every few seconds -- read cursors
+// for three members, not a roster of three -- which is what sent both the
+// reporter and the first person to trace it the wrong way (#743).
+const readStateHarness = (members, localAgents, events) => {
+  const capabilities = {
+    protocol_version: 1, server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id, min_available_seq: "0", current_seq: "0",
+    next_sequence_boundary: "1", accepted_envelope_versions: [1],
+    write_allowed_ciphers: ["none"], policy_revision: "0", effective_from_seq: "1",
+    max_blob_bytes: "1048576", policy_history: [{ policy_revision: "0",
+      effective_from_seq: "1", accepted_envelope_versions: [1], write_allowed_ciphers: ["none"] }],
+  };
+  return {
+    driverCall: async (operation) => {
+      if (operation === "capabilities") return [{ type: "sync_driver_capabilities",
+        capabilities: ["stage1-sync", "stage2-read-state"] }];
+      if (operation === "read-prepare") return members.map((member) => ({
+        type: "sync_read_frontier", member_id: member.member_id, server_seq: "0" }));
+      if (operation === "read-apply") {
+        // The line that misleads, reproduced verbatim: the storage driver is
+        // reporting read state FOR three members, and says so with a field
+        // named exactly like a roster count.
+        return [{ type: "sync_read_apply_result", min_available_seq: "0",
+          member_count: members.length }];
+      }
+      throw new Error(`unexpected driver operation ${operation}`);
+    },
+    requestCall: async (_config, path) => {
+      if (path === "/v1/capabilities") return capabilities;
+      if (path === "/v1/members") return { protocol_version: 1,
+        server_instance_id: config.server_instance_id, team_id: config.remote_team_id,
+        min_available_seq: "0", members_revision: "0",
+        members: members.map((member) => ({ ...member, registrations: [] })) };
+      return { protocol_version: 1, server_instance_id: config.server_instance_id,
+        team_id: config.remote_team_id, min_available_seq: "0", current_seq: "0",
+        items: members.map((member) => ({ kind: "frontier",
+          member_id: member.member_id, server_seq: "0" })),
+        next_page_after: null, has_more: false };
+    },
+    eventCall: async (name, value) => { events.push([name, value]); },
+    localAgentsCall: async () => localAgents,
+  };
+};
+
+const threeMembers = [
+  { member_id: "018f3f7e-0000-7000-8000-000000000010", name: "masa-claude" },
+  { member_id: "018f3f7e-0000-7000-8000-000000000020", name: "masa-codex" },
+  { member_id: "018f3f7e-0000-7000-8000-000000000030", name: "masa-grok" },
+];
+
+test("read-state names the members the local roster has not materialised", async () => {
+  const events = [];
+  await readStateCycle(config, 100, readStateHarness(threeMembers, [], events));
+  const incomplete = events.filter(([name]) => name === "roster.incomplete");
+  assert.equal(incomplete.length, 1);
+  // The names, not just a count: an agent about to choose its own name needs to
+  // know which are taken, which is the whole reason this step exists.
+  assert.deepEqual(incomplete[0][1], {
+    server_members: 3, local_members: 0,
+    missing: ["masa-claude", "masa-codex", "masa-grok"],
+  });
+  // And it sits beside the line that reads like the roster already arrived.
+  assert.ok(events.some(([name, value]) =>
+    name === "read-state.applied" && value.result.member_count === 3));
+});
+
+test("read-state reports a partial roster, not only an empty one", async () => {
+  const events = [];
+  await readStateCycle(config, 100,
+    readStateHarness(threeMembers, ["masa-claude", "masa-grok"], events));
+  const incomplete = events.filter(([name]) => name === "roster.incomplete");
+  assert.equal(incomplete.length, 1);
+  assert.deepEqual(incomplete[0][1],
+    { server_members: 3, local_members: 2, missing: ["masa-codex"] });
+});
+
+test("read-state stays quiet once the roster has caught up", async () => {
+  const events = [];
+  await readStateCycle(config, 100, readStateHarness(threeMembers,
+    threeMembers.map((member) => member.name), events));
+  // A converged machine must not log a standing complaint every few seconds --
+  // a warning that never clears is one people learn to scroll past.
+  assert.deepEqual(events.filter(([name]) => name === "roster.incomplete"), []);
+  // A local-only name is this machine's own, not a gap in the other direction.
+  const extra = [];
+  await readStateCycle(config, 100, readStateHarness(threeMembers,
+    [...threeMembers.map((member) => member.name), "masa-mini"], extra));
+  assert.deepEqual(extra.filter(([name]) => name === "roster.incomplete"), []);
+});
+
 test("read-state context refetches a concurrent retention floor", async () => {
   const capabilities10 = {
     protocol_version: 1, server_instance_id: config.server_instance_id,

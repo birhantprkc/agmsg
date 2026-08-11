@@ -132,6 +132,33 @@ remember_engine_pid() {
   ENGINE_PIDS="${ENGINE_PIDS:+$ENGINE_PIDS }$ENGINE_PID"
 }
 
+@test "status: a connected team that can name nobody says so (#743)" {
+  # `connected (engine running)` and `0 member(s)` were both true at once and
+  # nothing joined them, so the state read as a working team that happened to be
+  # empty rather than as a machine still waiting for a roster it cannot produce
+  # itself. This is the state a freshly pulled second machine is in.
+  local cfg="$TEST_SKILL_DIR/teams/testteam/config.json" escaped
+
+  # The negative control first, on the fixture as built: alice is registered
+  # here, so the line must be absent. Asserting only its presence below would
+  # pass just as well for a line printed unconditionally.
+  run bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"roster: no members known here yet"* ]]
+
+  escaped="$(sed "s/'/''/g" "$cfg")"
+  sqlite_mem "SELECT json_set('$escaped', '\$.agents', json_object());" > "$cfg"
+  # The premise, measured rather than assumed -- if this edit stopped emptying
+  # the roster, the assertion below would be testing the populated case.
+  [ "$(sqlite_mem "SELECT COUNT(*) FROM json_each(
+      json_extract(readfile('$(rf "$cfg")'), '\$.agents'));")" -eq 0 ]
+
+  run bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"connected ("* ]]
+  printf '%s\n' "$output" | grep -q -F -- "roster: no members known here yet"
+}
+
 @test "status: reports an active binding whose engine is stopped" {
   run bash "$SCRIPTS/remote.sh" status testteam
   [ "$status" -eq 0 ]

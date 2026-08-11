@@ -1530,8 +1530,16 @@ PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
   [ "$status" -eq 0 ]
   local cmd_name
   cmd_name="$(basename "$TEST_SKILL_DIR")"
-  [[ "$output" == *"This team is now local and ready for normal use."* ]]
-  [[ "$output" == *"Open your agent and invoke its installed '$cmd_name' command, then join with a new agent name."* ]]
+  # This fixture's stream carries no roster events, so this machine cannot name
+  # a single member -- and the advice that used to print here was "join with a
+  # new agent name", which is precisely what cannot be done safely from an empty
+  # roster: every name looks free, including the ones already answering
+  # elsewhere (#743). The pull is still a success; what it may not do is call
+  # the team ready.
+  [[ "$output" == *"This team is local, but not yet usable for joining."* ]]
+  [[ "$output" == *"No members are known here yet."* ]]
+  [[ "$output" != *"This team is now local and ready for normal use."* ]]
+  [[ "$output" != *"then join with a new agent name"* ]]
   # And NOT the locked branch's guidance. Asserting only that the right line is
   # present would pass for an output carrying both, which is what a reader
   # cannot reconcile -- the shape reported in #147.
@@ -1851,6 +1859,37 @@ PY_BIND
   source "$SCRIPTS/lib/storage.sh"
   agmsg_storage_load
   [ "$(storage_history mixed | jq -s 'length')" -eq 73 ]
+}
+
+@test "remote pull: a stream that carried the roster keeps the ordinary advice (#743)" {
+  # The positive control for the warning asserted in "clones a team". Without a
+  # pull that DOES materialise a roster, a warning printed on every pull and one
+  # printed on the right pulls look identical.
+  #
+  # Both knobs are needed and neither is incidental: MIXED supplies the roster
+  # events, and the plain profile keeps this out of the locked branch, which
+  # prints neither message. (Setting only MIXED lands in that branch -- which is
+  # how this control was found to be measuring nothing.)
+  MOCK_PULL_MIXED=1
+  MOCK_TEAM_CIPHER_PROFILE=none
+  restart_mock_server
+
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" named
+  [ "$status" -eq 0 ]
+  local cfg
+  cfg="$TEST_SKILL_DIR/teams/named/config.json"
+  # The premise of the control, asserted rather than assumed: this machine can
+  # name members. If the fixture ever stops carrying them, this fails here
+  # instead of silently turning the rest into a test of the empty case.
+  [ "$(sqlite_mem "SELECT COUNT(*) FROM json_each(
+      json_extract(readfile('$(rf "$cfg")'), '\$.agents'));")" -eq 7 ]
+
+  local cmd_name
+  cmd_name="$(basename "$TEST_SKILL_DIR")"
+  [[ "$output" == *"This team is now local and ready for normal use."* ]]
+  [[ "$output" == *"Open your agent and invoke its installed '$cmd_name' command, then join with a new agent name."* ]]
+  [[ "$output" != *"No members are known here yet."* ]]
+  [[ "$output" != *"not yet usable for joining"* ]]
 }
 
 @test "remote pull: an encrypted team with NO messages is still recorded as encrypted" {
