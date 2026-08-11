@@ -1454,6 +1454,14 @@ _remote_sync_engine_start() {
       "its pidfile could not be written"
     return 1
   fi
+  # The cycle record belongs to the engine that made it, and this is where a new
+  # one begins. Clearing it on STOP is not enough: an engine that crashes, is
+  # killed, or leaves a stale pidfile never runs that path, so its record would
+  # still be on disk when the replacement starts -- and `status` would attribute
+  # a predecessor's success to an engine that has not completed a cycle yet.
+  # Cleared here, before the new engine can be observed as running, so there is
+  # no window in which the old timestamp reads as the new engine's (#756).
+  rm -f "$(_remote_sync_engine_cycle_stamp "$team")"
   # nohup so the engine outlives this connect; remote-sync.sh execs node, so $!
   # stays the engine's own pid and is exactly what _remote_sync_engine_stop signals.
   # fds 3 and 4 are closed explicitly: under bats, fd 3 is the TAP pipe, and a
@@ -1965,11 +1973,14 @@ _remote_status_one() {
     stamp="$(_remote_sync_engine_cycle_stamp "$team")"
     last_cycle="$(_remote_read_config_field "$stamp" '$.last_success_at')"
     if [ -z "$last_cycle" ] || [ "$last_cycle" = "null" ]; then
-      # Absence of the record, not evidence of failure: an engine started seconds
-      # ago has not had time, and one whose run directory is unwritable syncs fine
-      # while recording nothing. Both are "cannot say", and saying more than that
-      # would invent the thing this line exists to prevent.
-      echo "		cycles: none recorded since this engine started — nothing has synced yet"
+      # Says what is absent, not what did not happen. The record is written
+      # best-effort, so its absence covers three states this cannot tell apart:
+      # no cycle has completed, one completed seconds ago and the write has not
+      # landed, or the run directory is unwritable and cycles are succeeding
+      # unrecorded. "nothing has synced yet" picks one of the three and asserts
+      # it -- a claim wider than the check, which is the defect this whole line
+      # exists to remove from `status` rather than to reintroduce.
+      echo "		cycles: no successful cycle recorded since this engine started"
     else
       echo "		cycles: last successful sync $last_cycle"
     fi

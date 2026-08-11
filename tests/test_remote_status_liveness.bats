@@ -148,7 +148,7 @@ remember_engine_pid() {
   run env PATH="$fake_bin:$PATH" bash "$SCRIPTS/remote.sh" status testteam
   [ "$status" -eq 0 ]
   printf '%s\n' "$output" | grep -q -F -- "connected (engine running"
-  printf '%s\n' "$output" | grep -q -F -- "cycles: none recorded since this engine started"
+  printf '%s\n' "$output" | grep -q -F -- "cycles: no successful cycle recorded since this engine started"
 
   printf '%s\n' '{"type":"sync_cycle_stamp","first_success_at":"2026-08-11T20:00:00.000Z","last_success_at":"2026-08-11T20:34:56.000Z"}' > "$stamp"
   run env PATH="$fake_bin:$PATH" bash "$SCRIPTS/remote.sh" status testteam
@@ -156,7 +156,7 @@ remember_engine_pid() {
   # The LAST success, not the first: "it worked once at some point" is the claim
   # that made the original report hard to read.
   printf '%s\n' "$output" | grep -q -F -- "cycles: last successful sync 2026-08-11T20:34:56.000Z"
-  refute grep -qF -- "none recorded" <<<"$output"
+  refute grep -qF -- "no successful cycle recorded" <<<"$output"
 }
 
 @test "status: a stopped engine does not also report zero cycles (#756)" {
@@ -318,6 +318,36 @@ remember_engine_pid() {
   [ "$output" = "Sync engine already running (pid $original_pid)." ]
   [ "$(cat "$TEST_SKILL_DIR/run/remote-sync.testteam.pid")" = "$original_pid" ]
   kill -0 "$original_pid"
+}
+
+@test "sync start: a replaced engine does not inherit its predecessor's cycle record (#756)" {
+  # The stop path clears the record, and that is not enough: an engine that
+  # crashes, is killed, or leaves a stale pidfile never runs it. The replacement
+  # would then find the old file on disk, and `status` would report a success
+  # this engine has not had. Review caught this; the original change cleared the
+  # record only where the pidfile was removed, which the crash path never reaches.
+  local fake_node fake_bin foreign_pid stamp
+  stamp="$TEST_SKILL_DIR/run/remote-sync.testteam.cycles.json"
+  fake_node="$(write_fake_node)"
+  sleep 30 &
+  foreign_pid=$!
+  fake_bin="$(write_fake_node_ps_fixture "$fake_node" "$foreign_pid")"
+  ENGINE_PIDS="${ENGINE_PIDS:+$ENGINE_PIDS }$foreign_pid"
+  # A dead engine's leftovers: a pidfile pointing at something that is not ours,
+  # and the record it wrote while it was alive.
+  printf '%s\n' "$foreign_pid" > "$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
+  printf '%s\n' '{"type":"sync_cycle_stamp","first_success_at":"2026-08-11T19:00:00.000Z","last_success_at":"2026-08-11T19:30:00.000Z"}' > "$stamp"
+
+  run env PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" bash "$SCRIPTS/remote.sh" sync start testteam
+  [ "$status" -eq 0 ]
+  remember_engine_pid
+
+  run env PATH="$fake_bin:$PATH" bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "connected (engine running, pid $ENGINE_PID)"
+  # The decisive assertion: the predecessor's timestamp must not appear at all.
+  refute grep -qF -- "19:30:00" <<<"$output"
+  printf '%s\n' "$output" | grep -q -F -- "cycles: no successful cycle recorded since this engine started"
 }
 
 @test "sync start: replaces stale ownership without signalling a foreign process" {
