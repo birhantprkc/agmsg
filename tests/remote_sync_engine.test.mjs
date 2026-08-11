@@ -2228,6 +2228,72 @@ test("runLoop: an explicit --limit caps both push and pull page sizes, even in c
   }
 });
 
+// The failing cycle has to be diagnosable from the log alone.
+//
+// `fetch` rejects with a bare `TypeError: fetch failed` whose own `code` is
+// undefined, so reading one property off the thrown error logged
+// `{"message":"fetch failed","code":null}` once a second, forever, for a TLS
+// trust failure Node had already named. The operator who hit that had to
+// reproduce the request by hand, with curl and with a raw Node client, to find
+// out which one was refusing the certificate (#744).
+const cycleErrorFor = async (error) => {
+  const logged = [];
+  await assert.rejects(() => runLoop(config, {}, {
+    cycleCall: async () => { throw error; },
+    sleepCall: async () => {},
+    isRetryableCall: () => false, // one iteration, then out
+    eventCall: async (name, payload) => { if (name === "cycle.error") logged.push(payload); },
+  }));
+  assert.equal(logged.length, 1);
+  return logged[0];
+};
+
+test("runLoop: cycle.error reports the code from the cause, not the wrapper's own empty one", async () => {
+  const wrapper = new TypeError("fetch failed");
+  wrapper.cause = Object.assign(new Error("self-signed certificate"),
+    { code: "DEPTH_ZERO_SELF_SIGNED_CERT" });
+  assert.deepEqual(await cycleErrorFor(wrapper), {
+    message: "fetch failed",
+    code: "DEPTH_ZERO_SELF_SIGNED_CERT",
+    cause: "self-signed certificate",
+  });
+});
+
+test("runLoop: cycle.error walks past an intermediate wrapper that carries no code", async () => {
+  // A proxied or agent-wrapped request nests further than one level, which is
+  // why the chain is walked rather than read at a fixed depth.
+  const inner = Object.assign(new Error("unable to verify the first certificate"),
+    { code: "UNABLE_TO_VERIFY_LEAF_SIGNATURE" });
+  const middle = new Error("socket error");
+  middle.cause = inner;
+  const wrapper = new TypeError("fetch failed");
+  wrapper.cause = middle;
+  const payload = await cycleErrorFor(wrapper);
+  assert.equal(payload.code, "UNABLE_TO_VERIFY_LEAF_SIGNATURE");
+  assert.equal(payload.cause, "unable to verify the first certificate");
+});
+
+test("runLoop: cycle.error keeps an error's own code rather than a deeper one", async () => {
+  // The outermost code is the one the engine's own error taxonomy sets, so a
+  // cause underneath must not silently replace what the caller declared.
+  const error = Object.assign(new Error("read-state limit exceeded"),
+    { code: "read-state-limit-exceeded" });
+  error.cause = Object.assign(new Error("inner"), { code: "ECONNRESET" });
+  const payload = await cycleErrorFor(error);
+  assert.equal(payload.code, "read-state-limit-exceeded");
+});
+
+test("runLoop: cycle.error survives a cyclic cause chain and invents nothing without one", async () => {
+  const a = new Error("a");
+  const b = new Error("b");
+  a.cause = b; b.cause = a; // a cause chain is not guaranteed to be a tree
+  const cyclic = await cycleErrorFor(a);
+  assert.equal(cyclic.message, "a");
+  // No cause at all must stay reportable, and must not grow a `cause` key that
+  // would read as a diagnosis nobody made.
+  assert.deepEqual(await cycleErrorFor(new Error("plain")), { message: "plain", code: null });
+});
+
 test("cycle: a large pull page (backlog present) is requested and accepted at pullLimit — trap 1 regression", async () => {
   const capabilities = {
     protocol_version: 1, server_instance_id: config.server_instance_id,
