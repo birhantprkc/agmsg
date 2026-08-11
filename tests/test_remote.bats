@@ -1419,7 +1419,7 @@ _truncate_team_config() {  # $1 = team -> replaces its config.json with malforme
 
 
 #
-# Deterministic, single-threaded simulation of the race a reviewer flagged (see
+# Deterministic, single-threaded simulation of the race flagged in review (see
 # feat/remote-connect-onboarding's PR #479): rather than actually racing two
 # live processes, pre-insert a row in the runtime `locks` table matching
 # exactly what `_remote_pending_lock_acquire` would have written, then

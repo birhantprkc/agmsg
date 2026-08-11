@@ -578,8 +578,8 @@ export default function App() {
   // below) if this component ever unmounts mid-gesture — App itself never
   // does in practice (root component, lives for the whole session), but the
   // event listeners it registers live on `document`/`window`, outside
-  // React's own teardown, so nothing else would ever clear them (review
-  // review, PR #481).
+  // React's own teardown, so nothing else would ever clear them
+  // (review, PR #481).
   const activePaneDragCancelRef = useRef<(() => void) | null>(null);
   useEffect(() => {
     return () => activePaneDragCancelRef.current?.();
