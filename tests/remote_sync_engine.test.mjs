@@ -2882,7 +2882,15 @@ test("the roster driver is handed a resolved file path, from the connection root
   await mkdir(join(connection, "teams", "demo"), { recursive: true });
   await mkdir(skill, { recursive: true });
   const script = join(root, "driver.sh");
+  // The `cat` is load-bearing, not tidiness: without it this test fails on a
+  // loaded CI runner with `write EPIPE` and nothing to do with what it asserts.
+  // `rosterDriver` writes the driver's stdin and then ends it; a stub that only
+  // prints has already exited by then, so the `end()` lands on a closed pipe and
+  // `runDriver` reports a driver failure -- correctly, since a real driver reads
+  // its input. Locally the parent always wins the race and it passes. It blocked
+  // three unrelated landings before the mechanism was named (#755).
   await writeFile(script, `#!/usr/bin/env bash
+cat >/dev/null
 printf '{"type":"seen","roster":"%s","connection_dir":"%s","trust_dir":"%s"}\\n' \\
   "\${AGMSG_SYNC_LOCAL_ROSTER_FILE:-}" "\${AGMSG_SYNC_CONNECTION_DIR:-}" "\${AGMSG_SYNC_TRUST_DIR:-}"
 `, { mode: 0o700 });
@@ -2954,7 +2962,11 @@ test("a secret handed in as the roster file cannot reach the driver as a secret"
   // today's callers behave; the parameter list proves a future one cannot.
   const root = await mkdtemp(join(tmpdir(), "agmsg-roster-allowlist-"));
   const script = join(root, "driver.sh");
+  // Same race as the stub above, same reason for the `cat`. This one has not
+  // been seen to fail, which is not a reason to leave it: it is the same shape,
+  // and the one next door failed three times before anyone looked.
   await writeFile(script, `#!/usr/bin/env bash
+cat >/dev/null
 printf '{"type":"seen","token":"%s","trust":"%s","conn":"%s","identity":"%s","roster":"%s"}\\n' \\
   "\${AGMSG_SYNC_TOKEN:-}" "\${AGMSG_SYNC_TRUST_DIR:-}" "\${AGMSG_SYNC_CONNECTION_DIR:-}" \\
   "\${AGMSG_AGE_IDENTITY:-}" "\${AGMSG_SYNC_LOCAL_ROSTER_FILE:-}"
