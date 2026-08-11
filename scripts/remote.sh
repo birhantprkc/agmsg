@@ -34,6 +34,31 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONNECTION_ROOT="${AGMSG_SYNC_CONNECTION_DIR:-$SKILL_DIR}"
+
+# One CA setting for both HTTP clients in this system.
+#
+# A team on a private CA is two clients, not one: this script talks over `curl`,
+# and everything it starts or shells out to -- the persistent sync engine, the
+# team-name lookup -- is Node. They read different variables, so setting the one
+# that makes `connect` succeed leaves the engine with no trust at all: it fails
+# every cycle, forever, while `status` still says "engine running" (#744).
+#
+# Nothing warns about the half-configured case, because from each client's own
+# side nothing is wrong. So the fix is a single name that feeds both, rather
+# than documentation telling people to set two.
+#
+# The upstream variables still win if they are already set: an operator who has
+# deliberately pointed one client somewhere else keeps that.
+if [ -n "${AGMSG_CA_CERT:-}" ]; then
+  if [ ! -r "$AGMSG_CA_CERT" ]; then
+    echo "agmsg: AGMSG_CA_CERT is set but not readable: $AGMSG_CA_CERT" >&2
+    echo "  Both the HTTP calls here and the sync engine need this file, so a" >&2
+    echo "  path only one of them can open would fail later and elsewhere." >&2
+    exit 1
+  fi
+  export CURL_CA_BUNDLE="${CURL_CA_BUNDLE:-$AGMSG_CA_CERT}"
+  export NODE_EXTRA_CA_CERTS="${NODE_EXTRA_CA_CERTS:-$AGMSG_CA_CERT}"
+fi
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/storage.sh"
 # shellcheck disable=SC1091

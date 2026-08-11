@@ -104,6 +104,33 @@ function rosterJournalPath(team) {
   return join(dirname(teamConfigPath(team)), "roster.jsonl");
 }
 
+// What actually went wrong, when the thing that threw is a wrapper.
+//
+// `fetch` rejects with a bare `TypeError: fetch failed` whose own `code` is
+// undefined; the diagnosis is one level down, in `cause`. Reporting
+// `error.code ?? null` therefore logged `{"message":"fetch failed","code":null}`
+// once a second, forever, for a TLS trust failure that Node had already named
+// (`DEPTH_ZERO_SELF_SIGNED_CERT`, `UNABLE_TO_VERIFY_LEAF_SIGNATURE`, …). The
+// operator who hit this had to reproduce the request by hand with curl and with
+// a raw Node client to find out which one was refusing the certificate (#744).
+//
+// The chain is walked rather than read one level deep because an agent-wrapped
+// or proxied request nests further, and bounded because a cause chain can be
+// cyclic.
+function causeOf(error) {
+  const seen = new Set();
+  let current = error;
+  let code = current?.code ?? null;
+  let cause = null;
+  for (let depth = 0; depth < 8 && current?.cause && !seen.has(current.cause); depth += 1) {
+    seen.add(current.cause);
+    current = current.cause;
+    if (code === null && current?.code !== undefined) code = current.code;
+    if (typeof current?.message === "string" && current.message !== "") cause = current.message;
+  }
+  return { code, ...(cause === null ? {} : { cause }) };
+}
+
 async function journalKeyRotations(config) {
   let records;
   try {
@@ -2653,7 +2680,7 @@ export async function runLoop(config, options, dependencies = {}) {
       // Best-effort: a logging failure must not abort failure handling or the
       // backoff below (event() can throw when AGMSG_SYNC_LOG_FILE append fails).
       try {
-        await eventCall("cycle.error", { message: error.message, code: error.code ?? null });
+        await eventCall("cycle.error", { message: error.message, ...causeOf(error) });
       } catch { /* logging is best-effort */ }
       if (!isRetryableCall(error)) throw error;
       consecutiveFailures += 1;
