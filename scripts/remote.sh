@@ -1977,7 +1977,7 @@ _remote_status_one() {
 # credential itself — this stays exactly as secret-free as the human-text
 # status output above.
 #
-# Reads config.json exactly ONCE (co1 delta review, ported from
+# Reads config.json exactly ONCE (delta review, ported from
 # feat/remote-connect-onboarding) — six independent
 # `_remote_read_config_field` calls would each independently re-open the
 # file from disk; a concurrent disconnect/reconnect/force-rebind's atomic

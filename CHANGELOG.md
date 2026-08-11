@@ -285,7 +285,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 - Add supported-agents logo strip
-- List hermes in the --agent-type help (co1 nit)
+- List hermes in the --agent-type help (nit)
 - Add docs/plugins.md + README section + plugins/ drop-in dir
 - Refresh manifest table + paths for the 1.1.0 layout
 - Lead Quick Start with npx, the zero-clone install path

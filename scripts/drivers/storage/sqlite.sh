@@ -29,7 +29,7 @@ _sqlite_lit() { printf '%s' "$1" | sed "s/'/''/g"; }
 # (pipefail), so a backend failure surfaces as a non-zero return instead of
 # being swallowed by tr's exit 0. The backend's error text goes to stderr (a
 # separate fd — it never pollutes the JSONL on stdout) so failures are
-# debuggable, per §2.1 framing (#203 (1) / co1 review).
+# debuggable, per §2.1 framing (#203 (1) / review).
 _sqlite_data() {
   ( set -o pipefail; agmsg_sqlite "$(_sqlite_db "$1")" "$2" | tr -d '\r' )
 }
@@ -401,7 +401,7 @@ storage_history() {
   # <agent> is optional: consume a leading NON-flag argument as the agent (an
   # empty string is allowed and also means team-wide). A leading --flag means no
   # agent was given. This is what makes `storage_history <team> --limit N` and
-  # `storage_history <team>` parse correctly per the §2.1 contract (co1 review).
+  # `storage_history <team>` parse correctly per the §2.1 contract (review).
   if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then agent="$1"; shift; fi
   while [ $# -gt 0 ]; do case "$1" in --limit) limit="$2"; shift 2 ;; *) shift ;; esac; done
   case "$limit" in ''|*[!0-9]*) limit="" ;; esac

@@ -405,7 +405,7 @@ function ipv6Groups(host) {
 // unbound: revert this function to its old inline loopback list and every such
 // test stays green while continued sync refuses LAN addresses again. That is
 // the failure this whole change exists to prevent, so the test drives it from
-// here (#717, co1 review).
+// here (#717, review).
 export function connectedBinding(value, team) {
   const binding = value?.remote_binding;
   if (value?.name !== team || !binding || typeof binding !== "object" ||
@@ -1320,7 +1320,7 @@ export function validateErrorBinding(config, status, body) {
   // carries the protocol envelope and omits the identity is malformed for that
   // stage, and the old code refused it. Keeping that refusal is why this is not
   // simply "check when identity is present": the inversion must not loosen a
-  // path (co1 review).
+  // path (review).
   const preResolution = status === 400 || status === 401 || status === 426;
   const claimsProtocol = body?.protocol_version !== undefined;
   if (claimsIdentity || (!preResolution && claimsProtocol)) validateBinding(config, body);

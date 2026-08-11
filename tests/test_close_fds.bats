@@ -82,7 +82,7 @@ setup() {
 # It was left off at first, on the reasoning that calling the helper there would
 # close the sourcing shell's descriptors — true, and not a reason to leave the
 # leak: wrapping only the spawn in a subshell closes the child's copies and
-# leaves the parent's alone (review P1, co1). "This one is different" is where
+# leaves the parent's alone (review P1). "This one is different" is where
 # an exclusion list goes wrong, so the list is now every path, with no
 # exceptions to audit.
 @test "close-fds: every long-lived spawn path calls it" {

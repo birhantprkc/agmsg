@@ -597,7 +597,7 @@ describe("transposeGrid", () => {
     expect(transposeGrid(transposeGrid(tree))).toEqual(tree);
   });
 
-  // co1 review: self-inverse does NOT generalize past 2 columns/rows — a
+  // review: self-inverse does NOT generalize past 2 columns/rows — a
   // transposed 3-column grid's own top-level children no longer match each
   // other (a 1-level leaf-pair vs. a 2-level chain), so a second
   // transposeGrid call is just a no-op rather than reconstructing the
@@ -658,7 +658,7 @@ describe("transposeGrid", () => {
 });
 
 describe("dividerDragKey", () => {
-  it("stays the same across a grid-segment transpose (regression, co1 review PR #390)", () => {
+  it("stays the same across a grid-segment transpose (regression, review PR #390)", () => {
     // A 3-column aligned grid: transposing a grid-segment divider from one
     // of these turns the OTHER segments' dividers from "grid-segment" into
     // "single" (a 2x2 grid stays grid-shaped either way — this needed 3+

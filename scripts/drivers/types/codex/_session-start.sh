@@ -190,7 +190,7 @@ EOF
   # close here directly would shut descriptors belonging to the shell that
   # sourced us. The subshell is what makes it safe: the close applies to the
   # forked child, which is the process that goes on to become the bridge, and
-  # the parent keeps everything it had (review P1, co1).
+  # the parent keeps everything it had (review P1).
   #
   # The `3>&- 4>&-` stays on the spawn line as well. test_spawn_fd_guard.bats
   # requires it there and says why: a file-level close can sit inside a

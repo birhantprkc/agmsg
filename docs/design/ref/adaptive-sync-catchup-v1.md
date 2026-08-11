@@ -226,7 +226,7 @@ instead of spinning.
   dominates (~5 ms/msg measured → ~8 min for 90k; 2–4× on slower/Windows
   hardware), so a progress indicator over batches acked is enough; no
   background/suspend-resume requirement. Seal parallelization is deferred until
-  the separated path is measured (and cc2's Windows numbers land).
+  the separated path is measured (and a reviewer's Windows numbers land).
 
 ## Scope / ownership
 

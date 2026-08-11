@@ -117,7 +117,7 @@ export type LoginShellInfo = { cmd: string; args: string[]; home: string };
 // fallback: an earlier version defaulted to bash when `info` was still
 // unresolved, which raced the mount-effect fetch (app just launched, user
 // immediately hits "+") — broken on Windows (no bash), and not the user's
-// actual login shell even on unix (co1 review, PR #431). Pure so the
+// actual login shell even on unix (review, PR #431). Pure so the
 // no-fallback contract is unit-testable without mounting the app.
 export function shellPaneFrom(info: LoginShellInfo | null, id: string, label: string, cwd: string | undefined): Pane | null {
   if (!info) return null;
@@ -128,7 +128,7 @@ export function shellPaneFrom(info: LoginShellInfo | null, id: string, label: st
 // getLoginShell await — false if the user switched teams while it was in
 // flight. Committing anyway would silently add a window under the stale
 // team (hidden — only the current team's windows render) while `active`
-// pointed at it (co1, PR #431).
+// pointed at it (#431).
 export function shellTabStillValid(currentTeam: string, requestedTeam: string): boolean {
   return currentTeam === requestedTeam;
 }
@@ -142,7 +142,7 @@ export function shellTabStillValid(currentTeam: string, requestedTeam: string): 
 // hidden-active bug openShellTab's shellTabStillValid guards against — a
 // window's `team` never changes after creation, so if the current team no
 // longer matches `requestedTeam` the window can't be a live tab regardless
-// of whether it's still present in `windows` (co1, PR #431).
+// of whether it's still present in `windows` (#431).
 export function shellSplitStillValid(
   windows: ReadonlyArray<Pick<Window, "id" | "team">>,
   windowId: string,
@@ -160,7 +160,7 @@ export function shellSplitStillValid(
 // dropped; ESC-prefixed bytes are terminal control sequences, not text.
 // The whole drop is rejected rather than stripping the offending bytes:
 // stripping would silently turn the dropped path into a DIFFERENT, wrong
-// path instead of the one actually dropped (co1 review, PR #481).
+// path instead of the one actually dropped (review, PR #481).
 const DROP_PATH_CONTROL_CHAR_RE = /[\u0000-\u001f\u007f]/;
 
 export function hasUnsafeDropPath(paths: string[]): boolean {
@@ -274,7 +274,7 @@ const CLICK_SUPPRESS_WINDOW_MS = 300;
 // just when it ended. Scoping by pane matters: a global timestamp alone
 // would suppress a deliberate click on some OTHER pane header too, just
 // because it happens to land within the window of an unrelated pane's drag
-// finishing (co1 review, PR #481, 3rd round).
+// finishing (review, PR #481, 3rd round).
 export type DragFinishInfo = { paneId: string; finishedAt: number } | null;
 
 // Whether the pane-header's onClick should treat an incoming click as the
@@ -286,7 +286,7 @@ export type DragFinishInfo = { paneId: string; finishedAt: number } | null;
 // even one that lands inside the same window, isn't ALSO wrongly
 // suppressed; an unbounded "consume exactly one click" native listener had
 // its own problems (see git history), but a per-pane bounded ref without
-// consuming still over-suppresses. Pure so the co1-requested regressions
+// consuming still over-suppresses. Pure so the review-requested regressions
 // are unit-testable without simulating real pointer/click event sequences.
 export function shouldSuppressClickAfterDrag(dragFinish: DragFinishInfo, paneId: string, now: number): boolean {
   return dragFinish !== null && dragFinish.paneId === paneId && now - dragFinish.finishedAt < CLICK_SUPPRESS_WINDOW_MS;
@@ -565,7 +565,7 @@ export default function App() {
   // The stale-context guard openShellTab/openShellInWindow re-check after
   // their getLoginShell await (see below) — a real gap now that login_shell
   // resolution can take real time, during which the user can switch teams
-  // or close the target tab (co1, PR #431).
+  // or close the target tab (#431).
   const teamRef = useRef<string>("");
   teamRef.current = team;
   // The current tab/window id, for the external-file-drop handler (mount-
@@ -578,7 +578,7 @@ export default function App() {
   // below) if this component ever unmounts mid-gesture — App itself never
   // does in practice (root component, lives for the whole session), but the
   // event listeners it registers live on `document`/`window`, outside
-  // React's own teardown, so nothing else would ever clear them (co1
+  // React's own teardown, so nothing else would ever clear them (review
   // review, PR #481).
   const activePaneDragCancelRef = useRef<(() => void) | null>(null);
   useEffect(() => {
@@ -594,7 +594,7 @@ export default function App() {
   // drag. Scoped per-pane and consumed on use, not a global unbounded
   // "consume the next click" listener or a bare timestamp — both over-
   // suppress in different ways (see shouldSuppressClickAfterDrag's own doc
-  // and git history; co1 review, PR #481, rounds 2 and 3).
+  // and git history; review, PR #481, rounds 2 and 3).
   const dragJustFinishedRef = useRef<DragFinishInfo>(null);
   const applyAgentState = useCallback((paneId: string, state: RawState) => {
     setPaneStatus((current) => applyStateChange(current, paneId, state));
@@ -616,7 +616,7 @@ export default function App() {
 
   // Which divider (by dividerDragKey, below) is currently being dragged —
   // state, not a captured DOM element, so the highlight survives a
-  // grid-segment transpose remounting the divider mid-drag (co1 review,
+  // grid-segment transpose remounting the divider mid-drag (review,
   // PR #390).
   const [draggingDividerKey, setDraggingDividerKey] = useState<string | null>(null);
 
@@ -696,7 +696,7 @@ export default function App() {
   // hasn't landed yet (real race: app just launched, user immediately hits
   // "+" or "Open shell"). Returns null on failure — callers must NOT
   // fall back to a guessed shell (e.g. "bash"): broken on Windows, and not
-  // the user's actual login shell even on unix (co1 review, PR #431).
+  // the user's actual login shell even on unix (review, PR #431).
   const getLoginShell = useCallback(async (): Promise<LoginShellInfo | null> => {
     if (loginShell) return loginShell;
     try {
@@ -1201,7 +1201,7 @@ export default function App() {
   // poking around — not agmsg's business). Awaits getLoginShell (see the
   // mount-effect section above) rather than reading `loginShell` state
   // directly — null means it's genuinely unresolved/unresolvable, at which
-  // point shellPaneFrom itself refuses to guess a fallback shell (co1, PR
+  // point shellPaneFrom itself refuses to guess a fallback shell (review, PR
   // #431); getLoginShell has already surfaced startupError in that case, so
   // callers just bail out with no pane. cwd defaults to the current team's
   // project dir (teamProject) rather than wherever the shell would
@@ -1222,7 +1222,7 @@ export default function App() {
   // a microtask) — the user can switch teams while it's in flight, which
   // would otherwise add the new window under the STALE `team` closed over
   // at click time (hidden, since only the current team's windows render)
-  // while `active` still points at it (co1, PR #431). Bail out rather than
+  // while `active` still points at it (#431). Bail out rather than
   // create an orphaned, invisible tab if the team moved on.
   const openShellTab = useCallback(async () => {
     const requestedTeam = team;
@@ -1243,7 +1243,7 @@ export default function App() {
   // pane, `active` pointing at a dead id), or the team can just switch
   // while the window itself stays open — it's now a hidden tab under the
   // team the user navigated away from, so splitting into it and activating
-  // it reproduces the same hidden-active bug (co1, PR #431).
+  // it reproduces the same hidden-active bug (#431).
   const openShellInWindow = useCallback(
     async (windowId: string) => {
       const requestedTeam = team;
@@ -1363,7 +1363,7 @@ export default function App() {
   // this is a plain click, and the existing onClick handler on the same
   // button (unchanged) fires normally once pointerup lands back on it.
   //
-  // Lifecycle robustness (co1 review, PR #481 — the first version only
+  // Lifecycle robustness (review, PR #481 — the first version only
   // listened for pointermove/pointerup/Escape):
   // - setPointerCapture on the source button, released on cleanup: without
   //   it, the pointer leaving the OS window before release means pointerup
@@ -1382,7 +1382,7 @@ export default function App() {
   //   gesture as a drag. dragJustFinishedRef (declared above, checked by
   //   the pane-header's own onClick) is a per-pane, short bounded window
   //   rather than an unbounded "consume the next click" listener — see its
-  //   own doc for why (co1 review, PR #481, 2nd round: a drag that ends via
+  //   own doc for why (review, PR #481, 2nd round: a drag that ends via
   //   blur/pointercancel/unmount with the pointer released outside the app
   //   never gets a matching click to consume at all, so a pending listener
   //   would sit on the button forever and wrongly swallow the next,

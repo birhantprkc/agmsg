@@ -66,7 +66,7 @@ function readVersion() {
 // It has to name what to type instead.
 //
 // The verb→script map is a HINT, and the two halves of that are tested
-// differently (review P1, co1):
+// differently (review P1):
 //
 //   NOT promised: that it is complete. This package does not ship scripts/,
 //     so it cannot enumerate them. A verb missing from here falls through to
@@ -92,7 +92,7 @@ const SCRIPT_FOR_VERB = {
 
 // The default install location. Checked because this package's whole job is
 // to install agmsg, so a person who has never run it reaches this branch too
-// (review P1, co1) — and for them every path below is a command that fails.
+// (review P1) — and for them every path below is a command that fails.
 // Advice that assumes the install is advice they cannot follow.
 function defaultSkillDir() {
   return path.join(os.homedir(), '.agents', 'skills', 'agmsg');
@@ -115,7 +115,7 @@ function printNotACommand(verb, skillDirForTest) {
   const scriptsDir = path.join(dir, 'scripts');
 
   // The contract differs by what is about to be printed, and that is the
-  // point (review P1, co1):
+  // point (review P1):
   //
   //   naming ONE script  -> that script file must exist. The repo-side pin
   //     proves the map matches THIS repo; it says nothing about the tree on
