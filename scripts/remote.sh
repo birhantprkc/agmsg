@@ -1442,6 +1442,30 @@ _remote_sync_engine_start() {
   if [ "$old_state" = "running" ]; then
     kill "$old_pid" 2>/dev/null || true
   fi
+  # The cycle record belongs to the engine that made it, and this is where a new
+  # one begins. Clearing it on STOP is not enough: an engine that crashes, is
+  # killed, or leaves a stale pidfile never runs that path, so its record would
+  # still be on disk when the replacement starts -- and `status` would attribute
+  # a predecessor's success to an engine that has not completed a cycle yet.
+  #
+  # The removal is CHECKED, and the check is absence rather than rm's exit code:
+  # `rm -f` reports success for a file that was not there (which is fine) and
+  # failure for a path it cannot remove at all -- a directory, or one under an
+  # unwritable parent -- where the old record survives. Ignoring that would start
+  # the replacement anyway and reproduce the misattribution through a path the
+  # clear was supposed to close.
+  #
+  # And it runs BEFORE the pidfile is truncated, so a refusal leaves no ownership
+  # claim behind: an engine that will not start must not look like one that owns
+  # this team (#756).
+  local cycle_stamp
+  cycle_stamp="$(_remote_sync_engine_cycle_stamp "$team")"
+  rm -f "$cycle_stamp" 2>/dev/null || true
+  if [ -e "$cycle_stamp" ]; then
+    _remote_sync_engine_start_refused "$team" "$pidfile" \
+      "the previous engine's cycle record at $cycle_stamp could not be removed, and starting now would report its successes as this engine's"
+    return 1
+  fi
   # Writability proven before the spawn -- but AFTER the block above, not before
   # it. Truncating the pidfile first destroys the pid that _remote_sync_engine_status
   # reads to decide whether an old engine owns this team, so the old one is never
@@ -1454,14 +1478,6 @@ _remote_sync_engine_start() {
       "its pidfile could not be written"
     return 1
   fi
-  # The cycle record belongs to the engine that made it, and this is where a new
-  # one begins. Clearing it on STOP is not enough: an engine that crashes, is
-  # killed, or leaves a stale pidfile never runs that path, so its record would
-  # still be on disk when the replacement starts -- and `status` would attribute
-  # a predecessor's success to an engine that has not completed a cycle yet.
-  # Cleared here, before the new engine can be observed as running, so there is
-  # no window in which the old timestamp reads as the new engine's (#756).
-  rm -f "$(_remote_sync_engine_cycle_stamp "$team")"
   # nohup so the engine outlives this connect; remote-sync.sh execs node, so $!
   # stays the engine's own pid and is exactly what _remote_sync_engine_stop signals.
   # fds 3 and 4 are closed explicitly: under bats, fd 3 is the TAP pipe, and a

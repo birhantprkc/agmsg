@@ -350,6 +350,30 @@ remember_engine_pid() {
   printf '%s\n' "$output" | grep -q -F -- "cycles: no successful cycle recorded since this engine started"
 }
 
+@test "sync start: refuses to start when the old cycle record cannot be removed (#756)" {
+  # `rm -f` returns success for a file that was not there and failure for a path
+  # it cannot remove at all. Measured: `rm -f <a directory>` exits 1 and leaves
+  # it. Ignoring that would start the replacement with the predecessor's record
+  # still on disk -- the misattribution, through the very path meant to close it.
+  local fake_node fake_bin stamp
+  stamp="$TEST_SKILL_DIR/run/remote-sync.testteam.cycles.json"
+  fake_node="$(write_fake_node)"
+  fake_bin="$(write_fake_node_ps_fixture "$fake_node" "")"
+  mkdir -p "$stamp"          # undeletable as a file: rm -f will not take it
+  [ -d "$stamp" ]
+
+  run env PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" bash "$SCRIPTS/remote.sh" sync start testteam
+  [ "$status" -ne 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "could not be removed"
+  # No engine, and no ownership claim left behind: a start that refuses must not
+  # look like one that owns this team.
+  [ ! -s "$TEST_SKILL_DIR/run/remote-sync.testteam.pid" ]
+
+  run env PATH="$fake_bin:$PATH" bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  refute grep -qF -- "engine running" <<<"$output"
+}
+
 @test "sync start: replaces stale ownership without signalling a foreign process" {
   local fake_node fake_bin foreign_pid
   fake_node="$(write_fake_node)"
