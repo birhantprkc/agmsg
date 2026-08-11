@@ -40,7 +40,7 @@ BIN="$BATS_TEST_DIRNAME/../bin/agmsg.js"
 }
 
 # EVERY entry in the map, not the one verb a hand-written test happened to
-# pick (review P1, co1). The map is allowed to be incomplete — a new verb
+# pick (review P1). The map is allowed to be incomplete — a new verb
 # missing from it costs nothing — but an entry that is PRESENT and stale makes
 # the message name a path that does not exist, which is worse than the general
 # advice it replaced. Completeness is not pinned; correctness of what is
@@ -57,7 +57,7 @@ BIN="$BATS_TEST_DIRNAME/../bin/agmsg.js"
     console.log("checked " + Object.keys(SCRIPT_FOR_VERB).length);
   ' "$BIN"
   [ "$status" -eq 0 ]
-  # Non-empty, not an exact count (co1): pinning the number would mean adding
+  # Non-empty, not an exact count (review): pinning the number would mean adding
   # a legitimate verb to the map fails this test, which makes the map harder
   # to extend for no safety gained. What must not pass is a map emptied to {}
   # reporting "nothing missing".
@@ -65,7 +65,7 @@ BIN="$BATS_TEST_DIRNAME/../bin/agmsg.js"
 }
 
 # The person this package exists for has NOT installed yet, and they reach
-# this same branch (review P1, co1). Telling them to `bash <install path>` is
+# this same branch (review P1). Telling them to `bash <install path>` is
 # telling them to run a command that fails. HOME is redirected to an empty
 # directory; nothing here touches the network.
 @test "bin/agmsg.js: with nothing installed, it says to install first" {
@@ -84,7 +84,7 @@ BIN="$BATS_TEST_DIRNAME/../bin/agmsg.js"
   mkdir -p "$home/.agents/skills/agmsg/scripts"
   # The FILE, not just the directory. An earlier version of this test created
   # an empty scripts/ and accepted advice pointing at a send.sh that was not
-  # there — the same defect as the map pin, one layer out (review P1, co1).
+  # there — the same defect as the map pin, one layer out (review P1).
   touch "$home/.agents/skills/agmsg/scripts/send.sh"
   run env HOME="$home" node "$BIN" send hello
   [ "$status" -eq 2 ]

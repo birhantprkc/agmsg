@@ -20,7 +20,7 @@ teardown() {
   [ "$status" -ne 0 ]
 }
 
-# --- co1 P1 finding: macOS CLT trampoline ------------------------------------
+# --- P1 finding: macOS CLT trampoline ------------------------------------
 # On Darwin, /usr/bin/python3 exists on PATH (so a bare `command -v python3`
 # succeeds) even when Xcode Command Line Tools are NOT installed -- it's a
 # trampoline that pops the OS's own "install command line developer tools?"
@@ -43,7 +43,7 @@ EOF
   [ "$status" -eq 0 ]
 }
 
-@test "python3_usable: Darwin + /usr/bin/python3 + CLT NOT installed -> NOT usable (the actual bug co1 found)" {
+@test "python3_usable: Darwin + /usr/bin/python3 + CLT NOT installed -> NOT usable (the actual bug found)" {
   _agmsg_python3_resolved_path() { printf '/usr/bin/python3'; }
   _agmsg_platform() { printf 'Darwin'; }
   local fakebin; fakebin="$(mktemp -d)"
@@ -105,7 +105,7 @@ EOF
   [[ "$output" != *"SHOULD NEVER RUN"* ]]
 }
 
-# --- co1 delta review P1: symlink resolution ---------------------------------
+# --- delta review P1: symlink resolution ---------------------------------
 # `command -v python3` can resolve through a symlink (e.g. ~/bin/python3 ->
 # /usr/bin/python3) whose literal string is NOT "/usr/bin/python3", even
 # though executing it still reaches the trampoline. These tests point

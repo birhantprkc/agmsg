@@ -1361,7 +1361,7 @@ _truncate_team_config() {  # $1 = team -> replaces its config.json with malforme
 }
 
 @test "status <team> [--json]: the human and --json forms classify every config shape identically (#650 review)" {
-  # co2's finding: _remote_config_malformed checked json_valid but not the
+  # a review finding: _remote_config_malformed checked json_valid but not the
   # top-level TYPE, so [] / null / 42 / "text" -- valid JSON, not an object
   # -- passed it, then fell through to json_extract-returns-null same as a
   # genuinely empty binding: rc=1 "never connected". The --json path's
@@ -1419,7 +1419,7 @@ _truncate_team_config() {  # $1 = team -> replaces its config.json with malforme
 
 
 #
-# Deterministic, single-threaded simulation of the race co1 flagged (see
+# Deterministic, single-threaded simulation of the race flagged in review (see
 # feat/remote-connect-onboarding's PR #479): rather than actually racing two
 # live processes, pre-insert a row in the runtime `locks` table matching
 # exactly what `_remote_pending_lock_acquire` would have written, then
@@ -1489,7 +1489,7 @@ VALUES ('remote-pending.$key', $owner_pid, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
   [[ "$output" == *"[x] python3 on PATH"* ]]
 }
 
-# --- co1 delta review P1: doctor must also check node (sync data plane) ----
+# --- delta review P1: doctor must also check node (sync data plane) ----
 # Node is a SEPARATE, independent dependency from python3 (remote sync data
 # plane vs. remote control plane) -- doctor claiming "All checks passed"
 # with age+python3 present but node missing would contradict reality, since

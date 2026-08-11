@@ -88,7 +88,7 @@ teardown() {
   [[ "$output" =~ "Delivery mode set to 'turn'" ]]
 }
 
-@test "dispatch: 'team list' reaches team-list.sh, not team.sh (co1 P1 — 'list' must never be treated as a team name)" {
+@test "dispatch: 'team list' reaches team-list.sh, not team.sh (P1 — 'list' must never be treated as a team name)" {
   run bash "$SCRIPTS/windows/dispatch.sh" --type codex --project "$PROJECT_ALICE" -- team list --json
   [ "$status" -eq 0 ]
   # team.sh's "Team not found: list" / "Team: list" output would appear if

@@ -134,7 +134,7 @@ json_field() {
   [ "$(sqlite_mem "SELECT json_extract('$(printf %s "$teams" | sed "s/'/''/g")', '\$[0].name');")" = "$team" ]
 }
 
-@test "team list --json: fails closed (no payload, exit 2) when a team's config has a duplicate JSON key (co1 P2 — never authoritative on a partial list)" {
+@test "team list --json: fails closed (no payload, exit 2) when a team's config has a duplicate JSON key (P2 — never authoritative on a partial list)" {
   mkdir -p "$SCRIPTS/../teams/badteam"
   printf '{"name":"badteam","agents":{},"agents":{}}' > "$SCRIPTS/../teams/badteam/config.json"
   bash "$SCRIPTS/join.sh" goodteam alice claude-code /tmp/project-a
@@ -176,7 +176,7 @@ json_field() {
   [[ "$output" == *"refusing to print a partial list"* ]]
 }
 
-@test "team list: rejects a non-numeric AGMSG_TEAM_LIST_MAX_TEAMS override (co1 delta review) — never silently unbounded" {
+@test "team list: rejects a non-numeric AGMSG_TEAM_LIST_MAX_TEAMS override (delta review) — never silently unbounded" {
   bash "$SCRIPTS/join.sh" myteam alice claude-code /tmp/project-a
   run bash -c "AGMSG_TEAM_LIST_MAX_TEAMS=not-a-number bash '$SCRIPTS/team-list.sh' --json"
   [ "$status" -ne 0 ]
@@ -199,7 +199,7 @@ json_field() {
   [[ "$output" != *"schema_version"* ]]
 }
 
-@test "team list: rejects an all-digit AGMSG_TEAM_LIST_MAX_TEAMS override too large for bash's native integer arithmetic (co1 delta review round 2)" {
+@test "team list: rejects an all-digit AGMSG_TEAM_LIST_MAX_TEAMS override too large for bash's native integer arithmetic (delta review round 2)" {
   # An all-digit string this long overflows bash's fixed-width `test`
   # arithmetic the SAME way a non-numeric value does (silent "integer
   # expression expected", never true, never truncates) — this is the

@@ -627,7 +627,7 @@ stored_types() {
   [[ "$output" == *"first message ever, after migration"* ]]
 }
 
-# co1's review of #696: the fix above feeds MAX(local_position) straight into
+# A review of #696: the fix above feeds MAX(local_position) straight into
 # sqlite_sequence.seq, an AUTOINCREMENT-authority column -- not a data column
 # like the ones the re-entry guard above already protects. SQLite ranks TEXT
 # above every INTEGER in its default comparison, so a single non-integer
@@ -638,7 +638,7 @@ stored_types() {
 #
 # The existing "not an integer is refused" test above covers RE-ENTRY only
 # (it migrates alpha successfully first, then corrupts the DESTINATION to
-# test _missing_from_dest). This is the gap co1 named: the FIRST-TIME path
+# test _missing_from_dest). This is the gap named: the FIRST-TIME path
 # never validated source cursor types at all before this fix started writing
 # them into sqlite_sequence. Reproduced by corrupting the SHARED cursor
 # BEFORE ever migrating, so the very first attempt is what has to refuse.
@@ -657,7 +657,7 @@ stored_types() {
 
   # Refused, not repaired: the malformed value is still exactly what it was
   # -- silently ignoring it in MAX() would have erased the evidence a bad
-  # cursor exists, which is explicitly not acceptable here (co1).
+  # cursor exists, which is explicitly not acceptable here (review).
   [ "$(sqlite3 "$SHARED" "SELECT local_position FROM read_cursors
         WHERE team='alpha' AND agent='ann';")" = "abc" ]
   # Nothing moved: the shared store still has the team's row, and no

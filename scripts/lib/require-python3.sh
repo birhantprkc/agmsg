@@ -11,7 +11,7 @@
 # command line developer tools?" GUI dialog (the /usr/bin/python3 shim is a
 # CLT installer trampoline, not a real interpreter, until CLT is present).
 #
-# `command -v python3` alone is NOT sufficient to detect this (co1 review,
+# `command -v python3` alone is NOT sufficient to detect this (review,
 # P1): the trampoline file genuinely exists at /usr/bin/python3, so
 # `command -v` reports success even when CLT is not installed -- the
 # dialog only fires once something actually EXECUTES it. So on Darwin,
@@ -23,7 +23,7 @@
 # just exits non-zero with no CLT installed.
 #
 # Comparing `command -v`'s raw output as a literal string is NOT enough
-# either (co1 delta review, P1): PATH may resolve python3 through a
+# either (delta review, P1): PATH may resolve python3 through a
 # symlink -- e.g. ~/bin/python3 -> /usr/bin/python3 -- in which case
 # `command -v` reports `~/bin/python3`, a string comparison against
 # `/usr/bin/python3` misses it, and the trampoline still fires once that

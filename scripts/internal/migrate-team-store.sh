@@ -236,7 +236,7 @@ if [ -e "$DEST" ]; then
   exit 1
 fi
 
-# #695 review (co1): the destination's sqlite_sequence floor below is set
+# #695 review: the destination's sqlite_sequence floor below is set
 # from MAX(local_position) over this team's copied cursors. SQLite stores
 # whatever type a column is given even when it's declared INTEGER (the same
 # looseness "a cursor that is not an integer is refused" already guards on

@@ -39,7 +39,7 @@ describe("shouldSuppressClickAfterDrag", () => {
   });
 
   it("does not suppress a click on a DIFFERENT pane, even immediately after", () => {
-    // Regression (co1, PR #481, 3rd round): a global timestamp with no pane
+    // Regression (#481, 3rd round): a global timestamp with no pane
     // identity would suppress a deliberate click on some other pane header
     // too, just because it lands within the window of an unrelated pane's
     // drag finishing.
@@ -71,7 +71,7 @@ describe("shellPaneFrom", () => {
     // Regression: an earlier version defaulted to "bash" here when the
     // async login_shell fetch hadn't landed yet, which broke on Windows
     // (no bash) and wasn't the user's actual login shell even on unix
-    // (co1 review, PR #431).
+    // (review, PR #431).
     expect(shellPaneFrom(null, "shell-1", "Shell", undefined)).toBeNull();
   });
 
@@ -102,7 +102,7 @@ describe("shellTabStillValid", () => {
   it("goes invalid when the user switched teams during the await", () => {
     // Regression: openShellTab used to commit the new window under the
     // stale (closed-over) team regardless, silently hiding it since only
-    // the current team's windows render (co1, PR #431).
+    // the current team's windows render (#431).
     expect(shellTabStillValid("teamB", "teamA")).toBe(false);
   });
 });
@@ -119,7 +119,7 @@ describe("shellSplitStillValid", () => {
 
   it("goes false when the target window was closed during the await", () => {
     // Regression: openShellInWindow used to commit anyway, leaving an
-    // orphaned pane and `active` pointing at a nonexistent window id (co1,
+    // orphaned pane and `active` pointing at a nonexistent window id (review,
     // PR #431).
     expect(shellSplitStillValid([{ id: "w-2", team: "teamA" }], "w-1", "teamA", "teamA")).toBe(false);
   });
@@ -129,11 +129,11 @@ describe("shellSplitStillValid", () => {
   });
 
   it("goes false when the team switched even though the window is still open", () => {
-    // Regression (2nd co1 round): the target window can survive the await
+    // Regression (2nd round): the target window can survive the await
     // untouched but now belong to the team the user navigated away from —
     // it's a hidden tab at that point, so splitting into it and activating
     // it reproduces the same hidden-active bug shellTabStillValid guards
-    // against on the new-tab path (co1, PR #431).
+    // against on the new-tab path (#431).
     expect(shellSplitStillValid(windows, "w-1", "teamB", "teamA")).toBe(false);
   });
 });
@@ -181,7 +181,7 @@ describe("joinDroppedPaths", () => {
   });
 
   it("rejects the WHOLE drop — returns null, not a sanitized string — when any path has a control character", () => {
-    // Regression (co1, PR #481): a crafted filename containing a newline
+    // Regression (#481): a crafted filename containing a newline
     // written raw to the PTY would submit whatever's on the current prompt
     // line the instant the file is dropped. Rejecting outright (not
     // stripping the bad byte) avoids silently writing a DIFFERENT path than
