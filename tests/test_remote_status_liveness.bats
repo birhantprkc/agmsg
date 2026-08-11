@@ -392,9 +392,15 @@ write_unownable_ps_fixture() {
 
   # What the operator is told. `grep -q`, not `[[ ]]`: a non-last `[[ ]]` is
   # not enforced on bash 3.2 (#670).
-  printf '%s\n' "$output" | grep -q -F "did not become ready, and could not be stopped"
+  printf '%s\n' "$output" | grep -q -F "did not become ready, and this command did not stop it"
   printf '%s\n' "$output" | grep -q -F "pid $child_pid is still running"
   printf '%s\n' "$output" | grep -q -F "keep retrying"
+  # This test drives the ownership-unproven path, where no signal is ever sent.
+  # The text must not claim signalling was refused -- that is the other branch,
+  # and asserting a cause this run did not establish is the defect the wording
+  # was changed for (review on #750).
+  printf '%s\n' "$output" | grep -q -F "either could not confirm the process was ours or could not signal it"
+  refute grep -q -F "was not allowed to signal it" <<<"$output"
   # That repeating the command accumulates them, and that the pidfile only
   # records the newest -- the part that turns one stuck engine into several.
   printf '%s\n' "$output" | grep -q -F "leaves another one behind"

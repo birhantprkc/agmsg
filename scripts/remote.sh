@@ -2106,31 +2106,45 @@ cmd_sync_start() {
       echo "agmsg: sync engine for '$team' did not become ready" >&2
       return 1
     fi
-    # The reap could not stop it, and the engine is still running. Measured
-    # cause: under Codex's sandbox this shell is not allowed to signal other
-    # processes at all -- `kill -0` and `kill -TERM` on the engine we just
-    # started both return "Operation not permitted", while the same signal
-    # from outside the sandbox is allowed. _remote_sync_engine_reap_owned
-    # sends TERM then KILL and gives up, which is correct; what was missing is
-    # saying what it leaves behind.
+    # The reap did not stop it, and the engine is still running.
     #
-    # Saying only "the pidfile was preserved" reads as a file kept for
-    # diagnosis. It is a live process that cannot reach the server, retries on
-    # a backoff forever, and is not stoppable from here -- and since the
-    # pidfile only ever names the most recent one, a second attempt leaves the
-    # first with nothing pointing at it. Measured: one after the first failed
-    # attempt, two after the second.
+    # _remote_sync_engine_reap_owned returns non-zero for two different
+    # reasons, and this branch cannot tell them apart:
+    #
+    #   ownership unproven   it returns BEFORE any kill -- deliberately, since
+    #                        it must never signal a pid it cannot prove is ours
+    #   signalling failed    TERM then KILL were sent and it survived
+    #
+    # So the text below says what is known -- it is running, and this command
+    # did not stop it -- and offers the sandbox as the likely reason rather
+    # than the established one. An earlier version asserted "this shell was not
+    # allowed to signal it" unconditionally, which is false on the first path,
+    # and the test here drives exactly that path. Naming a cause the check did
+    # not establish sends the next reader somewhere the evidence does not.
+    #
+    # The Codex observation is still worth carrying, because it produces BOTH:
+    # measured there, `kill -0` and `kill -TERM` on the engine this shell just
+    # started return "Operation not permitted" while the same signal from
+    # outside is allowed -- so ownership cannot be confirmed from in there
+    # either.
+    #
+    # Saying only "the pidfile was preserved" read as a file kept for
+    # diagnosis. It is a live process that cannot reach the server and retries
+    # on a backoff forever -- and since the pidfile only ever names the most
+    # recent one, a second attempt leaves the first with nothing pointing at
+    # it. Measured: one after the first failed attempt, two after the second.
     agmsg_lock_release
     {
-      echo "agmsg: sync engine for '$team' did not become ready, and could not be stopped."
+      echo "agmsg: sync engine for '$team' did not become ready, and this command did not stop it."
       echo "  pid $started_pid is still running. It cannot reach the server -- that is why"
       echo "  it never became ready -- and it will keep retrying on a backoff."
-      echo "  This shell was not allowed to signal it. If the agent is sandboxed"
-      echo "  (Codex is), signals to other processes are blocked inside that sandbox."
+      echo "  This shell either could not confirm the process was ours or could not signal it."
+      echo "  A sandboxed agent (Codex is one) produces both: signals to other processes are"
+      echo "  blocked inside it, and ownership cannot be confirmed from in there either."
       echo "  Nothing is syncing for this team meanwhile."
       echo "  Running sync start again leaves another one behind, and only the newest"
       echo "  is recorded in $(_remote_sync_engine_pidfile "$team")."
-      echo "  Stop it from a shell outside the sandbox:"
+      echo "  Stop it from a shell that can signal it:"
       echo "    kill $started_pid"
       echo "  or give up the binding entirely:"
       echo "    remote.sh disconnect $(agmsg_shq "$team")"
