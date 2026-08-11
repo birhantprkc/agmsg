@@ -115,15 +115,16 @@ function rosterJournalPath(team) {
 // a raw Node client to find out which one was refusing the certificate (#744).
 //
 // The chain is walked rather than read one level deep because an agent-wrapped
-// or proxied request nests further, and bounded because a cause chain can be
-// cyclic.
+// or proxied request nests further. The depth bound is what makes that safe: a
+// cause chain is not guaranteed to be a tree, and `a.cause = b; b.cause = a` is
+// reachable from user-supplied errors. A visited-set was tried here as well and
+// removed — with the bound in place it changes no output, and a mechanism no
+// test can distinguish is one the next reader has to reason about for nothing.
 function causeOf(error) {
-  const seen = new Set();
   let current = error;
   let code = current?.code ?? null;
   let cause = null;
-  for (let depth = 0; depth < 8 && current?.cause && !seen.has(current.cause); depth += 1) {
-    seen.add(current.cause);
+  for (let depth = 0; depth < 8 && current?.cause; depth += 1) {
     current = current.cause;
     if (code === null && current?.code !== undefined) code = current.code;
     if (typeof current?.message === "string" && current.message !== "") cause = current.message;
