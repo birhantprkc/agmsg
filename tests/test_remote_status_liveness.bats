@@ -374,3 +374,67 @@ remember_engine_pid() {
   [[ "$output" == *"team 'testteam' is disconnected"* ]]
   [ ! -e "$TEST_SKILL_DIR/run/remote-sync.testteam.pid" ]
 }
+
+# A ps fixture that never confirms ownership: every argv query answers with
+# something that is not this team's engine. `_remote_sync_engine_status` then
+# reports the pid as not-running, so `_remote_sync_engine_reap_owned` returns
+# without signalling -- by design, since it must never signal a pid it cannot
+# prove it owns.
+#
+# That models what a sandbox does. Measured under Codex's: `kill -0` and
+# `kill -TERM` on the engine this shell just started both return "Operation
+# not permitted", while the same signal from outside is allowed. The engine
+# survives, and ownership cannot be established from in there either.
+write_unownable_ps_fixture() {
+  local fake_bin="$TEST_SKILL_DIR/fake-ps-unownable"
+  mkdir -p "$fake_bin"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'args=0' \
+    'case " $* " in *" -o args= "*) args=1 ;; esac' \
+    '[ "$args" = 1 ] || exec /bin/ps "$@"' \
+    "printf '%s\\n' 'sleep 30'" > "$fake_bin/ps"
+  chmod +x "$fake_bin/ps"
+  printf '%s\n' "$fake_bin"
+}
+
+@test "sync start says a live engine was left behind when it cannot be reaped (#731)" {
+  local fake_node="$TEST_SKILL_DIR/fake-node-unreapable" fake_bin child_pid_file child_pid
+  child_pid_file="$TEST_SKILL_DIR/unreapable-child.pid"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "$$" > "$AGMSG_TEST_CHILD_PID_FILE"' \
+    'while :; do sleep 1; done' > "$fake_node"
+  chmod +x "$fake_node"
+  fake_bin="$(write_unownable_ps_fixture)"
+
+  run env PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" \
+    AGMSG_TEST_CHILD_PID_FILE="$child_pid_file" \
+    bash "$SCRIPTS/remote.sh" sync start testteam
+  [ "$status" -ne 0 ]
+
+  child_pid="$(cat "$child_pid_file")"
+  # The premise: it really is still running. Without this the assertions below
+  # would pass just as well against a message about a process that had died,
+  # which is the thing the old wording could not distinguish.
+  kill -0 "$child_pid"
+
+  # What the operator is told. `grep -q`, not `[[ ]]`: a non-last `[[ ]]` is
+  # not enforced on bash 3.2 (#670).
+  printf '%s\n' "$output" | grep -q -F "did not become ready, and this command did not stop it"
+  printf '%s\n' "$output" | grep -q -F "pid $child_pid is still running"
+  printf '%s\n' "$output" | grep -q -F "keep retrying"
+  # This test drives the ownership-unproven path, where no signal is ever sent.
+  # The text must not claim signalling was refused -- that is the other branch,
+  # and asserting a cause this run did not establish is the defect the wording
+  # was changed for (review on #750).
+  printf '%s\n' "$output" | grep -q -F "either could not confirm the process was ours or could not signal it"
+  refute grep -q -F "was not allowed to signal it" <<<"$output"
+  # That repeating the command accumulates them, and that the pidfile only
+  # records the newest -- the part that turns one stuck engine into several.
+  printf '%s\n' "$output" | grep -q -F "leaves another one behind"
+  # And a way out that works from where the operator actually is.
+  printf '%s\n' "$output" | grep -q -F "kill $child_pid"
+  printf '%s\n' "$output" | grep -q -F "remote.sh disconnect 'testteam'"
+
+  kill -9 "$child_pid" 2>/dev/null || true
+  wait "$child_pid" 2>/dev/null || true
+}
