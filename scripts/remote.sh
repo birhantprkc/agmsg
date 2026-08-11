@@ -2102,11 +2102,39 @@ cmd_sync_start() {
   if [ "$ready" -ne 1 ]; then
     if _remote_sync_engine_reap_owned "$team" "$started_pid"; then
       rm -f "$(_remote_sync_engine_pidfile "$team")"
-    else
-      echo "agmsg: failed engine ownership was preserved in its pidfile for diagnosis" >&2
+      agmsg_lock_release
+      echo "agmsg: sync engine for '$team' did not become ready" >&2
+      return 1
     fi
+    # The reap could not stop it, and the engine is still running. Measured
+    # cause: under Codex's sandbox this shell is not allowed to signal other
+    # processes at all -- `kill -0` and `kill -TERM` on the engine we just
+    # started both return "Operation not permitted", while the same signal
+    # from outside the sandbox is allowed. _remote_sync_engine_reap_owned
+    # sends TERM then KILL and gives up, which is correct; what was missing is
+    # saying what it leaves behind.
+    #
+    # Saying only "the pidfile was preserved" reads as a file kept for
+    # diagnosis. It is a live process that cannot reach the server, retries on
+    # a backoff forever, and is not stoppable from here -- and since the
+    # pidfile only ever names the most recent one, a second attempt leaves the
+    # first with nothing pointing at it. Measured: one after the first failed
+    # attempt, two after the second.
     agmsg_lock_release
-    echo "agmsg: sync engine for '$team' did not become ready" >&2
+    {
+      echo "agmsg: sync engine for '$team' did not become ready, and could not be stopped."
+      echo "  pid $started_pid is still running. It cannot reach the server -- that is why"
+      echo "  it never became ready -- and it will keep retrying on a backoff."
+      echo "  This shell was not allowed to signal it. If the agent is sandboxed"
+      echo "  (Codex is), signals to other processes are blocked inside that sandbox."
+      echo "  Nothing is syncing for this team meanwhile."
+      echo "  Running sync start again leaves another one behind, and only the newest"
+      echo "  is recorded in $(_remote_sync_engine_pidfile "$team")."
+      echo "  Stop it from a shell outside the sandbox:"
+      echo "    kill $started_pid"
+      echo "  or give up the binding entirely:"
+      echo "    remote.sh disconnect $(agmsg_shq "$team")"
+    } >&2
     return 1
   fi
   agmsg_lock_release
