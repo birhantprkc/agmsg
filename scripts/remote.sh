@@ -1422,10 +1422,60 @@ _remote_sync_engine_start_refused() {
 }
 
 _remote_sync_engine_start() {
+  local team="$1"
+  local lock_taken=0
+  case "$AGMSG_HELD_LOCKS" in
+    *"$TEAMS_DIR/$team/.config.lock"*) : ;;
+    *)
+      if [ -d "$TEAMS_DIR/$team" ]; then
+        if agmsg_lock_acquire "$TEAMS_DIR/$team"; then
+          lock_taken=1
+        else
+          # The acquire has already said why on stderr. A start that cannot
+          # serialise itself is refused rather than run unserialised: the
+          # failure this covers is two live engines, and "probably alone" is
+          # not a property anything downstream can check.
+          _remote_sync_engine_start_refused "$team" "$TEAMS_DIR/$team" \
+            "its team lock could not be acquired, so a second engine could start alongside this one"
+          return 1
+        fi
+      fi
+      ;;
+  esac
+
+  # The lock is released on EVERY exit, so the work is a separate function and
+  # this one is the only place that unlocks. Written inline it would need the
+  # release repeated at six returns and the success path; one of those is how
+  # a lock gets held for the life of a shell.
+  local rc=0
+  _remote_sync_engine_start_locked "$@" || rc=$?
+  # `if`, not `[ ] && release`: under `set -e` an AND-OR list whose first half
+  # is false makes the list false, and the list is a command like any other.
+  if [ "$lock_taken" -eq 1 ]; then agmsg_lock_release; fi
+  return "$rc"
+}
+
+_remote_sync_engine_start_locked() {
   local team="$1" startup_nonce="${2:-}" pidfile logfile old_pid old_state rundir
   pidfile="$(_remote_sync_engine_pidfile "$team")"
   logfile="$CONNECTION_ROOT/run/remote-sync.$team.log"
   rundir="$CONNECTION_ROOT/run"
+
+  # One engine per team, enforced where the invariant lives rather than at each
+  # caller. Everything from here to the pidfile write is check-then-act -- read
+  # the old pid, decide it is ours, kill it, truncate, spawn, record -- and two
+  # callers inside that window both spawn. The pidfile then names the second,
+  # and the FIRST is invisible to `status` and unreachable by `stop`: the orphan
+  # state this file guards against elsewhere, produced by the guard's own gap.
+  #
+  # Of the five callers, only `sync start` held the lock across its spawn.
+  # `pull`, `connect`, `unlock` and `set-endpoint` did not -- pull releases at
+  # line 934 and spawns at 998, and the other three never take it at all (#762).
+  #
+  # Taken here, so a caller cannot forget, and skipped when this process already
+  # holds it: the lock is a mkdir and is NOT reentrant, so acquiring it under
+  # `sync start` would spin until its own timeout and then refuse to start an
+  # engine because of a lock it is holding itself.
   # Cleared first: this is a global, and the early returns below happen before
   # any spawn. Left alone, a caller that reads it after a refusal would get the
   # pid of whatever this function started the previous time it was called.

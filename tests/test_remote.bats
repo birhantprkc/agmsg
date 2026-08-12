@@ -1555,6 +1555,50 @@ VALUES ('remote-pending.$key', $owner_pid, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 
 PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
 
+@test "remote pull: its engine start is serialised, and it was not before (#762)" {
+  # pull is one of the four callers that spawned OUTSIDE the lock -- it acquires
+  # at line 915 and releases at 934, then starts the engine at 998. Two pulls in
+  # that window both spawn; the pidfile names the second and the first becomes
+  # an orphan, invisible to `status` and unreachable by `stop`.
+  #
+  # The lock is taken inside the start helper now, so this holds for pull without
+  # pull knowing about it. Driven by holding the team lock from outside: the
+  # start must refuse rather than race. The pull itself still succeeds -- its
+  # purpose is to bring the team here, and it has -- which is why the assertion
+  # is on the engine, not on the command's exit status.
+  MOCK_TEAM_CIPHER_PROFILE=none
+  restart_mock_server
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" locked
+  [ "$status" -eq 0 ]
+  local pidfile="$TEST_SKILL_DIR/run/remote-sync.locked.pid"
+  [ -s "$pidfile" ]
+  local first_pid engines_before
+  first_pid="$(cat "$pidfile")"
+  kill "$first_pid" 2>/dev/null || true
+  # Counted by argv, not by pidfile: the failure this covers IS an engine the
+  # pidfile does not name, so asking the record whether the record is complete
+  # answers nothing. (`pgrep -fa` is not portable here -- macOS pgrep has no
+  # -a and reads the pattern as an option's argument.)
+  #
+  # A count rather than zero, because killing the pid the pidfile named does not
+  # always remove the process from argv immediately -- measured, and it is the
+  # same gap in miniature.
+  engines_before="$(ps -ax -o command= | grep -c "remote-sync.sh run --team locked" || true)"
+
+  # Now the same start with the lock held elsewhere.
+  local lock="$TEST_SKILL_DIR/teams/locked/.config.lock"
+  mkdir "$lock"
+  rm -f "$pidfile"        # removed, not emptied: teardown reads this file
+  run env AGMSG_LOCK_TRIES=2 bash "$SCRIPTS/remote.sh" sync start locked
+  [ "$status" -ne 0 ]
+  printf '%s\n' "$output" | grep -q -E -- "lock could not be acquired|timed out acquiring registry lock"
+  [ ! -s "$pidfile" ]
+  # The refusal added no engine. This is the assertion the issue is about: not
+  # "the pidfile is empty" but "nothing new is running that nobody can see".
+  [ "$(ps -ax -o command= | grep -c "remote-sync.sh run --team locked" || true)" -le "$engines_before" ]
+  rmdir "$lock"
+}
+
 @test "remote pull: clones a team, keeping the id the server gave" {
   # This team is a PLAIN one: say so. The fixture's default declaration is
   # age-v1, and the engine now follows the declaration rather than the

@@ -457,6 +457,39 @@ remember_engine_pid() {
   [ ! -e "$TEST_SKILL_DIR/run/remote-sync.testteam.pid" ]
 }
 
+@test "the engine start holds the team lock across the spawn (#762)" {
+  # `sync start` was the ONE caller of five that held the lock over its spawn;
+  # pull, connect, unlock and set-endpoint did not, so two of them in the same
+  # window both spawned and the pidfile named only the second. The first was
+  # then invisible to `status` and unreachable by `stop` -- the orphan state
+  # this file guards against elsewhere, produced by the guard's own gap.
+  #
+  # The lock is taken inside _remote_sync_engine_start now, so this holds for
+  # every caller rather than for the one that remembered. Measured here by
+  # holding the lock from outside and watching the start refuse rather than
+  # race: a start that cannot serialise itself must not run unserialised.
+  # Driven through `sync start`, which takes the lock ITSELF before calling the
+  # helper: the assertion is that the helper does not deadlock against a lock
+  # its own caller is holding. The lock is a mkdir and is not reentrant, so a
+  # naive "always acquire" would spin to its timeout and refuse to start an
+  # engine because of a lock the same process holds. That is the case this
+  # fix's shape has to survive, and it is the one a test can drive here.
+  local fake_node fake_bin lock
+  fake_node="$(write_fake_node)"
+  fake_bin="$(write_fake_node_ps_fixture "$fake_node")"
+  lock="$TEST_SKILL_DIR/teams/testteam/.config.lock"
+
+  run env PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" AGMSG_LOCK_TRIES=2 \
+    bash "$SCRIPTS/remote.sh" sync start testteam
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "Sync engine started"
+  remember_engine_pid
+  kill -0 "$ENGINE_PID"
+  # And the lock is not left behind -- a start that keeps it would block every
+  # later command on this team.
+  [ ! -d "$lock" ]
+}
+
 @test "concurrent sync start serializes ownership to one engine" {
   local fake_node fake_bin first_out second_out first_status=0 second_status=0
   fake_node="$(write_fake_node)"
