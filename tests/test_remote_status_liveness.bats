@@ -457,6 +457,135 @@ remember_engine_pid() {
   [ ! -e "$TEST_SKILL_DIR/run/remote-sync.testteam.pid" ]
 }
 
+@test "the engine start holds the team lock across the spawn (#762)" {
+  # `sync start` was the ONE caller of five that held the lock over its spawn;
+  # pull, connect, unlock and set-endpoint did not, so two of them in the same
+  # window both spawned and the pidfile named only the second. The first was
+  # then invisible to `status` and unreachable by `stop` -- the orphan state
+  # this file guards against elsewhere, produced by the guard's own gap.
+  #
+  # The lock is taken inside _remote_sync_engine_start now, so this holds for
+  # every caller rather than for the one that remembered. Measured here by
+  # holding the lock from outside and watching the start refuse rather than
+  # race: a start that cannot serialise itself must not run unserialised.
+  # Driven through `sync start`, which takes the lock ITSELF before calling the
+  # helper: the assertion is that the helper does not deadlock against a lock
+  # its own caller is holding. The lock is a mkdir and is not reentrant, so a
+  # naive "always acquire" would spin to its timeout and refuse to start an
+  # engine because of a lock the same process holds. That is the case this
+  # fix's shape has to survive, and it is the one a test can drive here.
+  local fake_node fake_bin lock
+  fake_node="$(write_fake_node)"
+  fake_bin="$(write_fake_node_ps_fixture "$fake_node")"
+  lock="$TEST_SKILL_DIR/teams/testteam/.config.lock"
+
+  run env PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" AGMSG_LOCK_TRIES=2 \
+    bash "$SCRIPTS/remote.sh" sync start testteam
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "Sync engine started"
+  remember_engine_pid
+  kill -0 "$ENGINE_PID"
+  # And the lock is not left behind -- a start that keeps it would block every
+  # later command on this team.
+  [ ! -d "$lock" ]
+}
+
+@test "the engine start acquires the lock itself, and refuses when it cannot (#762)" {
+  # The central contract of this change: a caller that does not hold the lock
+  # gets the whole check-then-act serialised by the helper, not by remembering
+  # to lock first. Until the sourceable seam existed this could not be driven --
+  # holding the lock from outside stops every command at an earlier acquire of
+  # its own -- so it went untested and was named as untested. It is testable now.
+  #
+  # `agmsg_lock_acquire` and the locked body are both replaced after sourcing:
+  # one records that it was called and can be made to fail, the other records
+  # whether the wrapper got that far. Nothing is re-implemented -- the wrapper
+  # under test is the production one.
+  run bash -c '
+    set -uo pipefail
+    export AGMSG_SYNC_CONNECTION_DIR='"$TEST_SKILL_DIR"'
+    . '"$SCRIPTS"'/remote.sh 2>/dev/null
+    log="$(mktemp)"
+    agmsg_lock_acquire() { echo "acquire:$1" >> "$log"; return "${STUB_ACQUIRE_RC:-0}"; }
+    agmsg_lock_release_one() { echo "release:$1" >> "$log"; }
+    _remote_sync_engine_start_locked() { echo "locked" >> "$log"; return 0; }
+
+    # 1. The caller holds nothing, so the wrapper must acquire.
+    STUB_ACQUIRE_RC=0 _remote_sync_engine_start testteam >/dev/null 2>&1
+    grep -q "^acquire:.*/teams/testteam$" "$log" || { echo "NO_ACQUIRE"; exit 1; }
+    grep -q "^locked$" "$log" || { echo "NEVER_REACHED_BODY"; exit 1; }
+    grep -q "^release:.*/teams/testteam$" "$log" || { echo "NOT_RELEASED"; exit 1; }
+
+    # 2. The acquire fails: the body must not run, and the call must report it.
+    : > "$log"
+    STUB_ACQUIRE_RC=1 _remote_sync_engine_start testteam >/dev/null 2>&1 && { echo "REFUSAL_RETURNED_ZERO"; exit 1; }
+    grep -q "^locked$" "$log" && { echo "BODY_RAN_UNSERIALISED"; exit 1; }
+    grep -q "^release:" "$log" && { echo "RELEASED_A_LOCK_IT_NEVER_TOOK"; exit 1; }
+    echo acquire-contract-ok
+  '
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "acquire-contract-ok"
+}
+
+@test "the engine start restores all three traps the acquire takes (#762)" {
+  # Drives `_remote_sync_engine_start` itself. The previous version of this test
+  # re-implemented the wrapper's save/acquire/release/replay in the test body and
+  # asserted on the copy: it passed with the implementation reduced to EXIT-only,
+  # which is the mutation it was written to catch. Review caught that; the fix is
+  # to call the real function, which is why remote.sh is now sourceable.
+  run bash -c '
+    set -uo pipefail
+    export AGMSG_SYNC_CONNECTION_DIR='"$TEST_SKILL_DIR"'
+    . '"$SCRIPTS"'/remote.sh 2>/dev/null
+    trap "echo CALLER_EXIT" EXIT
+    trap "echo CALLER_INT; exit 130" INT
+    trap "echo CALLER_TERM; exit 143" TERM
+    # Make the start fail fast and INSIDE the locked section: a directory where
+    # the pidfile goes. What is under test is the trap state it leaves behind,
+    # not whether an engine appeared.
+    mkdir -p "'"$TEST_SKILL_DIR"'/run/remote-sync.testteam.pid"
+    _remote_sync_engine_start testteam >/dev/null 2>&1 || true
+    rmdir "'"$TEST_SKILL_DIR"'/run/remote-sync.testteam.pid" 2>/dev/null || true
+    # Captured into a variable, NOT piped. In bash 3.2 the left side of a
+    # pipeline is a subshell with the traps reset, so `trap -p | grep` reports
+    # nothing there and this assertion fails on a correct implementation --
+    # measured: it passes under bash 5 and fails under 3.2, which is why it was
+    # green here and red on the macOS CI leg. Command substitution is also a
+    # subshell but reports the outer shell traps in both versions (70 bytes).
+    installed="$(trap -p EXIT INT TERM)"
+    for want in CALLER_EXIT CALLER_INT CALLER_TERM; do
+      case "$installed" in *"$want"*) ;; *) echo "MISSING:$want"; exit 1 ;; esac
+    done
+    case "$installed" in *agmsg_lock_release*) echo "LIBRARY_HANDLER_LEFT"; exit 1 ;; esac
+    echo wiring-ok
+  '
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "wiring-ok"
+}
+
+@test "releasing the engine's own lock leaves other held locks alone (#762)" {
+  # `agmsg_lock_release` drops every lock the process holds, and the library's
+  # contract is that a caller may hold several. The engine start acquires ONE,
+  # so it must release one: releasing all of them takes locks away from an
+  # operation that is still using them.
+  run bash -c '
+    set -euo pipefail
+    . '"$SCRIPTS"'/lib/registry-lock.sh
+    root="$(mktemp -d)"
+    mkdir -p "$root/a" "$root/b"
+    agmsg_lock_acquire "$root/a"
+    agmsg_lock_acquire "$root/b"
+    agmsg_lock_release_one "$root/a"
+    [ ! -d "$root/a/.config.lock" ] || { echo "own lock not released"; exit 1; }
+    [ -d "$root/b/.config.lock" ] || { echo "OTHER lock was released"; exit 1; }
+    case "$AGMSG_HELD_LOCKS" in *"$root/b/.config.lock"*) ;; *) echo "bookkeeping lost the other lock"; exit 1 ;; esac
+    case "$AGMSG_HELD_LOCKS" in *"$root/a/.config.lock"*) echo "bookkeeping kept the released lock"; exit 1 ;; esac
+    echo ok
+  '
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "ok"
+}
+
 @test "concurrent sync start serializes ownership to one engine" {
   local fake_node fake_bin first_out second_out first_status=0 second_status=0
   fake_node="$(write_fake_node)"

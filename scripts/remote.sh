@@ -31,9 +31,22 @@ set -euo pipefail
 # remote team into an empty local team. An encrypted pull remains locked until
 # `unlock` confirms the handed authority and starts the background sync engine.
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# `${BASH_SOURCE[0]}` rather than `$0`, so this resolves the same whether the
+# file is executed or sourced. Sourcing is what lets a test call the internal
+# functions directly; with `$0` it resolved to the sourcing shell and every
+# `source "$SCRIPT_DIR/lib/..."` below failed (#762).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONNECTION_ROOT="${AGMSG_SYNC_CONNECTION_DIR:-$SKILL_DIR}"
+
+# Whether the caller of _remote_sync_engine_start already holds this team's lock.
+#
+# Assigned unconditionally, NOT `${VAR:-0}`: the point of the flag is that it
+# cannot be supplied from outside. An exported variable of this name from a
+# parent process would otherwise make the engine start skip its own locking and
+# run the check-then-act unserialised -- the failure this flag exists to prevent,
+# handed to anything upstream that sets a name (#762).
+_REMOTE_ENGINE_CALLER_HOLDS_LOCK=0
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/storage.sh"
 # shellcheck disable=SC1091
@@ -1422,10 +1435,95 @@ _remote_sync_engine_start_refused() {
 }
 
 _remote_sync_engine_start() {
+  local team="$1"
+  # Skipped only when THIS PROCESS took the lock on the way in, proved by a flag
+  # a caller sets after its own successful acquire -- not by `AGMSG_HELD_LOCKS`.
+  # That variable is seeded from the environment (registry-lock.sh:27), so
+  # anything upstream can export it and be believed, and a substring test over it
+  # would additionally let one team's lock path vouch for another's when one name
+  # is a prefix of the other. Ownership has to be something this process did, not
+  # something it was told.
+  # `agmsg_lock_acquire` installs its own EXIT/INT/TERM traps, and its comment
+  # says so: "no current registry writer sets its own trap; a future caller that
+  # does must chain these in." Acquiring here made that false. `cmd_unlock` sets
+  # an EXIT trap to remove the handoff temp directory, and this acquire replaced
+  # it -- the directory survived every unlock that reached an engine start, which
+  # is how the suite caught it: an unrelated test asserts no such directory is
+  # left anywhere in $TMPDIR.
+  #
+  # So the caller's trap is saved before the acquire and restored after the
+  # release, and the window between them is exactly the critical section the
+  # library's own traps are there to protect.
+  local lock_taken=0 saved_traps=""
+  if [ "${_REMOTE_ENGINE_CALLER_HOLDS_LOCK:-0}" != "1" ] && [ -d "$TEAMS_DIR/$team" ]; then
+    # All THREE that the acquire overwrites, not just EXIT. `cmd_unlock` sets
+    # its cleanup on EXIT INT TERM HUP; restoring EXIT alone leaves the
+    # library's `agmsg_lock_release; exit 130` on INT and its TERM twin in
+    # place, so a Ctrl-C during an unlock would exit without removing the
+    # handoff directory -- the same leak this chaining was added to stop, on the
+    # paths nobody presses on a good day. (HUP is not touched by the acquire, so
+    # the caller's HUP handler survives on its own.)
+    saved_traps="$(trap -p EXIT INT TERM)"
+    if agmsg_lock_acquire "$TEAMS_DIR/$team"; then
+      lock_taken=1
+    else
+      # The acquire has already said why on stderr. A start that cannot
+      # serialise itself is refused rather than run unserialised: the failure
+      # this covers is two live engines, and "probably alone" is not a property
+      # anything downstream can check.
+      _remote_sync_engine_start_refused "$team" "$TEAMS_DIR/$team" \
+        "its team lock could not be acquired, so a second engine could start alongside this one"
+      return 1
+    fi
+  fi
+
+  # The lock is released on EVERY exit, so the work is a separate function and
+  # this one is the only place that unlocks. Written inline it would need the
+  # release repeated at six returns and the success path; one of those is how
+  # a lock gets held for the life of a shell.
+  local rc=0
+  _remote_sync_engine_start_locked "$@" || rc=$?
+  # `if`, not `[ ] && release`: under `set -e` an AND-OR list whose first half
+  # is false makes the list false, and the list is a command like any other.
+  # Releases the ONE lock this function took. `agmsg_lock_release` drops every
+  # lock the process holds, and the library's contract is that a caller may hold
+  # several: releasing all of them here would take locks away from an operation
+  # that is still using them.
+  if [ "$lock_taken" -eq 1 ]; then
+    agmsg_lock_release_one "$TEAMS_DIR/$team"
+    # Put back whatever the caller had, including "nothing": leaving the
+    # library's `agmsg_lock_release` on EXIT would also make a later exit drop
+    # locks this function never took.
+    # Clear all three first, then replay whatever the caller had. `trap -p`
+    # prints nothing for a signal with no handler, so replaying alone would
+    # leave the library's handler on any signal the caller had not set.
+    trap - EXIT INT TERM
+    if [ -n "$saved_traps" ]; then eval "$saved_traps"; fi
+  fi
+  return "$rc"
+}
+
+_remote_sync_engine_start_locked() {
   local team="$1" startup_nonce="${2:-}" pidfile logfile old_pid old_state rundir
   pidfile="$(_remote_sync_engine_pidfile "$team")"
   logfile="$CONNECTION_ROOT/run/remote-sync.$team.log"
   rundir="$CONNECTION_ROOT/run"
+
+  # One engine per team, enforced where the invariant lives rather than at each
+  # caller. Everything from here to the pidfile write is check-then-act -- read
+  # the old pid, decide it is ours, kill it, truncate, spawn, record -- and two
+  # callers inside that window both spawn. The pidfile then names the second,
+  # and the FIRST is invisible to `status` and unreachable by `stop`: the orphan
+  # state this file guards against elsewhere, produced by the guard's own gap.
+  #
+  # Of the five callers, only `sync start` held the lock across its spawn.
+  # `pull`, `connect`, `unlock` and `set-endpoint` did not -- pull releases at
+  # line 934 and spawns at 998, and the other three never take it at all (#762).
+  #
+  # Taken here, so a caller cannot forget, and skipped when this process already
+  # holds it: the lock is a mkdir and is NOT reentrant, so acquiring it under
+  # `sync start` would spin until its own timeout and then refuse to start an
+  # engine because of a lock it is holding itself.
   # Cleared first: this is a global, and the early returns below happen before
   # any spawn. Left alone, a caller that reads it after a refusal would get the
   # pid of whatever this function started the previous time it was called.
@@ -2196,6 +2294,10 @@ cmd_sync_start() {
   [ $# -eq 1 ] || { echo "Usage: remote.sh sync start <team>" >&2; exit 1; }
   agmsg_validate_team_name "$team" || exit 1
   agmsg_lock_acquire "$TEAMS_DIR/$team" || exit 1
+  # Set only after the acquire returned success, and only in the process that
+  # made the call: this is what _remote_sync_engine_start trusts instead of the
+  # inheritable AGMSG_HELD_LOCKS, so it must never be set optimistically (#762).
+  _REMOTE_ENGINE_CALLER_HOLDS_LOCK=1
   cfg="$(_remote_team_config "$team")"
   connected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.connected_at')"
   disconnected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.disconnected_at')"
@@ -2221,9 +2323,14 @@ cmd_sync_start() {
   [ -f "$logfile" ] && log_offset=$(( $(wc -c < "$logfile" | tr -d ' ') + 1 ))
   startup_nonce="$(compat_uuid7)"
   if ! _remote_sync_engine_start "$team" "$startup_nonce"; then
+    _REMOTE_ENGINE_CALLER_HOLDS_LOCK=0
     agmsg_lock_release
     return 1
   fi
+  # Cleared as soon as the start is over. The flag says "the caller holds the
+  # lock RIGHT NOW"; left standing past the release below, a second engine start
+  # in the same process would read a stale yes and skip its own locking.
+  _REMOTE_ENGINE_CALLER_HOLDS_LOCK=0
   started_pid="$(cat "$(_remote_sync_engine_pidfile "$team")")"
   while [ "$i" -lt 1600 ]; do
     IFS=$'\t' read -r engine_state ready_pid < <(_remote_sync_engine_status "$team")
@@ -2740,6 +2847,12 @@ cmd_set_endpoint() {
   fi
 }
 
+# The dispatcher runs only when this file is EXECUTED. Sourcing it defines the
+# functions and stops there, which is what makes the internal lock/trap wiring
+# testable at all: driven through the CLI, a wrapper's trap bookkeeping leaves
+# no trace an outside process can read, and a test that re-implements it is
+# testing its own copy (#762).
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 case "${1:-}" in
   connect) shift; agmsg_require_python3 "remote connect" || exit 1; cmd_connect "$@" ;;
   pull) shift; agmsg_require_python3 "remote pull" || exit 1; cmd_pull "$@" ;;
@@ -2754,3 +2867,4 @@ case "${1:-}" in
     echo "Usage: remote.sh <connect|pull|unlock|status|sync|set-endpoint|disconnect|forget|doctor> ..." >&2
     exit 1 ;;
 esac
+fi
