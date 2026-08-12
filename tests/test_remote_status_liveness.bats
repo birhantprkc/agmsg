@@ -490,6 +490,29 @@ remember_engine_pid() {
   [ ! -d "$lock" ]
 }
 
+@test "releasing the engine's own lock leaves other held locks alone (#762)" {
+  # `agmsg_lock_release` drops every lock the process holds, and the library's
+  # contract is that a caller may hold several. The engine start acquires ONE,
+  # so it must release one: releasing all of them takes locks away from an
+  # operation that is still using them.
+  run bash -c '
+    set -euo pipefail
+    . '"$SCRIPTS"'/lib/registry-lock.sh
+    root="$(mktemp -d)"
+    mkdir -p "$root/a" "$root/b"
+    agmsg_lock_acquire "$root/a"
+    agmsg_lock_acquire "$root/b"
+    agmsg_lock_release_one "$root/a"
+    [ ! -d "$root/a/.config.lock" ] || { echo "own lock not released"; exit 1; }
+    [ -d "$root/b/.config.lock" ] || { echo "OTHER lock was released"; exit 1; }
+    case "$AGMSG_HELD_LOCKS" in *"$root/b/.config.lock"*) ;; *) echo "bookkeeping lost the other lock"; exit 1 ;; esac
+    case "$AGMSG_HELD_LOCKS" in *"$root/a/.config.lock"*) echo "bookkeeping kept the released lock"; exit 1 ;; esac
+    echo ok
+  '
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "ok"
+}
+
 @test "concurrent sync start serializes ownership to one engine" {
   local fake_node fake_bin first_out second_out first_status=0 second_status=0
   fake_node="$(write_fake_node)"

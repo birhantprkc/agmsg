@@ -1555,6 +1555,38 @@ VALUES ('remote-pending.$key', $owner_pid, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 
 PULL_TEAM_ID=018f3f7e-2222-7000-8000-000000000002
 
+@test "remote pull: an exported AGMSG_HELD_LOCKS cannot buy the start out of locking (#762)" {
+  # Review caught the first version treating `AGMSG_HELD_LOCKS` as proof that
+  # this process holds the lock. It is seeded from the environment
+  # (registry-lock.sh:27), so anything upstream could export it and be believed;
+  # the substring test would also let one team's lock path vouch for another's
+  # when one name is a prefix of the other.
+  #
+  # Driven through `pull`, which does NOT take the lock itself at the spawn --
+  # `sync start` does, and would time out on its own acquire long before the
+  # helper's check is reached, so it cannot exercise this at all.
+  MOCK_TEAM_CIPHER_PROFILE=none
+  restart_mock_server
+  run bash "$SCRIPTS/remote.sh" pull --endpoint "$ENDPOINT" --team-id "$PULL_TEAM_ID" forged
+  [ "$status" -eq 0 ]
+  local pid; pid="$(cat "$TEST_SKILL_DIR/run/remote-sync.forged.pid")"
+  kill "$pid" 2>/dev/null || true
+  local before
+  before="$(ps -ax -o command= | grep -c "remote-sync.sh run --team forged" || true)"
+
+  # A real holder sits on the lock; the environment claims we already have it.
+  local lock="$TEST_SKILL_DIR/teams/forged/.config.lock"
+  mkdir "$lock"
+  rm -f "$TEST_SKILL_DIR/run/remote-sync.forged.pid"
+  run env AGMSG_LOCK_TRIES=2 AGMSG_HELD_LOCKS="$lock" \
+    bash "$SCRIPTS/remote.sh" unlock forged
+  # Whatever unlock decides about itself, no engine may have started behind the
+  # forged claim. Counted by argv: the failure is a process the pidfile does not
+  # name, so counting the pidfile asks the record about the record.
+  [ "$(ps -ax -o command= | grep -c "remote-sync.sh run --team forged" || true)" -le "$before" ]
+  rmdir "$lock"
+}
+
 @test "remote pull: its engine start is serialised, and it was not before (#762)" {
   # pull is one of the four callers that spawned OUTSIDE the lock -- it acquires
   # at line 915 and releases at 934, then starts the engine at 998. Two pulls in

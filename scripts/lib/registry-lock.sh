@@ -99,6 +99,35 @@ agmsg_lock_acquire() {
 # agmsg_lock_release
 # Release every lock this process holds (no-op if none). rmdir only removes the
 # (empty) lock dirs, never a team dir or its config.
+# agmsg_lock_release_one <team_dir>
+# Release ONE lock and leave every other held lock alone.
+#
+# `agmsg_lock_release` drops everything this process holds, which is right for a
+# command that is finishing and wrong for anything that acquires a lock inside a
+# larger operation: the caller may hold locks for other teams, and this library's
+# own contract is that it can. A caller that acquired one lock and released all
+# of them has taken locks away from code that is still using them.
+#
+# The line is matched WHOLE, not as a substring: lock paths nest (a team named
+# `a` and a team named `ab` under the same root), so a substring test would let
+# one team's release take another's.
+agmsg_lock_release_one() {
+  local lock="$1/.config.lock" kept="" l
+  [ -n "${AGMSG_HELD_LOCKS:-}" ] || return 0
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    if [ "$l" = "$lock" ]; then
+      rmdir "$l" 2>/dev/null || true
+    else
+      kept="${kept:+$kept
+}$l"
+    fi
+  done <<EOF
+$AGMSG_HELD_LOCKS
+EOF
+  AGMSG_HELD_LOCKS="$kept"
+}
+
 agmsg_lock_release() {
   [ -n "${AGMSG_HELD_LOCKS:-}" ] || return 0
   local l

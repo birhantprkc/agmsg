@@ -34,6 +34,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONNECTION_ROOT="${AGMSG_SYNC_CONNECTION_DIR:-$SKILL_DIR}"
+
+# Whether the caller of _remote_sync_engine_start already holds this team's lock.
+#
+# Assigned unconditionally, NOT `${VAR:-0}`: the point of the flag is that it
+# cannot be supplied from outside. An exported variable of this name from a
+# parent process would otherwise make the engine start skip its own locking and
+# run the check-then-act unserialised -- the failure this flag exists to prevent,
+# handed to anything upstream that sets a name (#762).
+_REMOTE_ENGINE_CALLER_HOLDS_LOCK=0
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/storage.sh"
 # shellcheck disable=SC1091
@@ -1423,25 +1432,27 @@ _remote_sync_engine_start_refused() {
 
 _remote_sync_engine_start() {
   local team="$1"
+  # Skipped only when THIS PROCESS took the lock on the way in, proved by a flag
+  # a caller sets after its own successful acquire -- not by `AGMSG_HELD_LOCKS`.
+  # That variable is seeded from the environment (registry-lock.sh:27), so
+  # anything upstream can export it and be believed, and a substring test over it
+  # would additionally let one team's lock path vouch for another's when one name
+  # is a prefix of the other. Ownership has to be something this process did, not
+  # something it was told.
   local lock_taken=0
-  case "$AGMSG_HELD_LOCKS" in
-    *"$TEAMS_DIR/$team/.config.lock"*) : ;;
-    *)
-      if [ -d "$TEAMS_DIR/$team" ]; then
-        if agmsg_lock_acquire "$TEAMS_DIR/$team"; then
-          lock_taken=1
-        else
-          # The acquire has already said why on stderr. A start that cannot
-          # serialise itself is refused rather than run unserialised: the
-          # failure this covers is two live engines, and "probably alone" is
-          # not a property anything downstream can check.
-          _remote_sync_engine_start_refused "$team" "$TEAMS_DIR/$team" \
-            "its team lock could not be acquired, so a second engine could start alongside this one"
-          return 1
-        fi
-      fi
-      ;;
-  esac
+  if [ "${_REMOTE_ENGINE_CALLER_HOLDS_LOCK:-0}" != "1" ] && [ -d "$TEAMS_DIR/$team" ]; then
+    if agmsg_lock_acquire "$TEAMS_DIR/$team"; then
+      lock_taken=1
+    else
+      # The acquire has already said why on stderr. A start that cannot
+      # serialise itself is refused rather than run unserialised: the failure
+      # this covers is two live engines, and "probably alone" is not a property
+      # anything downstream can check.
+      _remote_sync_engine_start_refused "$team" "$TEAMS_DIR/$team" \
+        "its team lock could not be acquired, so a second engine could start alongside this one"
+      return 1
+    fi
+  fi
 
   # The lock is released on EVERY exit, so the work is a separate function and
   # this one is the only place that unlocks. Written inline it would need the
@@ -1451,7 +1462,11 @@ _remote_sync_engine_start() {
   _remote_sync_engine_start_locked "$@" || rc=$?
   # `if`, not `[ ] && release`: under `set -e` an AND-OR list whose first half
   # is false makes the list false, and the list is a command like any other.
-  if [ "$lock_taken" -eq 1 ]; then agmsg_lock_release; fi
+  # Releases the ONE lock this function took. `agmsg_lock_release` drops every
+  # lock the process holds, and the library's contract is that a caller may hold
+  # several: releasing all of them here would take locks away from an operation
+  # that is still using them.
+  if [ "$lock_taken" -eq 1 ]; then agmsg_lock_release_one "$TEAMS_DIR/$team"; fi
   return "$rc"
 }
 
@@ -2246,6 +2261,10 @@ cmd_sync_start() {
   [ $# -eq 1 ] || { echo "Usage: remote.sh sync start <team>" >&2; exit 1; }
   agmsg_validate_team_name "$team" || exit 1
   agmsg_lock_acquire "$TEAMS_DIR/$team" || exit 1
+  # Set only after the acquire returned success, and only in the process that
+  # made the call: this is what _remote_sync_engine_start trusts instead of the
+  # inheritable AGMSG_HELD_LOCKS, so it must never be set optimistically (#762).
+  _REMOTE_ENGINE_CALLER_HOLDS_LOCK=1
   cfg="$(_remote_team_config "$team")"
   connected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.connected_at')"
   disconnected_at="$(_remote_read_config_field "$cfg" '$.remote_binding.disconnected_at')"
@@ -2271,9 +2290,14 @@ cmd_sync_start() {
   [ -f "$logfile" ] && log_offset=$(( $(wc -c < "$logfile" | tr -d ' ') + 1 ))
   startup_nonce="$(compat_uuid7)"
   if ! _remote_sync_engine_start "$team" "$startup_nonce"; then
+    _REMOTE_ENGINE_CALLER_HOLDS_LOCK=0
     agmsg_lock_release
     return 1
   fi
+  # Cleared as soon as the start is over. The flag says "the caller holds the
+  # lock RIGHT NOW"; left standing past the release below, a second engine start
+  # in the same process would read a stale yes and skip its own locking.
+  _REMOTE_ENGINE_CALLER_HOLDS_LOCK=0
   started_pid="$(cat "$(_remote_sync_engine_pidfile "$team")")"
   while [ "$i" -lt 1600 ]; do
     IFS=$'\t' read -r engine_state ready_pid < <(_remote_sync_engine_status "$team")
