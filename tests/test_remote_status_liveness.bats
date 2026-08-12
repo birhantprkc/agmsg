@@ -490,6 +490,43 @@ remember_engine_pid() {
   [ ! -d "$lock" ]
 }
 
+@test "the engine start acquires the lock itself, and refuses when it cannot (#762)" {
+  # The central contract of this change: a caller that does not hold the lock
+  # gets the whole check-then-act serialised by the helper, not by remembering
+  # to lock first. Until the sourceable seam existed this could not be driven --
+  # holding the lock from outside stops every command at an earlier acquire of
+  # its own -- so it went untested and was named as untested. It is testable now.
+  #
+  # `agmsg_lock_acquire` and the locked body are both replaced after sourcing:
+  # one records that it was called and can be made to fail, the other records
+  # whether the wrapper got that far. Nothing is re-implemented -- the wrapper
+  # under test is the production one.
+  run bash -c '
+    set -uo pipefail
+    export AGMSG_SYNC_CONNECTION_DIR='"$TEST_SKILL_DIR"'
+    . '"$SCRIPTS"'/remote.sh 2>/dev/null
+    log="$(mktemp)"
+    agmsg_lock_acquire() { echo "acquire:$1" >> "$log"; return "${STUB_ACQUIRE_RC:-0}"; }
+    agmsg_lock_release_one() { echo "release:$1" >> "$log"; }
+    _remote_sync_engine_start_locked() { echo "locked" >> "$log"; return 0; }
+
+    # 1. The caller holds nothing, so the wrapper must acquire.
+    STUB_ACQUIRE_RC=0 _remote_sync_engine_start testteam >/dev/null 2>&1
+    grep -q "^acquire:.*/teams/testteam$" "$log" || { echo "NO_ACQUIRE"; exit 1; }
+    grep -q "^locked$" "$log" || { echo "NEVER_REACHED_BODY"; exit 1; }
+    grep -q "^release:.*/teams/testteam$" "$log" || { echo "NOT_RELEASED"; exit 1; }
+
+    # 2. The acquire fails: the body must not run, and the call must report it.
+    : > "$log"
+    STUB_ACQUIRE_RC=1 _remote_sync_engine_start testteam >/dev/null 2>&1 && { echo "REFUSAL_RETURNED_ZERO"; exit 1; }
+    grep -q "^locked$" "$log" && { echo "BODY_RAN_UNSERIALISED"; exit 1; }
+    grep -q "^release:" "$log" && { echo "RELEASED_A_LOCK_IT_NEVER_TOOK"; exit 1; }
+    echo acquire-contract-ok
+  '
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "acquire-contract-ok"
+}
+
 @test "the engine start restores all three traps the acquire takes (#762)" {
   # Drives `_remote_sync_engine_start` itself. The previous version of this test
   # re-implemented the wrapper's save/acquire/release/replay in the test body and
