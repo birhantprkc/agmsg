@@ -490,6 +490,39 @@ remember_engine_pid() {
   [ ! -d "$lock" ]
 }
 
+@test "the lock acquire overwrites three traps, and all three come back (#762)" {
+  # `agmsg_lock_acquire` installs EXIT, INT and TERM. Restoring only EXIT --
+  # which is what the first version of this did -- leaves the library's
+  # `agmsg_lock_release; exit 130` sitting on INT and its TERM twin, so a Ctrl-C
+  # during an unlock exits without running the caller's cleanup. That is the
+  # same leak the chaining exists to stop, on the paths nobody presses on a good
+  # day, which is exactly where it would go unnoticed.
+  run bash -c '
+    set -uo pipefail
+    . '"$SCRIPTS"'/lib/registry-lock.sh
+    root="$(mktemp -d)"; mkdir -p "$root/t"
+    trap "echo CALLER_EXIT" EXIT
+    trap "echo CALLER_INT; exit 130" INT
+    trap "echo CALLER_TERM; exit 143" TERM
+    saved="$(trap -p EXIT INT TERM)"
+    agmsg_lock_acquire "$root/t" >/dev/null 2>&1
+    # The premise: the acquire really did take all three. Without this the test
+    # would pass on a library that never touched them.
+    trap -p EXIT INT TERM | grep -q "agmsg_lock_release. exit 130" || { echo "INT was not taken"; exit 1; }
+    trap -p EXIT INT TERM | grep -q "agmsg_lock_release. exit 143" || { echo "TERM was not taken"; exit 1; }
+    agmsg_lock_release_one "$root/t"
+    trap - EXIT INT TERM
+    [ -n "$saved" ] && eval "$saved"
+    for want in CALLER_EXIT CALLER_INT CALLER_TERM; do
+      trap -p EXIT INT TERM | grep -q "$want" || { echo "$want not restored"; exit 1; }
+    done
+    trap -p EXIT INT TERM | grep -q "agmsg_lock_release" && { echo "library handler still installed"; exit 1; }
+    echo restored-all-three
+  '
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "restored-all-three"
+}
+
 @test "releasing the engine's own lock leaves other held locks alone (#762)" {
   # `agmsg_lock_release` drops every lock the process holds, and the library's
   # contract is that a caller may hold several. The engine start acquires ONE,

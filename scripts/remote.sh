@@ -1450,9 +1450,16 @@ _remote_sync_engine_start() {
   # So the caller's trap is saved before the acquire and restored after the
   # release, and the window between them is exactly the critical section the
   # library's own traps are there to protect.
-  local lock_taken=0 saved_exit_trap=""
+  local lock_taken=0 saved_traps=""
   if [ "${_REMOTE_ENGINE_CALLER_HOLDS_LOCK:-0}" != "1" ] && [ -d "$TEAMS_DIR/$team" ]; then
-    saved_exit_trap="$(trap -p EXIT)"
+    # All THREE that the acquire overwrites, not just EXIT. `cmd_unlock` sets
+    # its cleanup on EXIT INT TERM HUP; restoring EXIT alone leaves the
+    # library's `agmsg_lock_release; exit 130` on INT and its TERM twin in
+    # place, so a Ctrl-C during an unlock would exit without removing the
+    # handoff directory -- the same leak this chaining was added to stop, on the
+    # paths nobody presses on a good day. (HUP is not touched by the acquire, so
+    # the caller's HUP handler survives on its own.)
+    saved_traps="$(trap -p EXIT INT TERM)"
     if agmsg_lock_acquire "$TEAMS_DIR/$team"; then
       lock_taken=1
     else
@@ -1483,7 +1490,11 @@ _remote_sync_engine_start() {
     # Put back whatever the caller had, including "nothing": leaving the
     # library's `agmsg_lock_release` on EXIT would also make a later exit drop
     # locks this function never took.
-    if [ -n "$saved_exit_trap" ]; then eval "$saved_exit_trap"; else trap - EXIT; fi
+    # Clear all three first, then replay whatever the caller had. `trap -p`
+    # prints nothing for a signal with no handler, so replaying alone would
+    # leave the library's handler on any signal the caller had not set.
+    trap - EXIT INT TERM
+    if [ -n "$saved_traps" ]; then eval "$saved_traps"; fi
   fi
   return "$rc"
 }
