@@ -1435,6 +1435,26 @@ _remote_sync_engine_start() {
       "its run directory could not be created"
     return 1
   fi
+  # The cycle record has to be clearable before anything is signalled.
+  #
+  # A start that will refuse must refuse while it is still free: past this point
+  # the previous engine is killed, and a refusal after that has taken down a
+  # working engine for a bookkeeping reason. So the pathological shapes are
+  # rejected here, where the cost of being wrong is a message.
+  #
+  # "Clearable" means absent or a plain file. Anything else is refused rather
+  # than removed: a directory cannot be removed by `rm -f` at all, and a symlink
+  # is worse than unremovable -- the engine writes THROUGH it, so a link left in
+  # place turns this record into a write to wherever it points. `-L` is tested
+  # before `-e` because `-e` follows the link and calls a dangling one absent,
+  # which would let exactly that case past (#756).
+  local cycle_stamp
+  cycle_stamp="$(_remote_sync_engine_cycle_stamp "$team")"
+  if [ -L "$cycle_stamp" ] || { [ -e "$cycle_stamp" ] && [ ! -f "$cycle_stamp" ]; }; then
+    _remote_sync_engine_start_refused "$team" "$cycle_stamp" \
+      "the previous engine's cycle record is not a plain file, so it cannot be cleared and its successes would be read as this engine's"
+    return 1
+  fi
   # Stop only an engine whose argv proves that it owns this team. A stale
   # pidfile may point at a recycled, unrelated process and must never authorize
   # signalling that process.
@@ -1448,22 +1468,23 @@ _remote_sync_engine_start() {
   # still be on disk when the replacement starts -- and `status` would attribute
   # a predecessor's success to an engine that has not completed a cycle yet.
   #
-  # The removal is CHECKED, and the check is absence rather than rm's exit code:
-  # `rm -f` reports success for a file that was not there (which is fine) and
-  # failure for a path it cannot remove at all -- a directory, or one under an
-  # unwritable parent -- where the old record survives. Ignoring that would start
-  # the replacement anyway and reproduce the misattribution through a path the
-  # clear was supposed to close.
+  # The shape was accepted before anything was signalled; the removal happens
+  # HERE, after the old engine is dead, because an engine that is still alive can
+  # write the record again between the clear and its own exit.
   #
-  # And it runs BEFORE the pidfile is truncated, so a refusal leaves no ownership
+  # Still checked, and the check is absence rather than rm's exit code: `rm -f`
+  # reports success for a file that was not there (which is fine) and failure for
+  # one it cannot remove -- e.g. under a parent that turned unwritable since the
+  # precondition. Absence is tested lexically, `! -e` AND `! -L`, because `-e`
+  # follows a symlink and calls a dangling one absent.
+  #
+  # It runs before the pidfile is truncated, so a refusal leaves no ownership
   # claim behind: an engine that will not start must not look like one that owns
   # this team (#756).
-  local cycle_stamp
-  cycle_stamp="$(_remote_sync_engine_cycle_stamp "$team")"
   rm -f "$cycle_stamp" 2>/dev/null || true
-  if [ -e "$cycle_stamp" ]; then
-    _remote_sync_engine_start_refused "$team" "$pidfile" \
-      "the previous engine's cycle record at $cycle_stamp could not be removed, and starting now would report its successes as this engine's"
+  if [ -e "$cycle_stamp" ] || [ -L "$cycle_stamp" ]; then
+    _remote_sync_engine_start_refused "$team" "$cycle_stamp" \
+      "the previous engine's cycle record could not be removed, and starting now would report its successes as this engine's"
     return 1
   fi
   # Writability proven before the spawn -- but AFTER the block above, not before
@@ -1515,7 +1536,15 @@ _remote_sync_engine_stop() {
   # The cycle record goes with the engine that made it. Left behind, the NEXT
   # engine's first `status` would report a predecessor's success as its own --
   # which is the exact claim this record was added to stop anyone making (#756).
-  rm -f "$(_remote_sync_engine_cycle_stamp "$team")"
+  #
+  # Quiet, and NOT this function's exit status. Written as a bare `rm -f` it was
+  # both: an unclearable record made a successful stop report failure, and
+  # set-endpoint then refused to move an endpoint over a piece of bookkeeping,
+  # after the engine it was protecting had already been stopped. This function
+  # promises one thing -- the engine is not running -- and that promise was kept
+  # in every case where this line spoke. The start path is where an unclearable
+  # record has to block, because that is where a stale one could be misread.
+  rm -f "$(_remote_sync_engine_cycle_stamp "$team")" 2>/dev/null || true
 }
 
 # Print "<state>\t<pid>", where pid is empty when no valid pid is available.

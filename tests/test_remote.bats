@@ -311,6 +311,43 @@ _binding_field() {  # $1 = team, $2 = json path under remote_binding
   [ "$(_binding_field testteam binding_revision)" = "$revision_before" ]
 }
 
+@test "set-endpoint: an unclearable cycle record does not cost the running engine (#756)" {
+  # A restart clears the previous engine's cycle record, and refuses if it
+  # cannot: left behind, `status` would report a predecessor's success as the new
+  # engine's. The refusal has to happen BEFORE the old engine is signalled --
+  # otherwise a bookkeeping problem has stopped a working engine, which is worse
+  # than the misattribution it avoids, because syncing stops.
+  #
+  # This lives here rather than beside the other #756 tests because it needs a
+  # restart path that actually reaches the kill: `sync start` reports "already
+  # running" and returns first (measured), so it never gets there. set-endpoint
+  # does, and needs the mock server this file has.
+  run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
+  [ "$status" -eq 0 ]
+  local pidfile engine_pid stamp
+  pidfile="$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
+  engine_pid="$(cat "$pidfile")"
+  kill -0 "$engine_pid"
+  stamp="$TEST_SKILL_DIR/run/remote-sync.testteam.cycles.json"
+  mkdir -p "$stamp"          # `rm -f` cannot take a directory: unclearable
+
+  run bash "$SCRIPTS/remote.sh" set-endpoint --endpoint "http://localhost:$MOCK_PORT" testteam
+  # The move is the operation; the record is bookkeeping. Written as a bare
+  # `rm -f`, the cleanup became the stop function's exit status, so an unclearable
+  # record made a successful stop report failure and set-endpoint refused to move
+  # at all -- after the engine was already down. The stop kept its promise in
+  # every one of those cases.
+  refute grep -qF -- "the sync engine did not stop" <<<"$output"
+  # And the failure does not leak as a bare rm(1) complaint with no subject.
+  refute grep -qF -- "is a directory" <<<"$output"
+  [ "$(_binding_field testteam endpoint)" = "http://localhost:$MOCK_PORT" ]
+  # The restart is what refuses, which is the right place: a stale record can
+  # only be misread by an engine that starts.
+  grep -Fq "did not restart" <<<"$output"
+
+  kill "$engine_pid" 2>/dev/null || true
+}
+
 @test "set-endpoint: refuses a different server instance at the new address, naming both ids (#718)" {
   run bash "$SCRIPTS/remote.sh" connect --endpoint "$ENDPOINT" testteam
   [ "$status" -eq 0 ]

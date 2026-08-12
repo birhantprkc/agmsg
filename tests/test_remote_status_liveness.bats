@@ -350,6 +350,53 @@ remember_engine_pid() {
   printf '%s\n' "$output" | grep -q -F -- "cycles: no successful cycle recorded since this engine started"
 }
 
+@test "sync start: refusing over the cycle record does not kill the engine that is running (#756)" {
+  # The refusal has to happen while the start is still free. Past the kill, a
+  # refusal has taken down a working engine for a bookkeeping reason -- worse
+  # than the misattribution it was avoiding, because syncing stops.
+  start_matching_engine
+  local fake_bin stamp
+  fake_bin="$(write_matching_ps_fixture)"
+  stamp="$TEST_SKILL_DIR/run/remote-sync.testteam.cycles.json"
+  mkdir -p "$stamp"
+
+  run env PATH="$fake_bin:$PATH" bash "$SCRIPTS/remote.sh" sync start testteam
+  # `sync start` against a verified running engine is a no-op that succeeds --
+  # measured, and it is the better answer than the refusal this test was first
+  # written to expect: there is nothing to replace, so the record's shape never
+  # becomes a reason to touch a working engine at all.
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "already running"
+  # The engine is untouched, and still the owner as far as status is concerned.
+  # Both halves matter: alive but disowned would be an orphan.
+  kill -0 "$ENGINE_PID"
+  run env PATH="$fake_bin:$PATH" bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "connected (engine running, pid $ENGINE_PID)"
+}
+
+@test "sync start: a symlink at the cycle record path is refused, dangling or not (#756)" {
+  # `[ -e ]` follows the link and reports a dangling one ABSENT, so an -e-only
+  # check lets it through. Leaving a link there is worse than leaving a stale
+  # file: the engine writes THROUGH it, so the record becomes a write to
+  # wherever it points.
+  local fake_node fake_bin stamp
+  stamp="$TEST_SKILL_DIR/run/remote-sync.testteam.cycles.json"
+  fake_node="$(write_fake_node)"
+  fake_bin="$(write_fake_node_ps_fixture "$fake_node" "")"
+  ln -s "$TEST_SKILL_DIR/no-such-target.json" "$stamp"
+  [ -L "$stamp" ]
+  [ ! -e "$stamp" ]      # the property that makes an -e-only check wrong
+
+  run env PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" bash "$SCRIPTS/remote.sh" sync start testteam
+  [ "$status" -ne 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "not a plain file"
+  [ ! -s "$TEST_SKILL_DIR/run/remote-sync.testteam.pid" ]
+  # And the link is left as it was found rather than followed.
+  [ -L "$stamp" ]
+  [ ! -e "$TEST_SKILL_DIR/no-such-target.json" ]
+}
+
 @test "sync start: refuses to start when the old cycle record cannot be removed (#756)" {
   # `rm -f` returns success for a file that was not there and failure for a path
   # it cannot remove at all. Measured: `rm -f <a directory>` exits 1 and leaves
@@ -364,7 +411,11 @@ remember_engine_pid() {
 
   run env PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" bash "$SCRIPTS/remote.sh" sync start testteam
   [ "$status" -ne 0 ]
-  printf '%s\n' "$output" | grep -q -F -- "could not be removed"
+  # Either refusal is correct here — the precondition rejects the shape before
+  # anything is signalled, and the post-kill removal check catches what gets
+  # past it. What must hold is that the start refused and left nothing behind,
+  # so this asserts the outcome rather than which of the two spoke.
+  printf '%s\n' "$output" | grep -q -E -- "not a plain file|could not be removed"
   # No engine, and no ownership claim left behind: a start that refuses must not
   # look like one that owns this team.
   [ ! -s "$TEST_SKILL_DIR/run/remote-sync.testteam.pid" ]
