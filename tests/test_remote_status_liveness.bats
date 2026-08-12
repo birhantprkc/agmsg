@@ -132,6 +132,55 @@ remember_engine_pid() {
   ENGINE_PIDS="${ENGINE_PIDS:+$ENGINE_PIDS }$ENGINE_PID"
 }
 
+@test "status: a running engine that has never completed a cycle says so (#756)" {
+  # `engine running` reports that a process is alive, which is true and is not
+  # the question an operator has. In #744's report an engine failed every cycle
+  # for an entire session while this line said `running` the whole time.
+  start_matching_engine
+  local fake_bin stamp
+  fake_bin="$(write_matching_ps_fixture)"
+  stamp="$TEST_SKILL_DIR/run/remote-sync.testteam.cycles.json"
+
+  # Negative side first, on the state a just-started engine is actually in: no
+  # record yet. Asserting only the populated case would pass for a line printed
+  # unconditionally.
+  [ ! -e "$stamp" ]
+  run env PATH="$fake_bin:$PATH" bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "connected (engine running"
+  printf '%s\n' "$output" | grep -q -F -- "cycles: no successful cycle recorded since this engine started"
+
+  printf '%s\n' '{"type":"sync_cycle_stamp","first_success_at":"2026-08-11T20:00:00.000Z","last_success_at":"2026-08-11T20:34:56.000Z"}' > "$stamp"
+  run env PATH="$fake_bin:$PATH" bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  # The LAST success, not the first: "it worked once at some point" is the claim
+  # that made the original report hard to read.
+  printf '%s\n' "$output" | grep -q -F -- "cycles: last successful sync 2026-08-11T20:34:56.000Z"
+  refute grep -qF -- "no successful cycle recorded" <<<"$output"
+}
+
+@test "status: a stopped engine does not also report zero cycles (#756)" {
+  # Two lines for one fault reads as two faults. The stopped line above already
+  # says the useful thing and names the command that fixes it.
+  run bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "connected (engine stopped"
+  refute grep -qF -- "cycles:" <<<"$output"
+}
+
+@test "stopping an engine takes its cycle record with it (#756)" {
+  # Left behind, the NEXT engine's first `status` would report a predecessor's
+  # success as its own -- the exact claim this record exists to prevent.
+  start_matching_engine
+  local stamp="$TEST_SKILL_DIR/run/remote-sync.testteam.cycles.json"
+  printf '%s\n' '{"type":"sync_cycle_stamp","first_success_at":"2026-08-11T20:00:00.000Z","last_success_at":"2026-08-11T20:00:00.000Z"}' > "$stamp"
+  [ -e "$stamp" ]
+
+  run bash "$SCRIPTS/remote.sh" disconnect testteam
+  [ "$status" -eq 0 ]
+  [ ! -e "$stamp" ]
+}
+
 @test "status: a connected team that can name nobody says so (#743)" {
   # `connected (engine running)` and `0 member(s)` were both true at once and
   # nothing joined them, so the state read as a working team that happened to be
@@ -269,6 +318,111 @@ remember_engine_pid() {
   [ "$output" = "Sync engine already running (pid $original_pid)." ]
   [ "$(cat "$TEST_SKILL_DIR/run/remote-sync.testteam.pid")" = "$original_pid" ]
   kill -0 "$original_pid"
+}
+
+@test "sync start: a replaced engine does not inherit its predecessor's cycle record (#756)" {
+  # The stop path clears the record, and that is not enough: an engine that
+  # crashes, is killed, or leaves a stale pidfile never runs it. The replacement
+  # would then find the old file on disk, and `status` would report a success
+  # this engine has not had. Review caught this; the original change cleared the
+  # record only where the pidfile was removed, which the crash path never reaches.
+  local fake_node fake_bin foreign_pid stamp
+  stamp="$TEST_SKILL_DIR/run/remote-sync.testteam.cycles.json"
+  fake_node="$(write_fake_node)"
+  sleep 30 &
+  foreign_pid=$!
+  fake_bin="$(write_fake_node_ps_fixture "$fake_node" "$foreign_pid")"
+  ENGINE_PIDS="${ENGINE_PIDS:+$ENGINE_PIDS }$foreign_pid"
+  # A dead engine's leftovers: a pidfile pointing at something that is not ours,
+  # and the record it wrote while it was alive.
+  printf '%s\n' "$foreign_pid" > "$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
+  printf '%s\n' '{"type":"sync_cycle_stamp","first_success_at":"2026-08-11T19:00:00.000Z","last_success_at":"2026-08-11T19:30:00.000Z"}' > "$stamp"
+
+  run env PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" bash "$SCRIPTS/remote.sh" sync start testteam
+  [ "$status" -eq 0 ]
+  remember_engine_pid
+
+  run env PATH="$fake_bin:$PATH" bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "connected (engine running, pid $ENGINE_PID)"
+  # The decisive assertion: the predecessor's timestamp must not appear at all.
+  refute grep -qF -- "19:30:00" <<<"$output"
+  printf '%s\n' "$output" | grep -q -F -- "cycles: no successful cycle recorded since this engine started"
+}
+
+@test "sync start: refusing over the cycle record does not kill the engine that is running (#756)" {
+  # The refusal has to happen while the start is still free. Past the kill, a
+  # refusal has taken down a working engine for a bookkeeping reason -- worse
+  # than the misattribution it was avoiding, because syncing stops.
+  start_matching_engine
+  local fake_bin stamp
+  fake_bin="$(write_matching_ps_fixture)"
+  stamp="$TEST_SKILL_DIR/run/remote-sync.testteam.cycles.json"
+  mkdir -p "$stamp"
+
+  run env PATH="$fake_bin:$PATH" bash "$SCRIPTS/remote.sh" sync start testteam
+  # `sync start` against a verified running engine is a no-op that succeeds --
+  # measured, and it is the better answer than the refusal this test was first
+  # written to expect: there is nothing to replace, so the record's shape never
+  # becomes a reason to touch a working engine at all.
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "already running"
+  # The engine is untouched, and still the owner as far as status is concerned.
+  # Both halves matter: alive but disowned would be an orphan.
+  kill -0 "$ENGINE_PID"
+  run env PATH="$fake_bin:$PATH" bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "connected (engine running, pid $ENGINE_PID)"
+}
+
+@test "sync start: a symlink at the cycle record path is refused, dangling or not (#756)" {
+  # `[ -e ]` follows the link and reports a dangling one ABSENT, so an -e-only
+  # check lets it through. Leaving a link there is worse than leaving a stale
+  # file: the engine writes THROUGH it, so the record becomes a write to
+  # wherever it points.
+  local fake_node fake_bin stamp
+  stamp="$TEST_SKILL_DIR/run/remote-sync.testteam.cycles.json"
+  fake_node="$(write_fake_node)"
+  fake_bin="$(write_fake_node_ps_fixture "$fake_node" "")"
+  ln -s "$TEST_SKILL_DIR/no-such-target.json" "$stamp"
+  [ -L "$stamp" ]
+  [ ! -e "$stamp" ]      # the property that makes an -e-only check wrong
+
+  run env PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" bash "$SCRIPTS/remote.sh" sync start testteam
+  [ "$status" -ne 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "not a plain file"
+  [ ! -s "$TEST_SKILL_DIR/run/remote-sync.testteam.pid" ]
+  # And the link is left as it was found rather than followed.
+  [ -L "$stamp" ]
+  [ ! -e "$TEST_SKILL_DIR/no-such-target.json" ]
+}
+
+@test "sync start: refuses to start when the old cycle record cannot be removed (#756)" {
+  # `rm -f` returns success for a file that was not there and failure for a path
+  # it cannot remove at all. Measured: `rm -f <a directory>` exits 1 and leaves
+  # it. Ignoring that would start the replacement with the predecessor's record
+  # still on disk -- the misattribution, through the very path meant to close it.
+  local fake_node fake_bin stamp
+  stamp="$TEST_SKILL_DIR/run/remote-sync.testteam.cycles.json"
+  fake_node="$(write_fake_node)"
+  fake_bin="$(write_fake_node_ps_fixture "$fake_node" "")"
+  mkdir -p "$stamp"          # undeletable as a file: rm -f will not take it
+  [ -d "$stamp" ]
+
+  run env PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" bash "$SCRIPTS/remote.sh" sync start testteam
+  [ "$status" -ne 0 ]
+  # Either refusal is correct here — the precondition rejects the shape before
+  # anything is signalled, and the post-kill removal check catches what gets
+  # past it. What must hold is that the start refused and left nothing behind,
+  # so this asserts the outcome rather than which of the two spoke.
+  printf '%s\n' "$output" | grep -q -E -- "not a plain file|could not be removed"
+  # No engine, and no ownership claim left behind: a start that refuses must not
+  # look like one that owns this team.
+  [ ! -s "$TEST_SKILL_DIR/run/remote-sync.testteam.pid" ]
+
+  run env PATH="$fake_bin:$PATH" bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  refute grep -qF -- "engine running" <<<"$output"
 }
 
 @test "sync start: replaces stale ownership without signalling a foreign process" {
