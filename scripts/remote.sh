@@ -31,7 +31,11 @@ set -euo pipefail
 # remote team into an empty local team. An encrypted pull remains locked until
 # `unlock` confirms the handed authority and starts the background sync engine.
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# `${BASH_SOURCE[0]}` rather than `$0`, so this resolves the same whether the
+# file is executed or sourced. Sourcing is what lets a test call the internal
+# functions directly; with `$0` it resolved to the sourcing shell and every
+# `source "$SCRIPT_DIR/lib/..."` below failed (#762).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONNECTION_ROOT="${AGMSG_SYNC_CONNECTION_DIR:-$SKILL_DIR}"
 
@@ -2843,6 +2847,12 @@ cmd_set_endpoint() {
   fi
 }
 
+# The dispatcher runs only when this file is EXECUTED. Sourcing it defines the
+# functions and stops there, which is what makes the internal lock/trap wiring
+# testable at all: driven through the CLI, a wrapper's trap bookkeeping leaves
+# no trace an outside process can read, and a test that re-implements it is
+# testing its own copy (#762).
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 case "${1:-}" in
   connect) shift; agmsg_require_python3 "remote connect" || exit 1; cmd_connect "$@" ;;
   pull) shift; agmsg_require_python3 "remote pull" || exit 1; cmd_pull "$@" ;;
@@ -2857,3 +2867,4 @@ case "${1:-}" in
     echo "Usage: remote.sh <connect|pull|unlock|status|sync|set-endpoint|disconnect|forget|doctor> ..." >&2
     exit 1 ;;
 esac
+fi

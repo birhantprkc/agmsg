@@ -490,37 +490,33 @@ remember_engine_pid() {
   [ ! -d "$lock" ]
 }
 
-@test "the lock acquire overwrites three traps, and all three come back (#762)" {
-  # `agmsg_lock_acquire` installs EXIT, INT and TERM. Restoring only EXIT --
-  # which is what the first version of this did -- leaves the library's
-  # `agmsg_lock_release; exit 130` sitting on INT and its TERM twin, so a Ctrl-C
-  # during an unlock exits without running the caller's cleanup. That is the
-  # same leak the chaining exists to stop, on the paths nobody presses on a good
-  # day, which is exactly where it would go unnoticed.
+@test "the engine start restores all three traps the acquire takes (#762)" {
+  # Drives `_remote_sync_engine_start` itself. The previous version of this test
+  # re-implemented the wrapper's save/acquire/release/replay in the test body and
+  # asserted on the copy: it passed with the implementation reduced to EXIT-only,
+  # which is the mutation it was written to catch. Review caught that; the fix is
+  # to call the real function, which is why remote.sh is now sourceable.
   run bash -c '
     set -uo pipefail
-    . '"$SCRIPTS"'/lib/registry-lock.sh
-    root="$(mktemp -d)"; mkdir -p "$root/t"
+    export AGMSG_SYNC_CONNECTION_DIR='"$TEST_SKILL_DIR"'
+    . '"$SCRIPTS"'/remote.sh 2>/dev/null
     trap "echo CALLER_EXIT" EXIT
     trap "echo CALLER_INT; exit 130" INT
     trap "echo CALLER_TERM; exit 143" TERM
-    saved="$(trap -p EXIT INT TERM)"
-    agmsg_lock_acquire "$root/t" >/dev/null 2>&1
-    # The premise: the acquire really did take all three. Without this the test
-    # would pass on a library that never touched them.
-    trap -p EXIT INT TERM | grep -q "agmsg_lock_release. exit 130" || { echo "INT was not taken"; exit 1; }
-    trap -p EXIT INT TERM | grep -q "agmsg_lock_release. exit 143" || { echo "TERM was not taken"; exit 1; }
-    agmsg_lock_release_one "$root/t"
-    trap - EXIT INT TERM
-    [ -n "$saved" ] && eval "$saved"
+    # Make the start fail fast and INSIDE the locked section: a directory where
+    # the pidfile goes. What is under test is the trap state it leaves behind,
+    # not whether an engine appeared.
+    mkdir -p "'"$TEST_SKILL_DIR"'/run/remote-sync.testteam.pid"
+    _remote_sync_engine_start testteam >/dev/null 2>&1 || true
+    rmdir "'"$TEST_SKILL_DIR"'/run/remote-sync.testteam.pid" 2>/dev/null || true
     for want in CALLER_EXIT CALLER_INT CALLER_TERM; do
-      trap -p EXIT INT TERM | grep -q "$want" || { echo "$want not restored"; exit 1; }
+      trap -p EXIT INT TERM | grep -q "$want" || { echo "MISSING:$want"; exit 1; }
     done
-    trap -p EXIT INT TERM | grep -q "agmsg_lock_release" && { echo "library handler still installed"; exit 1; }
-    echo restored-all-three
+    trap -p EXIT INT TERM | grep -q "agmsg_lock_release" && { echo "LIBRARY_HANDLER_LEFT"; exit 1; }
+    echo wiring-ok
   '
   [ "$status" -eq 0 ]
-  printf '%s\n' "$output" | grep -q -F -- "restored-all-three"
+  printf '%s\n' "$output" | grep -q -F -- "wiring-ok"
 }
 
 @test "releasing the engine's own lock leaves other held locks alone (#762)" {
