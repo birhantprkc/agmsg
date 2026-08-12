@@ -1439,8 +1439,20 @@ _remote_sync_engine_start() {
   # would additionally let one team's lock path vouch for another's when one name
   # is a prefix of the other. Ownership has to be something this process did, not
   # something it was told.
-  local lock_taken=0
+  # `agmsg_lock_acquire` installs its own EXIT/INT/TERM traps, and its comment
+  # says so: "no current registry writer sets its own trap; a future caller that
+  # does must chain these in." Acquiring here made that false. `cmd_unlock` sets
+  # an EXIT trap to remove the handoff temp directory, and this acquire replaced
+  # it -- the directory survived every unlock that reached an engine start, which
+  # is how the suite caught it: an unrelated test asserts no such directory is
+  # left anywhere in $TMPDIR.
+  #
+  # So the caller's trap is saved before the acquire and restored after the
+  # release, and the window between them is exactly the critical section the
+  # library's own traps are there to protect.
+  local lock_taken=0 saved_exit_trap=""
   if [ "${_REMOTE_ENGINE_CALLER_HOLDS_LOCK:-0}" != "1" ] && [ -d "$TEAMS_DIR/$team" ]; then
+    saved_exit_trap="$(trap -p EXIT)"
     if agmsg_lock_acquire "$TEAMS_DIR/$team"; then
       lock_taken=1
     else
@@ -1466,7 +1478,13 @@ _remote_sync_engine_start() {
   # lock the process holds, and the library's contract is that a caller may hold
   # several: releasing all of them here would take locks away from an operation
   # that is still using them.
-  if [ "$lock_taken" -eq 1 ]; then agmsg_lock_release_one "$TEAMS_DIR/$team"; fi
+  if [ "$lock_taken" -eq 1 ]; then
+    agmsg_lock_release_one "$TEAMS_DIR/$team"
+    # Put back whatever the caller had, including "nothing": leaving the
+    # library's `agmsg_lock_release` on EXIT would also make a later exit drop
+    # locks this function never took.
+    if [ -n "$saved_exit_trap" ]; then eval "$saved_exit_trap"; else trap - EXIT; fi
+  fi
   return "$rc"
 }
 
