@@ -546,10 +546,17 @@ remember_engine_pid() {
     mkdir -p "'"$TEST_SKILL_DIR"'/run/remote-sync.testteam.pid"
     _remote_sync_engine_start testteam >/dev/null 2>&1 || true
     rmdir "'"$TEST_SKILL_DIR"'/run/remote-sync.testteam.pid" 2>/dev/null || true
+    # Captured into a variable, NOT piped. In bash 3.2 the left side of a
+    # pipeline is a subshell with the traps reset, so `trap -p | grep` reports
+    # nothing there and this assertion fails on a correct implementation --
+    # measured: it passes under bash 5 and fails under 3.2, which is why it was
+    # green here and red on the macOS CI leg. Command substitution is also a
+    # subshell but reports the outer shell traps in both versions (70 bytes).
+    installed="$(trap -p EXIT INT TERM)"
     for want in CALLER_EXIT CALLER_INT CALLER_TERM; do
-      trap -p EXIT INT TERM | grep -q "$want" || { echo "MISSING:$want"; exit 1; }
+      case "$installed" in *"$want"*) ;; *) echo "MISSING:$want"; exit 1 ;; esac
     done
-    trap -p EXIT INT TERM | grep -q "agmsg_lock_release" && { echo "LIBRARY_HANDLER_LEFT"; exit 1; }
+    case "$installed" in *agmsg_lock_release*) echo "LIBRARY_HANDLER_LEFT"; exit 1 ;; esac
     echo wiring-ok
   '
   [ "$status" -eq 0 ]
