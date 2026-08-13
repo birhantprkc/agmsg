@@ -524,11 +524,28 @@ eperm_pid() {
   run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" </dev/null
   [ "$status" -eq 0 ]
   printf '%s\n' "$output" | grep -q -F -- "connected, but not syncing"
-  printf '%s\n' "$output" | grep -q -F -- "team"
-  printf '%s\n' "$output" | grep -q -F -- "sync start"
+  # The printed COMMAND must be runnable, not a template. Scoped to the command
+  # lines: the Monitor directive below legitimately contains `<team>` when it
+  # describes the message format `<ts> | <team> | <from> → <to> | <body>`, and a
+  # whole-output match calls that a defect. Measured — the first version of this
+  # assertion failed on exactly that line.
+  # Saved BEFORE the next `run`, which replaces $output. Asserting on $output
+  # after running the suggested command reads the command's output and calls it
+  # the hook's — measured here, it turned a passing check into a failing one for
+  # the wrong reason.
+  local session_out="$output" suggested
+  suggested="$(printf '%s\n' "$session_out" | sed -n 's/^  bash //p' | head -1)"
+  [ -n "$suggested" ]
+  refute grep -qF -- "<team>" <<<"$suggested"
+
   # The directive still has to be there: a warning that displaces it would stop
   # the session receiving anything at all, which is worse than the gap it names.
-  printf '%s\n' "$output" | grep -q -F -- "invoke the Monitor tool"
+  printf '%s\n' "$session_out" | grep -q -F -- "invoke the Monitor tool"
+
+  # Run what was printed. This is the assertion — that the line works — rather
+  # than a claim that it looks right. `Usage:` is what an unrunnable form gets.
+  run env AGMSG_RESOLVE_PROJECT=0 bash -c "bash $suggested"
+  refute grep -qF -- "Usage:" <<<"$output"
 }
 
 # --- session-start.sh role-aware resume directive (#339) ---

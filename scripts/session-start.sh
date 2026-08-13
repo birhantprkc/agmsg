@@ -266,18 +266,29 @@ fi
 # `off`, so those modes still get the absence only from `status`.
 if [ -x "$SKILL_DIR/scripts/remote.sh" ]; then
   _stale_teams="$("$SKILL_DIR/scripts/remote.sh" status 2>/dev/null \
-    | awk -F'\t' '/engine (stopped|stale)/ {print $1}' | tr '\n' ' ' || true)"
-  if [ -n "${_stale_teams% }" ]; then
-    cat <<EOF
-AGMSG: connected, but not syncing — ${_stale_teams% }
-
-No sync engine is running for the team(s) above, so messages from other
-machines are not arriving. Nothing restarts one after a reboot; it is started
-by hand:
-
-  bash $SKILL_DIR/scripts/remote.sh sync start <team>
-
-EOF
+    | awk -F'\t' '/engine (stopped|stale)/ {print $1}' || true)"
+  if [ -n "$_stale_teams" ]; then
+    printf '%s\n' "AGMSG: connected, but not syncing." ''
+    printf '%s\n' \
+      'No sync engine is running for the team(s) below, so messages from other' \
+      'machines are not arriving. Nothing restarts one after a reboot; run:' ''
+    # ONE RUNNABLE LINE PER TEAM, with no placeholder in it.
+    #
+    # The first version printed `sync start <team>` once. A reader has to
+    # replace `<team>` before that works, and an unreplaced `<team>` is a valid
+    # team name as far as validation is concerned — angle brackets are not among
+    # the characters it rejects. The names are already in hand here, so there is
+    # nothing to leave unfilled (the same reasoning #339 applied to the
+    # onboarding prompt).
+    #
+    # `printf %q` for both the path and the name: an install directory with a
+    # space in it, or a team name that needs quoting, otherwise produces a line
+    # that reads as runnable and is not.
+    printf '%s\n' "$_stale_teams" | while IFS= read -r _t; do
+      [ -n "$_t" ] || continue
+      printf '  bash %q sync start %q\n' "$SKILL_DIR/scripts/remote.sh" "$_t"
+    done
+    printf '\n'
   fi
 fi
 
