@@ -508,6 +508,153 @@ _wait_pidfile() {
 # DB-open healthcheck (#197): a store that exists but cannot be opened (the
 # native sqlite3.exe / Git Bash /c/ path mismatch, or bad perms) must surface a
 # loud error rather than spin silently delivering nothing.
+# Run watch.sh for <secs> with an active name (actas mode), then stop it.
+run_named_watcher_for() {
+  local sid="$1" out="$2" secs="$3" name="$4" pid
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code "$name" >"$out" 2>/dev/null 3>&- &
+  pid=$!
+  sleep "$secs"
+  _stop_watcher "$pid"
+}
+
+@test "watch: a second unfiltered watcher says it is sharing, and a lone one does not (#683)" {
+  # Two watchers with no active name subscribe to the same unclaimed pairs. The
+  # read cursor is one per (team, agent), so whoever polls first takes the row
+  # and the other never sees it — and `inbox.sh` then truthfully says "no new
+  # messages", because it was read. Nothing observable is left behind, so this
+  # is said at the only moment it can be: startup.
+  #
+  # Asserted from the LOG. In the configuration this runs in, fd2 is /dev/null
+  # (#691) — the helpers above redirect it too — so a warning written only to
+  # stderr would be invisible here and in production.
+  #
+  # Composite ids: a bare token is normalized on the way in (watch.sh:92), so
+  # naming the pidfile from a bare id waits for a file never written. Measured.
+  local run_dir="$TEST_SKILL_DIR/run"
+  local solo_id="solo-sid.$$" first_id="first-sid.$$" second_id="second-sid.$$" third_id="third-sid.$$"
+
+  # NEGATIVE FIRST, on the ordinary case: one watcher, alone. An implementation
+  # that always warns passes the positive half below and is wrong every start.
+  # Given seconds rather than a file to wait for, because the assertion is an
+  # ABSENCE — there is no arrival to synchronise on, and waiting longer only
+  # makes the negative stronger.
+  run_watcher_for "$solo_id" "$BATS_TEST_TMPDIR/solo.out" 2
+  refute grep -qF -- "another watcher" "$run_dir/watch.$solo_id.log"
+
+  # Now a live one, and a second started while it runs.
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$first_id" "$PROJ" claude-code \
+    >"$BATS_TEST_TMPDIR/first.out" 2>/dev/null 3>&- &
+  local first_pid=$!
+  wait_for_file "$run_dir/watch.$first_id.pid"
+
+  # Waits for the LAST of the three lines, not for the pidfile: the pidfile is
+  # written before the warning, so a test that waits on it kills the watcher
+  # mid-sentence and sees a partial message. Measured — that is how this failed.
+  local second_log="$run_dir/watch.$second_id.log"
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$second_id" "$PROJ" claude-code \
+    >"$BATS_TEST_TMPDIR/second.out" 2>/dev/null 3>&- &
+  local second_pid=$!
+  wait_for_file_contains "$second_log" "/agmsg actas"
+  _stop_watcher "$second_pid"
+
+  grep -q -F -- "another watcher" "$second_log"
+  # The remedy, not only the cause. A warning that names neither what is lost
+  # nor what to type leaves the reader stopped.
+  grep -q -F -- "polls first" "$second_log"
+  grep -q -F -- "/agmsg actas" "$second_log"
+
+  # And a filtered watcher stays quiet even with the same unfiltered one alive:
+  # it is not sharing anything.
+  run_named_watcher_for "$third_id" "$BATS_TEST_TMPDIR/third.out" 2 alice
+  refute grep -qF -- "another watcher" "$run_dir/watch.$third_id.log"
+
+  # A DIFFERENT PROJECT does not warn, even with this project's unfiltered
+  # watcher still live. `RUN_DIR` is per install, so the scan sees that pidfile
+  # — but the subscription is per project and they share no pairs. Without the
+  # project in the metadata this case warns, which is a false alarm on every
+  # installation serving two projects (raised in review).
+  local other_proj="/tmp/agmsg-watch-proj-other" other_id="other-proj-sid.$$"
+  bash "$SCRIPTS/join.sh" otherteam carol claude-code "$other_proj" >/dev/null
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$other_id" "$other_proj" claude-code \
+    >"$BATS_TEST_TMPDIR/other.out" 2>/dev/null 3>&- &
+  local other_pid=$!
+  sleep 2
+  _stop_watcher "$other_pid"
+  refute grep -qF -- "another watcher" "$run_dir/watch.$other_id.log"
+
+  _stop_watcher "$first_pid"
+}
+
+@test "watch: a filtered watcher is never mistaken for unfiltered while starting (#683)" {
+  # A reader that finds a live pid with no filter file SKIPS it: it cannot tell
+  # the role or the project. If the pidfile were published first, every filtered
+  # watcher would sit in exactly that state for the length of its startup
+  # window, and a scan landing inside it would reach the wrong conclusion about
+  # a watcher whose metadata was already on its way.
+  #
+  # Asserted on the ARTEFACTS rather than by racing: whenever a pidfile exists,
+  # its filter file exists too, and names this watcher's role. That is the
+  # property the ordering buys, and it holds at every instant rather than at the
+  # one this test happened to look.
+  # Read WHILE IT RUNS. The filter file is removed on exit by its own recorded
+  # owner (not by the pidfile's), so inspecting after the watcher stops measures
+  # the cleanup rather than the ordering — measured, that is how the first
+  # version of this failed.
+  local run_dir="$TEST_SKILL_DIR/run" named_id="named-order.$$"
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$named_id" "$PROJ" claude-code alice \
+    >"$BATS_TEST_TMPDIR/named.out" 2>/dev/null 3>&- &
+  local named_pid=$!
+  wait_for_file "$run_dir/watch.$named_id.pid"
+
+  # Whenever the pidfile exists, the filter file exists too and names the role.
+  # That is what publishing the metadata first buys, and it holds at every
+  # instant rather than at the one this test happened to look at.
+  [ -f "$run_dir/watch.$named_id.filter" ]
+  [ "$(sed -n '1p' "$run_dir/watch.$named_id.filter")" = "alice" ]
+  [ "$(sed -n '2p' "$run_dir/watch.$named_id.filter")" = "$PROJ" ]
+
+  _stop_watcher "$named_pid"
+}
+
+@test "watch: a watcher does not delete filter metadata it did not write (#683)" {
+  # The replacement path signals the previous watcher for this session id and
+  # does not wait for it, so a successor writes its filter file while the
+  # pidfile still names the predecessor. Deciding the filter's fate by the
+  # PIDFILE lets the predecessor delete metadata the successor just wrote — and
+  # the successor is then live with a pidfile and no filter, which a reader
+  # classifies as pre-change and skips. A second unfiltered watcher in the same
+  # project then goes unreported, which is the whole point of the warning.
+  #
+  # Driven deterministically rather than by racing two watchers: the race window
+  # is real but does not reproduce on demand, and a control that only sometimes
+  # enters the window is a control that only sometimes tests anything. Measured
+  # — the racing version passed with the ownership check removed.
+  #
+  # What is driven is the real `cleanup` in the real process: the file on disk
+  # is made to belong to somebody else, and the watcher is then stopped.
+  local run_dir="$TEST_SKILL_DIR/run" sid="owner.$$"
+  local pf="$run_dir/watch.$sid.pid" ff="$run_dir/watch.$sid.filter"
+
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code \
+    >"$BATS_TEST_TMPDIR/owner.out" 2>/dev/null 3>&- &
+  local w=$!
+  wait_for_file "$pf"
+  [ -f "$ff" ]
+  # Its own pid while it runs — the ordinary case, and the premise of the swap
+  # below. Without this the test could pass on a watcher that never wrote one.
+  [ "$(sed -n '3p' "$ff")" = "$(cat "$pf")" ]
+
+  # Now the file belongs to a successor: same role and project, different owner.
+  printf '%s\n%s\n%s\n' alice "$PROJ" 999999 > "$ff"
+
+  _stop_watcher "$w"
+
+  # The watcher owned the PIDFILE and removed it. It did not own the filter.
+  refute test -f "$pf"
+  [ -f "$ff" ]
+  [ "$(sed -n '3p' "$ff")" = "999999" ]
+}
+
 @test "watch: surfaces an unopenable DB once instead of spinning silently (#197)" {
   [ "$(id -u)" -eq 0 ] && skip "chmod 000 is ineffective as root"
   # The watcher opens the subscribed team's store, so that is the file to make

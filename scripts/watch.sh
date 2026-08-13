@@ -221,7 +221,95 @@ if [ -f "$PIDFILE" ]; then
   fi
 fi
 
+# Metadata BEFORE the pidfile, deliberately.
+#
+# A reader that finds a live pid with no filter file cannot tell what that
+# watcher is doing OR which project it serves, so it SKIPS it. Written the other
+# way round, every filtered watcher spends its startup window in exactly that
+# state, and a scan landing in the window reaches the opposite conclusion from
+# the one this metadata exists to support -- it would count nothing where there
+# is something to count, or, before the project was recorded, warn about a
+# watcher sharing nothing. The pidfile is what makes this process visible at
+# all, so nothing may be visible before what describes it (raised in review).
+#
+# The project is part of the record because RUN_DIR is per INSTALL, not per
+# project: two projects using the same install both write here, and their
+# watchers do not share a subscription -- the pairs come from the project's own
+# registrations. Counting across projects would warn about a hazard that does
+# not exist (also raised in review).
+FILTERFILE="$RUN_DIR/watch.$SESSION_ID.filter"
+# Three lines: role, project, and OWNER PID.
+#
+# The owner is what makes this survive a successor. The replacement path signals
+# the previous watcher and does not wait for it, so the order is: successor
+# writes this file, predecessor's EXIT runs, reads the pidfile (still its own
+# pid), and removes both -- taking the successor's fresh metadata with it. The
+# successor is then live with a pidfile and no filter, which a reader classifies
+# as pre-change and skips, so a real second unfiltered watcher in this project
+# goes unreported. The pidfile transfers ownership by being overwritten; this
+# file has to carry its own (raised in review).
+printf '%s\n%s\n%s\n' "${ACTIVE_NAME:-unfiltered}" "$PROJECT_PATH" "$$" > "$FILTERFILE" 2>/dev/null || true
+
 echo $$ > "$PIDFILE"
+
+# --- Say when this watcher is sharing an inbox with another (#683). ---
+#
+# A watcher started WITHOUT an active name subscribes to every (team, agent)
+# registered for this project that nobody else has claimed. The read cursor is
+# one per pair, so when two such watchers exist, whoever polls first takes the
+# row and the other sees nothing -- the comment at the subscription site says
+# exactly this. The message is not duplicated and it is not lost loudly: it is
+# delivered to one of them, and the other's `inbox.sh` truthfully answers "no
+# new messages" because the row was read.
+#
+# Nothing observable is left behind, which is why this has to be said at the one
+# moment something can be said: startup.
+#
+# NOT a lease. This process still subscribes to exactly what it would have
+# subscribed to; it only stops being quiet about the fact that someone else is
+# doing the same. Exclusion is a separate decision.
+# Only when the hazard is real. A warning printed on every start is a warning
+# nobody reads, and an unfiltered watcher running alone is not in danger.
+if [ -z "$ACTIVE_NAME" ]; then
+  _sharing=0
+  for _pf in "$RUN_DIR"/watch.*.pid; do
+    [ -f "$_pf" ] || continue
+    [ "$_pf" = "$PIDFILE" ] && continue
+    _other_pid="$(cat "$_pf" 2>/dev/null || true)"
+    case "$_other_pid" in ''|*[!0-9]*) continue ;; esac
+    # `_agmsg_pid_alive_local`, not a bare `kill -0`. The bare form reads EPERM
+    # as "dead", so a watcher this process cannot signal -- another user, a
+    # sandbox -- would be counted as gone and its inbox-sharing left unsaid. The
+    # repo enforces this (`no shipped script decides liveness with a bare
+    # kill -0`), and it caught this line: the first version used the bare form
+    # while the comment above it claimed to use what the rest of the file uses.
+    #
+    # A pidfile left by a crashed watcher names nobody, which is why liveness is
+    # checked at all: counting one would fire the warning on an installation
+    # that has no second watcher.
+    _agmsg_pid_alive_local "$_other_pid" || continue
+    _other_filter="${_pf%.pid}.filter"
+    # An absent filter file is a watcher from BEFORE this change. It cannot be
+    # asked which project it serves, so it is not counted: warning on it would
+    # fire for every unrelated project sharing this install, and this warning is
+    # only worth having if it is true. A pre-change watcher in the SAME project
+    # is a real hazard that goes unreported here -- named in the PR rather than
+    # papered over, and it disappears as installs update.
+    [ -f "$_other_filter" ] || continue
+    _other_name="$(sed -n '1p' "$_other_filter" 2>/dev/null || true)"
+    _other_project="$(sed -n '2p' "$_other_filter" 2>/dev/null || true)"
+    # Same project only. RUN_DIR is per install; the subscription is per
+    # project, so a watcher in another project shares no pairs with this one.
+    [ "$_other_project" = "$PROJECT_PATH" ] || continue
+    [ "$_other_name" = "unfiltered" ] || continue
+    _sharing=$((_sharing + 1))
+  done
+  if [ "$_sharing" -gt 0 ]; then
+    watch_log "another watcher ($_sharing) is receiving for the same unclaimed roles in this project."
+    watch_log "messages addressed to those roles will reach whichever of us polls first, and the others will not see them."
+    watch_log "to receive only your own: /agmsg actas <name>"
+  fi
+fi
 # Readiness sentinels this watcher created (see #108). Populated once the
 # subscription is resolved; removed on exit so the file is present iff a live
 # watcher is currently receiving for that role.
@@ -233,7 +321,24 @@ cleanup() {
   # would erase the successor's record. See #66.
   local pidfile_pid=""
   [ -f "$PIDFILE" ] && IFS= read -r pidfile_pid < "$PIDFILE" || true
+  # Both files are removed by their owner, but they do not share an owner test:
+  # the pidfile's owner is whoever it names, and the filter file's is whoever it
+  # records. See below for why the pidfile cannot answer for both.
+  #
+  # Neither may be left behind. A stale pidfile makes the next watcher count a
+  # ghost. A stale filter file is worse in the direction that matters: it keeps
+  # asserting a role on behalf of a dead process, and if that role is a name,
+  # every other watcher reads it as "filtered, not sharing" -- so the warning is
+  # SUPPRESSED by a process that no longer exists.
   [ "$pidfile_pid" = "$$" ] && rm -f "$PIDFILE"
+  # The filter file is judged on ITS OWN recorded owner, not on the pidfile.
+  # During a replacement the pidfile still names the predecessor while the
+  # successor's metadata is already on disk, so deciding by the pidfile lets the
+  # predecessor delete a file it did not write.
+  _ff="$RUN_DIR/watch.$SESSION_ID.filter"
+  if [ -f "$_ff" ] && [ "$(sed -n '3p' "$_ff" 2>/dev/null || true)" = "$$" ]; then
+    rm -f "$_ff" 2>/dev/null || true
+  fi
   if [ -n "$READY_FILES" ]; then
     while IFS= read -r _rf; do
       [ -z "$_rf" ] && continue
