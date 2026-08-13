@@ -180,7 +180,7 @@ table is a claim about adversary B.
 | Forward secrecy (adversary C) | **Not provided** | Recipient sets are per-epoch and immutable (`docs/spec/ref/age-v1-profile.md:88`); an identity that is later compromised decrypts that epoch's history |
 | Post-compromise recovery (adversary C) | **Partial, by rotation** | A new epoch is a new recipient set. The journal records the rotation and a fingerprint, never the key (`docs/design/remote-sync.md:103-104`) |
 | Downgrade resistance (server-forced) | **Provided by the spec's stanza rules** | Scrypt, SSH, plugin and every other non-X25519 stanza are excluded (`docs/spec/ref/age-v1-profile.md:58-63`) |
-| Downgrade resistance (client accepting `cipher: none`) | **Provided on the `remote.sh` path** | Both `configure` calls pass `--cipher age-v1` and `--minimum-security e2ee-required` together (`scripts/remote.sh:1280`, `:1758`), and there is no third. The refusal is `scripts/internal/remote-sync.mjs:1686`. Removable only by invoking `configure` directly with `plaintext-allowed` |
+| Downgrade resistance (client accepting `cipher: none`) | **Provided by every caller in the tree** | Both `configure` calls pass `--cipher age-v1` and `--minimum-security e2ee-required` together (`scripts/remote.sh:1280`, `:1758`), and there is no third. The refusal is `scripts/internal/remote-sync.mjs:1686`. Removable only by invoking `configure` directly with `plaintext-allowed` |
 
 ### On forward secrecy
 
@@ -316,8 +316,8 @@ Those are the only two. `grep -rn -- '--cipher' scripts/ tests/` returns four
 hits, and the other two are a usage string and an argument check
 (`scripts/internal/remote-sync.mjs:30`, `:2192`).
 
-**So a machine that reaches `age-v1` through `remote.sh` cannot get there
-without also setting `e2ee-required`** — the two flags are passed together, in both places, and there
+**So a machine that reaches `age-v1` through any code in this repository
+cannot get there without also setting `e2ee-required`** — the two flags are passed together, in both places, and there
 is no third place. That is stronger than "the default is safe": there is no
 supported way to reach the unsafe combination.
 
@@ -345,21 +345,36 @@ So the pull route does not bypass the pairing; it arrives at it one command
 later. The other caller, `_remote_configure_keyed_team`
 (`scripts/remote.sh:1729`, reached from `:1916`), passes the same two flags.
 
-That is the whole set: `grep -n 'remote-sync.sh" configure'` returns two hits,
-and both callers are on the path a machine must take before it can read
-anything.
+That is the whole set, and the search is tree-wide rather than inside one file
+— the earlier version of this paragraph derived it from `remote.sh` alone, which
+could not have ruled out a caller elsewhere:
+
+```
+grep -rnE 'remote-sync\.(sh|mjs)' . --include='*.sh' --include='*.mjs' --include='*.ts' \
+  | grep -v node_modules | grep -vE '^\./(docs|tests)/' | grep configure
+
+scripts/remote.sh:1280            a production caller
+scripts/remote.sh:1758            a production caller
+scripts/internal/remote-sync.mjs:29   a usage string
+```
+
+Two callers, one usage line, nothing else. Both callers pass
+`--minimum-security e2ee-required` and `--cipher age-v1` as **literals** — not
+variables that something upstream could set differently — and both are on the
+path a machine must take before it can read anything.
 
 ### What that means for the properties table
 
-The row reads **provided on the path through `remote.sh`** — not "out of scope",
-and not merely "conditional". Every route to `age-v1` that goes through that
-script also sets `e2ee-required`, so the accurate statement is: provided for a
-machine configured by the shipped commands, and removable by calling
-`remote-sync.sh configure` directly with the unsafe pairing.
+The row reads **provided by every caller in the tree** — not "out of scope",
+and not merely "conditional". There are two callers of `remote-sync.sh
+configure` in the whole repository, both pass the pairing as literals, and both
+sit on the path a machine must take before it can read anything.
 
-Said as a boundary rather than a property: this document measured `remote.sh`.
-A deployment driving `remote-sync.sh` by some other means is not described by
-that row.
+The boundary that remains is narrow and worth naming: this measures callers
+**in this repository**. Someone invoking `remote-sync.sh configure` by hand, or
+from their own script, can pair `--cipher age-v1` with
+`--minimum-security plaintext-allowed`. Nothing forbids that pairing; nothing
+shipped here produces it.
 
 ## What has not been examined
 
