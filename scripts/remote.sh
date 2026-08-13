@@ -2080,10 +2080,15 @@ _remote_status_one() {
     stopped)
       echo "$team	connected (engine stopped — run: bash $(agmsg_shq "$SKILL_DIR/scripts/remote.sh") sync start $(agmsg_shq "$team")) since $connected_at" ;;
     stale)
+      # Names the command, exactly as `stopped` does. The asymmetry mattered:
+      # `stopped` is what an operator reaches by stopping the engine themselves,
+      # and `stale` is what a REBOOT leaves — so the branch with no remedy was
+      # the one reached by someone who did nothing and has the least idea what
+      # to type (#761).
       if [ -n "$engine_pid" ]; then
-        echo "$team	connected (engine stale — pidfile $engine_pid points at a dead or foreign process) since $connected_at"
+        echo "$team	connected (engine stale — pidfile $engine_pid points at a dead or foreign process; run: bash $(agmsg_shq "$SKILL_DIR/scripts/remote.sh") sync start $(agmsg_shq "$team")) since $connected_at"
       else
-        echo "$team	connected (engine stale — pidfile does not contain a valid process id) since $connected_at"
+        echo "$team	connected (engine stale — pidfile does not contain a valid process id; run: bash $(agmsg_shq "$SKILL_DIR/scripts/remote.sh") sync start $(agmsg_shq "$team")) since $connected_at"
       fi
       ;;
   esac

@@ -491,6 +491,46 @@ eperm_pid() {
   [ "$3" = "$sp" ]
 }
 
+@test "session-start: a connected team with no engine is said, and a silent one is not (#761)" {
+  # A reboot kills every sync engine and nothing restarts one. `connected` keeps
+  # printing and `send` keeps succeeding locally, so the only symptom is silence
+  # — which reads as "nobody wrote anything". This hook is the first thing of
+  # ours that runs afterwards.
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
+
+  # NEGATIVE FIRST, on the state every ordinary machine is in: no connected
+  # team at all. A line printed unconditionally would pass the positive half
+  # below and be wrong every single session.
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" </dev/null
+  [ "$status" -eq 0 ]
+  refute grep -qF -- "connected, but not syncing" <<<"$output"
+
+  # Now a connected team whose engine is not running. Written through the same
+  # config the command reads, rather than by calling `connect` — no server here.
+  local cfg="$TEST_SKILL_DIR/teams/team/config.json" updated escaped
+  escaped="$(sed "s/'/''/g" "$cfg")"
+  updated="$(sqlite_mem "
+    SELECT json_set('$escaped', '\$.remote_binding', json_object(
+      'endpoint', 'https://remote.example',
+      'server_instance_id', '018f0000-0000-7000-8000-000000000001',
+      'remote_team_id', '018f0000-0000-7000-8000-000000000002',
+      'protocol_version', 1,
+      'capabilities', json_object('write_allowed_ciphers', json_array('none')),
+      'connected_at', '2026-08-12T00:00:00Z',
+      'disconnected_at', null
+    ));")"
+  printf '%s\n' "$updated" > "$cfg"
+
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" </dev/null
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "connected, but not syncing"
+  printf '%s\n' "$output" | grep -q -F -- "team"
+  printf '%s\n' "$output" | grep -q -F -- "sync start"
+  # The directive still has to be there: a warning that displaces it would stop
+  # the session receiving anything at all, which is worse than the gap it names.
+  printf '%s\n' "$output" | grep -q -F -- "invoke the Monitor tool"
+}
+
 # --- session-start.sh role-aware resume directive (#339) ---
 
 # Write a role-session record into the isolated skill dir's run/.

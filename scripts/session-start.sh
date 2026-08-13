@@ -245,6 +245,42 @@ if [ -n "$CC_PID" ]; then
   printf '%s\n' "$INSTANCE_ID" > "$STATE"
 fi
 
+# --- Say when a connected team has no engine (#761). ---
+# A reboot leaves every sync engine dead and nothing restarts one: the five
+# commands that start it are all operator actions. `connected` keeps printing,
+# `send` keeps succeeding locally, and the only symptom is messages not arriving
+# — which reads as "nobody wrote anything". This is the first moment after a
+# reboot when anything of ours runs, so it is where the absence gets said.
+#
+# BEFORE the three directive blocks below rather than inside them: there are
+# three ways out of this script (a watcher already streaming, the actas variant,
+# and the default), and a line added to one of them is missing from the other
+# two.
+#
+# Best-effort, and bounded. `status` is a subprocess and needs python3; if it
+# cannot run, this says nothing rather than guessing. That is a real gap and not
+# a silent one: the check reports what it saw, and what it could not see is the
+# absence of a line, which is why the line names the teams rather than a count.
+#
+# Reaches `monitor` and `both` only — this hook is not installed for `turn` or
+# `off`, so those modes still get the absence only from `status`.
+if [ -x "$SKILL_DIR/scripts/remote.sh" ]; then
+  _stale_teams="$("$SKILL_DIR/scripts/remote.sh" status 2>/dev/null \
+    | awk -F'\t' '/engine (stopped|stale)/ {print $1}' | tr '\n' ' ' || true)"
+  if [ -n "${_stale_teams% }" ]; then
+    cat <<EOF
+AGMSG: connected, but not syncing — ${_stale_teams% }
+
+No sync engine is running for the team(s) above, so messages from other
+machines are not arriving. Nothing restarts one after a reboot; it is started
+by hand:
+
+  bash $SKILL_DIR/scripts/remote.sh sync start <team>
+
+EOF
+  fi
+fi
+
 # --- Skip directive when a watcher is already alive for this instance. ---
 # /compact re-fires SessionStart within the same CC process and session_id, so
 # INSTANCE_ID is identical to the already-running watcher's.  Without this
