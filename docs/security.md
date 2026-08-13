@@ -21,10 +21,9 @@ repository — `server/`, `docs/spec/`, `docs/design/`.
 
 **Out of scope:** the hosted service. It is not covered by this document.
 
-**Out of scope:** the sync client's handling of a received envelope. See
-"What has not been examined", below, which explains why this is *out of scope*
-rather than *unverified* — the distinction matters and is used precisely
-throughout.
+**In scope:** the sync client's handling of a received envelope. It lives here
+— `scripts/internal/sync-cipher.mjs` and `scripts/internal/remote-sync.mjs` —
+and the downgrade question it decides was measured rather than deferred.
 
 ## Who the adversary is
 
@@ -181,7 +180,7 @@ table is a claim about adversary B.
 | Forward secrecy (adversary C) | **Not provided** | Recipient sets are per-epoch and immutable (`docs/spec/ref/age-v1-profile.md:88`); an identity that is later compromised decrypts that epoch's history |
 | Post-compromise recovery (adversary C) | **Partial, by rotation** | A new epoch is a new recipient set. The journal records the rotation and a fingerprint, never the key (`docs/design/remote-sync.md:103-104`) |
 | Downgrade resistance (server-forced) | **Provided by the spec's stanza rules** | Scrypt, SSH, plugin and every other non-X25519 stanza are excluded (`docs/spec/ref/age-v1-profile.md:58-63`) |
-| Downgrade resistance (client accepting `cipher: none`) | **Out of scope** | Not decided by any code in this repository — see below |
+| Downgrade resistance (client accepting `cipher: none`) | **Provided, conditionally** | Refused by the pull path only when local policy is `e2ee-required` (`scripts/internal/remote-sync.mjs:1686`). Under `plaintext-allowed` the envelope is accepted — measured, see below |
 
 ### On forward secrecy
 
@@ -232,19 +231,106 @@ standing between an attacker and the plaintext. Under `cipher: "none"` the
 contents are not protected — but that is section 1 above, not a property of the
 digest.
 
+## Downgrade on receipt: measured, and the answer has two layers
+
+**Question: does a participant configured for `age-v1` accept an injected
+`cipher: "none"` envelope?**
+
+The sync client is in this repository — `scripts/internal/sync-cipher.mjs` (819
+lines, a full age implementation) and `scripts/internal/remote-sync.mjs`. So
+this is answerable here, and it was answered by running it rather than by
+reading.
+
+**Layer 1 — the envelope opener does not decide it.** `openEnvelope` dispatches
+on the envelope's own `cipher` field and consults no configured profile:
+
+```
+scripts/internal/sync-cipher.mjs:718-725
+  export async function openEnvelope(input) {
+    …
+    const profile = cipherProfiles[envelope.cipher];
+    if (!profile) throw new CipherStateError("unsupported_cipher", …);
+    return profile.open(input);
+  }
+```
+
+Called directly with a well-formed `cipher: "none"` envelope built from the
+repository's own test vectors, it **returns the plaintext projection**. Measured:
+
+```
+node -e '… sealEnvelope({…, cipher: "none", key_id: null, recipients: []}) …'
+  ACCEPTED — openEnvelope returned the plaintext projection, with no reference
+             to any configured profile
+```
+
+**Layer 2 — the caller does decide it, and refuses.** The single call site is
+guarded, three checks above it:
+
+```
+scripts/internal/remote-sync.mjs:1686
+  (localPolicy.minimum_security_mode === "e2ee-required" && message.envelope.cipher === "none")
+    -> status: "policy_violation", reason: "envelope violates effective policy"
+```
+
+So the answer is: **a downgraded envelope is refused, by the pull path's policy
+check, not by the cipher layer.** The protection is real and it is one `if`
+away from the plaintext — which is worth knowing precisely, because any future
+caller of `openEnvelope` that does not replicate that check would accept
+injected plaintext silently.
+
+Note also `scripts/internal/remote-sync.mjs:1699`: the check that the configured
+profile matches only runs `if (message.envelope.cipher === "age-v1")`. A `none`
+envelope does not enter that branch at all. Line 1686 is the whole defence.
+
+### What that means for the properties table
+
+The "Downgrade resistance (client accepting `cipher: none`)" row reads
+**provided, conditional on `minimum_security_mode: "e2ee-required"`** — not "out
+of scope". A deployment on `age-v1` whose local policy is `plaintext-allowed`
+accepts the injected envelope: line 1686 is the only thing refusing it, and that
+condition is what it tests.
+
 ## What has not been examined
 
-**Whether a client configured for `age-v1` rejects an injected
-`cipher: "none"` envelope.** This is **out of scope**, and the distinction from
-"unverified" is deliberate: no code in this repository decides it. `cipher`
-appears in implementation only under `server/`, and the sync client that would
-enforce the profile on receipt lives elsewhere. A reviewer who wants this
-answered needs the client, not this repository.
-
-It is the right question to ask, and a reader should not take its absence here
-as a claim that the answer is favourable.
-
 **The hosted service.** Out of scope.
+
+**Whether `minimum_security_mode` is set to `e2ee-required` by any default
+path.** Not measured. The value appears at
+`scripts/internal/remote-sync.mjs:568` as `"plaintext-allowed"` and at `:875`,
+`:931` as `"e2ee-required"`; which one a real deployment ends up with was not
+traced, and the row above depends on it.
+
+## On the age of the specification this cites
+
+`docs/spec/ref/age-v1-profile.md` is marked **"Status: proposed (dogfood
+profile)"** and was last touched on 2026-07-27, by the commit that filed it as
+reference material — `1a56d8e docs: file superseded work as reference`. It lives
+under `ref/`, whose README says plainly: *"Nobody is building toward anything in
+a `ref/` directory."*
+
+That is a real reason to distrust it, so the two citations this document leans
+on were checked against the code rather than taken on the document's authority:
+
+- **`:342-345` (keys provisioned outside the message server).** Consistent with
+  the implementation, and more strongly than the sentence claims: the server has
+  no age implementation at all (see "The implementation agrees with the
+  specification"). Nothing in `server/` could hold, transit, or use a recipient
+  key.
+- **`:58-63` (X25519 stanzas only; scrypt, SSH and plugin excluded).** Enforced,
+  and not in the server — in the client:
+
+```
+scripts/internal/sync-cipher.mjs:277-281
+  const activeType = fields[1] === "scrypt" || fields[1] === "ssh-rsa" ||
+    fields[1] === "ssh-ed25519" || fields[1].startsWith("plugin-");
+  …
+  if (!stanzaIsGrease) malformed("age-v1 rejects active non-X25519 recipient stanzas");
+```
+
+So both cited requirements hold in code today. A reviewer should still read the
+profile document as *proposed*, and should treat any claim in it that this
+document does not cite as unchecked — this document verified the two it relies
+on, not the whole profile.
 
 ## Appendix: OWASP ASVS V6 mapping
 
