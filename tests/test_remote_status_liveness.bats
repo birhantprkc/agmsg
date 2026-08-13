@@ -238,6 +238,26 @@ remember_engine_pid() {
   [ "$(sqlite_mem "SELECT json_extract('$(printf '%s' "$output" | sed "s/'/''/g")', '\$.engine_pid');")" -eq "$ENGINE_PID" ]
 }
 
+@test "status: a stale engine names the command that fixes it, like a stopped one does (#761)" {
+  # A reboot leaves this state, and it was the one branch with no remedy in it.
+  # `stopped` is reached by an operator who stopped the engine themselves and
+  # already knows the command; `stale` is reached by someone who did nothing.
+  printf '%s\n' 999999 > "$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
+
+  run bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "connected (engine stale"
+  printf '%s\n' "$output" | grep -q -F -- "sync start"
+
+  # The other stale branch — a pidfile with nothing usable in it — is a separate
+  # line in the source, so asserting one says nothing about the other.
+  printf '%s\n' "not-a-pid" > "$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
+  run bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "does not contain a valid process id"
+  printf '%s\n' "$output" | grep -q -F -- "sync start"
+}
+
 @test "status: rejects a live foreign process behind a recycled pidfile" {
   sleep 30 &
   local foreign_pid=$!
