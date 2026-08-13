@@ -6,11 +6,10 @@
 > current shape is what it is, and the findings it records were closed rather
 > than dropped. Do not build to it.
 
-**Status: draft, revision 7.** Replaces the NOT READY subsection of
-`remote-connect-onboarding.md` §8, which recorded five findings from an
-adversarial review. A2 (one-directional authentication) was closed by the
-onboarding pivot's post-decryption bidirectional SAS. Revision 1 addressed
-A1, B, E1 and E2 and was returned CHANGES REQUIRED with eight blockers
+**Status: draft, revision 7.** Replaces the key-pairing work that the remote
+connect onboarding design had held back as NOT READY. One-directional
+authentication was closed by the onboarding pivot's post-decryption
+bidirectional SAS. Revision 1 was returned CHANGES REQUIRED with eight blockers
 (B1-B8), alongside eight further gaps from the mobile client. Revision 2
 rebuilt the document around observability and closed B1 and the frame,
 freeze-order, rate-limit-identity, non-addressee-validation, rollback-baseline

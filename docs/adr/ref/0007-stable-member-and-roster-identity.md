@@ -172,7 +172,6 @@ reconciliation protocol; matching display names are insufficient.
 ## Normative design and specifications
 
 - [Remote sync design](../../design/remote-sync.md)
-- [Remote connect onboarding design](../../design/ref/remote-connect-onboarding.md)
 - [HTTP API v1](../../../server/spec/v1.md)
 - [Stage-2 read-state synchronization](../../spec/ref/read-state-synchronization.md)
 - [ADR 0005: Remote synchronization contract](0005-remote-sync-contract.md)
