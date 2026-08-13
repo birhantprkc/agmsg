@@ -542,10 +542,54 @@ eperm_pid() {
   # the session receiving anything at all, which is worse than the gap it names.
   printf '%s\n' "$session_out" | grep -q -F -- "invoke the Monitor tool"
 
-  # Run what was printed. This is the assertion — that the line works — rather
-  # than a claim that it looks right. `Usage:` is what an unrunnable form gets.
-  run env AGMSG_RESOLVE_PROJECT=0 bash -c "bash $suggested"
-  refute grep -qF -- "Usage:" <<<"$output"
+  # Run what was printed, THROUGH AN INSTALL PATH THAT NEEDS QUOTING, and
+  # require it to succeed.
+  #
+  # The first version of this checked only that `Usage:` was absent, and never
+  # looked at `$status` — so `bash: …: No such file or directory` would have
+  # passed it. And the fixture's install path had no space in it, so dropping
+  # `%q` from the path changed nothing: the test could not fail for the reason
+  # it was written. Both raised in review, both true.
+  # A COPY, not a symlink. `SKILL_DIR` is `cd "$SCRIPT_DIR/.." && pwd`, and `..`
+  # resolves through a symlink to the physical parent — so a symlinked install
+  # with a space in its name arrives here as the real path without one, and the
+  # fixture would silently stop testing what it was built for. Measured.
+  local spaced="$BATS_TEST_TMPDIR/an install/skill"
+  mkdir -p "$spaced"
+  cp -R "$TEST_SKILL_DIR/." "$spaced/"
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$spaced/scripts/session-start.sh" claude-code "$TEST_PROJECT" </dev/null
+  [ "$status" -eq 0 ]
+  local spaced_cmd
+  spaced_cmd="$(printf '%s\n' "$output" | sed -n 's/^  bash //p' | head -1)"
+  [ -n "$spaced_cmd" ]
+  # `install`, not `an install`: %q escapes the space, so the literal phrase is
+  # never present in a correctly quoted line. Checking for it asserts the
+  # ABSENCE of the quoting this test exists to require — measured, it failed
+  # against a correct implementation twice.
+  printf '%s\n' "$spaced_cmd" | grep -q -F -- "install"
+
+  # A fake engine, so success is reachable at all: without one the command runs
+  # correctly and still exits non-zero with `sync engine … did not become ready`,
+  # and a test that accepted that would be accepting the failure it is meant to
+  # catch.
+  local fake_node="$BATS_TEST_TMPDIR/fake-node"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'if [ "${1:-}" = "--version" ]; then echo v23.0.0; exit 0; fi' \
+    'echo "{\"event\":\"capabilities\",\"startup_nonce\":\"${AGMSG_SYNC_START_NONCE:-}\"}"' \
+    'trap "exit 0" TERM INT' \
+    'while :; do sleep 1; done' > "$fake_node"
+  chmod +x "$fake_node"
+
+  run env AGMSG_RESOLVE_PROJECT=0 AGMSG_NODE="$fake_node" bash -c "bash $spaced_cmd"
+  # The STATUS, not the absence of one string. An unquoted path fails here with
+  # `No such file or directory` and a non-zero exit, and the earlier version of
+  # this check — `refute grep Usage:` — passed on exactly that.
+  [ "$status" -eq 0 ]
+  local started_pid
+  started_pid="$(cat "$spaced/run/remote-sync.team.pid" 2>/dev/null || true)"
+  [ -n "$started_pid" ]
+  ENGINE_PIDS="${ENGINE_PIDS:+$ENGINE_PIDS }$started_pid"
+  kill "$started_pid" 2>/dev/null || true
 }
 
 # --- session-start.sh role-aware resume directive (#339) ---
