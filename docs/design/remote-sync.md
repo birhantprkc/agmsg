@@ -2,9 +2,12 @@
 
 **Status:** the design being built to. Not implemented yet.
 
-This replaces the onboarding half of `remote-connect-onboarding.md`,
-`local-first-onboarding.md`, `device-pairing.md`, and
-`authentication-result-handoff.md`. Sync itself — Stage 1, read state,
+This replaces the onboarding half of `remote-connect-onboarding.md` and
+`device-pairing.md`. Two further documents were removed rather than kept as
+history: `local-first-onboarding.md`, whose onboarding this document replaces,
+and `authentication-result-handoff.md`, a proposal for a seam this design does
+not have — see "No authentication" below for what it removes. Their reasoning
+is in the git history. Sync itself — Stage 1, read state,
 retention gaps, the envelope format — is unchanged and specified elsewhere.
 
 ## What a remote is

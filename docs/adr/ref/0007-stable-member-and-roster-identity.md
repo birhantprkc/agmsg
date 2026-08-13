@@ -171,7 +171,7 @@ reconciliation protocol; matching display names are insufficient.
 
 ## Normative design and specifications
 
-- [Local-first onboarding and convergent roster design](../../design/ref/local-first-onboarding.md)
+- [Remote sync design](../../design/remote-sync.md)
 - [Remote connect onboarding design](../../design/ref/remote-connect-onboarding.md)
 - [HTTP API v1](../../../server/spec/v1.md)
 - [Stage-2 read-state synchronization](../../spec/ref/read-state-synchronization.md)
