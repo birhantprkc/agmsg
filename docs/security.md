@@ -180,7 +180,7 @@ table is a claim about adversary B.
 | Forward secrecy (adversary C) | **Not provided** | Recipient sets are per-epoch and immutable (`docs/spec/ref/age-v1-profile.md:88`); an identity that is later compromised decrypts that epoch's history |
 | Post-compromise recovery (adversary C) | **Partial, by rotation** | A new epoch is a new recipient set. The journal records the rotation and a fingerprint, never the key (`docs/design/remote-sync.md:103-104`) |
 | Downgrade resistance (server-forced) | **Provided by the spec's stanza rules** | Scrypt, SSH, plugin and every other non-X25519 stanza are excluded (`docs/spec/ref/age-v1-profile.md:58-63`) |
-| Downgrade resistance (client accepting `cipher: none`) | **Provided, conditionally** | Refused by the pull path only when local policy is `e2ee-required` (`scripts/internal/remote-sync.mjs:1686`). Under `plaintext-allowed` the envelope is accepted — measured, see below |
+| Downgrade resistance (client accepting `cipher: none`) | **Provided on the supported path** | Both `configure` calls pass `--cipher age-v1` and `--minimum-security e2ee-required` together (`scripts/remote.sh:1280`, `:1758`), and there is no third. The refusal is `scripts/internal/remote-sync.mjs:1686`. Removable only by invoking `configure` directly with `plaintext-allowed` |
 
 ### On forward secrecy
 
@@ -282,23 +282,68 @@ Note also `scripts/internal/remote-sync.mjs:1699`: the check that the configured
 profile matches only runs `if (message.envelope.cipher === "age-v1")`. A `none`
 envelope does not enter that branch at all. Line 1686 is the whole defence.
 
+### Only one of those two conditions protects you
+
+Line 1686 is a single `if` with three disjuncts, and a reader will take it as
+three defences. It is one:
+
+```
+scripts/internal/remote-sync.mjs:1684-1686
+  !serverPolicy.accepted_envelope_versions.includes(message.envelope.v) ||
+  !serverPolicy.write_allowed_ciphers.includes(message.envelope.cipher) ||
+  (localPolicy.minimum_security_mode === "e2ee-required" && message.envelope.cipher === "none")
+```
+
+The first two read `serverPolicy` — **values the server declares**. Against
+adversary A they are worth nothing: a server that wants to inject plaintext
+declares a policy that permits plaintext. They are useful for catching
+misconfiguration and version drift, not attack.
+
+**The third disjunct is the entire defence against a hostile server**, because
+`localPolicy` is the only term in that condition the server does not supply.
+
+### How a deployment ends up on `e2ee-required`
+
+Derived rather than assumed: every call to `remote-sync.sh configure` in the
+repository, and the flags each one passes.
+
+```
+scripts/remote.sh:1280    --minimum-security e2ee-required --cipher age-v1
+scripts/remote.sh:1758    --minimum-security e2ee-required --cipher age-v1
+```
+
+Those are the only two. `grep -rn -- '--cipher' scripts/ tests/` returns four
+hits, and the other two are a usage string and an argument check
+(`scripts/internal/remote-sync.mjs:30`, `:2192`).
+
+**So the supported path cannot select `age-v1` without also setting
+`e2ee-required`** — the two flags are passed together, in both places, and there
+is no third place. That is stronger than "the default is safe": there is no
+supported way to reach the unsafe combination.
+
+It is still reachable by invoking `remote-sync.sh configure` directly with
+`--cipher age-v1 --minimum-security plaintext-allowed`. Nothing forbids that
+pairing; it is simply not what any code path here does.
+
+One caveat, stated because it is the kind of thing that changes: a machine can
+also acquire `cipher_profile: "age-v1"` from a value pulled off the server
+(`scripts/remote.sh:916`). That write does not go through `configure` and so
+does not set `minimum_security_mode` itself. Whether such a machine later runs
+one of the two configure calls above before it pulls messages was **not traced**.
+
 ### What that means for the properties table
 
-The "Downgrade resistance (client accepting `cipher: none`)" row reads
-**provided, conditional on `minimum_security_mode: "e2ee-required"`** — not "out
-of scope". A deployment on `age-v1` whose local policy is `plaintext-allowed`
-accepts the injected envelope: line 1686 is the only thing refusing it, and that
-condition is what it tests.
+The row reads **provided on the supported path** — not "out of scope", and not
+merely "conditional". The condition it depends on is one the supported path
+always sets, so the accurate statement is: provided, and removable only by
+configuring the unsafe pairing by hand.
 
 ## What has not been examined
 
 **The hosted service.** Out of scope.
 
-**Whether `minimum_security_mode` is set to `e2ee-required` by any default
-path.** Not measured. The value appears at
-`scripts/internal/remote-sync.mjs:568` as `"plaintext-allowed"` and at `:875`,
-`:931` as `"e2ee-required"`; which one a real deployment ends up with was not
-traced, and the row above depends on it.
+*(The `minimum_security_mode` question this section used to leave open has been
+measured; see "How a deployment ends up on `e2ee-required`" above.)*
 
 ## On the age of the specification this cites
 
