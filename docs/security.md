@@ -325,11 +325,29 @@ It is still reachable by invoking `remote-sync.sh configure` directly with
 `--cipher age-v1 --minimum-security plaintext-allowed`. Nothing forbids that
 pairing; it is simply not what any code path here does.
 
-One caveat, stated because it is the kind of thing that changes: a machine can
-also acquire `cipher_profile: "age-v1"` from a value pulled off the server
-(`scripts/remote.sh:916`). That write does not go through `configure` and so
-does not set `minimum_security_mode` itself. Whether such a machine later runs
-one of the two configure calls above before it pulls messages was **not traced**.
+A second machine reaches `age-v1` by a different route, and it was traced rather
+than left open. `remote.sh`'s `cmd_pull` copies the team's declared cipher into
+the binding (`scripts/remote.sh:916`) without calling `configure` — so at that
+moment the machine has `cipher_profile: "age-v1"` and no
+`minimum_security_mode` of its own.
+
+It cannot sync in that state. Reading messages requires `unlock`, and
+`cmd_unlock` is one of the two callers of `configure`:
+
+```
+scripts/remote.sh:1076   cmd_unlock() {
+scripts/remote.sh:1280     bash "$SCRIPT_DIR/remote-sync.sh" configure \
+scripts/remote.sh:1284       --minimum-security e2ee-required \
+scripts/remote.sh:1285       --cipher age-v1
+```
+
+So the pull route does not bypass the pairing; it arrives at it one command
+later. The other caller, `_remote_configure_keyed_team`
+(`scripts/remote.sh:1729`, reached from `:1916`), passes the same two flags.
+
+That is the whole set: `grep -n 'remote-sync.sh" configure'` returns two hits,
+and both callers are on the path a machine must take before it can read
+anything.
 
 ### What that means for the properties table
 
