@@ -180,7 +180,7 @@ table is a claim about adversary B.
 | Forward secrecy (adversary C) | **Not provided** | Recipient sets are per-epoch and immutable (`docs/spec/ref/age-v1-profile.md:88`); an identity that is later compromised decrypts that epoch's history |
 | Post-compromise recovery (adversary C) | **Partial, by rotation** | A new epoch is a new recipient set. The journal records the rotation and a fingerprint, never the key (`docs/design/remote-sync.md:103-104`) |
 | Downgrade resistance (server-forced) | **Provided by the spec's stanza rules** | Scrypt, SSH, plugin and every other non-X25519 stanza are excluded (`docs/spec/ref/age-v1-profile.md:58-63`) |
-| Downgrade resistance (client accepting `cipher: none`) | **Provided on the supported path** | Both `configure` calls pass `--cipher age-v1` and `--minimum-security e2ee-required` together (`scripts/remote.sh:1280`, `:1758`), and there is no third. The refusal is `scripts/internal/remote-sync.mjs:1686`. Removable only by invoking `configure` directly with `plaintext-allowed` |
+| Downgrade resistance (client accepting `cipher: none`) | **Provided on the `remote.sh` path** | Both `configure` calls pass `--cipher age-v1` and `--minimum-security e2ee-required` together (`scripts/remote.sh:1280`, `:1758`), and there is no third. The refusal is `scripts/internal/remote-sync.mjs:1686`. Removable only by invoking `configure` directly with `plaintext-allowed` |
 
 ### On forward secrecy
 
@@ -316,8 +316,8 @@ Those are the only two. `grep -rn -- '--cipher' scripts/ tests/` returns four
 hits, and the other two are a usage string and an argument check
 (`scripts/internal/remote-sync.mjs:30`, `:2192`).
 
-**So the supported path cannot select `age-v1` without also setting
-`e2ee-required`** — the two flags are passed together, in both places, and there
+**So a machine that reaches `age-v1` through `remote.sh` cannot get there
+without also setting `e2ee-required`** — the two flags are passed together, in both places, and there
 is no third place. That is stronger than "the default is safe": there is no
 supported way to reach the unsafe combination.
 
@@ -351,10 +351,15 @@ anything.
 
 ### What that means for the properties table
 
-The row reads **provided on the supported path** — not "out of scope", and not
-merely "conditional". The condition it depends on is one the supported path
-always sets, so the accurate statement is: provided, and removable only by
-configuring the unsafe pairing by hand.
+The row reads **provided on the path through `remote.sh`** — not "out of scope",
+and not merely "conditional". Every route to `age-v1` that goes through that
+script also sets `e2ee-required`, so the accurate statement is: provided for a
+machine configured by the shipped commands, and removable by calling
+`remote-sync.sh configure` directly with the unsafe pairing.
+
+Said as a boundary rather than a property: this document measured `remote.sh`.
+A deployment driving `remote-sync.sh` by some other means is not described by
+that row.
 
 ## What has not been examined
 
