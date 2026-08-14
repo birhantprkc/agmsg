@@ -375,3 +375,88 @@ write_fake_remote() {
   printf '%s' "$output" | grep -q 'status=ok'
   [ "$status" -eq 0 ]
 }
+
+# --- #773: a team the server has refused is not started ---------------------
+#
+# Auto-start plus an engine that exits on a refusal is a restart loop: start,
+# refuse, exit, start again next session. #773 kept the engine up and put the
+# refusal where a reader can find it; this is the reader, at the one moment a
+# start would otherwise be attempted.
+
+# A `remote.sh` that reports a refusal from `status`, and RECORDS whether it was
+# ever asked to start anything. The record is the point: "did not start it" is
+# the claim, and an output check alone cannot tell "not started" from "started
+# and said nothing".
+write_refusing_status_remote() {
+  local line="$1" fake="$TEST_SKILL_DIR/fake-remote-refusal.sh"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' 'case "${1:-}" in'
+    printf '%s\n' "  status) printf '%s\\n' \"  $line\"; exit 0 ;;"
+    printf '%s\n' '  sync)   printf "%s\n" "$3" >> "$AGMSG_TEST_START_CALLS"; echo "Sync engine started for '"'"'$3'"'"' (pid 4242)."; exit 0 ;;'
+    printf '%s\n' 'esac'
+    printf '%s\n' 'exit 0'
+  } > "$fake"
+  chmod +x "$fake"
+  printf '%s\n' "$fake"
+}
+
+@test "autostart: a team the server has refused is never offered to sync start (#773)" {
+  source "$SCRIPTS/lib/sync-autostart.sh"
+  export AGMSG_TEST_START_CALLS="$TEST_SKILL_DIR/start-calls"
+  : > "$AGMSG_TEST_START_CALLS"
+  local fake; fake="$(write_refusing_status_remote 'refused: the server answered 402 payment_required (sync.example.test)')"
+
+  run agmsg_sync_autostart "$fake" testteam
+  [ "$status" -eq 0 ]
+
+  # The claim is "it was not started", so the call record is what is asserted.
+  [ ! -s "$AGMSG_TEST_START_CALLS" ]
+  # And the reason reaches the operator, in the server's words.
+  printf '%s' "$output" | grep -q 'the server refused'
+  printf '%s' "$output" | grep -q '402 payment_required'
+  printf '%s' "$output" | grep -q 'sync.example.test'
+  # Nothing invented about what it MEANS. Each of these is a sentence only the
+  # operator of that server may write.
+  refute grep -qi 'subscri' <<<"$output"
+  refute grep -qi 'upgrade' <<<"$output"
+  refute grep -qi 'billing' <<<"$output"
+  refute grep -qi 'plan'    <<<"$output"
+}
+
+@test "autostart: a status this client never enumerated still stops the start (#773)" {
+  # BY THE LINE, NOT BY THE NUMBER. A self-hosted server refuses for its own
+  # reasons with codes nothing here has heard of.
+  source "$SCRIPTS/lib/sync-autostart.sh"
+  export AGMSG_TEST_START_CALLS="$TEST_SKILL_DIR/start-calls"
+  : > "$AGMSG_TEST_START_CALLS"
+  local fake; fake="$(write_refusing_status_remote 'refused: the server answered 451 tenant_suspended_by_operator (sync.example.test)')"
+
+  run agmsg_sync_autostart "$fake" testteam
+  [ ! -s "$AGMSG_TEST_START_CALLS" ]
+  printf '%s' "$output" | grep -q '451 tenant_suspended_by_operator'
+}
+
+@test "autostart: with no refusal recorded, the team IS started (#773 negative control)" {
+  # Without this, the two cases above are satisfied by a helper that never
+  # starts anything at all.
+  source "$SCRIPTS/lib/sync-autostart.sh"
+  export AGMSG_TEST_START_CALLS="$TEST_SKILL_DIR/start-calls"
+  : > "$AGMSG_TEST_START_CALLS"
+  local fake="$TEST_SKILL_DIR/fake-remote-clean.sh"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' 'case "${1:-}" in'
+    printf '%s\n' '  status) printf "%s\n" "  testteam  connected since 2026-08-01"; exit 0 ;;'
+    printf '%s\n' '  sync)   printf "%s\n" "$3" >> "$AGMSG_TEST_START_CALLS"; echo "Sync engine started for '"'"'$3'"'"' (pid 4242)."; exit 0 ;;'
+    printf '%s\n' 'esac'
+    printf '%s\n' 'exit 0'
+  } > "$fake"
+  chmod +x "$fake"
+
+  run agmsg_sync_autostart "$fake" testteam
+  [ "$status" -eq 0 ]
+  grep -q '^testteam$' "$AGMSG_TEST_START_CALLS"
+  printf '%s' "$output" | grep -q 'started one for'
+  refute grep -q 'the server refused' <<<"$output"
+}

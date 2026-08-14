@@ -69,9 +69,31 @@ agmsg_sync_autostart() {
   local budget="${AGMSG_SYNC_AUTOSTART_TIMEOUT_S:-5}"
   local elapsed_start=$SECONDS
 
-  local team out rc tmp started="" failed="" slow=""
+  local team out rc tmp refusal_line started="" failed="" slow="" refused=""
   for team in "$@"; do
     [ -n "$team" ] || continue
+    # A TEAM THE SERVER HAS REFUSED IS NOT STARTED (#773).
+    #
+    # Without this, auto-start is a restart loop: the engine exits on a refusal
+    # the caller has to act on, this starts it again on the next session, it
+    # exits again. #773 kept the engine up and recorded the refusal where a
+    # reader can find it; this is that reader, at the one moment a start would
+    # otherwise be attempted.
+    #
+    # The `refused:` line is `remote.sh status`'s, and it repeats what the
+    # server said and nothing else. Reading the human line rather than the JSON
+    # keeps this free of a JSON parser in the session's critical path, and that
+    # line is under test in `tests/test_remote_refusal.bats`, so it is a
+    # contract rather than a formatting accident.
+    #
+    # The record is already compared against the last successful cycle by the
+    # reader, so a refusal that a later success reversed does not appear here —
+    # this does not re-decide staleness, and must not.
+    refusal_line="$("$remote_sh" status "$team" 2>/dev/null | grep -E '^[[:space:]]*refused:' | head -1)"
+    if [ -n "$refusal_line" ]; then
+      refused="$refused$team	$(printf '%s' "$refusal_line" | sed 's/^[[:space:]]*//')"$'\n'
+      continue
+    fi
     tmp="$(mktemp 2>/dev/null)" || tmp=""
     [ -n "$tmp" ] || return 0
     # stderr folded in: `cmd_sync_start` says why it refused on stderr, and that
@@ -164,6 +186,22 @@ agmsg_sync_autostart() {
       printf '  bash %q status %q\n' "$remote_sh" "$t"
     done
     printf '\n'
+  fi
+
+  if [ -n "$refused" ]; then
+    # THE SERVER'S SENTENCE, AND NOTHING ADDED TO IT.
+    #
+    # This client talks to whatever remote it was pointed at — self-hosted,
+    # somebody else's, or a service — and it cannot know why that one refused.
+    # A sentence invented here is wrong for some server, and the operator of
+    # that server is the only one who can write the right one. So the line is
+    # repeated as `status` printed it, and the remedy offered is to ask them.
+    printf '%s\n' 'AGMSG: not starting a sync engine — the server refused:' ''
+    printf '%s' "$refused" | while IFS=$'\t' read -r t line; do
+      [ -n "$t" ] || continue
+      printf '  %s: %s\n' "$t" "$line"
+    done
+    printf '%s\n' '' 'The engine is not started while that stands. The session continues.' ''
   fi
 
   if [ -n "$failed" ]; then
