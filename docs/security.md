@@ -5,23 +5,23 @@ and what has not been examined. It follows the structure RFC 3552 (BCP 72) asks
 for, because that structure forces the second and third of those to be written
 down rather than implied.
 
-It is written for a reviewer who intends to check it, so every claim is labelled
-with what stands behind it. Four labels are used, and they are not
-interchangeable:
+It is written for a reviewer who intends to check it. **The central claims — what
+is protected, what is not, and why — carry a `file:line` in this repository.**
+Some rows of the properties table are summaries and carry no citation; where a
+row rests on something other than this tree, it says so in place of one
+(`inherited` for a property of the `age` format itself, `assumption` for
+something taken as given).
 
-- **cited** — a `file:line` in this repository. The great majority of claims.
-- **assumption** — taken as given, not derived here. Named as such where it
-  appears.
-- **out of scope** — this document did not examine it. Not a soft way of saying
-  "absent".
-- **inherited** — a property of `age` itself, not of this repository. Checking
-  it means reading the age specification, not this tree.
+That is a weaker promise than the one this paragraph used to make. The earlier
+version said every claim carries a citation and that anything without one is
+marked as an assumption. Both halves were false, and the sentence was itself an
+uncited claim about the document — the shape this whole document exists to
+refuse. A true weak promise is strictly better here: in a security document, a
+false statement about its own rigour discredits the parts that are rigorous.
 
-An earlier version of this paragraph said every claim carries a citation. That
-was itself an uncited claim about the document, and it was false: two rows of
-the properties table rested on nothing visible. Raised in review. The labels
-above exist because the fix is to say which is which, not to assert that they
-are all one kind.
+What is NOT claimed: that every sentence below has been individually classified.
+Deriving the full claim set and labelling each one is real work and is filed as
+`fujibee/agmsg#787`.
 
 If any citation does not say what this document says it says, treat every other
 claim here as unverified until re-checked — that is the correct response, and
