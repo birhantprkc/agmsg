@@ -510,8 +510,18 @@ eperm_pid() {
   # unchanged; only the reason they are reachable is new. This is a reversal of
   # a decision, not a test edited to fit new output (raised in review).
   #
-  # THE FAILURE IS FORCED, AND THAT IS ITS ONLY CAUSE. An unusable interpreter
-  # makes `sync start` fail immediately and for a named reason.
+  # THE FAILURE IS FORCED BY THE COMMAND ITSELF, not by its environment.
+  #
+  # It used to be forced with an unusable interpreter, on the reasoning that
+  # `sync start` would then "fail immediately and for a named reason". That is
+  # a claim about a machine, and it was false on one: on a macOS CI runner the
+  # command had not returned after SIXTY seconds, so the hook printed "a start
+  # is still in flight" — a different fact, tested elsewhere — and this case
+  # failed for a reason that had nothing to do with what it asserts.
+  #
+  # So `remote.sh` is replaced, for this half of the test, by one that answers
+  # `status` with a connected team and refuses `sync start` at once. The real
+  # one is restored before the section below, which needs it to SUCCEED.
   #
   # It used to be inherited instead — the fixture simply had no engine to start
   # — and that held only while this file ran alone: the case passed under
@@ -523,8 +533,6 @@ eperm_pid() {
   # The budget is raised as well: under the 5s default a slow failure is
   # reported as "still in flight", which is a different fact and is tested
   # separately in tests/test_sync_autostart.bats.
-  export AGMSG_NODE="$TEST_SKILL_DIR/no-such-node-for-this-test"
-  export AGMSG_SYNC_AUTOSTART_TIMEOUT_S=60
   env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
 
   # NEGATIVE FIRST, on the state every ordinary machine is in: no connected
@@ -550,6 +558,23 @@ eperm_pid() {
     ));")"
   printf '%s\n' "$updated" > "$cfg"
 
+  # The stub goes in HERE, after the negative half has run against the real
+  # command. Installed any earlier it would report a connected team before one
+  # exists, and the negative assertion — the one that catches a line printed
+  # unconditionally — would be testing the stub instead of the hook.
+  cp "$SCRIPTS/remote.sh" "$TEST_SKILL_DIR/remote.real.sh"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' 'if [ "${1:-}" = "status" ] && [ -z "${2:-}" ]; then'
+    printf '%s\n' '  printf "team\tconnected since 2026-08-12\n"; exit 0'
+    printf '%s\n' 'fi'
+    printf '%s\n' 'if [ "${1:-}" = "sync" ]; then'
+    printf '%s\n' '  echo "agmsg: cannot start the sync engine for '"'"'$3'"'"': no runtime" >&2; exit 1'
+    printf '%s\n' 'fi'
+    printf '%s\n' 'exit 0'
+  } > "$SCRIPTS/remote.sh"
+  chmod +x "$SCRIPTS/remote.sh"
+
   run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" </dev/null
   [ "$status" -eq 0 ]
   printf '%s\n' "$output" | grep -q -F -- "connected, but not syncing"
@@ -570,6 +595,12 @@ eperm_pid() {
   # The directive still has to be there: a warning that displaces it would stop
   # the session receiving anything at all, which is worse than the gap it names.
   printf '%s\n' "$session_out" | grep -q -F -- "invoke the Monitor tool"
+
+  # The real command is back from here on: the rest of this test requires a
+  # `sync start` that can succeed, and a stub that always refuses would make
+  # the final assertion unreachable rather than true.
+  cp "$TEST_SKILL_DIR/remote.real.sh" "$SCRIPTS/remote.sh"
+  chmod +x "$SCRIPTS/remote.sh"
 
   # Run what was printed, THROUGH AN INSTALL PATH THAT NEEDS QUOTING, and
   # require it to succeed.
