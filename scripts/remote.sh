@@ -1358,6 +1358,15 @@ _remote_sync_engine_pidfile() { printf '%s' "$CONNECTION_ROOT/run/remote-sync.$1
 # Written by the engine after a cycle completes (#756). Derived here the same way
 # the pidfile is, because it has the same lifetime and the same owner.
 _remote_sync_engine_cycle_stamp() { printf '%s' "$CONNECTION_ROOT/run/remote-sync.$1.cycles.json"; }
+# Written by the engine when the server REFUSED, and removed by the engine on
+# the next successful cycle (#773). Same directory, same derivation, same
+# lifetime as the two above.
+#
+# The reason for its existence is that the reason was already on disk and
+# unread: `event()` writes a `fatal` line into the run log with a timestamp,
+# and nothing `status` opens has ever mentioned it. This is a place to read
+# from, not a new place to write.
+_remote_sync_engine_refusal() { printf '%s' "$CONNECTION_ROOT/run/remote-sync.$1.refusal.json"; }
 
 # _remote_holds_current_key <team> -> 0 when this machine holds the identity
 # for the team's CURRENT epoch, 1 otherwise.
@@ -2133,6 +2142,32 @@ _remote_status_one() {
       echo "		cycles: last successful sync $last_cycle"
     fi
   fi
+  # WHY IT IS NOT SYNCING, when the server has said so (#773).
+  #
+  # Printed for a running engine AND a stopped one: a refusal recorded by an
+  # engine that has since been stopped is still the last thing the server said,
+  # and the operator asking "why" is owed it either way.
+  #
+  # REPEATED, NOT INTERPRETED. The status and the code are the server's words.
+  # This client talks to *a* remote — self-hosted, someone else's, or a service
+  # — and cannot know what a particular one means by a particular code. A
+  # sentence invented here is wrong for some server. What it may add is where
+  # the operator of that server would be reached, which is the host the
+  # binding already names.
+  local refusal_file refusal_status refusal_code refusal_at refusal_host
+  refusal_file="$(_remote_sync_engine_refusal "$team")"
+  if [ -f "$refusal_file" ]; then
+    refusal_status="$(_remote_read_config_field "$refusal_file" '$.status')"
+    refusal_code="$(_remote_read_config_field "$refusal_file" '$.code')"
+    refusal_at="$(_remote_read_config_field "$refusal_file" '$.at')"
+    refusal_host="$(_remote_read_config_field "$refusal_file" '$.endpoint_host')"
+    if [ -n "$refusal_status" ] && [ "$refusal_status" != "null" ]; then
+      echo "		refused: the server answered $refusal_status${refusal_code:+ $refusal_code} at $refusal_at"
+      if [ -n "$refusal_host" ] && [ "$refusal_host" != "null" ]; then
+        echo "		         that server is $refusal_host — what the answer means is theirs to say"
+      fi
+    fi
+  fi
   if [ "$binding_cipher" = "age-v1" ]; then
     if [ -n "$key_id" ] && [ "$key_id" != "null" ]; then
       echo "		encryption: age-v1, key present"
@@ -2202,8 +2237,21 @@ _remote_status_json_one() {
   _remote_config_shape_ok "$raw" || return 2
 
   IFS=$'\t' read -r engine_state engine_pid < <(_remote_sync_engine_status "$team")
-  printf '%s' "$raw" | python3 -c '
-import json, sys
+  # THE SURFACE AN AGENT READS (#773).
+  #
+  # Someone asks their agent "why isn't this syncing?" and the agent has to be
+  # able to answer. `/agmsg remote status` runs this with `--json`, and it is
+  # the only thing an agent consults about the engine — so the refusal has to
+  # be here, not only in a line a human reads.
+  #
+  # Passed as a whole file rather than as parsed fields: whatever the engine
+  # recorded is what the reader gets, and adding a field there does not need a
+  # change here.
+  local refusal_raw="" refusal_file
+  refusal_file="$(_remote_sync_engine_refusal "$team")"
+  [ -f "$refusal_file" ] && refusal_raw="$(cat "$refusal_file" 2>/dev/null || true)"
+  printf '%s' "$raw" | REFUSAL_JSON="$refusal_raw" python3 -c '
+import json, os, sys
 team, engine_state, engine_pid_text = sys.argv[1:4]
 try:
     cfg = json.loads(sys.stdin.read())
@@ -2219,6 +2267,12 @@ engine_pid = int(engine_pid_text) if engine_pid_text else None
 if state == "disconnected":
     engine_state = "stopped"
     engine_pid = None
+try:
+    refusal = json.loads(os.environ.get("REFUSAL_JSON") or "null")
+except Exception:
+    refusal = None
+if not isinstance(refusal, dict):
+    refusal = None
 print(json.dumps({
     "local_team": team,
     "endpoint": binding.get("endpoint"),
@@ -2228,6 +2282,10 @@ print(json.dumps({
     "state": state,
     "engine_state": engine_state,
     "engine_pid": engine_pid,
+    # null when the server has refused nothing, or when what was recorded
+    # cannot be read. An unreadable record is reported as absent rather than
+    # guessed at; the human line above is derived from the same file.
+    "refusal": refusal,
 }, sort_keys=True))
 ' "$team" "$engine_state" "$engine_pid"
 }

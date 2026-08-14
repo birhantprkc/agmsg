@@ -2,7 +2,7 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { spawn } from "node:child_process";
-import { appendFile, lstat, mkdir, open, readFile, rename, rmdir, stat, writeFile } from "node:fs/promises";
+import { appendFile, lstat, mkdir, open, readFile, rename, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import process from "node:process";
 import { realpathSync } from "node:fs";
@@ -140,6 +140,98 @@ async function recordCycleSuccess(team, at, writeFileCall = writeFile) {
       type: "sync_cycle_stamp", first_success_at: first, last_success_at: at,
     })}\n`);
   } catch { /* best-effort: never fail a working cycle over its own bookkeeping */ }
+}
+
+// A refusal the caller can act on, recorded where something can read it (#773).
+//
+// A remote may answer a write with a status meaning "the caller must do
+// something" rather than "try again later". The engine used to treat that as a
+// transport failure: not retryable, so it left the loop, and the process
+// exited. `status` then said "engine stopped -- run: remote.sh sync start",
+// which invites the one action that cannot work; starting it again produces
+// the same refusal and the same exit, for as long as the server's answer
+// stands.
+//
+// THE REASON WAS NEVER MISSING. `event()` writes `fatal` to stdout and
+// `sync start` captures it into `run/remote-sync.<team>.log`, with a
+// timestamp, at a known path. What was missing is a place to READ it from:
+// `status` opens a pidfile and the cycle stamp, and nothing an agent consults
+// mentions the log. So this is one more fact beside the cycle stamp, not a new
+// mechanism -- the same move #760 made.
+//
+// WHAT IS STORED, AND WHAT IS DELIBERATELY NOT.
+//
+// Stored: the status, the code, the time, and the host from the endpoint the
+// config already holds. Verbatim, as the server said them.
+//
+// Not stored: any sentence about what the refusal MEANS or what to do about
+// it. This engine talks to *a* remote -- self-hosted, someone else's, or a
+// service -- and it cannot know why a particular one refused. A sentence it
+// invents is wrong for some server. Interpretation belongs to whoever operates
+// that server, and the host is there so a reader knows who that is.
+function refusalPath(team) {
+  const connectionRoot = process.env.AGMSG_SYNC_CONNECTION_DIR ?? process.env.SKILL_DIR;
+  if (!connectionRoot) throw new Error("sync connection root is unavailable");
+  return join(connectionRoot, "run", `remote-sync.${team}.refusal.json`);
+}
+
+/**
+ * A refusal is a 4xx the retry policy does not cover.
+ *
+ * BY CLASS, NOT BY NUMBER. There is one such status in use today, and it is
+ * deliberately not named anywhere in this file — not in the code and not in
+ * this comment, which a check enforces. A server may refuse for reasons this
+ * protocol never enumerates, and every one of them is "the server decided, and
+ * said so" rather than "ask again later"; naming one would invite the next
+ * reader to special-case it, and the one after that to add a sentence about
+ * what it means.
+ *
+ * Everything in the 4xx range that the retry policy does not cover lands here,
+ * for that same reason. 5xx stays a transport failure and the retryable
+ * statuses stay retryable, because `isRetryable` is asked first.
+ *
+ * 5xx stays a transport failure, and the retryable 4xx (408, 429) stay
+ * retryable, because `isRetryable` is asked first.
+ */
+/** The host of an endpoint, or null when it cannot be read as a URL. */
+function hostOf(endpoint) {
+  try {
+    return new URL(endpoint).host;
+  } catch {
+    return null;
+  }
+}
+
+export function isRefusal(error) {
+  const status = error?.status;
+  if (typeof status !== "number") return false;
+  if (isRetryable(error)) return false;
+  return status >= 400 && status < 500;
+}
+
+/**
+ * Write the refusal down. Best-effort, like the cycle stamp and for the same
+ * reason: bookkeeping must never be the thing that takes syncing down.
+ */
+async function recordRefusal(team, fact, writeFileCall = writeFile) {
+  try {
+    await writeFileCall(refusalPath(team), `${JSON.stringify({
+      type: "sync_refusal", ...fact,
+    })}\n`);
+  } catch { /* best-effort */ }
+}
+
+/**
+ * Forget it, because a cycle has since succeeded.
+ *
+ * A refusal that outlives its truth is worse than no record: `status` would
+ * keep reporting a server decision that has been reversed, and the operator
+ * would keep acting on it. Cleared in the same place the success is recorded.
+ */
+async function clearRefusal(team, rmCall = rm) {
+  try {
+    await rmCall(refusalPath(team), { force: true });
+  } catch { /* best-effort */ }
 }
 
 // What actually went wrong, when the thing that threw is a wrapper.
@@ -2722,6 +2814,9 @@ export async function runLoop(config, options, dependencies = {}) {
   const eventCall = dependencies.eventCall ?? event;
   const isRetryableCall = dependencies.isRetryableCall ?? isRetryable;
   const recordCycleCall = dependencies.recordCycleCall ?? recordCycleSuccess;
+  const clearRefusalCall = dependencies.clearRefusalCall ?? clearRefusal;
+  const recordRefusalCall = dependencies.recordRefusalCall ?? recordRefusal;
+  const isRefusalCall = dependencies.isRefusalCall ?? isRefusal;
   const nowCall = dependencies.nowCall ?? (() => new Date().toISOString());
 
   // An explicit --limit is a ceiling for BOTH push and pull (request size /
@@ -2751,6 +2846,9 @@ export async function runLoop(config, options, dependencies = {}) {
       // success. Same shape as the `cycle.error` logging below.
       try {
         await recordCycleCall(config.local_team, nowCall());
+        // A success outdates any refusal on record. Cleared HERE, beside the
+        // stamp, so the two facts can never disagree about the same cycle.
+        await clearRefusalCall(config.local_team);
       } catch { /* bookkeeping is best-effort; the cycle already succeeded */ }
       catchUp = result?.pushSaturated === true;
       // catch-up removes the wait ONLY between successful, progress-making
@@ -2763,6 +2861,40 @@ export async function runLoop(config, options, dependencies = {}) {
       try {
         await eventCall("cycle.error", { message: error.message, ...causeOf(error) });
       } catch { /* logging is best-effort */ }
+
+      // A REFUSAL DOES NOT LEAVE THE LOOP (#773).
+      //
+      // It is not retryable — asking again does not change a decision — and it
+      // is not a transport failure either: the server has answered, and said
+      // what it decided. Exiting on it turns a recoverable condition into a
+      // dead process whose `status` line recommends starting it again, which
+      // reproduces the refusal and the exit.
+      //
+      // And the answer CAN change, out of band: someone pays, a quota resets,
+      // an operator fixes a setting. Staying up means the next cycle recovers
+      // with nobody typing anything. So this backs off to the longest interval
+      // and keeps asking quietly, and the failure count is not advanced —
+      // a refusal is not evidence that the transport is degrading.
+      if (isRefusalCall(error)) {
+        try {
+          await recordRefusalCall(config.local_team, {
+            status: error?.status ?? null,
+            code: error?.code ?? null,
+            at: nowCall(),
+            // From the config the engine already holds. Not an interpretation:
+            // it says WHERE the operator of that server would be reached.
+            endpoint_host: hostOf(config.endpoint),
+          });
+        } catch { /* best-effort */ }
+        try {
+          await eventCall("cycle.refused", {
+            status: error?.status ?? null, code: error?.code ?? null,
+          });
+        } catch { /* logging is best-effort */ }
+        await sleepCall(MAX_BACKOFF_MS);
+        continue;
+      }
+
       if (!isRetryableCall(error)) throw error;
       consecutiveFailures += 1;
       const backoffMs = Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2 ** (consecutiveFailures - 1));

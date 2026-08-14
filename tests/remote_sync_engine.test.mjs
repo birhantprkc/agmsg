@@ -18,6 +18,7 @@ import {
   exportAgeSnapshot,
   isRetryable,
   initialAgeSnapshot,
+  isRefusal,
   runLoop,
   loadConfig,
   nextLocalAgeSnapshot,
@@ -3387,4 +3388,106 @@ test("an error code is read from the protocol shape, and from the edge's for now
   assert.equal(errorCode({ error: "" }), "unknown-error");
   assert.equal(errorCode({}), "unknown-error");
   assert.equal(errorCode(undefined), "unknown-error");
+});
+
+// ── a refusal the caller can act on (#773) ──────────────────────────────────
+//
+// The engine used to leave the loop on one: not retryable, so it threw, main()
+// rejected, and the process exited. `status` then said "engine stopped — run:
+// remote.sh sync start", which invites the one action that cannot work.
+
+test("isRefusal: a 4xx the retry policy does not cover, by class and not by number", () => {
+  // The status in use today is deliberately not named in the engine, so it is
+  // not named here either — what is asserted is the CLASS. A server may refuse
+  // for reasons this protocol never enumerates.
+  for (const status of [400, 401, 402, 403, 409, 422, 451]) {
+    assert.equal(isRefusal({ status }), true, `${status} should be a refusal`);
+  }
+  // Retryable 4xx stay retryable: isRetryable is asked first.
+  for (const status of [408, 429]) {
+    assert.equal(isRefusal({ status }), false, `${status} is retryable, not refused`);
+  }
+  // 5xx is a transport failure, not a decision.
+  for (const status of [500, 502, 503, 504]) {
+    assert.equal(isRefusal({ status }), false, `${status} is transport, not refused`);
+  }
+  // An error carrying no status at all — a socket failure — is neither.
+  assert.equal(isRefusal(new Error("fetch failed")), false);
+  assert.equal(isRefusal({ retryable: true, status: 402 }), false);
+});
+
+test("runLoop: a refusal is recorded and does NOT leave the loop", async () => {
+  const recorded = [];
+  const sleeps = [];
+  let i = 0;
+  // An endpoint the host can actually be read from: the recorded host is the
+  // one fact here that says WHERE the operator of that server would be
+  // reached, and a fixture without one would let the assertion pass on null.
+  const refusedConfig = { ...config, endpoint: "https://sync.example.test" };
+  await assert.rejects(() => runLoop(refusedConfig, {}, {
+    cycleCall: async () => {
+      i += 1;
+      if (i <= 2) { const refused = new Error("HTTP 402 payment_required"); refused.status = 402; refused.code = "payment_required"; throw refused; }
+      // Only a DIFFERENT, non-retryable error ends the loop — which is how
+      // this test can end at all. If a refusal exited, i would never reach 3.
+      const stop = new Error("stop"); stop.retryable = false; throw stop;
+    },
+    isRetryableCall: (error) => error.retryable === true,
+    isRefusalCall: (error) => typeof error.status === "number" && error.status >= 400 && error.status < 500,
+    recordRefusalCall: async (team, fact) => { recorded.push({ team, ...fact }); },
+    clearRefusalCall: async () => {},
+    nowCall: () => "2026-08-14T00:00:00Z",
+    sleepCall: async (ms) => { sleeps.push(ms); },
+    eventCall: async () => {},
+  }), /stop/);
+
+  // It came back for a second cycle after the first refusal, and a third.
+  assert.equal(i, 3);
+  // Both refusals were written down, verbatim, with the host from the config.
+  assert.equal(recorded.length, 2);
+  assert.equal(recorded[0].status, 402);
+  assert.equal(recorded[0].code, "payment_required");
+  assert.equal(recorded[0].at, "2026-08-14T00:00:00Z");
+  assert.equal(recorded[0].endpoint_host, "sync.example.test");
+  // Backed off to the longest interval rather than hammering, and the failure
+  // count was not advanced — a refusal is not evidence the transport is
+  // degrading, so it must not shorten anything else's backoff.
+  assert.deepEqual(sleeps, [60000, 60000]);
+});
+
+test("runLoop: a successful cycle clears a refusal that is no longer true", async () => {
+  // A record that outlives its truth is worse than no record: `status` would
+  // keep reporting a decision the server has since reversed.
+  const cleared = [];
+  let i = 0;
+  await assert.rejects(() => runLoop(config, {}, {
+    cycleCall: async () => {
+      i += 1;
+      if (i === 1) { const refused = new Error("refused"); refused.status = 402; throw refused; }
+      if (i === 2) return { pushSaturated: false };
+      const stop = new Error("stop"); stop.retryable = false; throw stop;
+    },
+    isRetryableCall: (error) => error.retryable === true,
+    isRefusalCall: (error) => typeof error.status === "number" && error.status >= 400 && error.status < 500,
+    recordRefusalCall: async () => {},
+    clearRefusalCall: async (team) => { cleared.push(team); },
+    recordCycleCall: async () => {},
+    nowCall: () => "2026-08-14T00:00:00Z",
+    sleepCall: async () => {},
+    eventCall: async () => {},
+  }), /stop/);
+  assert.deepEqual(cleared, [config.local_team]);
+});
+
+test("runLoop: a non-retryable error that is NOT a refusal still ends the loop", async () => {
+  // The negative control. Staying up for everything would turn a malformed
+  // config into an engine that spins forever saying nothing useful — exiting
+  // is right for that, and the refusal case is the exception, not the rule.
+  await assert.rejects(() => runLoop(config, {}, {
+    cycleCall: async () => { const bad = new Error("config is unreadable"); throw bad; },
+    isRetryableCall: () => false,
+    isRefusalCall: () => false,
+    sleepCall: async () => {},
+    eventCall: async () => {},
+  }), /config is unreadable/);
 });
