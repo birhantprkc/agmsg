@@ -489,4 +489,22 @@ write_refusing_status_remote() {
   [ "$status" -eq 0 ]
   # The budget is 2s; anything near the fake's forever is the bound missing.
   [ "$took" -lt 10 ]
+
+  # AND NOTHING IS LEFT BEHIND. Bounding the caller while the probe runs for
+  # ever adds a process and two temp paths to every session and every actas,
+  # which is a leak measured in machine uptime rather than in one run. A
+  # `status` reads, so there is nothing half-made to protect by leaving it.
+  # Matched by the path THIS TEST'S fake actually runs under, not by its bare
+  # name. A bare name matches a stray from any other run in the same process
+  # tree -- a CI shard runs many files in one -- and this assertion then goes
+  # red for somebody else's leftover. It did exactly that here, against a
+  # leftover from an earlier experiment of my own, and passed under `--filter`
+  # while failing in the full file: the same coupling this suite already fixed
+  # in the other direction.
+  local i alive=1
+  for i in $(seq 1 50); do
+    pgrep -f "$TEST_SKILL_DIR/fake-remote-hanging-status" >/dev/null 2>&1 || { alive=0; break; }
+    sleep 0.1
+  done
+  [ "$alive" -eq 0 ]
 }

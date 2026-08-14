@@ -69,7 +69,7 @@ agmsg_sync_autostart() {
   local budget="${AGMSG_SYNC_AUTOSTART_TIMEOUT_S:-5}"
   local elapsed_start=$SECONDS
 
-  local team out rc tmp probe refusal_line started="" failed="" slow="" refused=""
+  local team out rc tmp probe probe_pid _pp refusal_line started="" failed="" slow="" refused=""
   for team in "$@"; do
     [ -n "$team" ] || continue
     # A TEAM THE SERVER HAS REFUSED IS NOT STARTED (#773).
@@ -112,9 +112,28 @@ agmsg_sync_autostart() {
         "$remote_sh" status "$team" >"$probe" 2>/dev/null
         printf '%s\n' done > "$probe.rc"
       ) </dev/null >/dev/null 2>&1 &
+      probe_pid=$!
       while [ ! -f "$probe.rc" ] && [ $((SECONDS - elapsed_start)) -lt "$budget" ]; do
         sleep 0.1
       done
+      if [ ! -f "$probe.rc" ]; then
+        # A TIMED-OUT PROBE IS REAPED. The start is not, and the difference is
+        # what each one is in the middle of: a start may be a moment away from
+        # having an engine and a pidfile, so killing it can leave half of one
+        # behind. A `status` READS — there is nothing half-made to protect, and
+        # a probe left running is a process and two temp paths added by every
+        # session and every actas, for as long as the machine is up (raised in
+        # review, and it was the start's rule applied where it does not belong).
+        #
+        # The command itself, then the subshell holding it. `pgrep` is absent
+        # on some runtimes; there the subshell is still reaped and the command
+        # is left to the same fate as any orphan, which is no worse than before.
+        for _pp in $(pgrep -P "$probe_pid" 2>/dev/null); do
+          kill "$_pp" 2>/dev/null || true
+        done
+        kill "$probe_pid" 2>/dev/null || true
+        rm -f "$probe" "$probe.rc"
+      fi
       if [ -f "$probe.rc" ]; then
         # `|| true` because a grep that matches nothing exits 1, and this
         # helper's contract with both hooks is that it never returns non-zero
@@ -123,8 +142,6 @@ agmsg_sync_autostart() {
         refusal_line="$(grep -E '^[[:space:]]*refused:' "$probe" 2>/dev/null | head -1 || true)"
         rm -f "$probe" "$probe.rc"
       fi
-      # No `rm` on the timeout path: the child still owns those two files, and
-      # removing them under it is how a half-written answer becomes a wrong one.
     fi
     if [ -n "$refusal_line" ]; then
       refused="$refused$team	$(printf '%s' "$refusal_line" | sed 's/^[[:space:]]*//')"$'\n'
