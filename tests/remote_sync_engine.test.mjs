@@ -509,6 +509,56 @@ test("a file fault names the condition that failed, and permissions last", () =>
   }
 });
 
+test("a driver failure names the binding, or says why it cannot be named", async () => {
+  // THE PRODUCTION ENTRY, not the helper beside it: `driver()` resolves the
+  // binding path itself, so this drives the same call a sync makes.
+  //
+  // Two cases, and the second is the one that was silent. `teamConfigPath`
+  // throws without a connection root, and a caller that has none still has to
+  // run -- so the run continues either way, and the difference is what the
+  // failure message can say. Returning `undefined` and dropping the reason is
+  // what #802 collects; reverting to it turns the second half of this red.
+  const root = await mkdtemp(join(tmpdir(), "agmsg-binding-"));
+  const previousDriver = process.env.AGMSG_SYNC_DRIVER;
+  const previousConnection = process.env.AGMSG_SYNC_CONNECTION_DIR;
+  const previousSkill = process.env.SKILL_DIR;
+  try {
+    const script = join(root, "driver.sh");
+    // Exits non-zero with NOTHING on stderr, so the fallback diagnostic -- the
+    // one that names the binding -- is the sentence under test.
+    await writeFile(script, "#!/usr/bin/env bash\ncat > /dev/null\nexit 9\n", { mode: 0o755 });
+    process.env.AGMSG_SYNC_DRIVER = script;
+    const config = {
+      local_team: "t", server_instance_id: "018f3f7e-0000-7000-8000-000000000001",
+      remote_team_id: "018f3f7e-0000-7000-8000-000000000002", protocol_version: 1,
+    };
+
+    process.env.AGMSG_SYNC_CONNECTION_DIR = root;
+    delete process.env.SKILL_DIR;
+    await assert.rejects(() => driver("prepare", config, []), (error) =>
+      error.message.includes(join(root, "teams", "t", "config.json")) &&
+      /failed for team 't'/u.test(error.message));
+
+    // No connection root: the path cannot be resolved. The run still reaches
+    // the driver and still reports its exit -- and now says WHY there is no
+    // path instead of quietly leaving the sentence short.
+    delete process.env.AGMSG_SYNC_CONNECTION_DIR;
+    delete process.env.SKILL_DIR;
+    await assert.rejects(() => driver("prepare", config, []), (error) =>
+      /failed for team 't' \(exit 9\)/u.test(error.message) &&
+      /its path could not be resolved: sync connection root is unavailable/u.test(error.message));
+  } finally {
+    if (previousDriver === undefined) delete process.env.AGMSG_SYNC_DRIVER;
+    else process.env.AGMSG_SYNC_DRIVER = previousDriver;
+    if (previousConnection === undefined) delete process.env.AGMSG_SYNC_CONNECTION_DIR;
+    else process.env.AGMSG_SYNC_CONNECTION_DIR = previousConnection;
+    if (previousSkill === undefined) delete process.env.SKILL_DIR;
+    else process.env.SKILL_DIR = previousSkill;
+    if (!root.startsWith(tmpdir())) throw new Error("unsafe test root");
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("an unreadable age identity says which condition failed, and keeps the parser's own reason", async () => {
   // The real entry point, not a helper beside it. Reverting the change in
   // sync-cipher.mjs turns each of the first three red; the fourth is here to

@@ -1629,12 +1629,34 @@ export function describeChildExit(code, signal) {
 // it cannot. `teamConfigPath` throws without a connection root, and a caller
 // that has none is a caller that still has to be able to run -- the path is for
 // a sentence in a failure message, so it must not become a new way to fail.
-function bindingPathIfKnown(team) {
+// The team's binding path, or WHY there is none.
+//
+// `teamConfigPath` throws without a connection root, and a caller that has none
+// still has to run -- the path is for a sentence in a failure message, so it
+// must not become a new way to fail. That much was right the first time.
+//
+// What was wrong was returning `undefined` and dropping the reason. A failure
+// turned into an ordinary value with nothing recorded is the shape #802
+// collects, and it had no business being in a change whose whole subject is
+// messages that say what actually happened. Swallowing is fine here. Going
+// silent is not, so the reason travels with the fallback.
+export function bindingPathOrReason(team, resolve = teamConfigPath) {
   try {
-    return teamConfigPath(team);
-  } catch {
-    return undefined;
+    return { path: resolve(team) };
+  } catch (error) {
+    return { unavailable: error instanceof Error ? error.message : String(error) };
   }
+}
+
+// What the diagnostic says about the binding: where it is, or why it cannot be
+// named. Never nothing -- "and its binding" alone is the sentence that sent a
+// reader looking for a file this process could not even locate.
+function bindingNote(binding) {
+  if (binding?.path !== undefined) return ` and its binding at ${binding.path}`;
+  if (binding?.unavailable !== undefined) {
+    return ` and its binding (its path could not be resolved: ${binding.unavailable})`;
+  }
+  return " and its binding";
 }
 
 function runDriver({ args, label, operation, parse, input, rosterFile, team, bindingPath }) {
@@ -1722,7 +1744,7 @@ function runDriver({ args, label, operation, parse, input, rosterFile, team, bin
       const subject = team === undefined ? "" : ` for team '${team}'`;
       const diagnostic = stderr.trim() ||
         "driver returned a non-zero exit without diagnostics; inspect that team's storage" +
-          (bindingPath === undefined ? " and its binding" : ` and its binding at ${bindingPath}`);
+          bindingNote(bindingPath);
       fail(new Error(
         `${label} ${operation} failed${subject} (${describeChildExit(code, signal)}): ${diagnostic}`));
     });
@@ -1747,7 +1769,7 @@ export async function driver(operation, config, input, extra = []) {
     label: "storage sync",
     operation,
     team: config.local_team,
-    bindingPath: bindingPathIfKnown(config.local_team),
+    bindingPath: bindingPathOrReason(config.local_team),
     parse: (stdout) => (["resync-status", "resync"].includes(operation) ?
       parseStrictJsonl(stdout) : parseJsonl(stdout)),
     input,
@@ -1777,7 +1799,7 @@ export async function rosterDriver(operation, config, input, extra = []) {
     label: "roster sync",
     operation,
     team: config.local_team,
-    bindingPath: bindingPathIfKnown(config.local_team),
+    bindingPath: bindingPathOrReason(config.local_team),
     parse: parseJsonl,
     input,
     // The roster file, resolved here and handed over as one path — not the
