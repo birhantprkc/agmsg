@@ -5,17 +5,33 @@ and what has not been examined. It follows the structure RFC 3552 (BCP 72) asks
 for, because that structure forces the second and third of those to be written
 down rather than implied.
 
-It is written for a reviewer who intends to check it. **Every claim below cites
-a file and a line**, at the revision named next to it. A claim without a
-citation is marked as an assumption. If any citation does not say what this
-document says it says, treat every other claim here as unverified until
-re-checked — that is the correct response, and the reason the citations are
-here.
+It is written for a reviewer who intends to check it, so every claim is labelled
+with what stands behind it. Four labels are used, and they are not
+interchangeable:
 
-Measured on `integration/remote`. Citations resolve at this branch's head; the
-only file changed since the branch point `452da72` is this document, so every
-`file:line` below points at code that is identical at either revision — verify
-against whichever you have.
+- **cited** — a `file:line` in this repository. The great majority of claims.
+- **assumption** — taken as given, not derived here. Named as such where it
+  appears.
+- **out of scope** — this document did not examine it. Not a soft way of saying
+  "absent".
+- **inherited** — a property of `age` itself, not of this repository. Checking
+  it means reading the age specification, not this tree.
+
+An earlier version of this paragraph said every claim carries a citation. That
+was itself an uncited claim about the document, and it was false: two rows of
+the properties table rested on nothing visible. Raised in review. The labels
+above exist because the fix is to say which is which, not to assert that they
+are all one kind.
+
+If any citation does not say what this document says it says, treat every other
+claim here as unverified until re-checked — that is the correct response, and
+the reason the citations are here.
+
+Measured on `integration/remote`. Citations resolve at this branch's head. The
+only files this branch changes are `docs/security.md` and `docs/security.ja.md`
+— no code moves on it — so every `file:line` below points at code that is
+identical at the head and at the branch point `452da72`. Verify against
+whichever you have.
 
 ## Scope
 
@@ -108,10 +124,21 @@ server/src/protocol.ts:13     const cipherPattern = /^[a-z0-9][a-z0-9._-]{0,63}$
 server/src/protocol.ts:68     cipher: z.string().regex(cipherPattern),
 ```
 
-There is no age implementation in `server/`, no key material, no decryption
-path, and nothing that could construct a recipient stanza. That is a stronger
-statement than "the server is not given the keys": there is no code here that
-would know what to do with them.
+What that measures, exactly: **`server/` contains no age vocabulary** — no
+implementation, no key interpretation, no decryption path, nothing that names a
+recipient stanza.
+
+What it does **not** measure, and the difference matters: the server stores and
+forwards opaque blobs. The absence of age-specific words constrains nothing
+about the bytes inside a generic buffer, and this search cannot rule out a
+server that happens to hold key material it never names. It rules out a server
+that *works with* keys.
+
+The claim that keys are not there at all is a **specification requirement**, not
+a finding of this grep — `docs/spec/ref/age-v1-profile.md:342-345`, quoted
+above. The two support each other and neither replaces the other: the spec says
+the keys are provisioned elsewhere, and this search says the code has nothing
+that would use them if they arrived.
 
 Reproduce it with one command:
 
@@ -176,10 +203,10 @@ table is a claim about adversary B.
 | Property | Status | Basis |
 |---|---|---|
 | Confidentiality of message contents | **Provided** | age X25519 encryption; identities are outside the server (`docs/spec/ref/age-v1-profile.md:342-345`) |
-| Integrity of message contents | **Provided** | age AEAD. The server's own digest is *not* the mechanism — see below |
+| Integrity of message contents | **Provided** | **inherited** — age's own AEAD, a property of the age format rather than of this tree. The profile deliberately adds no second AEAD layer (`docs/spec/ref/age-v1-profile.md:13`), so the guarantee is age's and is checked by reading age, not this repository. The server's digest is *not* the mechanism — see below |
 | Unforgeability of message contents | **Provided** | Requires recipients' public keys, which the spec places outside the server (`docs/spec/ref/age-v1-profile.md:342-345`, `:58-63`) |
 | Peer authentication | **Not provided** | No key-to-person binding in the protocol (`docs/design/remote-sync.md:93-94`) |
-| Metadata confidentiality | **Not provided** | Addressing and timing are visible to the server by design |
+| Metadata confidentiality | **Not provided** | **assumption**, and the easy kind: the server routes and orders by the envelope's addressing and timing, so it reads them. No citation is offered because nothing in the tree states it as a rule — it follows from the server doing its job |
 | Forward secrecy (adversary C) | **Not provided** | Recipient sets are per-epoch and immutable (`docs/spec/ref/age-v1-profile.md:88`); an identity that is later compromised decrypts that epoch's history |
 | Post-compromise recovery (adversary C) | **Partial, by rotation** | A new epoch is a new recipient set. The journal records the rotation and a fingerprint, never the key (`docs/design/remote-sync.md:103-104`) |
 | Downgrade resistance (server-forced) | **Provided by the spec's stanza rules** | Scrypt, SSH, plugin and every other non-X25519 stanza are excluded (`docs/spec/ref/age-v1-profile.md:58-63`) |
