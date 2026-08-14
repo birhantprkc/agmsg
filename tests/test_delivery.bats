@@ -513,10 +513,21 @@ eperm_pid() {
   # the operator is told are unchanged. What is new is the reason they are
   # reachable.
   #
-  # The budget is raised so this is the FAILURE path deterministically. Under
-  # the 5s default, `remote.sh sync start` may not have finished failing when
-  # the hook stops waiting, and the honest sentence is then "still in flight" —
-  # a different fact, tested separately in tests/test_sync_autostart.bats.
+  # THE FAILURE IS FORCED, not inherited from the fixture.
+  #
+  # The first version relied on there being no engine to start, which is true
+  # when this file runs alone and NOT when it runs with its neighbours: the
+  # case passed under `--filter` and failed in the full file, because what the
+  # start does depends on what other tests left behind. That is the same
+  # cross-test coupling this PR fixes in its own suite, arriving from the other
+  # direction — so the condition is stated here instead of assumed.
+  #
+  # An unusable interpreter makes `sync start` fail immediately and for a named
+  # reason, which is what the warning below is about. The budget is raised as
+  # well: under the 5s default a slow refusal is reported as "still in flight",
+  # which is a different fact and is tested separately in
+  # tests/test_sync_autostart.bats.
+  export AGMSG_NODE="$TEST_SKILL_DIR/no-such-node-for-this-test"
   export AGMSG_SYNC_AUTOSTART_TIMEOUT_S=60
   env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
 
