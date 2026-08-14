@@ -508,3 +508,39 @@ write_refusing_status_remote() {
   done
   [ "$alive" -eq 0 ]
 }
+
+@test "autostart: with several teams, a hanging status leaves nothing behind for any of them (#773)" {
+  # The per-team probe and the whole-call budget have to be measured from the
+  # same origin. When the watchdog inside the probe slept the FULL budget while
+  # this side allowed only what was left of it, the second team's outer
+  # deadline arrived first, killed the wrapper, and orphaned the read it was
+  # watching — with a watchdog that would never reach it. One team could not
+  # show that; the second is where the two clocks separate.
+  source "$SCRIPTS/lib/sync-autostart.sh"
+  export AGMSG_TEST_START_CALLS="$TEST_SKILL_DIR/start-calls"
+  : > "$AGMSG_TEST_START_CALLS"
+  local fake="$TEST_SKILL_DIR/fake-remote-hanging-status.sh"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' 'case "${1:-}" in'
+    printf '%s\n' '  status) while :; do sleep 1; done ;;'
+    printf '%s\n' '  sync)   printf "%s\n" "$3" >> "$AGMSG_TEST_START_CALLS"; echo "Sync engine started for '"'"'$3'"'"' (pid 4242)."; exit 0 ;;'
+    printf '%s\n' 'esac'
+    printf '%s\n' 'exit 0'
+  } > "$fake"
+  chmod +x "$fake"
+
+  local began=$SECONDS
+  AGMSG_SYNC_AUTOSTART_TIMEOUT_S=2 run agmsg_sync_autostart "$fake" teamone teamtwo teamthree
+  local took=$((SECONDS - began))
+  [ "$status" -eq 0 ]
+  # One budget for the whole call, not one per team.
+  [ "$took" -lt 10 ]
+
+  local i alive=1
+  for i in $(seq 1 50); do
+    pgrep -f "$TEST_SKILL_DIR/fake-remote-hanging-status" >/dev/null 2>&1 || { alive=0; break; }
+    sleep 0.1
+  done
+  [ "$alive" -eq 0 ]
+}
