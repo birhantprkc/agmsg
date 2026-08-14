@@ -23,9 +23,19 @@ try {
   if (error?.code === "ENOENT") process.exit(0);
   throw error;
 }
-if (!metadata.isFile() || metadata.isSymbolicLink() ||
-    (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
-  throw new Error("remote sync config must be a private regular file");
+// Each condition names itself, and the mode test is last so that no message
+// above it can be about permissions -- on win32 that test does not run at all,
+// and a message about privacy was the one thing a Windows operator could not
+// act on (#781, same shape as remote-sync.mjs).
+if (metadata.isSymbolicLink()) {
+  throw new Error(`remote sync config must not be a symbolic link: ${source}`);
+}
+if (!metadata.isFile()) {
+  throw new Error(`remote sync config must be a regular file: ${source}`);
+}
+if (process.platform !== "win32" && (metadata.mode & 0o077) !== 0) {
+  throw new Error(
+    `remote sync config must not be readable or writable by group or others: ${source}`);
 }
 const config = JSON.parse(await readFile(source, "utf8"));
 if (config.local_team !== oldTeam) throw new Error("remote sync config local team mismatch");

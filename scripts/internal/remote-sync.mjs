@@ -570,13 +570,44 @@ export function connectedBinding(value, team) {
   return binding;
 }
 
+// What disqualifies a file this process is about to trust, said in the words of
+// the condition that actually failed -- or null when nothing does.
+//
+// One function rather than a condition here and a sentence there. The two had
+// drifted: the sentence named a permission problem while the condition had
+// already excluded permissions on win32 (#781), so a Windows operator who hit a
+// missing file, a symlink or an oversized one was told to go and look at modes
+// that platform never carried. Someone did, after the same message on Linux had
+// been a real `0664`. The message was right once and wrong once, for the same
+// bytes.
+//
+// Returning the fault instead of throwing lets each caller name its own subject
+// while the reason stays derived from the check that produced it.
+export function authorityFileFault(stats, { maxBytes, privateFile }) {
+  if (stats.isSymbolicLink()) return "must not be a symbolic link";
+  if (!stats.isFile()) return "must be a regular file";
+  if (maxBytes !== undefined && stats.size > maxBytes) {
+    return `must not be larger than ${maxBytes} bytes (it is ${stats.size})`;
+  }
+  // POSIX modes only. Windows does not carry them, so this is not consulted
+  // there -- and because it is the LAST thing consulted, no message above can
+  // be about it. That ordering is the fix, not a detail of it.
+  if (process.platform !== "win32" && (stats.mode & (privateFile ? 0o077 : 0o022)) !== 0) {
+    return privateFile
+      ? "must not be readable or writable by group or others"
+      : "must not be writable by group or others";
+  }
+  return null;
+}
+
 async function readBoundedAuthorityFile(path, maxBytes, privateFile) {
   const before = await lstat(path);
-  const unsafeMode = process.platform !== "win32" &&
-    (before.mode & (privateFile ? 0o077 : 0o022)) !== 0;
-  if (!before.isFile() || before.isSymbolicLink() || unsafeMode || before.size > maxBytes) {
-    throw new Error(privateFile ? "remote credential must be a private regular file" :
-      "connected team binding must be a non-writable regular file");
+  const fault = authorityFileFault(before, { maxBytes, privateFile });
+  if (fault) {
+    // The path too: the previous message named a property without naming what
+    // had it, on a machine that may hold several.
+    throw new Error(
+      `${privateFile ? "remote credential" : "connected team binding"} ${fault}: ${path}`);
   }
   const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {
@@ -1235,10 +1266,8 @@ function compareRetainedCheckpoint(config, retained) {
 
 async function readRetainedCheckpointFile(path) {
   const metadata = await lstat(path);
-  if (!metadata.isFile() || metadata.isSymbolicLink() ||
-      (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
-    throw new Error("retained age checkpoint must be a private regular file");
-  }
+  const fault = authorityFileFault(metadata, { privateFile: true });
+  if (fault) throw new Error(`retained age checkpoint ${fault}: ${path}`);
   const records = parseStrictJsonl(await readFile(path, "utf8"));
   if (records.length < 1 || records.length > 4096) {
     throw new Error("retained age checkpoint history is invalid");
@@ -1279,10 +1308,18 @@ export async function retainAgeCheckpoint(config, confirmation) {
   }
   const retained = checkpointRecord(config, confirmation);
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  const directoryMetadata = await lstat(dirname(path));
-  if (!directoryMetadata.isDirectory() ||
-      (process.platform !== "win32" && (directoryMetadata.mode & 0o077) !== 0)) {
-    throw new Error("AGMSG_SYNC_TRUST_DIR must be a private directory");
+  const trustDirectory = dirname(path);
+  const directoryMetadata = await lstat(trustDirectory);
+  // Not in the report that prompted this, and the same shape as the two above:
+  // on win32 "private" is the half that was never checked, so it was the half
+  // the message must not lead with. Fixing the other two and leaving this one
+  // would have reproduced the defect from here.
+  if (!directoryMetadata.isDirectory()) {
+    throw new Error(`AGMSG_SYNC_TRUST_DIR must be a directory: ${trustDirectory}`);
+  }
+  if (process.platform !== "win32" && (directoryMetadata.mode & 0o077) !== 0) {
+    throw new Error(
+      `AGMSG_SYNC_TRUST_DIR must not be readable or writable by group or others: ${trustDirectory}`);
   }
   try {
     const handle = await open(path, "wx", 0o600);
@@ -1566,7 +1603,63 @@ export function validateMembers(config, value) {
 // only success does, because only success has to read all of stdout. What this
 // process owns is what it can be sure of releasing, so that is what it releases:
 // a grandchild is left to the operator, not chased through the process tree.
-function runDriver({ args, label, operation, parse, input, rosterFile }) {
+// A child's ending, said so that every platform's answer is legible.
+//
+// `signal ?? code` printed one number and hid which field produced it. On
+// Windows/Git Bash a driver that died to a signal arrives through `code` as a
+// raw wait status -- one report carried `3840` -- and the operator got a bare
+// number with no way to tell it from an ordinary exit status (#782).
+//
+// Both fields are named, and a `code` outside the range an exit status can take
+// is additionally shown DECOMPOSED rather than decoded. Under the POSIX
+// encoding 3840 is `WIFEXITED` with status 15, while the report that raised it
+// described a signal; nobody reproducing this has the platform to settle which
+// layer produced the number. Printing both components lets the operator see
+// which one is non-zero. Asserting one of them would put a second wrong
+// sentence exactly where the first one was, which is the defect this fixes.
+export function describeChildExit(code, signal) {
+  if (signal) return `signal ${signal}`;
+  if (typeof code !== "number") return "no exit status";
+  if (code >= 0 && code <= 255) return `exit ${code}`;
+  return `exit ${code}, outside the 0-255 an exit status can take; ` +
+    `read as a wait status that is exit ${(code >> 8) & 0xff}, signal ${code & 0x7f}`;
+}
+
+// The team's binding path when this process can work one out, and nothing when
+// it cannot. `teamConfigPath` throws without a connection root, and a caller
+// that has none is a caller that still has to be able to run -- the path is for
+// a sentence in a failure message, so it must not become a new way to fail.
+// The team's binding path, or WHY there is none.
+//
+// `teamConfigPath` throws without a connection root, and a caller that has none
+// still has to run -- the path is for a sentence in a failure message, so it
+// must not become a new way to fail. That much was right the first time.
+//
+// What was wrong was returning `undefined` and dropping the reason. A failure
+// turned into an ordinary value with nothing recorded is the shape #802
+// collects, and it had no business being in a change whose whole subject is
+// messages that say what actually happened. Swallowing is fine here. Going
+// silent is not, so the reason travels with the fallback.
+export function bindingPathOrReason(team, resolve = teamConfigPath) {
+  try {
+    return { path: resolve(team) };
+  } catch (error) {
+    return { unavailable: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+// What the diagnostic says about the binding: where it is, or why it cannot be
+// named. Never nothing -- "and its binding" alone is the sentence that sent a
+// reader looking for a file this process could not even locate.
+function bindingNote(binding) {
+  if (binding?.path !== undefined) return ` and its binding at ${binding.path}`;
+  if (binding?.unavailable !== undefined) {
+    return ` and its binding (its path could not be resolved: ${binding.unavailable})`;
+  }
+  return " and its binding";
+}
+
+function runDriver({ args, label, operation, parse, input, rosterFile, team, bindingPath }) {
   return new Promise((resolve, reject) => {
     const childEnvironment = { ...process.env };
     delete childEnvironment.AGMSG_SYNC_TOKEN;
@@ -1642,9 +1735,18 @@ function runDriver({ args, label, operation, parse, input, rosterFile }) {
     child.on("exit", (code, signal) => {
       if (failure) { fail(failure); return; }
       if (code === 0 && !signal) return;
+      // The team and the binding path, because the previous fallback said
+      // "inspect its team storage and binding" and named neither -- on a
+      // machine that may hold several teams, that is an instruction with no
+      // object. Both values are the caller's; this function is handed them
+      // rather than reading them back out of `args`, where they sit behind a
+      // positional index that has already been miscounted once.
+      const subject = team === undefined ? "" : ` for team '${team}'`;
       const diagnostic = stderr.trim() ||
-        "driver returned a non-zero exit without diagnostics; inspect its team storage and binding";
-      fail(new Error(`${label} ${operation} failed (${signal ?? code}): ${diagnostic}`));
+        "driver returned a non-zero exit without diagnostics; inspect that team's storage" +
+          bindingNote(bindingPath);
+      fail(new Error(
+        `${label} ${operation} failed${subject} (${describeChildExit(code, signal)}): ${diagnostic}`));
     });
     child.on("close", () => {
       if (failure) { settle(failure, null); return; }
@@ -1666,6 +1768,8 @@ export async function driver(operation, config, input, extra = []) {
       config.remote_team_id, String(config.protocol_version), ...extra],
     label: "storage sync",
     operation,
+    team: config.local_team,
+    bindingPath: bindingPathOrReason(config.local_team),
     parse: (stdout) => (["resync-status", "resync"].includes(operation) ?
       parseStrictJsonl(stdout) : parseJsonl(stdout)),
     input,
@@ -1694,6 +1798,8 @@ export async function rosterDriver(operation, config, input, extra = []) {
       config.remote_team_id, String(config.protocol_version), ...extra],
     label: "roster sync",
     operation,
+    team: config.local_team,
+    bindingPath: bindingPathOrReason(config.local_team),
     parse: parseJsonl,
     input,
     // The roster file, resolved here and handed over as one path — not the
