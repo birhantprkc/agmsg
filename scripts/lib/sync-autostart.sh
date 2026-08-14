@@ -69,110 +69,27 @@ agmsg_sync_autostart() {
   local budget="${AGMSG_SYNC_AUTOSTART_TIMEOUT_S:-5}"
   local elapsed_start=$SECONDS
 
-  local team out rc tmp probe probe_pid remaining refusal_line started="" failed="" slow="" refused=""
+  local team out rc tmp started="" failed="" slow=""
   for team in "$@"; do
     [ -n "$team" ] || continue
-    # A TEAM THE SERVER HAS REFUSED IS NOT STARTED (#773).
+    # WHY THERE IS NO REFUSAL CHECK HERE, having had one (#773).
     #
-    # Without this, auto-start is a restart loop: the engine exits on a refusal
-    # the caller has to act on, this starts it again on the next session, it
-    # exits again. #773 kept the engine up and recorded the refusal where a
-    # reader can find it; this is that reader, at the one moment a start would
-    # otherwise be attempted.
+    # The version of this that read `remote.sh status` before each start
+    # existed to stop a restart loop: the engine used to EXIT when the server
+    # refused, so auto-start would raise it again on the next session and it
+    # would exit again.
     #
-    # The `refused:` line is `remote.sh status`'s, and it repeats what the
-    # server said and nothing else. Reading the human line rather than the JSON
-    # keeps this free of a JSON parser in the session's critical path, and that
-    # line is under test in `tests/test_remote_refusal.bats`, so it is a
-    # contract rather than a formatting accident.
+    # #792 removed that. The engine now records the refusal, backs off to its
+    # longest interval and keeps the loop — `sleepCall(MAX_BACKOFF_MS);
+    # continue;` — so starting a refused team costs one quiet process that
+    # reports the reason through `status`, and there is no loop to prevent.
     #
-    # The record is already compared against the last successful cycle by the
-    # reader, so a refusal that a later success reversed does not appear here —
-    # this does not re-decide staleness, and must not.
-    # UNDER THE SAME BUDGET AS THE START, for the same reason.
-    #
-    # The first version of this ran `status` synchronously, before the budget
-    # was consulted at all. `status` opens a pidfile, a cycle stamp and a
-    # refusal record — all local reads, all fast — but "fast" is a claim about
-    # a machine, and this sits in the path where a session prints its Monitor
-    # directive and where `actas` prints `status=ok`. An unbounded call there
-    # is exactly the defect the background start exists to prevent, put back
-    # one line above it (raised in review).
-    #
-    # On timeout the answer is UNKNOWN, and unknown proceeds to the start. The
-    # start is itself bounded, and a team that really is refused will be
-    # refused again — visibly, by the command, with the server's own sentence.
-    # Skipping the start instead would let a slow local read stop syncing,
-    # which is the failure #774 exists to remove.
-    # ONE DEADLINE, SHARED BY BOTH SIDES.
-    #
-    # The watchdog inside the probe used to sleep the WHOLE per-call budget
-    # while this loop allowed only what was left of it. On the second team, or
-    # at the first team's scheduling boundary, the outer deadline arrives first,
-    # kills the wrapper, and the read it was watching is orphaned with a
-    # watchdog that will never reach it — the leak returns exactly where a
-    # multi-team session needs it not to (raised in review). Both sides are
-    # given the same remaining seconds, computed once, from one origin.
-    #
-    # With nothing left, no probe is started at all: the answer is unknown, and
-    # unknown proceeds to the start, as it does on timeout.
-    remaining=$(( budget - (SECONDS - elapsed_start) ))
-    probe=""
-    refusal_line=""
-    [ "$remaining" -gt 0 ] && { probe="$(mktemp 2>/dev/null)" || probe=""; }
-    if [ -n "$probe" ]; then
-      (
-        agmsg_close_inherited_fds
-        # THE PROBE BOUNDS ITSELF, so the bound does not depend on this side
-        # reaching it, and does not depend on `pgrep` existing to find the
-        # command afterwards. A watchdog sibling signals the read at the same
-        # budget; whichever finishes first, the sentinel is written and this
-        # subshell exits. The earlier version killed from the outside and, on
-        # a runtime without `pgrep`, left the actual `status` running for ever
-        # (raised in review) -- a leak measured in machine uptime.
-        "$remote_sh" status "$team" >"$probe" 2>/dev/null &
-        _read_pid=$!
-        ( sleep "$remaining"; kill "$_read_pid" 2>/dev/null || true ) &
-        _dog_pid=$!
-        wait "$_read_pid" 2>/dev/null || true
-        kill "$_dog_pid" 2>/dev/null || true
-        wait "$_dog_pid" 2>/dev/null || true
-        printf '%s\n' done > "$probe.rc"
-      ) </dev/null >/dev/null 2>&1 &
-      probe_pid=$!
-      while [ ! -f "$probe.rc" ] && [ $((SECONDS - elapsed_start)) -lt "$budget" ]; do
-        sleep 0.1
-      done
-      if [ ! -f "$probe.rc" ]; then
-        # The wrapper missed its own deadline, which means the wrapper itself
-        # is wedged rather than the read. Signal it, WAIT for it, and only then
-        # remove the paths: removing them while it may still be running is how
-        # a file comes back after it was deleted (raised in review).
-        #
-        # A timed-out probe is reaped; a timed-out START is not, and the reason
-        # is what each is in the middle of. A start may be a moment away from
-        # having an engine and a pidfile, so killing it can leave half of one.
-        # A `status` reads, and has nothing half-made to protect.
-        kill "$probe_pid" 2>/dev/null || true
-        wait "$probe_pid" 2>/dev/null || true
-        rm -f "$probe" "$probe.rc"
-      fi
-      if [ -f "$probe.rc" ]; then
-        # `|| true` because a grep that matches nothing exits 1, and this
-        # helper's contract with both hooks is that it never returns non-zero
-        # and never trips a caller's errexit. Relying on the caller's own
-        # `|| true` would make that contract theirs to keep.
-        refusal_line="$(grep -E '^[[:space:]]*refused:' "$probe" 2>/dev/null | head -1 || true)"
-        # The wrapper has written its sentinel, so it is finished; reaped here
-        # so a session that starts many teams does not accumulate zombies.
-        wait "$probe_pid" 2>/dev/null || true
-        rm -f "$probe" "$probe.rc"
-      fi
-    fi
-    if [ -n "$refusal_line" ]; then
-      refused="$refused$team	$(printf '%s' "$refusal_line" | sed 's/^[[:space:]]*//')"$'\n'
-      continue
-    fi
+    # The check was not free. It put a second command in the path where a
+    # session prints its Monitor directive, and bounding it correctly took a
+    # background wrapper, a watchdog, a shared deadline, a grace period and a
+    # reaping rule — seven review rounds of machinery to make a lookup safe
+    # that the thing it protected against no longer needs. Reading the engine
+    # is what settled it, not the review count.
     tmp="$(mktemp 2>/dev/null)" || tmp=""
     [ -n "$tmp" ] || return 0
     # stderr folded in: `cmd_sync_start` says why it refused on stderr, and that
@@ -265,22 +182,6 @@ agmsg_sync_autostart() {
       printf '  bash %q status %q\n' "$remote_sh" "$t"
     done
     printf '\n'
-  fi
-
-  if [ -n "$refused" ]; then
-    # THE SERVER'S SENTENCE, AND NOTHING ADDED TO IT.
-    #
-    # This client talks to whatever remote it was pointed at — self-hosted,
-    # somebody else's, or a service — and it cannot know why that one refused.
-    # A sentence invented here is wrong for some server, and the operator of
-    # that server is the only one who can write the right one. So the line is
-    # repeated as `status` printed it, and the remedy offered is to ask them.
-    printf '%s\n' 'AGMSG: not starting a sync engine — the server refused:' ''
-    printf '%s' "$refused" | while IFS=$'\t' read -r t line; do
-      [ -n "$t" ] || continue
-      printf '  %s: %s\n' "$t" "$line"
-    done
-    printf '%s\n' '' 'The engine is not started while that stands. The session continues.' ''
   fi
 
   if [ -n "$failed" ]; then
