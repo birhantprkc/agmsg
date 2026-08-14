@@ -460,3 +460,33 @@ write_refusing_status_remote() {
   printf '%s' "$output" | grep -q 'started one for'
   refute grep -q 'the server refused' <<<"$output"
 }
+
+@test "autostart: a status that hangs does not hold the session (#773 under the same budget)" {
+  # The refusal lookup asks the same command the rest of this file drives, and
+  # it runs in the session's critical path. An unbounded call there is the
+  # defect the background start exists to prevent, one line above it.
+  #
+  # Bound checked from the OUTSIDE, by wall clock, because a bound that only
+  # exists in the source is not a bound.
+  source "$SCRIPTS/lib/sync-autostart.sh"
+  export AGMSG_TEST_START_CALLS="$TEST_SKILL_DIR/start-calls"
+  : > "$AGMSG_TEST_START_CALLS"
+  local fake="$TEST_SKILL_DIR/fake-remote-hanging-status.sh"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' 'case "${1:-}" in'
+    printf '%s\n' '  status) while :; do sleep 1; done ;;'
+    printf '%s\n' '  sync)   printf "%s\n" "$3" >> "$AGMSG_TEST_START_CALLS"; echo "Sync engine started for '"'"'$3'"'"' (pid 4242)."; exit 0 ;;'
+    printf '%s\n' 'esac'
+    printf '%s\n' 'exit 0'
+  } > "$fake"
+  chmod +x "$fake"
+
+  local began=$SECONDS
+  AGMSG_SYNC_AUTOSTART_TIMEOUT_S=2 run agmsg_sync_autostart "$fake" testteam
+  local took=$((SECONDS - began))
+
+  [ "$status" -eq 0 ]
+  # The budget is 2s; anything near the fake's forever is the bound missing.
+  [ "$took" -lt 10 ]
+}

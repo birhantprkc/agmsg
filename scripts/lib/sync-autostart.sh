@@ -69,7 +69,7 @@ agmsg_sync_autostart() {
   local budget="${AGMSG_SYNC_AUTOSTART_TIMEOUT_S:-5}"
   local elapsed_start=$SECONDS
 
-  local team out rc tmp refusal_line started="" failed="" slow="" refused=""
+  local team out rc tmp probe refusal_line started="" failed="" slow="" refused=""
   for team in "$@"; do
     [ -n "$team" ] || continue
     # A TEAM THE SERVER HAS REFUSED IS NOT STARTED (#773).
@@ -89,7 +89,43 @@ agmsg_sync_autostart() {
     # The record is already compared against the last successful cycle by the
     # reader, so a refusal that a later success reversed does not appear here —
     # this does not re-decide staleness, and must not.
-    refusal_line="$("$remote_sh" status "$team" 2>/dev/null | grep -E '^[[:space:]]*refused:' | head -1)"
+    # UNDER THE SAME BUDGET AS THE START, for the same reason.
+    #
+    # The first version of this ran `status` synchronously, before the budget
+    # was consulted at all. `status` opens a pidfile, a cycle stamp and a
+    # refusal record — all local reads, all fast — but "fast" is a claim about
+    # a machine, and this sits in the path where a session prints its Monitor
+    # directive and where `actas` prints `status=ok`. An unbounded call there
+    # is exactly the defect the background start exists to prevent, put back
+    # one line above it (raised in review).
+    #
+    # On timeout the answer is UNKNOWN, and unknown proceeds to the start. The
+    # start is itself bounded, and a team that really is refused will be
+    # refused again — visibly, by the command, with the server's own sentence.
+    # Skipping the start instead would let a slow local read stop syncing,
+    # which is the failure #774 exists to remove.
+    probe="$(mktemp 2>/dev/null)" || probe=""
+    refusal_line=""
+    if [ -n "$probe" ]; then
+      (
+        agmsg_close_inherited_fds
+        "$remote_sh" status "$team" >"$probe" 2>/dev/null
+        printf '%s\n' done > "$probe.rc"
+      ) </dev/null >/dev/null 2>&1 &
+      while [ ! -f "$probe.rc" ] && [ $((SECONDS - elapsed_start)) -lt "$budget" ]; do
+        sleep 0.1
+      done
+      if [ -f "$probe.rc" ]; then
+        # `|| true` because a grep that matches nothing exits 1, and this
+        # helper's contract with both hooks is that it never returns non-zero
+        # and never trips a caller's errexit. Relying on the caller's own
+        # `|| true` would make that contract theirs to keep.
+        refusal_line="$(grep -E '^[[:space:]]*refused:' "$probe" 2>/dev/null | head -1 || true)"
+        rm -f "$probe" "$probe.rc"
+      fi
+      # No `rm` on the timeout path: the child still owns those two files, and
+      # removing them under it is how a half-written answer becomes a wrong one.
+    fi
     if [ -n "$refusal_line" ]; then
       refused="$refused$team	$(printf '%s' "$refusal_line" | sed 's/^[[:space:]]*//')"$'\n'
       continue
