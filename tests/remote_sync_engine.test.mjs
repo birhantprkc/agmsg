@@ -9,6 +9,8 @@ import { readNativeAgeIdentity } from "../scripts/internal/sync-cipher.mjs";
 import {
   ageSnapshotDigest,
   activateKeyRotations,
+  authorityFileFault,
+  describeChildExit,
   canonicalJson,
   consistentReadStateContext,
   configure,
@@ -444,24 +446,79 @@ async function writeConnectedTeam(root, overrides = {}) {
 }
 
 test("connected binding is a bounded non-writable nofollow authority", async () => {
+  // Each refusal names the condition that actually failed. This test used to
+  // accept one sentence about permissions for all three, which is how a
+  // Windows operator -- where the permission test does not run at all -- was
+  // sent to look at modes for a symlink and for an oversized file (#781).
   await withConnectedCredential(async (root) => {
     await writeConnectedTeam(root);
     const path = join(root, "teams", "demo", "config.json");
     if (process.platform !== "win32") {
       await chmod(path, 0o666);
-      await assert.rejects(loadConfig("demo"), /non-writable regular file/u);
+      await assert.rejects(loadConfig("demo"), /must not be writable by group or others/u);
       await unlink(path);
       const target = join(root, "binding-target.json");
       await writeConnectedTeam(root);
       await rename(path, target);
       await symlink(target, path);
-      await assert.rejects(loadConfig("demo"), /non-writable regular file/u);
+      await assert.rejects(loadConfig("demo"), (error) =>
+        // NEGATIVE CONTROL, and the whole point: a symlink must not be
+        // reported as a permission problem. The old message did exactly that.
+        /must not be a symbolic link/u.test(error.message) &&
+        !/writable|group or others/u.test(error.message));
       await unlink(path);
       await rename(target, path);
     }
     await writeFile(path, "x".repeat(2 * 1024 * 1024 + 1), { mode: 0o644 });
-    await assert.rejects(loadConfig("demo"), /non-writable regular file|byte limit/u);
+    await assert.rejects(loadConfig("demo"), (error) =>
+      /must not be larger than \d+ bytes/u.test(error.message) &&
+      !/writable|symbolic link/u.test(error.message));
   });
+});
+
+test("a file fault names the condition that failed, and permissions last", () => {
+  // Directly, because the ordering is the fix: the mode test is consulted only
+  // after the others, so no message above it can be about permissions -- which
+  // is what makes the win32 case (where it is never consulted) safe.
+  const stats = (over = {}) => ({
+    isSymbolicLink: () => false, isFile: () => true, size: 10, mode: 0o600, ...over,
+  });
+  assert.equal(authorityFileFault(stats(), { maxBytes: 100, privateFile: true }), null);
+  assert.match(
+    authorityFileFault(stats({ isSymbolicLink: () => true }), { maxBytes: 100 }),
+    /symbolic link/u);
+  assert.match(
+    authorityFileFault(stats({ isFile: () => false }), { maxBytes: 100 }), /regular file/u);
+  assert.match(
+    authorityFileFault(stats({ size: 101 }), { maxBytes: 100 }), /larger than 100 bytes/u);
+  // A symlink that is ALSO group-writable reports the symlink: the caller can
+  // only act on one, and the one it can act on is the one that is true on
+  // every platform.
+  assert.match(
+    authorityFileFault(stats({ isSymbolicLink: () => true, mode: 0o666 }), { maxBytes: 100 }),
+    /symbolic link/u);
+  if (process.platform !== "win32") {
+    assert.match(
+      authorityFileFault(stats({ mode: 0o666 }), { maxBytes: 100, privateFile: true }),
+      /readable or writable by group or others/u);
+    assert.match(
+      authorityFileFault(stats({ mode: 0o666 }), { maxBytes: 100 }),
+      /must not be writable by group or others/u);
+  }
+});
+
+test("a child's ending is named by field, and an out-of-range code is decomposed", () => {
+  assert.equal(describeChildExit(7, null), "exit 7");
+  assert.equal(describeChildExit(0, "SIGTERM"), "signal SIGTERM");
+  assert.equal(describeChildExit(null, null), "no exit status");
+  // The reported case: 3840 arrived through `code` with no signal. Both
+  // components are shown and NEITHER is asserted as the reading -- under the
+  // POSIX encoding this is an exit status of 15, while the report that raised
+  // it described a signal, and no one reproducing it has that platform.
+  const decomposed = describeChildExit(3840, null);
+  assert.match(decomposed, /exit 3840/u);
+  assert.match(decomposed, /exit 15/u);
+  assert.match(decomposed, /signal 0/u);
 });
 
 test("an age-selected binding never synthesizes a plaintext config", async () => {
@@ -1770,7 +1827,10 @@ exit 7
     // The exit code has to survive: it is the whole diagnostic. So does the
     // stderr collected before the child went away.
     await assert.rejects(() => promise, (error) =>
-      /failed \(7\)/u.test(error.message) && /giving up/u.test(error.message));
+      // The number is labelled and the team is named: `failed (7)` did not say
+      // which field 7 came from, nor which team it was about (#782).
+      /failed for team 't' \(exit 7\)/u.test(error.message) &&
+      /giving up/u.test(error.message));
     assert.ok(gone(childPid), "the failed driver was left running");
   }
 });

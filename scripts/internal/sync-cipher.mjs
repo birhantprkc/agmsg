@@ -398,9 +398,27 @@ export function nativeAgeIdentity(bytes) {
 
 export function readNativeAgeIdentity(path) {
   try {
-    const metadata = statSync(path);
-    if (!metadata.isFile() || (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
-      throw new Error("identity file is not private");
+    // Each reason is raised as a CipherStateError so it SURVIVES the catch
+    // below, which otherwise replaces every failure with one sentence about
+    // privacy. On win32 the mode test does not run at all, so that sentence
+    // could not have been earned there -- and a missing file or an unparseable
+    // one produced it just the same (#781, the same shape as remote-sync.mjs).
+    let metadata;
+    try {
+      metadata = statSync(path);
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        throw new CipherStateError("pending_key", `age identity was not found: ${path}`);
+      }
+      throw error;
+    }
+    if (!metadata.isFile()) {
+      throw new CipherStateError("pending_key", `age identity must be a regular file: ${path}`);
+    }
+    // Last, so nothing above it can be mistaken for a permission problem.
+    if (process.platform !== "win32" && (metadata.mode & 0o077) !== 0) {
+      throw new CipherStateError("pending_key",
+        `age identity must not be readable or writable by group or others: ${path}`);
     }
     return nativeAgeIdentity(readFileSync(path));
   } catch (error) {
