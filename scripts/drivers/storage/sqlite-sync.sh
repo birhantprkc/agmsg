@@ -741,7 +741,7 @@ storage_sync_apply_pull() {
   _sqlite_sync_schema "$team" || return $?
   local generation db tl sql_file line type final_cursor="" corrupt=0 outcome_ids=""
   local seq wire received v cipher key_id blob status policy local_rev reason kind
-  local from to body at local_id q
+  local from to body at local_id q line_next_after jq_ok
   generation=$(_sqlite_sync_generation "$team"); db="$(_sqlite_db "$team")"; tl="$(_sqlite_lit "$team")"
   _sqlite_sync_ensure_binding "$team" "$server" "$remote" "$protocol" "$generation" || return 13
   sql_file=$(mktemp "${TMPDIR:-/tmp}/agmsg-sync-sql.XXXXXX") || return 13
@@ -751,29 +751,62 @@ storage_sync_apply_pull() {
 
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    type=$(printf '%s\n' "$line" | jq -r '.type // empty')
+    # One `jq` per message, not one per field (#780). This read cost 18
+    # processes, and process creation -- not parsing -- is what a pull spends
+    # its time on; it is the whole cost on Windows, where a spawn is dear.
+    #
+    # `@sh` is jq's shell-quoting filter, so every value arrives verbatim,
+    # tabs and newlines and quotes included, with no delimiter convention for
+    # this side to get wrong. `jq_ok` is emitted last: a line jq cannot parse
+    # produces no output at all, and the eval then leaves it 0 rather than
+    # letting the previous message's fields stand in for this one's.
+    #
+    # `tostring` where the old code had no `// empty`: those fields print
+    # "null" when absent, and the arity and status checks below reject that.
+    # `// ""` would turn a missing envelope.v into an empty string, which
+    # passes the digits check.
+    #
+    # No test can tell those two apart, and that is not an oversight. An empty
+    # envelope_v reaches SQLite as `,,` and the batch dies of a syntax error,
+    # so the page is refused either way and the suite sees one exit status for
+    # two different rejections. The check is kept because a message refused by
+    # the check names what was wrong with it, and a message refused by a
+    # syntax error names a comma.
+    jq_ok=0
+    eval "$(printf '%s\n' "$line" | jq -r '
+      "type=\(.type // "" | @sh)",
+      "line_next_after=\(.next_after // "" | @sh)",
+      "seq=\(.server_seq // "" | @sh)",
+      "wire=\(.id // "" | @sh)",
+      "received=\(.server_received_at // "" | @sh)",
+      "v=\(.envelope.v | tostring | @sh)",
+      "cipher=\(.envelope.cipher | tostring | @sh)",
+      "key_id=\(.envelope.key_id // "" | @sh)",
+      "blob=\(.envelope.blob | tostring | @sh)",
+      "status=\(.status | tostring | @sh)",
+      "policy=\(.policy_revision // "" | @sh)",
+      "local_rev=\(.local_security_revision // "" | @sh)",
+      "reason=\(.reason // "" | @sh)",
+      "kind=\(.projection.kind // "" | @sh)",
+      "from=\(.projection.from_agent // "" | @sh)",
+      "to=\(.projection.to_agent // "" | @sh)",
+      "body=\(.projection.body // "" | @sh)",
+      "at=\(.projection.created_at // "" | @sh)",
+      "jq_ok=1"' 2>/dev/null)"
+    [ "$jq_ok" = 1 ] || { rm -f "$sql_file"; return 13; }
     if [ "$type" = sync_pull_cursor ]; then
-      final_cursor=$(printf '%s\n' "$line" | jq -r '.next_after // empty')
+      # Held in its own variable and copied only here. Every line now carries
+      # a next_after, so assigning the cursor directly would let a message
+      # line after the cursor line blank it.
+      final_cursor="$line_next_after"
       case "$final_cursor" in ''|*[!0-9]*) rm -f "$sql_file"; return 13 ;; esac
       continue
     fi
     [ "$type" = sync_pull_message ] || { rm -f "$sql_file"; return 13; }
-    seq=$(printf '%s\n' "$line" | jq -r '.server_seq // empty')
-    wire=$(printf '%s\n' "$line" | jq -r '.id // empty')
     printf '%s\n' "$wire" | grep -Eq \
       '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' \
       || { rm -f "$sql_file"; trap - EXIT INT TERM HUP; return 13; }
     outcome_ids="${outcome_ids}${outcome_ids:+,}'$wire'"
-    received=$(printf '%s\n' "$line" | jq -r '.server_received_at // empty')
-    v=$(printf '%s\n' "$line" | jq -r '.envelope.v')
-    cipher=$(printf '%s\n' "$line" | jq -r '.envelope.cipher')
-    key_id=$(printf '%s\n' "$line" | jq -r '.envelope.key_id // empty')
-    blob=$(printf '%s\n' "$line" | jq -r '.envelope.blob')
-    status=$(printf '%s\n' "$line" | jq -r '.status')
-    policy=$(printf '%s\n' "$line" | jq -r '.policy_revision // empty')
-    local_rev=$(printf '%s\n' "$line" | jq -r '.local_security_revision // empty')
-    reason=$(printf '%s\n' "$line" | jq -r '.reason // empty')
-    kind=$(printf '%s\n' "$line" | jq -r '.projection.kind // empty')
     case "$seq:$v" in *[!0-9:]*) rm -f "$sql_file"; return 13 ;; esac
     case "$status" in importable|unsupported_cipher|pending_key|authentication_failed|malformed|policy_violation) ;; *) rm -f "$sql_file"; return 13 ;; esac
     q="'$(_sqlite_lit "$key_id")'"; [ -n "$key_id" ] || q=NULL
@@ -889,10 +922,6 @@ storage_sync_apply_pull() {
              AND server_seq='$seq' AND status='importable';" >> "$sql_file"
         continue
       fi
-      from=$(printf '%s\n' "$line" | jq -r '.projection.from_agent // empty')
-      to=$(printf '%s\n' "$line" | jq -r '.projection.to_agent // empty')
-      body=$(printf '%s\n' "$line" | jq -r '.projection.body // empty')
-      at=$(printf '%s\n' "$line" | jq -r '.projection.created_at // empty')
       [ -n "$from" ] && [ -n "$to" ] && [ -n "$body" ] && [ -n "$at" ] || {
         echo "agmsg: storage sync apply received an importable message without its projection" >&2
         rm -f "$sql_file"; trap - EXIT INT TERM HUP; return 13;
