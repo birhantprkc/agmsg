@@ -100,11 +100,16 @@ _break_only_this_teams_store() {
 # What the hook runtimes actually do with a Stop-hook run, applied to a real
 # invocation of check-inbox.sh.
 #
-# The contract is theirs, not ours: stdout is read as control JSON only when
-# the process exits 0. A non-zero exit is logged as a hook failure and the
-# output is DISCARDED. Asserting on the shell's stdout alone cannot see that —
-# the first attempt at this fix emitted the messages and then exited non-zero,
-# so it was inert on the only path that was broken while its tests passed.
+# The contract is theirs, not ours: as DOCUMENTED, stdout is read as control
+# JSON only when the process exits 0, and a non-zero exit is logged as a hook
+# failure with the output discarded. Measured on Claude Code 2.1.226 it was
+# processed on exit 0, 1, 2 and 3 alike (#658), so the two disagree — and this
+# helper models the documented rule deliberately, because a helper that assumed
+# the laxer observed behaviour would stop catching the defect on any runtime
+# that follows the document. Asserting on the shell's stdout alone cannot see
+# either: the first attempt at this fix emitted the messages and then exited
+# non-zero, so it was inert on the only path that was broken while its tests
+# passed.
 #
 # The parse is part of the contract too. Returning raw stdout would stay green
 # for malformed JSON, for a payload under some other key, or for text outside

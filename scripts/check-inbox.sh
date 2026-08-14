@@ -161,12 +161,15 @@ agmsg_storage_load
 # So a failure stops the loop instead of ending the script, and what was
 # already accumulated is delivered.
 #
-# The failure is reported IN THE PAYLOAD, not by the exit status. The runtimes
-# read stdout as control JSON only on exit 0, so a non-zero exit throws the
-# delivery away -- which is what the first attempt at this fix did, on exactly
-# the path that was broken. When there are messages to hand over the status is
-# 0 and the text says the poll was partial; only when there is nothing to
-# deliver does the status carry the failure.
+# The failure is reported IN THE PAYLOAD, not by the exit status. The documented
+# contract is that stdout is read as control JSON only on exit 0 -- and the
+# measurement disagrees with it (see the emit points below, and #658). Either
+# way this is the safe shape: if a runtime does discard on non-zero, exiting
+# non-zero here throws away a payload whose rows are already marked read, which
+# is what the first attempt at this fix did on exactly the path that was broken.
+# When there are messages to hand over the status is 0 and the text says the
+# poll was partial; only when there is nothing to deliver does the status carry
+# the failure.
 OUTPUT=""
 LOOP_RC=0
 LOOP_FAILED_TEAM=""
@@ -278,11 +281,20 @@ done
 
 # The exit code cannot carry both the delivery and the failure report.
 #
-# The hook runtimes read stdout as control JSON only when the process exits 0;
-# a non-zero exit is logged as a hook failure and the output is discarded. So
-# emitting the messages and THEN exiting non-zero delivers nothing — on exactly
-# the path where messages were already marked read. The first version of this
-# fix did that, and was therefore inert on the only path that was broken.
+# The DOCUMENTED contract is that stdout is read as control JSON only on exit 0.
+# MEASURED (Claude Code 2.1.226, one-shot `claude -p`, a synthetic probe hook --
+# not this script, not an interactive session): the stdout control JSON was
+# processed on exit 0, 1, 2 and 3 alike. So this codebase depends on an area
+# where the documented contract and the observed implementation disagree; the
+# measurement is on #658.
+#
+# This fix is correct either way, which is why it does not bet on which is real.
+# If a runtime DOES discard stdout on a non-zero exit, as documented, then
+# emitting the messages and then exiting non-zero throws away the payload that
+# already cost these rows their unread state -- consumed and never shown, worse
+# than the failure the status was meant to report. If it does NOT discard it, as
+# measured, the non-zero exit was never needed to preserve the delivery or to
+# report the partial failure, because the payload already carries both.
 #
 # Delivery and the report are separated: the messages go out with exit 0, and
 # the partial failure is stated inside the payload the operator actually reads.
