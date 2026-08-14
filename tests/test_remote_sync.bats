@@ -813,3 +813,51 @@ second line	after a tab"
   [ "$(sqlite3 "$db" "SELECT count(*) FROM events WHERE body='no envelope';" | tr -d '\r')" -eq 0 ]
   [ "$(sqlite3 "$db" "SELECT count(*) FROM sync_quarantine WHERE wire_id='550e8400-e29b-41d4-a716-4466554400d4';" | tr -d '\r')" -eq 0 ]
 }
+
+# One line is not one JSON value to jq. Given two concatenated objects it parses
+# both, and a filter that emits assignments emits the whole list twice — the
+# eval runs both and the second overwrites the first, `jq_ok` included. A page
+# could put anything it liked in front of a well-formed message and have it
+# vanish.
+#
+# The per-field reads this replaced refused it by accident: each substitution
+# came back holding two lines, and the type and arity checks rejected the
+# embedded newline. Raised in review of the single-read change.
+#
+# The leading object here is a VALID message with its own wire id, not garbage,
+# so the assertion cannot pass merely because the line failed to parse — and the
+# ids are checked separately, because "the page was refused" and "the right one
+# was refused" are different claims.
+@test "sync contract: two JSON values on one line are refused, not resolved to the last" {
+  local first second db rc=0
+  db=$(agmsg_db_path demo)
+  first=$(jq -nc '
+    {type:"sync_pull_message",server_seq:"6",
+     id:"550e8400-e29b-41d4-a716-4466554400e1",
+     server_received_at:"2026-07-20T13:00:06.000000Z",
+     envelope:{v:1,cipher:"none",key_id:null,blob:(
+       {body:"hidden in front",created_at:"2026-07-20T13:00:06.000000Z",
+        from_agent:"carol",to_agent:"bob"}|tojson|@base64)},
+     status:"importable",policy_revision:"0",local_security_revision:"0",
+     projection:{body:"hidden in front",created_at:"2026-07-20T13:00:06.000000Z",
+                 from_agent:"carol",to_agent:"bob"}}')
+  second=$(jq -nc '
+    {type:"sync_pull_message",server_seq:"7",
+     id:"550e8400-e29b-41d4-a716-4466554400e2",
+     server_received_at:"2026-07-20T13:00:07.000000Z",
+     envelope:{v:1,cipher:"none",key_id:null,blob:(
+       {body:"the visible one",created_at:"2026-07-20T13:00:07.000000Z",
+        from_agent:"carol",to_agent:"bob"}|tojson|@base64)},
+     status:"importable",policy_revision:"0",local_security_revision:"0",
+     projection:{body:"the visible one",created_at:"2026-07-20T13:00:07.000000Z",
+                 from_agent:"carol",to_agent:"bob"}}')
+
+  printf '%s %s\n%s\n' "$first" "$second" '{"type":"sync_pull_cursor","next_after":"7"}' \
+    | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null 2>&1 || rc=$?
+  [ "$rc" -ne 0 ]
+
+  # Neither of them, and neither wire id. The dangerous outcome is the SECOND
+  # one landing while the first disappears without trace, so both are named.
+  [ "$(sqlite3 "$db" "SELECT count(*) FROM events WHERE body IN ('hidden in front','the visible one');" | tr -d '\r')" -eq 0 ]
+  [ "$(sqlite3 "$db" "SELECT count(*) FROM sync_quarantine WHERE wire_id IN ('550e8400-e29b-41d4-a716-4466554400e1','550e8400-e29b-41d4-a716-4466554400e2');" | tr -d '\r')" -eq 0 ]
+}

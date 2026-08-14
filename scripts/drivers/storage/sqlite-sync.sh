@@ -772,9 +772,21 @@ storage_sync_apply_pull() {
     # two different rejections. The check is kept because a message refused by
     # the check names what was wrong with it, and a message refused by a
     # syntax error names a comma.
+    # `-s` with a length check, because one line is not one JSON value to jq.
+    # Given `{...} {...}` on a single line it parses BOTH and emits the whole
+    # assignment list twice; the eval runs both and the second silently
+    # overwrites the first, `jq_ok` included. A page could then hide anything
+    # it liked in front of a well-formed message.
+    #
+    # The per-field reads this replaced rejected that by accident: each
+    # substitution came back holding two lines, and the type and arity checks
+    # refused the embedded newline. Raised in review, and it was a real
+    # regression -- the reason has to be explicit now that it is no longer a
+    # side effect of how the fields were read.
     jq_ok=0
-    eval "$(printf '%s\n' "$line" | jq -r '
-      "type=\(.type // "" | @sh)",
+    eval "$(printf '%s\n' "$line" | jq -r -s '
+      if length != 1 then error("one JSON value per line") else .[0] end
+      | "type=\(.type // "" | @sh)",
       "line_next_after=\(.next_after // "" | @sh)",
       "seq=\(.server_seq // "" | @sh)",
       "wire=\(.id // "" | @sh)",
