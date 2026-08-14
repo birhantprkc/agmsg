@@ -41,6 +41,12 @@ teardown() {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   done
+  # The "does not wait" cases leave a `sync start` child running ON PURPOSE —
+  # that is the behaviour under test. It must not outlive the test: a CI shard
+  # runs many files in one process tree, and a fake that loops forever would
+  # then be somebody else's flake (raised in review).
+  pkill -f "$TEST_SKILL_DIR/fake-remote.sh" 2>/dev/null || true
+  pkill -f "$TEST_SKILL_DIR/fake-node" 2>/dev/null || true
   teardown_test_env
 }
 
@@ -273,7 +279,12 @@ write_fake_remote() {
   # The connected team was started...
   grep -q '^testteam$' "$calls"
   # ...and the disconnected one was never offered to the command.
-  ! grep -q '^otherteam$' "$calls"
+  #
+  # `refute`, not `! grep`. A leading `!` does not trip errexit on either
+  # interpreter, so in a non-last position it reports ok whatever it finds —
+  # I removed five of those from this file and introduced this one in the same
+  # head (raised in review).
+  refute grep -q '^otherteam$' "$calls"
   # ...and the thing the session actually needs still came out.
   printf '%s' "$output" | grep -q 'AGMSG'
   [ "$status" -eq 0 ]

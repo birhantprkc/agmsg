@@ -130,9 +130,12 @@ agmsg_sync_autostart() {
     printf '%s' "$failed" | while IFS=$'\t' read -r t reason; do
       [ -n "$t" ] || continue
       printf '  %s: %s\n' "$t" "$reason"
-      # The runnable line, unchanged from #765: the remedy is still a person
-      # running the command, and now they also know it has been tried.
-      printf '    bash %q sync start %q\n' "$remote_sh" "$t"
+      # The runnable line, UNCHANGED FROM #765 — including its two-space
+      # indent. That prefix is part of the contract: `test_delivery.bats`
+      # extracts the command with `sed -n 's/^  bash //p'` and runs it, so a
+      # deeper indent leaves the operator's remedy unrunnable by the check that
+      # proves it is runnable (measured: it failed on exactly that).
+      printf '  bash %q sync start %q\n' "$remote_sh" "$t"
     done
     printf '\n'
   fi

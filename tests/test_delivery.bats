@@ -491,11 +491,33 @@ eperm_pid() {
   [ "$3" = "$sp" ]
 }
 
-@test "session-start: a connected team with no engine is said, and a silent one is not (#761)" {
+@test "session-start: a connected team with no engine is started, and said when that fails (#761, #774)" {
   # A reboot kills every sync engine and nothing restarts one. `connected` keeps
   # printing and `send` keeps succeeding locally, so the only symptom is silence
   # — which reads as "nobody wrote anything". This hook is the first thing of
   # ours that runs afterwards.
+  #
+  # A RULING WAS REVERSED HERE, and this test is where it is recorded.
+  #
+  # #761/#765 decided: do NOT start anything, make the absence VISIBLE. That
+  # decision is what this test was written to hold. #774 reverses it — an agent
+  # arriving at a connected team now STARTS the engine — on the grounds that
+  # visibility asks a person for something the machine can do.
+  #
+  # What #765 built is not discarded: its warning, its wording and its runnable
+  # remedy are exactly what remains when the start FAILS, which is the case
+  # below. So the assertions about what the operator is told are unchanged, and
+  # only the reason they are reachable is new. This is a reversal of a decision,
+  # not a test edited to fit new output (raised in review). It fails here because there is no engine to start in this fixture,
+  # which is exactly the case the warning is for, so the assertions about what
+  # the operator is told are unchanged. What is new is the reason they are
+  # reachable.
+  #
+  # The budget is raised so this is the FAILURE path deterministically. Under
+  # the 5s default, `remote.sh sync start` may not have finished failing when
+  # the hook stops waiting, and the honest sentence is then "still in flight" —
+  # a different fact, tested separately in tests/test_sync_autostart.bats.
+  export AGMSG_SYNC_AUTOSTART_TIMEOUT_S=60
   env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
 
   # NEGATIVE FIRST, on the state every ordinary machine is in: no connected
