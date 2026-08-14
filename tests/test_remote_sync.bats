@@ -678,3 +678,186 @@ _reconcile_one_ack() {
   [ "$(storage_history demo | jq -s '[.[]|select(.body=="older than the event log")]|length')" -eq 1 ]
   [ "$(storage_list_unread demo bob | jq -s '[.[]|select(.body=="older than the event log")]|length')" -eq 1 ]
 }
+
+# The single read is only possible because the shell `eval`s what jq emits, so
+# the safety of that eval is this change's load-bearing claim. `@sh` is jq's
+# shell-quoting filter and exists for exactly this — but a claim about a
+# quoting filter is worth what its adversarial case is worth, and there was no
+# adversarial case here before.
+#
+# The body carries every character class a shell acts on: command substitution
+# in both spellings, a quote, a semicolon with a destructive command behind it,
+# a backslash. Plus the tab and the newline, which is the other half — a reader
+# that joined the fields with a delimiter would split this body into pieces.
+#
+# Asserted from both ends: nothing executed, and the value arrived unchanged.
+# Either one alone passes for an implementation that is wrong in the other
+# direction — a mangled body proves no injection, and a safe eval says nothing
+# about whether the tab survived.
+@test "sync contract: a projection body reaches the store verbatim, whatever it contains" {
+  local canary body remote db got
+  canary="$BATS_TEST_TMPDIR/should-not-exist"
+  body="it's \$(touch $canary) \`touch $canary\`; rm -rf . \\ end
+second line	after a tab"
+
+  remote=$(jq -nc --arg b "$body" '
+    {type:"sync_pull_message",server_seq:"1",
+     id:"550e8400-e29b-41d4-a716-4466554400d1",
+     server_received_at:"2026-07-20T13:00:01.000000Z",
+     envelope:{v:1,cipher:"none",key_id:null,blob:(
+       {body:$b,created_at:"2026-07-20T13:00:01.000000Z",
+        from_agent:"carol",to_agent:"bob"}|tojson|@base64)},
+     status:"importable",policy_revision:"0",local_security_revision:"0",
+     projection:{body:$b,created_at:"2026-07-20T13:00:01.000000Z",
+                 from_agent:"carol",to_agent:"bob"}}')
+  printf '%s\n%s\n' "$remote" '{"type":"sync_pull_cursor","next_after":"1"}' \
+    | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
+
+  [ ! -e "$canary" ]
+
+  db=$(agmsg_db_path demo)
+  # Reached through the wire mapping rather than by matching on the body, which
+  # is the value under test and cannot also be the key that finds it.
+  got=$(sqlite3 "$db" "SELECT e.body FROM events e JOIN sync_messages m
+          ON m.local_id=e.id
+        WHERE m.wire_id='550e8400-e29b-41d4-a716-4466554400d1';" | tr -d '\r')
+  [ "$got" = "$body" ]
+}
+
+# Every line of a page now carries a next_after, not just the cursor line,
+# because all the fields are read in one pass. So the cursor has to be taken
+# from the line whose TYPE says it is the cursor — assigning it from whatever
+# the last read produced lets a message line arriving afterwards blank it, and
+# the apply then either fails with no cursor or rewinds the transport.
+#
+# Position is not significant in the format, and this is the assertion that
+# says so.
+@test "sync contract: a message line after the cursor line does not blank the cursor" {
+  local remote db
+  db=$(agmsg_db_path demo)
+  remote=$(jq -nc '
+    {type:"sync_pull_message",server_seq:"9",
+     id:"550e8400-e29b-41d4-a716-4466554400d2",
+     server_received_at:"2026-07-20T13:00:09.000000Z",
+     envelope:{v:1,cipher:"none",key_id:null,blob:(
+       {body:"after the cursor",created_at:"2026-07-20T13:00:09.000000Z",
+        from_agent:"carol",to_agent:"bob"}|tojson|@base64)},
+     status:"importable",policy_revision:"0",local_security_revision:"0",
+     projection:{body:"after the cursor",created_at:"2026-07-20T13:00:09.000000Z",
+                 from_agent:"carol",to_agent:"bob"}}')
+  printf '%s\n%s\n' '{"type":"sync_pull_cursor","next_after":"9"}' "$remote" \
+    | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null
+
+  [ "$(sqlite3 "$db" "SELECT transport_cursor FROM sync_bindings WHERE local_team='demo';" | tr -d '\r')" = 9 ]
+}
+
+# A line jq cannot parse produces NO output, and an eval of nothing is not an
+# error — it leaves every field holding the previous line's value. So the read
+# has to say whether it happened, and the last thing jq emits is that flag.
+#
+# The garbage line is placed AFTER the cursor line on purpose. Before it, the
+# stale fields still say "sync_pull_message" and the page fails at the end for
+# want of a cursor, so the bug is invisible. After it, the stale fields say
+# "sync_pull_cursor", the loop skips the line as if it had been one, and the
+# page COMMITS — an unparseable line accepted as a page terminator.
+@test "sync contract: an unparseable line fails the page, wherever it sits" {
+  local remote db rc=0
+  db=$(agmsg_db_path demo)
+  remote=$(jq -nc '
+    {type:"sync_pull_message",server_seq:"4",
+     id:"550e8400-e29b-41d4-a716-4466554400d3",
+     server_received_at:"2026-07-20T13:00:04.000000Z",
+     envelope:{v:1,cipher:"none",key_id:null,blob:(
+       {body:"before the garbage",created_at:"2026-07-20T13:00:04.000000Z",
+        from_agent:"carol",to_agent:"bob"}|tojson|@base64)},
+     status:"importable",policy_revision:"0",local_security_revision:"0",
+     projection:{body:"before the garbage",created_at:"2026-07-20T13:00:04.000000Z",
+                 from_agent:"carol",to_agent:"bob"}}')
+  printf '%s\n%s\n%s\n' "$remote" '{"type":"sync_pull_cursor","next_after":"4"}' \
+    'this is not json' \
+    | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null 2>&1 || rc=$?
+  [ "$rc" -ne 0 ]
+  # And nothing from the page reached the store, including the message that
+  # came before the bad line. Asserting only the exit status passes for an
+  # implementation that committed and then reported the failure.
+  [ "$(sqlite3 "$db" "SELECT count(*) FROM events WHERE body='before the garbage';" | tr -d '\r')" -eq 0 ]
+}
+
+# `.envelope.v` leaves jq with no default on purpose: absent, it reads "null",
+# and the arity check rejects that. An empty-string default would let
+# "$seq:$v" hold nothing but digits and a colon and walk straight past it.
+#
+# This test does NOT bind that choice, and saying so is the point of the
+# paragraph. Run it against the empty-string default and it still passes —
+# because an empty `envelope_v` interpolates into the batch as `,,`, which is a
+# SQLite syntax error, so the page is refused a second time further down. Two
+# rejections, one exit status, and the suite cannot see which one fired.
+#
+# What it does pin is the outcome for an input that has no envelope at all:
+# refused, and nothing left behind in either table. The reason for preferring
+# the check over the syntax error is in the driver, where a reader deciding
+# whether the `tostring` matters will be standing.
+@test "sync contract: a message with no envelope is refused, not defaulted" {
+  local remote db rc=0
+  db=$(agmsg_db_path demo)
+  remote=$(jq -nc '
+    {type:"sync_pull_message",server_seq:"5",
+     id:"550e8400-e29b-41d4-a716-4466554400d4",
+     server_received_at:"2026-07-20T13:00:05.000000Z",
+     status:"importable",policy_revision:"0",local_security_revision:"0",
+     projection:{body:"no envelope",created_at:"2026-07-20T13:00:05.000000Z",
+                 from_agent:"carol",to_agent:"bob"}}')
+  printf '%s\n%s\n' "$remote" '{"type":"sync_pull_cursor","next_after":"5"}' \
+    | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null 2>&1 || rc=$?
+  [ "$rc" -ne 0 ]
+  [ "$(sqlite3 "$db" "SELECT count(*) FROM events WHERE body='no envelope';" | tr -d '\r')" -eq 0 ]
+  [ "$(sqlite3 "$db" "SELECT count(*) FROM sync_quarantine WHERE wire_id='550e8400-e29b-41d4-a716-4466554400d4';" | tr -d '\r')" -eq 0 ]
+}
+
+# One line is not one JSON value to jq. Given two concatenated objects it parses
+# both, and a filter that emits assignments emits the whole list twice — the
+# eval runs both and the second overwrites the first, `jq_ok` included. A page
+# could put anything it liked in front of a well-formed message and have it
+# vanish.
+#
+# The per-field reads this replaced refused it by accident: each substitution
+# came back holding two lines, and the type and arity checks rejected the
+# embedded newline. Raised in review of the single-read change.
+#
+# The leading object here is a VALID message with its own wire id, not garbage,
+# so the assertion cannot pass merely because the line failed to parse — and the
+# ids are checked separately, because "the page was refused" and "the right one
+# was refused" are different claims.
+@test "sync contract: two JSON values on one line are refused, not resolved to the last" {
+  local first second db rc=0
+  db=$(agmsg_db_path demo)
+  first=$(jq -nc '
+    {type:"sync_pull_message",server_seq:"6",
+     id:"550e8400-e29b-41d4-a716-4466554400e1",
+     server_received_at:"2026-07-20T13:00:06.000000Z",
+     envelope:{v:1,cipher:"none",key_id:null,blob:(
+       {body:"hidden in front",created_at:"2026-07-20T13:00:06.000000Z",
+        from_agent:"carol",to_agent:"bob"}|tojson|@base64)},
+     status:"importable",policy_revision:"0",local_security_revision:"0",
+     projection:{body:"hidden in front",created_at:"2026-07-20T13:00:06.000000Z",
+                 from_agent:"carol",to_agent:"bob"}}')
+  second=$(jq -nc '
+    {type:"sync_pull_message",server_seq:"7",
+     id:"550e8400-e29b-41d4-a716-4466554400e2",
+     server_received_at:"2026-07-20T13:00:07.000000Z",
+     envelope:{v:1,cipher:"none",key_id:null,blob:(
+       {body:"the visible one",created_at:"2026-07-20T13:00:07.000000Z",
+        from_agent:"carol",to_agent:"bob"}|tojson|@base64)},
+     status:"importable",policy_revision:"0",local_security_revision:"0",
+     projection:{body:"the visible one",created_at:"2026-07-20T13:00:07.000000Z",
+                 from_agent:"carol",to_agent:"bob"}}')
+
+  printf '%s %s\n%s\n' "$first" "$second" '{"type":"sync_pull_cursor","next_after":"7"}' \
+    | storage_sync_apply_pull demo "$SERVER_ID" "$TEAM_ID" 1 >/dev/null 2>&1 || rc=$?
+  [ "$rc" -ne 0 ]
+
+  # Neither of them, and neither wire id. The dangerous outcome is the SECOND
+  # one landing while the first disappears without trace, so both are named.
+  [ "$(sqlite3 "$db" "SELECT count(*) FROM events WHERE body IN ('hidden in front','the visible one');" | tr -d '\r')" -eq 0 ]
+  [ "$(sqlite3 "$db" "SELECT count(*) FROM sync_quarantine WHERE wire_id IN ('550e8400-e29b-41d4-a716-4466554400e1','550e8400-e29b-41d4-a716-4466554400e2');" | tr -d '\r')" -eq 0 ]
+}
