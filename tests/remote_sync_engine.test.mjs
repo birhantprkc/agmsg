@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, unlink,
   writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { readNativeAgeIdentity } from "../scripts/internal/sync-cipher.mjs";
 import {
   ageSnapshotDigest,
@@ -504,6 +506,94 @@ test("a file fault names the condition that failed, and permissions last", () =>
     assert.match(
       authorityFileFault(stats({ mode: 0o666 }), { maxBytes: 100 }),
       /must not be writable by group or others/u);
+  }
+});
+
+test("an unreadable age identity says which condition failed, and keeps the parser's own reason", async () => {
+  // The real entry point, not a helper beside it. Reverting the change in
+  // sync-cipher.mjs turns each of the first three red; the fourth is here to
+  // pin what must NOT change -- the parser's own reason already survived the
+  // catch on the base, and a fix that started routing it through the generic
+  // sentence would be a regression this file would otherwise not notice.
+  const root = await mkdtemp(join(tmpdir(), "agmsg-identity-"));
+  try {
+    const missing = join(root, "absent.key");
+    assert.throws(() => readNativeAgeIdentity(missing), (error) =>
+      /was not found/u.test(error.message) &&
+      error.message.includes(missing) &&
+      !/securely readable/u.test(error.message));
+
+    const directory = join(root, "a-directory");
+    await mkdir(directory);
+    assert.throws(() => readNativeAgeIdentity(directory), (error) =>
+      /must be a regular file/u.test(error.message) &&
+      error.message.includes(directory) &&
+      !/securely readable|group or others/u.test(error.message));
+
+    const malformedPath = join(root, "malformed.key");
+    await writeFile(malformedPath, "not an age key\nnor is this\n", { mode: 0o600 });
+    assert.throws(() => readNativeAgeIdentity(malformedPath), (error) =>
+      // The parser's own CipherStateError, unchanged: state "malformed", and
+      // NOT the privacy sentence. This already held before this change.
+      error.state === "malformed" && !/securely readable/u.test(error.message));
+
+    if (process.platform !== "win32") {
+      const loose = join(root, "loose.key");
+      await writeFile(loose, "x\n", { mode: 0o666 });
+      assert.throws(() => readNativeAgeIdentity(loose), (error) =>
+        /readable or writable by group or others/u.test(error.message) &&
+        error.message.includes(loose) &&
+        !/regular file|was not found/u.test(error.message));
+    }
+  } finally {
+    if (!root.startsWith(tmpdir())) throw new Error("unsafe test root");
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the rename script says which condition failed, and names the file", async () => {
+  // Driven as the script, because that is how it runs. A helper extracted for
+  // the test would leave the file's own entry point unbound -- which is what
+  // this test exists to stop.
+  const root = await mkdtemp(join(tmpdir(), "agmsg-rename-"));
+  try {
+    const directory = join(root, "remote-sync");
+    await mkdir(directory, { recursive: true });
+    const source = join(directory, "old.json");
+    const script = fileURLToPath(
+      new URL("../scripts/internal/rename-sync-config.mjs", import.meta.url));
+    const run = () => spawnSync(process.execPath, [script, root, "old", "new"], {
+      encoding: "utf8",
+    });
+
+    await writeFile(join(root, "elsewhere.json"), "{}\n", { mode: 0o600 });
+    await symlink(join(root, "elsewhere.json"), source);
+    let result = run();
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /must not be a symbolic link/u);
+    assert.ok(result.stderr.includes(source), "the message names the file");
+    assert.doesNotMatch(result.stderr, /group or others/u);
+    await unlink(source);
+
+    await mkdir(source);
+    result = run();
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /must be a regular file/u);
+    assert.ok(result.stderr.includes(source), "the message names the file");
+    assert.doesNotMatch(result.stderr, /symbolic link|group or others/u);
+    await rm(source, { recursive: true });
+
+    if (process.platform !== "win32") {
+      await writeFile(source, "{}\n", { mode: 0o666 });
+      result = run();
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /must not be readable or writable by group or others/u);
+      assert.ok(result.stderr.includes(source), "the message names the file");
+      assert.doesNotMatch(result.stderr, /symbolic link|must be a regular file/u);
+    }
+  } finally {
+    if (!root.startsWith(tmpdir())) throw new Error("unsafe test root");
+    await rm(root, { recursive: true, force: true });
   }
 });
 

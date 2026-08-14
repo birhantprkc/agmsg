@@ -398,19 +398,31 @@ export function nativeAgeIdentity(bytes) {
 
 export function readNativeAgeIdentity(path) {
   try {
-    // Each reason is raised as a CipherStateError so it SURVIVES the catch
-    // below, which otherwise replaces every failure with one sentence about
-    // privacy. On win32 the mode test does not run at all, so that sentence
-    // could not have been earned there -- and a missing file or an unparseable
-    // one produced it just the same (#781, the same shape as remote-sync.mjs).
+    // These reasons are raised as CipherStateError so they SURVIVE the catch
+    // below.
+    //
+    // What that catch collapses is a PLAIN Error: the stat and read failures.
+    // The parser's own CipherStateError already passed through it untouched on
+    // the way in, and still does -- an unparseable identity was never one of
+    // the failures that lost its reason, and the test below pins that it stays
+    // that way.
+    //
+    // What DID lose its reason was a missing file, a directory, an unreadable
+    // one, and a mode this platform may never have checked: on win32 that test
+    // does not run at all, so "not private" was the one thing a Windows
+    // operator could not act on -- and did (#781).
     let metadata;
     try {
       metadata = statSync(path);
     } catch (error) {
-      if (error?.code === "ENOENT") {
-        throw new CipherStateError("pending_key", `age identity was not found: ${path}`);
-      }
-      throw error;
+      // Every stat failure names itself, not just the common one. Leaving the
+      // rest to the generic sentence would keep this defect alive for EACCES
+      // and EPERM, which is where a permissions claim would at least be about
+      // something -- and still not about what happened.
+      const reason = error?.code === "ENOENT"
+        ? "was not found"
+        : `could not be read (${error?.code ?? "unknown error"})`;
+      throw new CipherStateError("pending_key", `age identity ${reason}: ${path}`);
     }
     if (!metadata.isFile()) {
       throw new CipherStateError("pending_key", `age identity must be a regular file: ${path}`);
@@ -420,7 +432,14 @@ export function readNativeAgeIdentity(path) {
       throw new CipherStateError("pending_key",
         `age identity must not be readable or writable by group or others: ${path}`);
     }
-    return nativeAgeIdentity(readFileSync(path));
+    let bytes;
+    try {
+      bytes = readFileSync(path);
+    } catch (error) {
+      throw new CipherStateError("pending_key",
+        `age identity could not be read (${error?.code ?? "unknown error"}): ${path}`);
+    }
+    return nativeAgeIdentity(bytes);
   } catch (error) {
     if (error instanceof CipherStateError) throw error;
     throw new CipherStateError("pending_key", "age identity is not securely readable");
