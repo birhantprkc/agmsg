@@ -1368,6 +1368,48 @@ _remote_sync_engine_cycle_stamp() { printf '%s' "$CONNECTION_ROOT/run/remote-syn
 # from, not a new place to write.
 _remote_sync_engine_refusal() { printf '%s' "$CONNECTION_ROOT/run/remote-sync.$1.refusal.json"; }
 
+# The refusal record, or nothing when a cycle has SINCE succeeded.
+#
+# THE READER DOES NOT TRUST THE DELETE. The engine removes this file after a
+# successful cycle, and that removal is best-effort — an unwritable run
+# directory, a permission change, a crash between the two writes. If the
+# removal is the only thing standing between a reversed decision and the
+# operator, then a failed removal reports a refusal that is no longer true,
+# for ever, on every `status` (raised in review).
+#
+# So the file is not the answer; the file COMPARED TO THE LAST SUCCESSFUL
+# CYCLE is. Deleting can fail. Comparing cannot. That makes this the stronger
+# of the two guarantees — "it does not lie even when the delete failed" rather
+# than "the delete is made certain" — and it is why the clear stays
+# best-effort in the engine rather than growing a retry.
+#
+# The comparison is lexicographic on the two timestamps, which is exact
+# because BOTH are written by the same engine in the same format (an ISO-8601
+# UTC instant). It is not a general date comparison and must not be reused as
+# one.
+#
+# With no cycle stamp there is nothing to compare against, and the refusal is
+# reported: an engine that has refused and never succeeded is exactly the case
+# the record exists for.
+_remote_sync_engine_refusal_current() {
+  local team="$1" file stamp last_cycle refused_at
+  file="$(_remote_sync_engine_refusal "$team")"
+  [ -f "$file" ] || return 0
+  # Quiet on purpose: an unreadable record is ABSENT, and saying so on stderr
+  # would put a parse error into the same stream a caller reads the JSON from
+  # (measured — it turned the "unreadable reads as absent" case red).
+  refused_at="$(_remote_read_config_field "$file" '$.at' 2>/dev/null)"
+  [ -n "$refused_at" ] && [ "$refused_at" != "null" ] || return 0
+  stamp="$(_remote_sync_engine_cycle_stamp "$team")"
+  if [ -f "$stamp" ]; then
+    last_cycle="$(_remote_read_config_field "$stamp" '$.last_success_at' 2>/dev/null)"
+    if [ -n "$last_cycle" ] && [ "$last_cycle" != "null" ] && [[ "$last_cycle" > "$refused_at" ]]; then
+      return 0
+    fi
+  fi
+  cat "$file" 2>/dev/null || true
+}
+
 # _remote_holds_current_key <team> -> 0 when this machine holds the identity
 # for the team's CURRENT epoch, 1 otherwise.
 #
@@ -2154,9 +2196,11 @@ _remote_status_one() {
   # sentence invented here is wrong for some server. What it may add is where
   # the operator of that server would be reached, which is the host the
   # binding already names.
-  local refusal_file refusal_status refusal_code refusal_at refusal_host
-  refusal_file="$(_remote_sync_engine_refusal "$team")"
-  if [ -f "$refusal_file" ]; then
+  local refusal_raw refusal_status refusal_code refusal_at refusal_host
+  # Through the currency check, not straight off the file — see the helper.
+  refusal_raw="$(_remote_sync_engine_refusal_current "$team")"
+  if [ -n "$refusal_raw" ]; then
+    local refusal_file="$(_remote_sync_engine_refusal "$team")"
     refusal_status="$(_remote_read_config_field "$refusal_file" '$.status')"
     refusal_code="$(_remote_read_config_field "$refusal_file" '$.code')"
     refusal_at="$(_remote_read_config_field "$refusal_file" '$.at')"
@@ -2247,9 +2291,10 @@ _remote_status_json_one() {
   # Passed as a whole file rather than as parsed fields: whatever the engine
   # recorded is what the reader gets, and adding a field there does not need a
   # change here.
-  local refusal_raw="" refusal_file
-  refusal_file="$(_remote_sync_engine_refusal "$team")"
-  [ -f "$refusal_file" ] && refusal_raw="$(cat "$refusal_file" 2>/dev/null || true)"
+  # Same currency check as the human line, from the same helper: the two must
+  # not be able to disagree about whether a refusal still stands.
+  local refusal_raw
+  refusal_raw="$(_remote_sync_engine_refusal_current "$team")"
   printf '%s' "$raw" | REFUSAL_JSON="$refusal_raw" python3 -c '
 import json, os, sys
 team, engine_state, engine_pid_text = sys.argv[1:4]

@@ -226,7 +226,20 @@ async function recordRefusal(team, fact, writeFileCall = writeFile) {
  *
  * A refusal that outlives its truth is worse than no record: `status` would
  * keep reporting a server decision that has been reversed, and the operator
- * would keep acting on it. Cleared in the same place the success is recorded.
+ * would keep acting on it.
+ *
+ * BEST-EFFORT, AND NOT WHAT MAKES THAT TRUE. This removal can fail — an
+ * unwritable run directory, a permission change, a crash between the two
+ * writes — and it is deliberately not retried or escalated, for the same
+ * reason `recordCycleSuccess` is not: bookkeeping must never take down a cycle
+ * that worked.
+ *
+ * What makes the guarantee hold is on the READING side: `remote.sh` compares
+ * the record to the last successful cycle and reports nothing older. Deleting
+ * can fail; comparing cannot. An earlier version of this comment said the two
+ * facts were written in the same place and so could never disagree — they are,
+ * and they still could, because one of the two writes is allowed to fail
+ * (raised in review).
  */
 async function clearRefusal(team, rmCall = rm) {
   try {
@@ -2847,7 +2860,9 @@ export async function runLoop(config, options, dependencies = {}) {
       try {
         await recordCycleCall(config.local_team, nowCall());
         // A success outdates any refusal on record. Cleared HERE, beside the
-        // stamp, so the two facts can never disagree about the same cycle.
+        // stamp, so a reader that never looks at the timestamps still sees the
+        // right thing most of the time — but the guarantee is the reader's
+        // comparison, not this line, because this line may fail.
         await clearRefusalCall(config.local_team);
       } catch { /* bookkeeping is best-effort; the cycle already succeeded */ }
       catchUp = result?.pushSaturated === true;

@@ -113,3 +113,58 @@ write_refusal() {
   # something in that file, or these three prove nothing.
   grep -q 'isRefusal' "$SCRIPTS/internal/remote-sync.mjs"
 }
+
+# ── a refusal that is no longer true ────────────────────────────────────────
+#
+# The engine removes the record after a successful cycle, best-effort. If that
+# removal fails — an unwritable run directory, a permission change, a crash
+# between the two writes — the file stays. Nothing else stood between it and
+# the operator, so `status` reported a reversed decision for ever (raised in
+# review, and it contradicted this PR's own stated standard).
+#
+# The reader now compares the record to the last successful cycle. Deleting can
+# fail; comparing cannot.
+
+write_cycle_stamp() {
+  printf '%s\n' "{\"type\":\"sync_cycle_stamp\",\"first_success_at\":\"$1\",\"last_success_at\":\"$1\"}" \
+    > "$TEST_SKILL_DIR/run/remote-sync.testteam.cycles.json"
+}
+
+@test "a refusal older than the last successful cycle is not reported, even if the file remains" {
+  write_refusal 402 payment_required                # recorded at 2026-08-14T00:00:00Z
+  write_cycle_stamp "2026-08-14T01:00:00Z"          # and a cycle succeeded after it
+  # The file is still there — this is the failed-delete case, made deliberate.
+  [ -f "$TEST_SKILL_DIR/run/remote-sync.testteam.refusal.json" ]
+
+  run bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  refute grep -q 'refused:' <<<"$output"
+
+  run bash "$SCRIPTS/remote.sh" status testteam --json
+  local got
+  got="$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["refusal"])')"
+  [ "$got" = "None" ]
+}
+
+@test "a refusal newer than the last successful cycle is still reported" {
+  # The other side of the comparison. Without this the check could be satisfied
+  # by never reporting anything, which is the failure mode of every filter.
+  write_cycle_stamp "2026-08-13T00:00:00Z"
+  write_refusal 402 payment_required                # recorded a day later
+  run bash "$SCRIPTS/remote.sh" status testteam
+  printf '%s' "$output" | grep -q 'refused: the server answered 402'
+
+  run bash "$SCRIPTS/remote.sh" status testteam --json
+  local got
+  got="$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["refusal"]["status"])')"
+  [ "$got" = "402" ]
+}
+
+@test "with no cycle stamp at all, the refusal is reported" {
+  # An engine that has refused and never succeeded is exactly the case the
+  # record exists for. Nothing to compare against must not mean "assume stale".
+  write_refusal 402 payment_required
+  [ ! -f "$TEST_SKILL_DIR/run/remote-sync.testteam.cycles.json" ]
+  run bash "$SCRIPTS/remote.sh" status testteam
+  printf '%s' "$output" | grep -q 'refused: the server answered 402'
+}
