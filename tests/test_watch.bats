@@ -517,6 +517,128 @@ run_named_watcher_for() {
   _stop_watcher "$pid"
 }
 
+# Record the ORDER THAT ACTUALLY HAPPENED; do not try to impose one (#595).
+#
+# Two earlier versions of this control were wrong in the same way twice. The
+# first slept between the steps, so the ordering was decided by machine load.
+# The second had the processes rendezvous on marker files, with a bounded wait
+# — and a bound that PROCEEDS when it expires turns the negative control green
+# on the broken code: if the predecessor is slow to reach its cleanup, the
+# successor's wait times out, it writes anyway, and the predecessor then reads
+# a pidfile that already names the successor and correctly deletes nothing.
+# The control would have reported the defect as fixed (raised in review).
+#
+# So nothing is imposed and nothing is waited for. Each process APPENDS a word
+# to one file as it passes the point that matters, and the assertion is about
+# the sequence that came out. Under either implementation the events happen in
+# whatever order they happen; the fix's whole content is which order that is,
+# and a recorded order cannot be lost to load.
+#
+#   claim   the successor wrote its own pid to the pidfile
+#   signal  the successor sent the previous holder its signal
+#   read    the departing predecessor read the pidfile in its EXIT guard
+#
+# The fix says `claim` precedes `signal`. Everything else follows from that:
+# a `read` triggered by the signal necessarily lands after the claim, and the
+# guard then sees a pid that is not its own.
+_record_handover_events() {
+  local sh="$SCRIPTS/watch.sh" applied
+  export AGMSG_TEST_EVENTS="$TEST_SKILL_DIR/run/handover.events"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  : > "$AGMSG_TEST_EVENTS"
+  perl -0pi -e 's/(\[ -f "\$PIDFILE" \] && IFS= read -r pidfile_pid < "\$PIDFILE" \|\| true)/$1\n  [ -n "\${AGMSG_TEST_EVENTS:-}" ] && printf %s\\ %s\\\\n read \$\$ >> "\$AGMSG_TEST_EVENTS"  # RECORDED/' "$sh"
+  perl -0pi -e 's/^echo \$\$ > "\$PIDFILE"$/echo \$\$ > "\$PIDFILE"\n[ -n "\${AGMSG_TEST_EVENTS:-}" ] && printf %s\\ %s\\\\n claim \$\$ >> "\$AGMSG_TEST_EVENTS"  # RECORDED/m' "$sh"
+  perl -0pi -e 's/(kill "\$PREV_PID_TO_DISPLACE" 2>\/dev\/null \|\| true|kill "\$prev_pid" 2>\/dev\/null \|\| true)/[ -n "\${AGMSG_TEST_EVENTS:-}" ] \&\& printf %s\\ %s\\\\n signal \$\$ >> "\$AGMSG_TEST_EVENTS"  # RECORDED\n      $1/g' "$sh"
+  # A control on the instrumentation: an edit that matched nothing would leave
+  # every assertion below reading an empty file and passing.
+  applied="$(grep -c 'RECORDED' "$sh")"
+  [ "$applied" -ge 3 ]
+}
+
+@test "watch: the successor claims the pidfile before it signals, and keeps its record (#595)" {
+  skip_on_windows "watcher process mgmt under Git Bash (#182)"
+  _record_handover_events
+
+  local sesspid; sleep 600 3>&- & sesspid=$!
+  local iid="solo.$sesspid"
+  local pf="$TEST_SKILL_DIR/run/watch.$iid.pid"
+
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >/dev/null 2>&1 3>&- 4>&- &
+  local w1=$!
+  _wait_pidfile "$pf" "$w1"
+
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >/dev/null 2>&1 3>&- 4>&- &
+  local w2=$!
+
+  # Wait for the PREDECESSOR TO BE GONE, which is a condition and not a
+  # duration: its remove is the last thing it does, so once it is gone nothing
+  # else can touch the pidfile.
+  local i
+  for i in $(seq 1 200); do
+    kill -0 "$w1" 2>/dev/null || break
+    sleep 0.1
+  done
+  run kill -0 "$w1"; [ "$status" -ne 0 ]
+  run kill -0 "$w2"; [ "$status" -eq 0 ]
+
+  # The order that actually occurred. Both events must be present -- an
+  # assertion over a sequence that is missing one of its terms proves nothing.
+  local claim_at signal_at read_at
+  # BY PID, not by event name. Both watchers claim the slot -- the predecessor
+  # when it starts -- so a search for the first `claim` finds the wrong one and
+  # the assertion passes on the broken code. The mutation caught that before
+  # CI did; the events carry the pid that wrote them for exactly this reason.
+  claim_at="$(grep -n "^claim $w2\$"  "$AGMSG_TEST_EVENTS" | head -1 | cut -d: -f1)"
+  signal_at="$(grep -n "^signal $w2\$" "$AGMSG_TEST_EVENTS" | head -1 | cut -d: -f1)"
+  read_at="$(grep -n "^read $w1\$"    "$AGMSG_TEST_EVENTS" | head -1 | cut -d: -f1)"
+  [ -n "$claim_at" ]
+  [ -n "$signal_at" ]
+  [ -n "$read_at" ]
+  # The fix, stated as the thing it is: the slot is claimed first.
+  [ "$claim_at" -lt "$signal_at" ]
+  # And the consequence, which is what the operator actually loses when the
+  # order is wrong: the record the live watcher wrote is still there.
+  [ "$read_at" -gt "$claim_at" ]
+  local seen; seen="$( [ -e "$pf" ] && cat "$pf" 2>/dev/null || printf '<no-file>' )"
+  [ "$seen" = "$w2" ]
+
+  kill "$w2" "$sesspid" 2>/dev/null || true
+  wait "$w2" 2>/dev/null || true
+}
+
+
+@test "watch: the slot is claimed before the previous holder is signalled (#595)" {
+  # The property is an ORDER between two statements, and the failure it
+  # prevents is a race, so this is asserted where the order lives rather than
+  # by trying to lose the race on purpose. A timing test here would pass on
+  # every machine that happens to win it -- which is how the defect survived:
+  # `bats tests/test_watch.bats` is green on a developer machine and the
+  # failure only ever appeared on a CI runner.
+  #
+  # What the order buys: the predecessor's EXIT guard removes the pidfile only
+  # if it still records the predecessor's pid, and that read-check-remove is
+  # three steps. Signalling first lets the successor's write land between the
+  # read and the remove, and the successor's record is deleted by a process on
+  # its way out. Writing first makes the guard's own read see the successor.
+  local watch_sh="$SCRIPTS/watch.sh" claim displace
+  claim="$(grep -n '^echo \$\$ > "\$PIDFILE"$' "$watch_sh" | head -1 | cut -d: -f1)"
+  displace="$(grep -n 'kill "\$PREV_PID_TO_DISPLACE"' "$watch_sh" | head -1 | cut -d: -f1)"
+
+  # Both anchors must exist, or this test passes by finding nothing -- the
+  # failure mode of every grep-based check.
+  [ -n "$claim" ]
+  [ -n "$displace" ]
+  [ "$displace" -gt "$claim" ]
+
+  # And the takeover block must not signal anyone on its own. The first
+  # version of this line anchored the pattern to the start of a line, and a
+  # mutation that put the old `kill "$prev_pid"` back INSIDE the case arm --
+  # where it lived before, after the pattern and a `)` -- left this test
+  # green. Unanchored, because what matters is that the previous holder is
+  # never signalled through that variable at all, wherever it is written.
+  refute grep -n 'kill "\$prev_pid"' "$watch_sh"
+}
+
 @test "watch: a second unfiltered watcher says it is sharing, and a lone one does not (#683)" {
   # Two watchers with no active name subscribe to the same unclaimed pairs. The
   # read cursor is one per (team, agent), so whoever polls first takes the row
