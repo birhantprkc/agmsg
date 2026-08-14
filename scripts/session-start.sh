@@ -245,50 +245,51 @@ if [ -n "$CC_PID" ]; then
   printf '%s\n' "$INSTANCE_ID" > "$STATE"
 fi
 
-# --- Say when a connected team has no engine (#761). ---
+# --- Start the engine for a connected team that has none (#761, #774). ---
 # A reboot leaves every sync engine dead and nothing restarts one: the five
 # commands that start it are all operator actions. `connected` keeps printing,
 # `send` keeps succeeding locally, and the only symptom is messages not arriving
 # — which reads as "nobody wrote anything". This is the first moment after a
-# reboot when anything of ours runs, so it is where the absence gets said.
+# reboot when anything of ours runs, so it is where it gets started.
+#
+# #765 made the absence VISIBLE here, in this block, and that was the right
+# first step and not enough: the warning appeared only when someone opened a
+# session, and it asked the person for something the machine can do. Starting it
+# is the same trigger doing the whole job.
 #
 # BEFORE the three directive blocks below rather than inside them: there are
 # three ways out of this script (a watcher already streaming, the actas variant,
 # and the default), and a line added to one of them is missing from the other
 # two.
 #
-# Best-effort, and bounded. `status` is a subprocess and needs python3; if it
-# cannot run, this says nothing rather than guessing. That is a real gap and not
-# a silent one: the check reports what it saw, and what it could not see is the
-# absence of a line, which is why the line names the teams rather than a count.
+# WHICH TEAMS. `status` is asked for CONNECTED teams — the binding, not the
+# engine. Whether an engine is running is `sync start`'s question, under the
+# lock that makes the answer true; asking it here as well is the second answer
+# that diverges (see scripts/lib/sync-autostart.sh).
+#
+# Best-effort, and bounded IN TIME as well as in outcome. `status` is a
+# subprocess and needs python3; if it cannot run, this does nothing rather than
+# guessing. A start that fails never fails the session, and a start that is SLOW
+# never delays the Monitor directive below: the helper waits for a whole-call
+# budget (`AGMSG_SYNC_AUTOSTART_TIMEOUT_S`, 5s) and then leaves the start
+# running and moves on. An agent that will not open because a sync engine was
+# thinking is worse than a sync engine that is down.
 #
 # Reaches `monitor` and `both` only — this hook is not installed for `turn` or
 # `off`, so those modes still get the absence only from `status`.
-if [ -x "$SKILL_DIR/scripts/remote.sh" ]; then
-  _stale_teams="$("$SKILL_DIR/scripts/remote.sh" status 2>/dev/null \
-    | awk -F'\t' '/engine (stopped|stale)/ {print $1}' || true)"
-  if [ -n "$_stale_teams" ]; then
-    printf '%s\n' "AGMSG: connected, but not syncing." ''
-    printf '%s\n' \
-      'No sync engine is running for the team(s) below, so messages from other' \
-      'machines are not arriving. Nothing restarts one after a reboot; run:' ''
-    # ONE RUNNABLE LINE PER TEAM, with no placeholder in it.
-    #
-    # The first version printed `sync start <team>` once. A reader has to
-    # replace `<team>` before that works, and an unreplaced `<team>` is a valid
-    # team name as far as validation is concerned — angle brackets are not among
-    # the characters it rejects. The names are already in hand here, so there is
-    # nothing to leave unfilled (the same reasoning #339 applied to the
-    # onboarding prompt).
-    #
-    # `printf %q` for both the path and the name: an install directory with a
-    # space in it, or a team name that needs quoting, otherwise produces a line
-    # that reads as runnable and is not.
-    printf '%s\n' "$_stale_teams" | while IFS= read -r _t; do
-      [ -n "$_t" ] || continue
-      printf '  bash %q sync start %q\n' "$SKILL_DIR/scripts/remote.sh" "$_t"
-    done
-    printf '\n'
+if [ -x "$SKILL_DIR/scripts/remote.sh" ] && [ -r "$SKILL_DIR/scripts/lib/sync-autostart.sh" ]; then
+  # shellcheck source=scripts/lib/sync-autostart.sh
+  . "$SKILL_DIR/scripts/lib/sync-autostart.sh"
+  _connected_teams="$("$SKILL_DIR/scripts/remote.sh" status 2>/dev/null \
+    | awk -F'\t' '$2 ~ /^connected/ {print $1}' || true)"
+  if [ -n "$_connected_teams" ]; then
+    # Word splitting on newlines only: a team name may contain a space, and
+    # `$(...)` unquoted would split it into two names that start nothing.
+    _old_ifs="$IFS"; IFS=$'\n'
+    # shellcheck disable=SC2086
+    set -- $_connected_teams
+    IFS="$_old_ifs"
+    agmsg_sync_autostart "$SKILL_DIR/scripts/remote.sh" "$@" || true
   fi
 fi
 
