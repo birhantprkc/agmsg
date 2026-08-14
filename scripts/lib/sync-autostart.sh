@@ -69,7 +69,7 @@ agmsg_sync_autostart() {
   local budget="${AGMSG_SYNC_AUTOSTART_TIMEOUT_S:-5}"
   local elapsed_start=$SECONDS
 
-  local team out rc tmp probe probe_pid refusal_line started="" failed="" slow="" refused=""
+  local team out rc tmp probe probe_pid remaining refusal_line started="" failed="" slow="" refused=""
   for team in "$@"; do
     [ -n "$team" ] || continue
     # A TEAM THE SERVER HAS REFUSED IS NOT STARTED (#773).
@@ -104,8 +104,22 @@ agmsg_sync_autostart() {
     # refused again — visibly, by the command, with the server's own sentence.
     # Skipping the start instead would let a slow local read stop syncing,
     # which is the failure #774 exists to remove.
-    probe="$(mktemp 2>/dev/null)" || probe=""
+    # ONE DEADLINE, SHARED BY BOTH SIDES.
+    #
+    # The watchdog inside the probe used to sleep the WHOLE per-call budget
+    # while this loop allowed only what was left of it. On the second team, or
+    # at the first team's scheduling boundary, the outer deadline arrives first,
+    # kills the wrapper, and the read it was watching is orphaned with a
+    # watchdog that will never reach it — the leak returns exactly where a
+    # multi-team session needs it not to (raised in review). Both sides are
+    # given the same remaining seconds, computed once, from one origin.
+    #
+    # With nothing left, no probe is started at all: the answer is unknown, and
+    # unknown proceeds to the start, as it does on timeout.
+    remaining=$(( budget - (SECONDS - elapsed_start) ))
+    probe=""
     refusal_line=""
+    [ "$remaining" -gt 0 ] && { probe="$(mktemp 2>/dev/null)" || probe=""; }
     if [ -n "$probe" ]; then
       (
         agmsg_close_inherited_fds
@@ -118,7 +132,7 @@ agmsg_sync_autostart() {
         # (raised in review) -- a leak measured in machine uptime.
         "$remote_sh" status "$team" >"$probe" 2>/dev/null &
         _read_pid=$!
-        ( sleep "$budget"; kill "$_read_pid" 2>/dev/null || true ) &
+        ( sleep "$remaining"; kill "$_read_pid" 2>/dev/null || true ) &
         _dog_pid=$!
         wait "$_read_pid" 2>/dev/null || true
         kill "$_dog_pid" 2>/dev/null || true
