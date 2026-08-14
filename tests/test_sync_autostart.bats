@@ -510,12 +510,21 @@ write_refusing_status_remote() {
 }
 
 @test "autostart: with several teams, a hanging status leaves nothing behind for any of them (#773)" {
-  # The per-team probe and the whole-call budget have to be measured from the
-  # same origin. When the watchdog inside the probe slept the FULL budget while
-  # this side allowed only what was left of it, the second team's outer
-  # deadline arrived first, killed the wrapper, and orphaned the read it was
-  # watching — with a watchdog that would never reach it. One team could not
-  # show that; the second is where the two clocks separate.
+  # What this DOES measure: a call over several teams spends one budget, not
+  # one per team, and leaves nothing running afterwards.
+  #
+  # What it does NOT measure, stated because a reader will assume otherwise:
+  # it does not catch the two clocks drifting apart. Giving the probe's own
+  # watchdog the full budget while this side allows only the remainder leaves
+  # this test green — with a `status` that never returns, the FIRST team
+  # consumes the whole budget, every later team gets zero remaining and starts
+  # no probe at all, so there is no second probe for the two clocks to disagree
+  # about. Measured, not assumed: that mutation was run and stayed green.
+  #
+  # The shared deadline is therefore justified by reading the code, not by this
+  # control. A control that does discriminate would need a first team that is
+  # slow-but-finishing and a second that hangs, which is a timing construction
+  # of exactly the kind this file has twice been told not to build.
   source "$SCRIPTS/lib/sync-autostart.sh"
   export AGMSG_TEST_START_CALLS="$TEST_SKILL_DIR/start-calls"
   : > "$AGMSG_TEST_START_CALLS"
