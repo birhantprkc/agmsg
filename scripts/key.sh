@@ -53,7 +53,7 @@ _key_cred_dir() {
 
 # Refuse to proceed without a working age/age-keygen — this is the same
 # preflight `remote.sh connect` runs before its own key-bootstrap prompt
-# (remote-connect onboarding design), duplicated here since key.sh can also be invoked directly
+# (see docs/design/remote-sync.md), duplicated here since key.sh can also be invoked directly
 # (e.g. `key.sh import` ahead of ever running `connect`).
 _key_require_age() {
   if ! command -v age >/dev/null 2>&1 || ! command -v age-keygen >/dev/null 2>&1; then
