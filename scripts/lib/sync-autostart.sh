@@ -53,6 +53,14 @@
 # moment, and "nothing changed" is not news.
 agmsg_sync_autostart() {
   local remote_sh="$1"; shift
+  # Sourced here rather than at file scope: this file is sourced by two hooks,
+  # and pulling in a second file at their top level is a cost they pay whether
+  # or not anything is started.
+  if ! declare -F agmsg_close_inherited_fds >/dev/null 2>&1; then
+    local _lib_dir="${BASH_SOURCE[0]%/*}"
+    # shellcheck source=scripts/lib/close-fds.sh
+    [ -r "$_lib_dir/close-fds.sh" ] && . "$_lib_dir/close-fds.sh"
+  fi
   [ -x "$remote_sh" ] || return 0
   [ $# -gt 0 ] || return 0
 
@@ -90,7 +98,22 @@ agmsg_sync_autostart() {
     # here could see: I measured it as a suite that stopped finishing.
     #
     # stdin too: a child left on a terminal can stop for input.
-    ( "$remote_sh" sync start "$team" >"$tmp" 2>&1; printf '%s\n' "$?" > "$tmp.rc" ) </dev/null >/dev/null 2>&1 &
+    (
+      # EVERY INHERITED DESCRIPTOR, not just 0/1/2.
+      #
+      # Detaching stdin/stdout/stderr was necessary and not sufficient: bats
+      # hands a harness pipe down on fd 3 and 4, and a child that keeps them
+      # open holds the shard after every case has passed. `scripts/lib/close-fds.sh`
+      # exists because that exact leak hung a shard once already, from a
+      # different spawn path — and a repo-wide check found mine.
+      #
+      # Called INSIDE the subshell so it closes the child's copies and leaves
+      # this shell's own descriptors alone, which is the pattern that file's
+      # own comment prescribes.
+      agmsg_close_inherited_fds
+      "$remote_sh" sync start "$team" >"$tmp" 2>&1
+      printf '%s\n' "$?" > "$tmp.rc"
+    ) </dev/null >/dev/null 2>&1 &
     while [ ! -f "$tmp.rc" ] && [ $((SECONDS - elapsed_start)) -lt "$budget" ]; do
       sleep 0.1
     done
