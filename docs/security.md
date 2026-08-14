@@ -12,7 +12,10 @@ document says it says, treat every other claim here as unverified until
 re-checked — that is the correct response, and the reason the citations are
 here.
 
-Measured on `integration/remote` at `452da72`.
+Measured on `integration/remote`. Citations resolve at this branch's head; the
+only file changed since the branch point `452da72` is this document, so every
+`file:line` below points at code that is identical at either revision — verify
+against whichever you have.
 
 ## Scope
 
@@ -312,9 +315,23 @@ scripts/remote.sh:1280    --minimum-security e2ee-required --cipher age-v1
 scripts/remote.sh:1758    --minimum-security e2ee-required --cipher age-v1
 ```
 
-Those are the only two. `grep -rn -- '--cipher' scripts/ tests/` returns four
-hits, and the other two are a usage string and an argument check
-(`scripts/internal/remote-sync.mjs:30`, `:2192`).
+Those are the only two, and the search is the whole tree minus `docs/` — the
+earlier version of this looked in `scripts/` and `tests/`, which is narrower
+than the sentence it was supporting and, worse, reads as "the tests were checked
+too" while missing `server/test/`:
+
+```
+grep -rn 'remote-sync\.sh' . --exclude-dir=docs --exclude-dir=.git \
+  --exclude-dir=node_modules | grep configure
+
+scripts/remote.sh:1280                a caller
+scripts/remote.sh:1758                a caller
+scripts/internal/remote-sync.mjs:29   a usage string
+```
+
+`server/test/sync-client.integration.test.ts` does invoke `remote-sync.sh`
+through a generic helper that forwards `...args`, so it could in principle call
+`configure`. It does not: `configure` appears zero times in that file.
 
 **So a machine that reaches `age-v1` through any code in this repository
 cannot get there without also setting `e2ee-required`** — the two flags are passed together, in both places, and there
@@ -431,11 +448,12 @@ the sections above are the claim.
 
 ## How to check this document
 
-Every citation is `path:line` at `452da72` on `integration/remote`. To verify one:
+Every citation is `path:line`. To verify one, against this branch's head or the
+branch point — the code is the same at both:
 
 ```
-git show 452da72:docs/spec/ref/age-v1-profile.md | sed -n '342,345p'
-git show 452da72:server/src/protocol.ts          | sed -n '221,238p'
+sed -n '342,345p' docs/spec/ref/age-v1-profile.md
+sed -n '221,238p' server/src/protocol.ts
 ```
 
 Line numbers move. If a citation does not land where this says, check the same
