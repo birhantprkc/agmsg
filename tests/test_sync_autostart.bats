@@ -45,8 +45,12 @@ teardown() {
   # that is the behaviour under test. It must not outlive the test: a CI shard
   # runs many files in one process tree, and a fake that loops forever would
   # then be somebody else's flake (raised in review).
-  pkill -f "$TEST_SKILL_DIR/fake-remote.sh" 2>/dev/null || true
-  pkill -f "$TEST_SKILL_DIR/fake-node" 2>/dev/null || true
+  # BY THE PATH THEY ACTUALLY RUN UNDER. The hanging fake is COPIED over
+  # `$SCRIPTS/remote.sh`, so matching the name it was written as reaps nothing
+  # and the child outlives the whole file — which is how this suite stopped
+  # exiting even with every case green. Both paths are inside the test's own
+  # skill dir, so the pattern cannot reach anything else.
+  pkill -f "$TEST_SKILL_DIR/" 2>/dev/null || true
   teardown_test_env
 }
 
@@ -106,6 +110,29 @@ wait_for_call() {
   return 1
 }
 
+# A `remote.sh` that answers instantly, for the cases where the SUBJECT is what
+# the helper does with an answer — not how long the real command takes.
+#
+# The real command is kept for the race case below, which is about inheriting
+# its lock. Everywhere else it only made the suite slow and timing-coupled:
+# raising the budget so a case could not be cut short is the same admission,
+# with a worse failure mode (a 60s case that goes red when the machine is busy).
+write_answering_remote() {
+  local answer="$1" fake="$TEST_SKILL_DIR/fake-remote-answer.sh"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' '[ "${1:-}" = "sync" ] || exit 0'
+    case "$answer" in
+      started)  printf '%s\n' 'echo "Sync engine started for '"'"'$3'"'"' (pid 4242)."; exit 0' ;;
+      running)  printf '%s\n' 'echo "Sync engine already running (pid 4242)."; exit 0' ;;
+      refused)  printf '%s\n' 'echo "agmsg: team '"'"'$3'"'"' is disconnected; connect or pull it before starting sync" >&2; exit 1' ;;
+      broken)   printf '%s\n' 'echo "engine exploded" >&2; exit 1' ;;
+    esac
+  } > "$fake"
+  chmod +x "$fake"
+  printf '%s\n' "$fake"
+}
+
 collect_engine_pids() {
   local pidfile="$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
   [ -f "$pidfile" ] && ENGINE_PIDS="$ENGINE_PIDS $(cat "$pidfile")"
@@ -113,6 +140,9 @@ collect_engine_pids() {
 }
 
 @test "starts an engine for a connected team that has none" {
+  # THE REAL COMMAND, because this case asserts on the artifact it leaves: a
+  # pidfile naming a live process. The sentence is not the evidence.
+  export AGMSG_SYNC_AUTOSTART_TIMEOUT_S=60
   export AGMSG_NODE="$(write_fake_node)"
   source "$SCRIPTS/lib/sync-autostart.sh"
   run agmsg_sync_autostart "$SCRIPTS/remote.sh" testteam
@@ -120,17 +150,16 @@ collect_engine_pids() {
   [ "$status" -eq 0 ]
   printf '%s' "$output" | grep -q 'started one for'
   printf '%s' "$output" | grep -q 'testteam'
-  # The artifact, not the sentence: a pidfile naming a live process.
   [ -f "$TEST_SKILL_DIR/run/remote-sync.testteam.pid" ]
-  kill -0 "$(cat "$TEST_SKILL_DIR/run/remote-sync.testteam.pid")"
+  # Liveness through the shipped helper, not a bare kill -0 (a repo-wide check
+  # forbids the latter, and it caught this branch once already).
+  run bash -c 'source "'"$SCRIPTS"'/lib/instance-id.sh"; _agmsg_pid_alive "$(cat "'"$TEST_SKILL_DIR"'/run/remote-sync.testteam.pid")"'
+  [ "$status" -eq 0 ]
 }
 
 @test "says nothing at all when the engine is already running" {
-  export AGMSG_NODE="$(write_fake_node)"
-  bash "$SCRIPTS/remote.sh" sync start testteam
-  collect_engine_pids
   source "$SCRIPTS/lib/sync-autostart.sh"
-  run agmsg_sync_autostart "$SCRIPTS/remote.sh" testteam
+  run agmsg_sync_autostart "$(write_answering_remote running)" testteam
   [ "$status" -eq 0 ]
   # Starting is a side effect nobody asked for in this moment; "nothing
   # changed" is not news, and a line here would appear on every session start
@@ -183,21 +212,19 @@ collect_engine_pids() {
   [ "$live" = "1" ]
 }
 
-@test "a team that is disconnected is not started, and the refusal is shown" {
-  export AGMSG_NODE="$(write_fake_node)"
-  local cfg="$TEST_SKILL_DIR/teams/testteam/config.json" escaped updated
-  escaped="$(sed "s/'/''/g" "$cfg")"
-  updated="$(sqlite_mem "
-    SELECT json_set('$escaped', '\$.remote_binding.disconnected_at', '2026-08-01T00:00:00Z');")"
-  printf '%s\n' "$updated" > "$cfg"
-
+@test "a refusal from the command is repeated, not replaced" {
+  # THE SUBJECT IS THE HELPER'S HANDLING of a refusal, so the refusal is given
+  # to it directly. Driving the real command here made the case depend on how
+  # busy the machine was — it went green alone and red in the full file — and
+  # raising the budget only made it slow instead of wrong.
+  #
+  # The binding check itself belongs to `cmd_sync_start` and is tested where it
+  # lives; what is asserted here is that its sentence survives.
   source "$SCRIPTS/lib/sync-autostart.sh"
-  run agmsg_sync_autostart "$SCRIPTS/remote.sh" testteam
+  run agmsg_sync_autostart "$(write_answering_remote refused)" testteam
   [ "$status" -eq 0 ]
-  # The binding check is the COMMAND's, inherited: it refuses by name before it
-  # starts anything, and the reason it gave is repeated rather than replaced.
   printf '%s' "$output" | grep -q 'disconnected'
-  [ ! -f "$TEST_SKILL_DIR/run/remote-sync.testteam.pid" ]
+  printf '%s' "$output" | grep -q 'connected, but not syncing'
 }
 
 @test "a start that fails does not fail the caller, and says what the command said" {
@@ -210,11 +237,8 @@ collect_engine_pids() {
   # is TRUE and is a different sentence. The two outcomes are tested
   # separately rather than folded together: "it failed" and "it has not
   # answered yet" are different facts and the tool says different things.
-  export AGMSG_SYNC_AUTOSTART_TIMEOUT_S=60
-  export AGMSG_NODE="$(write_failing_node)"
-
   source "$SCRIPTS/lib/sync-autostart.sh"
-  run agmsg_sync_autostart "$SCRIPTS/remote.sh" testteam
+  run agmsg_sync_autostart "$(write_answering_remote broken)" testteam
   [ "$status" -eq 0 ]
   printf '%s' "$output" | grep -q 'connected, but not syncing'
   printf '%s' "$output" | grep -q 'The session continues.'

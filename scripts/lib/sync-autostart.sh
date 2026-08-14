@@ -61,7 +61,7 @@ agmsg_sync_autostart() {
   local budget="${AGMSG_SYNC_AUTOSTART_TIMEOUT_S:-5}"
   local elapsed_start=$SECONDS
 
-  local team out rc pid tmp started="" failed="" slow=""
+  local team out rc tmp started="" failed="" slow=""
   for team in "$@"; do
     [ -n "$team" ] || continue
     tmp="$(mktemp 2>/dev/null)" || tmp=""
@@ -69,21 +69,42 @@ agmsg_sync_autostart() {
     # stderr folded in: `cmd_sync_start` says why it refused on stderr, and that
     # sentence is the useful half of a failure. Swallowing it would leave this
     # printing "could not start" with the reason on the floor.
-    "$remote_sh" sync start "$team" >"$tmp" 2>&1 &
-    pid=$!
-    while kill -0 "$pid" 2>/dev/null && [ $((SECONDS - elapsed_start)) -lt "$budget" ]; do
+    # THE QUESTION IS "HAS IT FINISHED?", NOT "IS IT ALIVE?".
+    #
+    # The child writes its exit status to a sentinel as its last act, and this
+    # polls for the sentinel. No pid is examined, so no liveness check is made
+    # — which is what `scripts/lib/instance-id.sh`'s `_agmsg_pid_alive` exists
+    # to own, and what a bare `kill -0` here would have duplicated badly (a
+    # repo-wide check catches that; mine reached CI before I did).
+    #
+    # It is also the more exact question. `kill -0` succeeds for a child that
+    # has exited and not been reaped, so polling liveness would have waited
+    # past the moment the answer was available.
+    # DETACHED FROM THIS CALLER'S STREAMS, and that is not tidiness.
+    #
+    # The child is deliberately allowed to outlive this function. If it still
+    # holds the caller's stdout, anything that CAPTURES that output — `run` in
+    # a test, `$(...)`, a hook whose output is piped — waits for EOF, and a
+    # start that hangs then hangs the session. That is the requirement this
+    # whole budget exists for, broken in a way no exit code and no timeout
+    # here could see: I measured it as a suite that stopped finishing.
+    #
+    # stdin too: a child left on a terminal can stop for input.
+    ( "$remote_sh" sync start "$team" >"$tmp" 2>&1; printf '%s\n' "$?" > "$tmp.rc" ) </dev/null >/dev/null 2>&1 &
+    while [ ! -f "$tmp.rc" ] && [ $((SECONDS - elapsed_start)) -lt "$budget" ]; do
       sleep 0.1
     done
-    if kill -0 "$pid" 2>/dev/null; then
-      # Budget spent. NOT killed — see the header. The temp file is left for the
-      # child to finish writing into; it is in the system temp dir and is the
-      # price of not truncating a start that may be about to succeed.
+    if [ ! -f "$tmp.rc" ]; then
+      # Budget spent. The child is NOT killed — see the header — so its two
+      # temp files are left for it to finish writing into. They are in the
+      # system temp directory, and that is the price of not truncating a start
+      # that may be about to succeed.
       slow="$slow$team"$'\n'
       continue
     fi
-    wait "$pid"; rc=$?
+    rc="$(cat "$tmp.rc" 2>/dev/null || printf '1')"
     out="$(cat "$tmp" 2>/dev/null)"
-    rm -f "$tmp"
+    rm -f "$tmp" "$tmp.rc"
     if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'already running'; then
       continue
     fi
