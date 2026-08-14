@@ -362,23 +362,10 @@ So the pull route does not bypass the pairing; it arrives at it one command
 later. The other caller, `_remote_configure_keyed_team`
 (`scripts/remote.sh:1729`, reached from `:1916`), passes the same two flags.
 
-That is the whole set, and the search is tree-wide rather than inside one file
-— the earlier version of this paragraph derived it from `remote.sh` alone, which
-could not have ruled out a caller elsewhere:
-
-```
-grep -rnE 'remote-sync\.(sh|mjs)' . --include='*.sh' --include='*.mjs' --include='*.ts' \
-  | grep -v node_modules | grep -vE '^\./(docs|tests)/' | grep configure
-
-scripts/remote.sh:1280            a production caller
-scripts/remote.sh:1758            a production caller
-scripts/internal/remote-sync.mjs:29   a usage string
-```
-
-Two callers, one usage line, nothing else. Both callers pass
-`--minimum-security e2ee-required` and `--cipher age-v1` as **literals** — not
-variables that something upstream could set differently — and both are on the
-path a machine must take before it can read anything.
+That is the whole set — the same two callers derived above. Both pass
+`--minimum-security e2ee-required` and `--cipher age-v1` as **literals**, not
+variables something upstream could set apart, and both sit on the path a machine
+must take before it can read anything.
 
 ### What that means for the properties table
 
