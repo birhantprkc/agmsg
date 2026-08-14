@@ -131,7 +131,12 @@ agmsg_sync_autostart() {
       agmsg_close_inherited_fds
       "$remote_sh" sync start "$team" >"$tmp" 2>&1
       printf '%s\n' "$?" > "$tmp.rc"
-    ) </dev/null >/dev/null 2>&1 &
+    # The literal `3>&- 4>&-` as well as the call inside, because the repo-wide
+    # check reads the spawn LINE (tests/test_spawn_fd_guard.bats). Belt and
+    # braces is the right answer here anyway: the call closes whatever the
+    # runtime handed down, and the redirections say so where a reader — and
+    # that check — can see it without following a function.
+    ) </dev/null >/dev/null 2>&1 3>&- 4>&- &
     while [ ! -f "$tmp.rc" ] && [ $((SECONDS - elapsed_start)) -lt "$budget" ]; do
       sleep 0.1
     done
