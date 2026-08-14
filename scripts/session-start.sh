@@ -267,10 +267,13 @@ fi
 # lock that makes the answer true; asking it here as well is the second answer
 # that diverges (see scripts/lib/sync-autostart.sh).
 #
-# Best-effort, and bounded. `status` is a subprocess and needs python3; if it
-# cannot run, this does nothing rather than guessing. A failure to start never
-# fails the session: an agent that will not open because a sync engine refused
-# is worse than a sync engine that is down.
+# Best-effort, and bounded IN TIME as well as in outcome. `status` is a
+# subprocess and needs python3; if it cannot run, this does nothing rather than
+# guessing. A start that fails never fails the session, and a start that is SLOW
+# never delays the Monitor directive below: the helper waits for a whole-call
+# budget (`AGMSG_SYNC_AUTOSTART_TIMEOUT_S`, 5s) and then leaves the start
+# running and moves on. An agent that will not open because a sync engine was
+# thinking is worse than a sync engine that is down.
 #
 # Reaches `monitor` and `both` only — this hook is not installed for `turn` or
 # `off`, so those modes still get the absence only from `status`.

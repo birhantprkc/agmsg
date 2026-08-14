@@ -28,9 +28,22 @@
 # active binding and a disconnected team, by name, before it starts anything.
 # Filtering on the binding here would be the same duplication one level up.
 #
-# NOTHING HERE MAY FAIL A SESSION. An agent that will not open because a sync
-# engine refused is worse than a sync engine that is down, so every path returns
-# 0 and the worst outcome is a line of text.
+# NOTHING HERE MAY FAIL A SESSION, AND FAILING INCLUDES BEING SLOW.
+#
+# Returning 0 on every path is only half of it — the first version did that and
+# still ran `sync start` synchronously, which means `actas` did not print
+# `status=ok` and session start did not emit the Monitor directive until the
+# engine was ready. `cmd_sync_start` waits for a readiness nonce (~16s of its
+# own before it gives up), takes a per-team lock others may be holding, and can
+# be stuck for as long as its child is. Multiplied by the number of connected
+# teams, in the critical path of an agent opening. A release-blocker fix that
+# can stop a session from starting is not a fix (raised in review).
+#
+# So each start runs in the BACKGROUND and this waits, at most, for a whole-call
+# budget shared by every team. When the budget runs out the child is LEFT
+# RUNNING rather than killed: it may be seconds from having started the engine,
+# and killing it could leave a half-made pidfile behind. What stops is the
+# WAITING. The session goes on and the line says a start is still in flight.
 
 # Usage: agmsg_sync_autostart <remote.sh path> <team>...
 #
@@ -43,13 +56,34 @@ agmsg_sync_autostart() {
   [ -x "$remote_sh" ] || return 0
   [ $# -gt 0 ] || return 0
 
-  local team out rc started="" failed=""
+  # Seconds, for the whole call. Overridable so a test can drive the deadline
+  # without waiting for it, and so an operator on a slow machine can raise it.
+  local budget="${AGMSG_SYNC_AUTOSTART_TIMEOUT_S:-5}"
+  local elapsed_start=$SECONDS
+
+  local team out rc pid tmp started="" failed="" slow=""
   for team in "$@"; do
     [ -n "$team" ] || continue
+    tmp="$(mktemp 2>/dev/null)" || tmp=""
+    [ -n "$tmp" ] || return 0
     # stderr folded in: `cmd_sync_start` says why it refused on stderr, and that
     # sentence is the useful half of a failure. Swallowing it would leave this
     # printing "could not start" with the reason on the floor.
-    out="$("$remote_sh" sync start "$team" 2>&1)"; rc=$?
+    "$remote_sh" sync start "$team" >"$tmp" 2>&1 &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null && [ $((SECONDS - elapsed_start)) -lt "$budget" ]; do
+      sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      # Budget spent. NOT killed — see the header. The temp file is left for the
+      # child to finish writing into; it is in the system temp dir and is the
+      # price of not truncating a start that may be about to succeed.
+      slow="$slow$team"$'\n'
+      continue
+    fi
+    wait "$pid"; rc=$?
+    out="$(cat "$tmp" 2>/dev/null)"
+    rm -f "$tmp"
     if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'already running'; then
       continue
     fi
@@ -70,6 +104,20 @@ agmsg_sync_autostart() {
     printf '%s' "$started" | while IFS= read -r t; do
       [ -n "$t" ] || continue
       printf '  %s\n' "$t"
+    done
+    printf '\n'
+  fi
+
+  if [ -n "$slow" ]; then
+    printf '%s\n' "AGMSG: a sync engine start is still in flight after ${budget}s; not waiting for it:"
+    printf '%s' "$slow" | while IFS= read -r t; do
+      [ -n "$t" ] || continue
+      printf '  %s\n' "$t"
+    done
+    printf '%s\n' 'The session continues. Check it with:' ''
+    printf '%s' "$slow" | while IFS= read -r t; do
+      [ -n "$t" ] || continue
+      printf '  bash %q status %q\n' "$remote_sh" "$t"
     done
     printf '\n'
   fi

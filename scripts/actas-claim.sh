@@ -106,9 +106,14 @@ done <<< "$TEAMS"
 # known.
 #
 # AFTER the claim and BEFORE the status line: the claim is the thing the caller
-# is waiting on, and nothing about starting an engine may delay or fail it. The
-# helper returns 0 on every path and `|| true` says so a second time, because a
-# session that will not open is worse than an engine that is down.
+# is waiting on, and nothing about starting an engine may delay or fail it.
+#
+# DELAY IS THE HALF THAT NEEDED WORK. Returning 0 is not enough — a synchronous
+# `sync start` holds `status=ok` back for as long as the engine takes to become
+# ready, which is up to ~16s per team before the command even gives up. The
+# helper bounds the WAIT (`AGMSG_SYNC_AUTOSTART_TIMEOUT_S`, 5s for the whole
+# call) and leaves a slow start running rather than killing it. `|| true` says
+# the exit-status half a second time.
 #
 # Whether an engine is already running is not asked here — `sync start` answers
 # it under the per-team lock, and the concurrent case (several sessions claiming
