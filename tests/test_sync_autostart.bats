@@ -207,8 +207,15 @@ collect_engine_pids() {
   local pidfile="$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
   [ -f "$pidfile" ]
   kill -0 "$(cat "$pidfile")"
+  # COUNTED IN THIS TEST'S OWN TREE. `fake-node` as a bare name matches any
+  # leftover from another run in the same process tree — a CI shard runs many
+  # files in one — so the count would include somebody else's engine and this
+  # assertion would fail for their leak rather than a second engine here.
+  # Measured: with two strays present on the machine it read 3 and went red,
+  # green on the run before, which is what a global pattern looks like from
+  # the inside.
   local live
-  live="$(pgrep -f "fake-node" 2>/dev/null | wc -l | tr -d ' ')"
+  live="$(pgrep -f "$TEST_SKILL_DIR/fake-node" 2>/dev/null | wc -l | tr -d ' ')"
   [ "$live" = "1" ]
 }
 
