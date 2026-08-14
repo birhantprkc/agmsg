@@ -2,9 +2,9 @@
 
 **Status:** the design being built to. Not implemented yet.
 
-This replaces the onboarding half of `device-pairing.md`. It also replaced the
-remote connect onboarding design, which has moved to the agmsg-cloud repository
-— that document was about the hosted service, and this one is not. Two further documents were removed rather than kept as
+This replaces the onboarding half of `device-pairing.md`, and the remote connect
+onboarding design that used to sit beside it — that document was about the
+hosted service, so it does not belong in this repository. Two further documents were removed rather than kept as
 history: `local-first-onboarding.md`, whose onboarding this document replaces,
 and `authentication-result-handoff.md`, a proposal for a seam this design does
 not have — see "No authentication" below for what it removes. Their reasoning
