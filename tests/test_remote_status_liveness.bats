@@ -743,8 +743,8 @@ write_unownable_ps_fixture() {
 }
 
 # --- the probe a minted pid is checked with (#652) -----------------------
-#     Field report, koit's Windows dogfood: `ps -W` found node 33872, the
-#     pidfile held 33872, and status still said "engine stale — pidfile 33872
+#     Field report from the owner's Windows dogfood: `ps -W` found node 33872,
+#     the pidfile held 33872, and status still said "engine stale — pidfile
 #     points at a dead or foreign process". The pid was right; the thing asking
 #     whether it was alive could not see it.
 #
@@ -789,9 +789,15 @@ write_unownable_ps_fixture() {
   # because the failure it guards against is a new call site appearing rather
   # than an existing one changing.
   #
-  # Comment lines are stripped first: this file names the non-local probe in
-  # prose to explain why it is not used, and counting those would make the
-  # check measure its own commentary.
-  run bash -c "grep -v '^[[:space:]]*#' \"\$1\" | grep -c '_agmsg_pid_alive \"'" _ "$SCRIPTS/remote.sh"
+  # NOT `grep '_agmsg_pid_alive "'`. That pattern pins the CALL SITE'S SPELLING,
+  # not the call: two spaces, a tab, an unquoted `$pid`, or a line continuation
+  # after the name all slip past it, so a reverted call site could sit here
+  # green (raised in review).
+  #
+  # Instead: strip whole-line comments, delete every `_agmsg_pid_alive_local`
+  # token, and count what is left of the name. Nothing about the argument or
+  # the spacing is assumed, because nothing after the name is looked at. The
+  # helper is defined in instance-id.sh, so no definition is counted here.
+  run bash -c "grep -v '^[[:space:]]*#' \"\$1\" | sed 's/_agmsg_pid_alive_local//g' | grep -c '_agmsg_pid_alive'" _ "$SCRIPTS/remote.sh"
   [ "$output" = "0" ]
 }
