@@ -219,60 +219,109 @@ skip_if_root() {
   # platform that breaks it. Review caught that. So it is driven here rather than
   # argued: `MSYSTEM` plus a `tasklist` that answers nothing is the condition
   # #652 reproduces, and it runs on any host.
-  # FROM A KNOWN STATE, because this test COUNTS.
   #
-  # Earlier cases in this file start real engines for this same team, and the
-  # count below would include them -- so the first draft passed alone and failed
-  # in the full file. Worse than flaky: a surviving engine makes the second
-  # `sync start` read `running` from the PIDFILE and return, which hides exactly
-  # the defect this exists to catch. The fixture stood inside its own instrument.
-  pkill -f "remote-sync.mjs run --team testteam" 2>/dev/null || true
-  rm -f "$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
-  local settle=0
-  while [ "$settle" -lt 100 ]; do
-    [ -z "$(pgrep -f "remote-sync.mjs run --team testteam")" ] && break
-    settle=$((settle + 1)); sleep 0.05
-  done
-  [ -z "$(pgrep -f "remote-sync.mjs run --team testteam")" ]
+  # A TEAM NAME NOBODY ELSE USES, because this test counts processes.
+  #
+  # It first counted with `pgrep -f "... --team testteam"`, which is machine-wide
+  # and names a team half this suite also uses: it counted -- and KILLED --
+  # engines belonging to other cases, other files and other shards. Scoping by
+  # `$TEST_SKILL_DIR` would not help either, since the store is passed in the
+  # environment and never appears in argv. The team name IS in argv, so making it
+  # unique makes every match this test's own (raised in review).
+  local team="lockrace817"
+  bash "$SCRIPTS/join.sh" "$team" alice claude-code /tmp/project-lockrace >/dev/null
+
+  local cfg="$TEST_SKILL_DIR/teams/$team/config.json" escaped updated
+  escaped="$(sed "s/'/''/g" "$cfg")"
+  updated="$(sqlite_mem "
+    SELECT json_set('$escaped', '\$.remote_binding', json_object(
+      'endpoint', 'https://remote.example',
+      'server_instance_id', '018f0000-0000-7000-8000-000000000001',
+      'remote_team_id', '018f0000-0000-7000-8000-000000000002',
+      'protocol_version', 1,
+      'capabilities', json_object('write_allowed_ciphers', json_array('none')),
+      'connected_at', '2026-07-30T00:00:00Z',
+      'disconnected_at', null
+    ));")"
+  printf '%s\n' "$updated" > "$cfg"
+
+  local pattern="remote-sync.mjs run --team $team"
+  # Nothing of this name may exist yet; if it does, the isolation is not real
+  # and every count below would be meaningless.
+  [ -z "$(pgrep -f "$pattern")" ]
 
   local blind="$TEST_SKILL_DIR/blind-probe"
   mkdir -p "$blind"
   printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$blind/tasklist"
   chmod +x "$blind/tasklist"
 
-  local pidfile="$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
-  local one two
+  local pidfile="$TEST_SKILL_DIR/run/remote-sync.$team.pid"
+  local one two i=0 k=0 running=0
 
-  env PATH="$blind:$PATH" MSYSTEM=MINGW64 bash "$SCRIPTS/remote.sh" sync start testteam >/dev/null 2>&1 &
+  env PATH="$blind:$PATH" MSYSTEM=MINGW64 bash "$SCRIPTS/remote.sh" sync start "$team" >/dev/null 2>&1 &
   one=$!
-  # The second starts once the first has an engine -- which is exactly the
-  # window the early release opens, and the window this has to be safe in.
-  local i=0
   while [ ! -f "$pidfile" ] && [ "$i" -lt 400 ]; do i=$((i + 1)); sleep 0.05; done
   [ -f "$pidfile" ]
-  env PATH="$blind:$PATH" MSYSTEM=MINGW64 bash "$SCRIPTS/remote.sh" sync start testteam >/dev/null 2>&1 &
+  env PATH="$blind:$PATH" MSYSTEM=MINGW64 bash "$SCRIPTS/remote.sh" sync start "$team" >/dev/null 2>&1 &
   two=$!
 
   # NOT waiting for either starter to return, deliberately. With the blind probe
-  # in place the readiness marker can never be satisfied, so each starter runs
-  # its whole 1600-turn loop -- minutes here, and the thing being measured is
-  # over long before that. A second engine, if it is going to exist, exists as
-  # soon as the second caller has decided; that decision is what this watches.
-  local k=0 running=0
+  # the readiness marker can never be satisfied, so each starter runs its whole
+  # 1600-turn loop -- minutes here, and the thing being measured is over long
+  # before that. A second engine, if it is going to exist, exists as soon as the
+  # second caller has decided; that decision is what this watches.
   while [ "$k" -lt 60 ]; do
-    running="$(pgrep -f "remote-sync.mjs run --team testteam" | wc -l | tr -d ' ')"
+    running="$(pgrep -f "$pattern" | wc -l | tr -d ' ')"
     [ "$running" -gt 1 ] && break        # fail fast: the defect has happened
     kill -0 "$two" 2>/dev/null || break  # the second caller is done deciding
     k=$((k + 1)); sleep 0.05
   done
-  running="$(pgrep -f "remote-sync.mjs run --team testteam" | wc -l | tr -d ' ')"
+  running="$(pgrep -f "$pattern" | wc -l | tr -d ' ')"
 
   # Counted by what is actually running rather than by what the pidfile says --
   # the pidfile only ever names the most recent, which is how a second engine
-  # hides from anyone who asks the file.
-  pkill -f "remote-sync.mjs run --team testteam" 2>/dev/null || true
+  # hides from anyone who asks the file. Everything torn down here carries this
+  # test's own team name, so nothing else on the machine is touched.
+  pkill -f "$pattern" 2>/dev/null || true
   kill "$one" "$two" 2>/dev/null || true
   wait "$one" "$two" 2>/dev/null || true
 
   [ "$running" -le 1 ]
+}
+
+@test "sync start: a timed-out starter does not clear another engine's records (#817)" {
+  # THE CLEANUP AFTER THE WAIT WRITES SHARED STATE, and the early release means
+  # it can arrive to find that state belonging to somebody else.
+  #
+  # The pidfile and the cycle stamp are per team, not per caller. While this
+  # starter polls, another `sync start` may complete and record its own engine --
+  # and that pidfile is the only thing naming it. Retaking the lock stops the
+  # file changing under the removal; it does not make the file this call's to
+  # remove. Both are needed, and this drives the second.
+  #
+  # The other starter is simulated rather than run: what matters to the code
+  # under test is a pidfile naming a pid that is not the one it started, which
+  # is exactly what a completed second start leaves. Running a real one would
+  # need the blind probe, and with it a second 1600-turn wait.
+  local pidfile="$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
+  local starter foreign i=0
+
+  bash "$SCRIPTS/remote.sh" sync start testteam >/dev/null 2>&1 &
+  starter=$!
+  while [ ! -f "$pidfile" ] && [ "$i" -lt 400 ]; do i=$((i + 1)); sleep 0.05; done
+  [ -f "$pidfile" ]
+
+  # Somebody else's engine, recorded while this starter is still polling.
+  sleep 300 &
+  foreign=$!
+  printf '%s\n' "$foreign" > "$pidfile"
+
+  wait "$starter" 2>/dev/null || true
+
+  # The record survives, and still names the other engine.
+  [ -f "$pidfile" ]
+  [ "$(cat "$pidfile")" = "$foreign" ]
+
+  kill "$foreign" 2>/dev/null || true
+  wait "$foreign" 2>/dev/null || true
 }

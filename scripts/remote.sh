@@ -2489,12 +2489,45 @@ cmd_sync_start() {
     sleep 0.01
   done
   if [ "$ready" -ne 1 ]; then
+    # TAKEN BACK FOR THE CLEANUP, because the cleanup WRITES SHARED STATE.
+    #
+    # The pidfile and the cycle stamp are per team, not per caller. Releasing
+    # before the wait -- which is the point of this change -- means another
+    # `sync start` may have taken the lock, decided this engine was gone and
+    # started its own by the time we get here. Removing those two files without
+    # the lock would then delete the state of an engine this call never
+    # started, and the pidfile is the only thing that names it (raised in
+    # review). Reaping is guarded by `_remote_sync_engine_reap_owned`, which
+    # refuses a pid it cannot prove is ours; the file removal had no such guard.
+    #
+    # A lock that cannot be retaken must not swallow the diagnostic below, so
+    # the failure is reported and the files are left rather than removed blind:
+    # a stale pidfile is what `status` already knows how to describe.
+    local relocked=1
+    agmsg_lock_acquire "$TEAMS_DIR/$team" || relocked=0
     if _remote_sync_engine_reap_owned "$team" "$started_pid"; then
-      rm -f "$(_remote_sync_engine_pidfile "$team")"
-      rm -f "$(_remote_sync_engine_cycle_stamp "$team")"   # same reason as in _remote_sync_engine_stop
-            echo "agmsg: sync engine for '$team' did not become ready" >&2
+      if [ "$relocked" -eq 1 ]; then
+        # AND ONLY IF IT IS STILL OURS. Retaking the lock stops the file from
+        # changing under the removal; it does not make the file this call's to
+        # remove. Between the release and here another `sync start` may have
+        # completed and written its own pid, and that pidfile is the only thing
+        # naming its engine -- removing it would leave a live engine nothing
+        # points at, which is the shape `set-endpoint` already warns about.
+        local recorded
+        recorded="$(cat "$(_remote_sync_engine_pidfile "$team")" 2>/dev/null || true)"
+        if [ "$recorded" = "$started_pid" ]; then
+          rm -f "$(_remote_sync_engine_pidfile "$team")"
+          rm -f "$(_remote_sync_engine_cycle_stamp "$team")"   # same reason as in _remote_sync_engine_stop
+        fi
+        agmsg_lock_release
+      else
+        echo "agmsg: could not retake the registry lock to clear the engine's records for '$team'" >&2
+        echo "  the engine is stopped; its pidfile is left, and 'remote.sh status' reads it as stale." >&2
+      fi
+      echo "agmsg: sync engine for '$team' did not become ready" >&2
       return 1
     fi
+    [ "$relocked" -eq 1 ] && agmsg_lock_release
     # The reap did not stop it, and the engine is still running.
     #
     # _remote_sync_engine_reap_owned returns non-zero for two different
