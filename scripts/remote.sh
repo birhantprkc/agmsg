@@ -2450,6 +2450,30 @@ cmd_sync_start() {
   # in the same process would read a stale yes and skip its own locking.
   _REMOTE_ENGINE_CALLER_HOLDS_LOCK=0
   started_pid="$(cat "$(_remote_sync_engine_pidfile "$team")")"
+
+  # RELEASED HERE, BEFORE THE WAIT, AND THAT IS THE WHOLE FIX (#817).
+  #
+  # The lock exists to serialise "is one running, and if not, start one". Both
+  # halves are over by this line: the pidfile names a live engine, so a second
+  # `sync start` that takes this lock now reads `running` from
+  # `_remote_sync_engine_status` -- which asks the pidfile, the pid's liveness
+  # and its cmdline, and never asks about readiness -- and returns
+  # "already running" without starting anything. Nothing below needs exclusion:
+  # the loop only reads status and tails a log.
+  #
+  # Holding it across the wait is what put the lock in the field report. The
+  # engine's own first cycle emits the capabilities marker this loop waits for
+  # and THEN asks for this same lock, for `roster prepare`. On a host where
+  # noticing the marker is cheap the release lands first and nothing collides.
+  # On Windows each turn of the loop spawns a process substitution, a `tail`,
+  # an `awk` and a `sleep`, so the engine reaches its lock request first, waits
+  # its whole budget, and dies -- after which the marker can never be satisfied
+  # (`_remote_sync_engine_status` stops saying `running`) and this loop runs its
+  # full 1600 turns holding the lock the rest of the machine needs.
+  #
+  # It is a race, not a deadlock: nothing here waits on anything the engine
+  # holds. What the platform changes is only who gets there first.
+  agmsg_lock_release
   while [ "$i" -lt 1600 ]; do
     IFS=$'\t' read -r engine_state ready_pid < <(_remote_sync_engine_status "$team")
     if [ "$engine_state" = "running" ] && [ "$ready_pid" = "$started_pid" ] &&
@@ -2468,8 +2492,7 @@ cmd_sync_start() {
     if _remote_sync_engine_reap_owned "$team" "$started_pid"; then
       rm -f "$(_remote_sync_engine_pidfile "$team")"
       rm -f "$(_remote_sync_engine_cycle_stamp "$team")"   # same reason as in _remote_sync_engine_stop
-      agmsg_lock_release
-      echo "agmsg: sync engine for '$team' did not become ready" >&2
+            echo "agmsg: sync engine for '$team' did not become ready" >&2
       return 1
     fi
     # The reap did not stop it, and the engine is still running.
@@ -2499,8 +2522,7 @@ cmd_sync_start() {
     # on a backoff forever -- and since the pidfile only ever names the most
     # recent one, a second attempt leaves the first with nothing pointing at
     # it. Measured: one after the first failed attempt, two after the second.
-    agmsg_lock_release
-    {
+        {
       echo "agmsg: sync engine for '$team' did not become ready, and this command did not stop it."
       echo "  pid $started_pid is still running. It cannot reach the server -- that is why"
       echo "  it never became ready -- and it will keep retrying on a backoff."
@@ -2517,8 +2539,7 @@ cmd_sync_start() {
     } >&2
     return 1
   fi
-  agmsg_lock_release
-  echo "Sync engine started for '$team' (pid $started_pid)."
+    echo "Sync engine started for '$team' (pid $started_pid)."
 }
 
 cmd_sync() {

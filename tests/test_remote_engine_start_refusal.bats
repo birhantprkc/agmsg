@@ -166,3 +166,41 @@ skip_if_root() {
   refute grep -qF "Nothing is syncing for this team" <<<"$output"
   refute grep -qF "could not start the sync engine" <<<"$output"
 }
+
+@test "sync start: the registry lock is free while readiness is still polled (#817)" {
+  # THE FIELD DEFECT, OBSERVED FROM OUTSIDE THE COMMAND.
+  #
+  # `cmd_sync_start` took the team's registry lock, started the engine, and then
+  # polled for a readiness marker while still holding it. The engine's own first
+  # cycle emits that marker and THEN asks for the same lock, for `roster
+  # prepare`. Where noticing the marker is cheap the release lands first; where
+  # it is not -- Windows spawns a process substitution, a `tail`, an `awk` and a
+  # `sleep` every 10ms of that loop -- the engine asks first, waits its whole
+  # budget, and dies. Measured on the reporting machine: the lock was held from
+  # 23:05 with the starter still sitting in the loop hours later.
+  #
+  # So this asserts the property from outside: while the starter is STILL
+  # polling, the lock must not be held. Nothing here inspects the loop.
+  local lock="$TEST_SKILL_DIR/teams/testteam/.config.lock"
+  local pidfile="$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
+  local starter i=0 j=0 freed=0
+
+  bash "$SCRIPTS/remote.sh" sync start testteam >/dev/null 2>&1 &
+  starter=$!
+
+  # The engine existing is what says the START is over and the WAIT has begun.
+  while [ ! -f "$pidfile" ] && [ "$i" -lt 400 ]; do i=$((i + 1)); sleep 0.05; done
+  [ -f "$pidfile" ]
+
+  # Both halves in one condition, deliberately: a free lock AFTER the starter
+  # has returned proves nothing -- that is the old behaviour too. What has to
+  # hold is free WHILE it is still in there.
+  while [ "$j" -lt 60 ]; do
+    if [ ! -d "$lock" ] && kill -0 "$starter" 2>/dev/null; then freed=1; break; fi
+    j=$((j + 1)); sleep 0.05
+  done
+  [ "$freed" -eq 1 ]
+
+  kill "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null || true
+  wait "$starter" 2>/dev/null || true
+}
