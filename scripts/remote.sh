@@ -2461,18 +2461,28 @@ cmd_sync_start() {
   # "already running" without starting anything. Nothing below needs exclusion:
   # the loop only reads status and tails a log.
   #
-  # Holding it across the wait is what put the lock in the field report. The
-  # engine's own first cycle emits the capabilities marker this loop waits for
-  # and THEN asks for this same lock, for `roster prepare`. On a host where
-  # noticing the marker is cheap the release lands first and nothing collides.
-  # On Windows each turn of the loop spawns a process substitution, a `tail`,
-  # an `awk` and a `sleep`, so the engine reaches its lock request first, waits
-  # its whole budget, and dies -- after which the marker can never be satisfied
-  # (`_remote_sync_engine_status` stops saying `running`) and this loop runs its
-  # full 1600 turns holding the lock the rest of the machine needs.
+  # WHAT THE FIELD REPORT ACTUALLY WAS, in the order it happened.
   #
-  # It is a race, not a deadlock: nothing here waits on anything the engine
-  # holds. What the platform changes is only who gets there first.
+  # The engine emits the capabilities marker BEFORE it asks for this lock, so the
+  # ordinary sequence is: marker, this loop sees it, release, then `roster
+  # prepare` takes the lock. That order was never the problem, and an earlier
+  # version of this comment said it was.
+  #
+  # On the reporting machine the loop never reached the marker check at all.
+  # `_remote_sync_engine_status` answered `stale` for a pid this shell had just
+  # started -- the non-local probe cannot see it on Windows (#652) -- so
+  # `engine_state = running` was false and the condition short-circuited before
+  # the marker was ever read. The loop then ran to its ceiling, which is counted
+  # in ITERATIONS and not in time (#779), and on that host 1600 turns of four
+  # spawned processes each is not sixteen seconds. The lock was held for all of
+  # it, and every other operation for that team waited on a directory that was
+  # not going to be removed.
+  #
+  # #812 removed the direct cause: the status probe is local now. This release is
+  # not a second fix for that. It is a separate contract -- the lock covers
+  # deciding whether to start and starting, and nothing after -- so that a marker
+  # that is late or missing for ANY reason costs this caller its own wait and
+  # not the rest of the machine.
   agmsg_lock_release
   while [ "$i" -lt 1600 ]; do
     IFS=$'\t' read -r engine_state ready_pid < <(_remote_sync_engine_status "$team")

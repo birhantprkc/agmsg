@@ -171,13 +171,20 @@ skip_if_root() {
   # THE FIELD DEFECT, OBSERVED FROM OUTSIDE THE COMMAND.
   #
   # `cmd_sync_start` took the team's registry lock, started the engine, and then
-  # polled for a readiness marker while still holding it. The engine's own first
-  # cycle emits that marker and THEN asks for the same lock, for `roster
-  # prepare`. Where noticing the marker is cheap the release lands first; where
-  # it is not -- Windows spawns a process substitution, a `tail`, an `awk` and a
-  # `sleep` every 10ms of that loop -- the engine asks first, waits its whole
-  # budget, and dies. Measured on the reporting machine: the lock was held from
-  # 23:05 with the starter still sitting in the loop hours later.
+  # polled for a readiness marker while still holding it.
+  #
+  # The engine emits that marker BEFORE it asks for the same lock, so the order
+  # was never the problem -- an earlier version of this comment said it was. On
+  # the reporting machine the loop never reached the marker check:
+  # `_remote_sync_engine_status` answered `stale` for a pid this shell had just
+  # started (#652), so the condition short-circuited, and the ceiling it then ran
+  # to is counted in iterations rather than time (#779). The lock was held for
+  # all of it.
+  #
+  # #812 removed that direct cause. What this case pins is the contract, not the
+  # cure: the lock covers deciding whether to start and starting, and nothing
+  # after -- so a marker that is late or missing for any reason costs this caller
+  # its own wait and not the rest of the machine.
   #
   # So this asserts the property from outside: while the starter is STILL
   # polling, the lock must not be held. Nothing here inspects the loop.
@@ -332,4 +339,43 @@ skip_if_root() {
 
   kill "$foreign" 2>/dev/null || true
   wait "$foreign" 2>/dev/null || true
+}
+
+@test "sync start: a cleanup that cannot retake the lock says so and keeps the record (#817)" {
+  # THE RETAKE, OBSERVED WHERE IT DIFFERS FROM NOT RETAKING.
+  #
+  # After the early release the timeout cleanup writes shared state, so it takes
+  # the lock back first. That is only distinguishable from not taking it when
+  # somebody else is holding it -- so a helper holds this team's lock for the
+  # whole window, and the starter has to arrive at its cleanup and find it taken.
+  #
+  # Our own engine is ended first for the same reason as the case above: it is
+  # the only way `_remote_sync_engine_reap_owned` reaches its success path, and
+  # therefore the only way the cleanup gets as far as the records.
+  local pidfile="$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
+  local lock="$TEST_SKILL_DIR/teams/testteam/.config.lock"
+  local starter engine i=0 err="$TEST_SKILL_DIR/retake.err"
+
+  bash "$SCRIPTS/remote.sh" sync start testteam >"$err" 2>&1 &
+  starter=$!
+  while [ ! -f "$pidfile" ] && [ "$i" -lt 400 ]; do i=$((i + 1)); sleep 0.05; done
+  [ -f "$pidfile" ]
+  engine="$(cat "$pidfile")"
+
+  # Somebody else takes the lock and keeps it. Held with mkdir directly, the way
+  # the library takes it, so no helper of ours has to survive the wait.
+  mkdir "$lock"
+
+  kill "$engine" 2>/dev/null || true
+  i=0
+  while kill -0 "$engine" 2>/dev/null && [ "$i" -lt 200 ]; do i=$((i + 1)); sleep 0.05; done
+
+  wait "$starter" 2>/dev/null || true
+
+  # 1. it said it could not retake, rather than clearing the records blind
+  grep -q 'could not retake the registry lock' "$err"
+  # 2. and the record is still there
+  [ -f "$pidfile" ]
+
+  rmdir "$lock" 2>/dev/null || true
 }
