@@ -2226,8 +2226,14 @@ test("a cleanup that cannot remove the staged input says so, and does not fail t
   // the half-built cases -- the ones a failure actually produces -- are the
   // ones that leak.
   t.after(async () => {
+    // The chmod is best effort on purpose: it runs before the directory below
+    // necessarily exists, and its only job is to make the removal possible.
     await chmod(join(parent, "refuses-removal"), 0o700).catch(() => {});
-    await rm(parent, { recursive: true, force: true }).catch(() => {});
+    // The removal is NOT. `force: true` already treats a path that is not there
+    // as success, so a catch here could only ever hide a real failure -- and
+    // what it would hide is this fixture's content staying on disk while the
+    // test reports green, which is the exact shape this test is about.
+    await rm(parent, { recursive: true, force: true });
   });
   // NOT named `agmsg-driver-input-*`. That prefix is what the residue test
   // counts, and a fixture standing in the middle of another test's instrument
