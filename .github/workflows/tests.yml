@@ -530,6 +530,7 @@ jobs:
           - leg: install helpers
             filter: "[Ww]indows"
             target: tests/test_install.bats
+            sqlite: true
           # The Windows runtime path, which nothing here covered until #567: a
           # change to how liveness is decided on Windows shipped through a CI
           # that never decided liveness on Windows. Everything else about that
@@ -545,6 +546,7 @@ jobs:
           - leg: windows runtime (#567)
             filter: "windows-native"
             target: tests/test_codex_monitor.bats tests/test_codex_bridge_launcher.bats
+            sqlite: true
           # The roster driver's staged input (#817). Same reasoning as the leg
           # above, one layer down: the fix is for Windows, and two of the things
           # it rests on -- an ordinary file descriptor arriving as Git Bash's
@@ -555,6 +557,12 @@ jobs:
           - leg: driver input (#817)
             filter: "driver-input"
             target: tests/test_remote_sync_driver_input.bats
+            # No sqlite3: these two drive a mock bash driver and never open a
+            # store. Installing it anyway made this leg red for an outage in a
+            # third-party package feed, on a run where its own tests never
+            # started -- a leg that fails for something it does not use reports
+            # on that thing, not on the code.
+            sqlite: false
     defaults:
       run:
         # bats is bash; on Windows runners `shell: bash` is Git Bash, the same
@@ -568,12 +576,12 @@ jobs:
         run: echo "Diff is documentation-only; skipping the Windows bats legs."
 
       - name: Install sqlite3
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && matrix.sqlite
         shell: pwsh
         run: choco install sqlite -y --no-progress
 
       - name: Put chocolatey shims on PATH (Git Bash form)
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && matrix.sqlite
         run: echo "/c/ProgramData/chocolatey/bin" >> "$GITHUB_PATH"
 
       - name: Install bats
