@@ -18,6 +18,7 @@ import {
   consistentReadStateContext,
   configure,
   cycle,
+  discardInputDirectory,
   driver,
   exportAgeHandoff,
   exportAgeSnapshot,
@@ -2197,6 +2198,54 @@ printf '{"ok":true}\\n'
     "the staged input still had a name while the driver was reading it");
   for (const { promise } of started) await promise;
   assert.equal(await residue(), before, "and none after it settled");
+});
+
+test("a cleanup that cannot remove the staged input says so, and does not fail the call",
+  { timeout: 30_000 }, async (t) => {
+  // The staged file is message content. When its removal fails there are two
+  // wrong answers and this takes neither: failing the call would trade a sync
+  // that completed for a cleanup detail the caller cannot act on, and staying
+  // silent would leave that content on disk with nobody told.
+  //
+  // Driven directly rather than through a driver call, because the state it
+  // needs -- a directory that refuses removal -- cannot be arranged from
+  // outside `runDriver` without reaching into the timing of its own staging,
+  // and a test that depends on that timing breaks on the next refactor for
+  // reasons unrelated to what it checks.
+  if (process.platform === "win32") {
+    t.skip("chmod is the mechanism here and Windows does not honour it that way");
+    return;
+  }
+  if (process.getuid?.() === 0) {
+    t.skip("root ignores the permissions this arranges, so the failure never happens");
+    return;
+  }
+  const parent = await mkdtemp(join(tmpdir(), "agmsg-sync-stuck-"));
+  const directory = join(parent, "agmsg-driver-input-stuck");
+  await mkdir(directory);
+  await writeFile(join(directory, "input.jsonl"), "{\"a\":1}\n");
+  // Not writable, so the file inside it cannot be unlinked and the recursive
+  // removal has to fail.
+  await chmod(directory, 0o500);
+  t.after(async () => {
+    await chmod(directory, 0o700).catch(() => {});
+  });
+
+  const warnings = [];
+  const collect = (warning) => warnings.push(warning);
+  process.on("warning", collect);
+  // Must not throw. That is half the contract and it is asserted by being here
+  // at all -- a throw fails this test on the line above the assertions.
+  discardInputDirectory(directory, "the driver call ended");
+  // emitWarning is delivered on the next tick.
+  await new Promise((resolve) => setImmediate(resolve));
+  process.off("warning", collect);
+
+  // The directory itself, because that is the one thing an operator needs in
+  // order to go and remove it. A warning that says "cleanup failed" and not
+  // where is a warning that cannot be acted on.
+  assert.ok(warnings.some((warning) => warning.message.includes(directory)),
+    `no warning named the directory left behind: ${warnings.map((w) => w.message)}`);
 });
 
 test("a driver that fails after starting a helper fails the call, and says how",

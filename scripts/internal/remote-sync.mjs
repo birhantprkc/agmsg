@@ -1746,7 +1746,7 @@ function stageInput(input, staging) {
 // is message content, and a swallowed failure leaves it on disk with nobody
 // told. So the failure is downgraded to a warning that names the directory,
 // which is the one thing an operator needs to remove it.
-function discardInputDirectory(directory, reason) {
+export function discardInputDirectory(directory, reason) {
   try {
     rmSync(directory, { recursive: true, force: true });
   } catch (error) {
