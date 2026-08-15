@@ -61,8 +61,9 @@ source "$SCRIPT_DIR/lib/shquote.sh"
 source "$SCRIPT_DIR/lib/require-python3.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/node.sh"
-# For _agmsg_pid_alive — the one piece of watch.sh's daemon plumbing that is
-# already a shared, reusable helper. The rest of the sync engine's lifecycle
+# For _agmsg_pid_alive_local — the one piece of watch.sh's daemon plumbing that
+# is already a shared, reusable helper. The LOCAL probe, because every pid this
+# file checks is one it minted itself (#652); see the lifecycle note below. The rest of the sync engine's lifecycle
 # (below) is written here rather than shared, because watch.sh's is inline and
 # keyed on watcher-only concepts (session/actas) this engine does not have.
 # shellcheck disable=SC1091
@@ -1322,7 +1323,7 @@ EOF
   _remote_sync_engine_start "$team" || true
   local pid="${REMOTE_SYNC_ENGINE_PID:-}" ready=0 attempts=0
   while [ "$attempts" -lt 50 ]; do
-    if [ -z "$pid" ] || ! _agmsg_pid_alive "$pid"; then
+    if [ -z "$pid" ] || ! _agmsg_pid_alive_local "$pid"; then
       break
     fi
     if tail -c "+$log_offset" "$engine_log" 2>/dev/null |
@@ -1336,7 +1337,7 @@ EOF
   local pidfile="$(_remote_sync_engine_pidfile "$team")" recorded_pid=""
   [ -f "$pidfile" ] && recorded_pid="$(cat "$pidfile" 2>/dev/null || true)"
   if [ "$ready" -ne 1 ] || [ "$recorded_pid" != "$pid" ] ||
-      ! _agmsg_pid_alive "$pid"; then
+      ! _agmsg_pid_alive_local "$pid"; then
     _remote_sync_engine_stop "$team"
     echo "agmsg: encrypted sync was configured, but the sync engine did not become ready" >&2
     exit 1
@@ -1351,7 +1352,16 @@ EOF
 # polling to push new local messages and pull remote ones. Its lifecycle mirrors
 # watch.sh's FORM without sharing its code (see the instance-id.sh source note):
 # one pidfile per unit under the connection's run dir, SIGTERM to stop, and
-# _agmsg_pid_alive to tell a live engine from a stale pidfile. This leaves the
+# _agmsg_pid_alive_local to tell a live engine from a stale pidfile.
+#
+# LOCAL, and that is not a detail. Every pid checked in this file came from `$!`
+# in this shell, or was read back from the pidfile this shell wrote it to — and
+# a pidfile does not move a number into another pid space. Under Git Bash those
+# are MSYS pids, which `tasklist` has no record of, so the non-local probe
+# answers "dead" for an engine that is running: the field report in #652, where
+# `ps -W` found the process, the pidfile held the same number, and status still
+# said stale. The rule is in instance-id.sh and it is about WHERE THE PID WAS
+# MINTED, not about whether it arrived through a file. This leaves the
 # pidfile lifecycle in two places (here and watch.sh); factoring it into a shared
 # lib is intentionally deferred, not overlooked.
 _remote_sync_engine_pidfile() { printf '%s' "$CONNECTION_ROOT/run/remote-sync.$1.pid"; }
@@ -1711,7 +1721,7 @@ _remote_sync_engine_status() {
     printf 'stale\t\n'
     return
   fi
-  if ! _agmsg_pid_alive "$pid"; then
+  if ! _agmsg_pid_alive_local "$pid"; then
     printf 'stale\t%s\n' "$pid"
     return
   fi
@@ -1727,17 +1737,17 @@ _remote_sync_engine_reap_owned() {
   local team="$1" owned_pid="$2" state pid signal attempts
   for signal in TERM KILL; do
     IFS=$'\t' read -r state pid < <(_remote_sync_engine_status "$team")
-    if ! _agmsg_pid_alive "$owned_pid"; then return 0; fi
+    if ! _agmsg_pid_alive_local "$owned_pid"; then return 0; fi
     [ "$state" = "running" ] && [ "$pid" = "$owned_pid" ] || return 1
     kill "-$signal" "$owned_pid" 2>/dev/null || true
     attempts=0
     while [ "$attempts" -lt 100 ]; do
-      _agmsg_pid_alive "$owned_pid" || return 0
+      _agmsg_pid_alive_local "$owned_pid" || return 0
       attempts=$((attempts + 1))
       sleep 0.01
     done
   done
-  ! _agmsg_pid_alive "$owned_pid"
+  ! _agmsg_pid_alive_local "$owned_pid"
 }
 
 # Upgrade a team that predates local ids: mint a team_id AND a member_id for

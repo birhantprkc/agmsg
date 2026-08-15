@@ -741,3 +741,63 @@ write_unownable_ps_fixture() {
   kill -9 "$child_pid" 2>/dev/null || true
   wait "$child_pid" 2>/dev/null || true
 }
+
+# --- the probe a minted pid is checked with (#652) -----------------------
+#     Field report from the owner's Windows dogfood: `ps -W` found node 33872,
+#     the pidfile held 33872, and status still said "engine stale — pidfile
+#     points at a dead or foreign process". The pid was right; the thing asking
+#     whether it was alive could not see it.
+#
+#     `remote.sh` mints every pid it checks — `$!` in this shell, or read back
+#     from the pidfile this shell wrote it to — and a pidfile does not move a
+#     number into another pid space. Under Git Bash those are MSYS pids, which
+#     `tasklist` has no record of.
+
+@test "the non-local probe cannot see a pid this shell minted, and the local one can (#652)" {
+  # Windows modelled on this host: MSYSTEM set, and a `tasklist` that answers
+  # nothing — which is exactly what the real one does when asked about an MSYS
+  # pid. This reproduces the mechanism; it is not a Windows run.
+  local fake_bin="$TEST_SKILL_DIR/fake-tasklist-blind"
+  mkdir -p "$fake_bin"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/tasklist"
+  chmod +x "$fake_bin/tasklist"
+
+  sleep 30 &
+  local minted=$!
+
+  # The premise, checked rather than assumed: the process really is alive.
+  run kill -0 "$minted"
+  [ "$status" -eq 0 ]
+
+  run env PATH="$fake_bin:$PATH" MSYSTEM=MINGW64 bash -c \
+    'source "$1/lib/instance-id.sh"; _agmsg_pid_alive "$2" && echo ALIVE || echo DEAD' \
+    _ "$SCRIPTS" "$minted"
+  [ "$output" = "DEAD" ]   # the defect, reproduced
+
+  run env PATH="$fake_bin:$PATH" MSYSTEM=MINGW64 bash -c \
+    'source "$1/lib/instance-id.sh"; _agmsg_pid_alive_local "$2" && echo ALIVE || echo DEAD' \
+    _ "$SCRIPTS" "$minted"
+  [ "$output" = "ALIVE" ]  # the probe the minted pid is entitled to
+
+  kill "$minted" 2>/dev/null || true
+  wait "$minted" 2>/dev/null || true
+}
+
+@test "remote.sh checks every pid it minted with the local probe (#652)" {
+  # The test above pins the DIFFERENCE between the probes; it says nothing
+  # about which one `remote.sh` calls. This says that, and it is a count
+  # because the failure it guards against is a new call site appearing rather
+  # than an existing one changing.
+  #
+  # NOT `grep '_agmsg_pid_alive "'`. That pattern pins the CALL SITE'S SPELLING,
+  # not the call: two spaces, a tab, an unquoted `$pid`, or a line continuation
+  # after the name all slip past it, so a reverted call site could sit here
+  # green (raised in review).
+  #
+  # Instead: strip whole-line comments, delete every `_agmsg_pid_alive_local`
+  # token, and count what is left of the name. Nothing about the argument or
+  # the spacing is assumed, because nothing after the name is looked at. The
+  # helper is defined in instance-id.sh, so no definition is counted here.
+  run bash -c "grep -v '^[[:space:]]*#' \"\$1\" | sed 's/_agmsg_pid_alive_local//g' | grep -c '_agmsg_pid_alive'" _ "$SCRIPTS/remote.sh"
+  [ "$output" = "0" ]
+}
