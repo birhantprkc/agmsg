@@ -22,8 +22,14 @@
   [ "$status" -eq 0 ]
   # A pattern that selects nothing exits 0 with nothing run, which is precisely
   # the shape of a leg that looks green because it never happened. So the count
-  # is asserted, not just the status: two tests, both of them passing.
-  echo "$output" | grep -qE '(^|[^0-9])tests 2([^0-9]|$)'
+  # is asserted, not just the status.
+  #
+  # On `pass` and `fail`, deliberately not on `tests`. How the runner totals
+  # `tests` under a name filter is a version-dependent detail -- whether the
+  # unselected ones are excluded or counted as skipped -- and pinning it would
+  # make this leg fail on a Node upgrade for a reason that has nothing to do
+  # with the code. `pass 2` carries the whole guard on its own: nothing selected
+  # means nothing passed.
   echo "$output" | grep -qE '(^|[^0-9])pass 2([^0-9]|$)'
   echo "$output" | grep -qE '(^|[^0-9])fail 0([^0-9]|$)'
 }

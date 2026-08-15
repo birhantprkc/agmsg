@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, unlink,
   writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -2077,6 +2077,49 @@ exit 9
     (mock, config) => [() => rosterDriver("apply", config, input)]);
   for (const { promise } of broken) await assert.rejects(() => promise);
   assert.equal(await residue(), before, "a failed call left its input behind");
+
+  // The third route, and the one nothing else here reaches: the spawn itself
+  // fails. It is staged by then -- the input is written before the spawn, on
+  // purpose -- so this is the window where the descriptor and, on Windows, a
+  // named file of message content have no owner at all. A synchronous spawn
+  // failure never reaches 'error', so the settle path that cleans up after
+  // every other route is not on this one.
+  //
+  // Forced through the arguments rather than through the environment: a NUL in
+  // an argument is rejected by spawn() before it does anything, which is a
+  // synchronous throw and not an ENOENT the runner would answer later.
+  // Called directly, without the driver fixture: nothing is started, so there
+  // is no pid for that helper to wait on, and the driver script is never read
+  // because the spawn does not get that far.
+  // On this platform the directory count cannot see this route at all, and
+  // saying so is the point: the name is taken away at handover, so what a
+  // spawn failure strands here is the DESCRIPTOR, not a directory. Windows,
+  // where the file cannot be unlinked while open, is the other way round --
+  // there the directory assertion above is the one that catches it, which is
+  // why this test runs in the focused Windows leg too.
+  //
+  // So the descriptor is counted, and the route is run enough times that one
+  // leaked per call is unmistakable rather than lost in noise.
+  const descriptors = () => {
+    try { return readdirSync("/dev/fd").length; } catch { return null; }
+  };
+  const openBefore = descriptors();
+  for (let attempt = 0; attempt < 24; attempt += 1) {
+    await assert.rejects(() => rosterDriver("apply", {
+      local_team: "team\u0000name",
+      server_instance_id: "018f0000-0000-7000-8000-000000000001",
+      remote_team_id: "018f0000-0000-7000-8000-000000000002",
+      protocol_version: 1,
+    }, input));
+  }
+  assert.equal(await residue(), before, "a failed spawn left its input behind");
+  if (openBefore !== null) {
+    // Not exact equality: this process is doing other things, and a count that
+    // has to be identical would fail on something unrelated. Twenty-four leaked
+    // descriptors is not a margin, it is the defect.
+    assert.ok(descriptors() < openBefore + 12,
+      `a failed spawn leaked its descriptor: ${openBefore} -> ${descriptors()}`);
+  }
 });
 
 test("a driver that fails after starting a helper fails the call, and says how",
