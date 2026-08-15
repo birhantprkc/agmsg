@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, unlink,
   writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -1889,30 +1890,44 @@ async function driverLifecycleFixture(t, { script, calls, root }) {
   return { started, gone };
 }
 
-test("a driver that stops reading its input fails the call and is not left running",
+test("a driver that stops reading its input is left to release its own lock",
   { timeout: 30_000 }, async (t) => {
-  // The write loses its reader and takes EPIPE, which arrives on the stdin
-  // stream rather than on the child -- and an unhandled stream 'error' is
-  // thrown, not returned. So the failure escaped the promise and killed the
-  // process, surfacing as an uncaughtException inside whichever unrelated test
-  // was running when it fired, which is how it read as a flake.
+  // This was a test about EPIPE. The parent wrote the input down a pipe, a
+  // driver that had stopped reading took the write's error, and the call
+  // answered by SIGKILLing that driver -- which is the one thing it must not do.
+  // roster-sync-driver.sh takes the team's registry lock as its first act and
+  // holds it for the whole call, and its only release routes are traps. SIGKILL
+  // runs none of them, so the fast failure was bought by leaving `.config.lock`
+  // behind with no owner, and every later run for that team then waits on a
+  // directory nobody is going to remove.
   //
-  // Rejecting is only half of it: a rejected call that leaves the driver running
-  // trades "the process dies" for "the process cannot exit". So the fixture
-  // records its pid, and leaves a background descendant holding the inherited
-  // pipes -- what a real driver that starts a helper does, and the thing that
-  // keeps 'close' from ever arriving -- then replaces itself with a sleep longer
-  // than this test may run, so nothing here can pass by waiting.
+  // So the fixture now takes a lock the way the driver does -- a directory,
+  // released from an EXIT trap -- and stops reading its input while still
+  // holding it. It keeps the background descendant that holds the inherited
+  // pipes, which is what a real driver starting a helper leaves and the reason
+  // 'close' never arrives, but it ends itself rather than sleeping past the
+  // test: nothing here may pass by waiting, and nothing may hang.
   //
   // The payload is past any platform's pipe buffer (64 KiB on Linux, less on
-  // macOS), so the write cannot complete unread.
-  const root = await mkdtemp(join(tmpdir(), "agmsg-sync-driver-epipe-"));
+  // macOS): under the old code the write could not complete unread, which is
+  // what made it fail there.
+  //
+  // Measured against the previous implementation this test fails -- the driver
+  // is killed about 20ms in and the trap never runs. What it costs is the fast
+  // failure: the call now waits for the driver to end instead of ending it.
+  // That trade is deliberate, and bounding a driver that HANGS is separate work
+  // that is not done here.
+  const root = await mkdtemp(join(tmpdir(), "agmsg-sync-driver-lock-"));
+  const lockFor = (pidFile) => `${pidFile}.lock`;
   const script = (pidFile, helperFile) => `#!/usr/bin/env bash
 echo $$ > ${JSON.stringify(pidFile)}
 sleep 300 &
 echo $! > ${JSON.stringify(helperFile)}
+mkdir ${JSON.stringify(lockFor(pidFile))} || exit 1
+trap 'rmdir ${JSON.stringify(lockFor(pidFile))} 2>/dev/null' EXIT
 exec 0<&-
-exec sleep 300
+sleep 2
+exit 7
 `;
   const wide = "x".repeat(4096);
   const input = Array.from({ length: 512 }, (_, index) => ({ type: "probe", index, wide }));
@@ -1922,21 +1937,58 @@ exec sleep 300
       () => rosterDriver("apply", config, input),
     ]);
 
-  for (const { promise, childPid } of started) {
-    // On the marker the stdin handler sets, not on the errno. This asserted
-    // EPIPE first and so passed or failed by platform -- macOS answers ENOTCONN
-    // or EPIPE from the same event -- and enumerating the codes seen so far only
-    // moves the problem to whichever spelling appears next. The set of errnos is
-    // not closed; the set of places that set this marker is.
-    //
-    // It stays load-bearing for the same reason it is stable: only that handler
-    // sets it, so a rejection arriving from 'close' cannot satisfy this, and
-    // removing the handler fails the test.
+  for (const [index, { promise, childPid }] of started.entries()) {
+    // The call still fails, but through the ordinary route -- the driver's own
+    // exit status -- rather than through a write whose reader went away. Both
+    // halves are asserted: a rejection carrying the stdin-write marker would
+    // mean the pipe write came back, and that marker is set in exactly one
+    // place, so it cannot be satisfied by accident.
     await assert.rejects(() => promise,
-      (error) => error.driverFailurePhase === "stdin-write");
+      (error) => error.driverFailurePhase === undefined &&
+        /exit/iu.test(String(error.message)));
     // No poll and no grace period. The call settles only after the driver has
     // exited, so by this line it is already gone.
     assert.ok(gone(childPid), "the failed driver was left running");
+    // The property this test exists for.
+    assert.ok(!existsSync(lockFor(join(root, `child-${index}.pid`))),
+      "the driver was killed before its trap could release the lock");
+  }
+});
+
+test("a driver is handed its whole input, from the start of it",
+  { timeout: 30_000 }, async (t) => {
+  // The input is staged in a file and that file's descriptor is handed over as
+  // the child's stdin. Two ways that goes silently wrong, and neither one
+  // announces itself -- the driver reads a short input or an empty one and
+  // reports a perfectly successful sync of nothing:
+  //
+  //   - the descriptor the write used is passed on, and it sits at EOF
+  //   - the file is still being written when the child starts reading
+  //
+  // So the driver counts what it actually received and the count is asserted
+  // against what was sent. A payload well past any pipe buffer, because a small
+  // one is delivered correctly by almost any mistake.
+  const root = await mkdtemp(join(tmpdir(), "agmsg-sync-driver-input-"));
+  const script = (pidFile, helperFile) => `#!/usr/bin/env bash
+echo $$ > ${JSON.stringify(pidFile)}
+echo $$ > ${JSON.stringify(helperFile)}
+lines=$(wc -l)
+printf '{"lines":%d}\\n' "$lines"
+`;
+  const wide = "x".repeat(4096);
+  const RECORDS = 512;
+  const input = Array.from({ length: RECORDS },
+    (_, index) => ({ type: "probe", index, wide }));
+  const { started } = await withDriverEnvironment(t, root, script,
+    (mock, config) => [
+      () => driver("prepare", config, input, ["1"]),
+      () => rosterDriver("apply", config, input),
+    ]);
+
+  for (const { promise } of started) {
+    const result = await promise;
+    assert.equal(result[0]?.lines, RECORDS,
+      "the driver did not receive every record that was sent");
   }
 });
 
