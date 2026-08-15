@@ -173,10 +173,9 @@ for f in "$RUN_DIR"/cc-instance.*; do
         # our watch.sh. Defends against pid recycling — a stale pidfile
         # could point at an unrelated process that took the same pid.
         cmd=$(compat_get_cmdline "$orphan_pid" 2>/dev/null || true)
-        case "$cmd" in
-          *"$SKILL_DIR/scripts/watch.sh"*) kill "$orphan_pid" 2>/dev/null || true ;;
-          *) ;;  # not our watcher anymore; leave it alone
-        esac
+        if agmsg_cmdline_names_path "$cmd" "$SKILL_DIR/scripts/watch.sh"; then
+          kill "$orphan_pid" 2>/dev/null || true
+        fi   # otherwise it is not our watcher anymore; leave it alone
       fi
       rm -f "$orphan_pidfile"
     fi

@@ -664,20 +664,18 @@ kill_all_watchers() {
         # our watch.sh. Defends against pid recycling — a stale pidfile
         # could point at an unrelated process that reused the pid.
         cmd=$(compat_get_cmdline "$pid" 2>/dev/null || true)
-        case "$cmd" in
-          *"$SKILL_DIR/scripts/watch.sh"*)
-            # When scoped, skip (and preserve the pidfile of) watchers that don't
-            # match this (project, type) — i.e. other projects, and other types
-            # in the same project.
-            if [ -n "$needle" ]; then
-              case " $cmd " in
-                *"$needle"*) ;;
-                *) continue ;;
-              esac
-            fi
-            kill "$pid" 2>/dev/null && killed=$((killed + 1)) ;;
-          *) ;;  # not our watcher; leave it
-        esac
+        if agmsg_cmdline_names_path "$cmd" "$SKILL_DIR/scripts/watch.sh"; then
+          # When scoped, skip (and preserve the pidfile of) watchers that don't
+          # match this (project, type) — i.e. other projects, and other types
+          # in the same project.
+          if [ -n "$needle" ]; then
+            case " $cmd " in
+              *"$needle"*) ;;
+              *) continue ;;
+            esac
+          fi
+          kill "$pid" 2>/dev/null && killed=$((killed + 1))
+        fi   # otherwise it is not our watcher; leave it
       fi
       rm -f "$f"
     done

@@ -227,9 +227,9 @@ if [ -f "$PIDFILE" ]; then
   if [ -n "$prev_pid" ] && [ "$prev_pid" != "$$" ] && _agmsg_pid_alive_local "$prev_pid"; then
     prev_cmd=$(compat_get_cmdline "$prev_pid" 2>/dev/null || true)
     if [ -n "$prev_cmd" ]; then
-      case "$prev_cmd" in
-        *"$SKILL_DIR/scripts/watch.sh"*) PREV_PID_TO_DISPLACE="$prev_pid" ;;
-      esac
+      if agmsg_cmdline_names_path "$prev_cmd" "$SKILL_DIR/scripts/watch.sh"; then
+        PREV_PID_TO_DISPLACE="$prev_pid"
+      fi
     else
       # ps unavailable (sandboxed) — skip cmdline validation, rely on kill -0
       PREV_PID_TO_DISPLACE="$prev_pid"
