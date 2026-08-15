@@ -87,3 +87,34 @@ teardown() { teardown_test_env; }
   run agmsg_cmdline_names_path "" "$ENGINE_PATH"
   [ "$status" -ne 0 ]
 }
+
+@test "cmdline-path: no caller compares a shell path against a command line directly (#652)" {
+  # The structural control, and the reason it is structural: the four watcher
+  # sites decide whether to KILL something, and a per-site regression test would
+  # have to stand up a fake watcher four times to say what one grep says once.
+  #
+  # This is the criterion the sweep used, not a list of the five files found by
+  # it -- a sixth site added tomorrow fails this without anyone editing it.
+  #
+  # The shape being banned: a `case`/`[[` arm whose pattern interpolates a
+  # shell-derived path and whose subject came from `compat_get_cmdline`.
+  local offenders
+  offenders="$(grep -rnE '\*"\$(SKILL_DIR|SCRIPT_DIR)[^"]*"\*?\)' "$SCRIPTS"/*.sh "$SCRIPTS"/drivers/types/codex/*.sh 2>/dev/null || true)"
+  [ -z "$offenders" ] || {
+    printf 'a path is being matched against a command line directly:\n%s\n' "$offenders" >&3
+    false
+  }
+}
+
+@test "cmdline-path: every file that reads a command line for a path uses the comparator (#652)" {
+  # The other half. The ban above is satisfied by deleting a check entirely;
+  # this says the five that need the comparison still make it.
+  local f
+  for f in remote.sh watch.sh session-end.sh session-start.sh delivery.sh; do
+    grep -q 'agmsg_cmdline_names_path' "$SCRIPTS/$f" || {
+      printf '%s no longer asks the comparator\n' "$f" >&3
+      false
+      return
+    }
+  done
+}

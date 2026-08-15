@@ -132,6 +132,66 @@ remember_engine_pid() {
   ENGINE_PIDS="${ENGINE_PIDS:+$ENGINE_PIDS }$ENGINE_PID"
 }
 
+# The Windows spelling, through the production entry. (#652)
+#
+# `write_matching_ps_fixture` answers with the POSIX path, which is the case
+# that never broke. These two answer with what the reporting machine actually
+# showed -- a drive-letter path -- and put a `cygpath` stub on PATH so the
+# conversion the comparator relies on exists.
+#
+# The point is the WIRING, not the comparator: `tests/test_cmdline_path_match.bats`
+# drives `agmsg_cmdline_names_path` alone, and every one of its cases stays green
+# if `remote.sh` goes back to the old suffix match. These two go red.
+write_windows_spelling_fixtures() {
+  local fake_bin="$TEST_SKILL_DIR/fake-win-bin" engine_win="C:/w/scripts/internal/remote-sync.mjs"
+  mkdir -p "$fake_bin"
+  # ps: this pid's argv, spelled the way a native binary reports it.
+  printf '%s\n' '#!/usr/bin/env bash' \
+    "if [[ \" \$* \" == *\" -p $ENGINE_PID \"* && \" \$* \" == *\" -o args= \"* ]]; then" \
+    "  printf '%s\\n' '\"C:\\Program Files\\nodejs\\node.exe\" $engine_win run --team testteam'" \
+    '  exit 0' \
+    'fi' \
+    'exec /bin/ps "$@"' > "$fake_bin/ps"
+  # cygpath: only the one path this test is about. A stub that rewrote
+  # everything would hide a comparator that converts the wrong operand.
+  printf '%s\n' '#!/usr/bin/env bash' \
+    "if [ \"\$2\" = \"$SCRIPTS/internal/remote-sync.mjs\" ]; then" \
+    "  printf '%s' '$engine_win'" \
+    '  exit 0' \
+    'fi' \
+    'printf %s "$2"' > "$fake_bin/cygpath"
+  chmod +x "$fake_bin/ps" "$fake_bin/cygpath"
+  printf '%s\n' "$fake_bin"
+}
+
+@test "status: a Windows-spelled argv still names this team's engine (#652)" {
+  start_matching_engine
+  local fake_bin; fake_bin="$(write_windows_spelling_fixtures)"
+  run env PATH="$fake_bin:$PATH" bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  # `stale` is what the reporting machine got while the engine was running.
+  refute grep -qi 'stale' <<<"$output"
+  grep -qiE 'running|active' <<<"$output"
+}
+
+@test "disconnect: a Windows-spelled argv gets the engine stopped, not just forgotten (#652)" {
+  # The third contract, and it is not reached by a `sync stop` -- there is no
+  # such command. `_remote_sync_engine_stop` is what `unlock`, `disconnect`,
+  # `forget` and `set-endpoint` all call, and it reaps ONLY when the state is
+  # `running` while removing the pidfile either way. So a comparison that reads
+  # `stale` makes `disconnect` erase the engine's whereabouts and leave it
+  # polling a team whose binding was just torn off.
+  start_matching_engine
+  local fake_bin; fake_bin="$(write_windows_spelling_fixtures)"
+  run env PATH="$fake_bin:$PATH" bash "$SCRIPTS/remote.sh" disconnect testteam
+  [ "$status" -eq 0 ]
+  refute test -f "$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
+  # The engine itself -- the half that "forgotten" leaves behind, and the whole
+  # reason the pidfile assertion above is not enough on its own.
+  sleep 1
+  refute kill -0 "$ENGINE_PID" 2>/dev/null
+}
+
 @test "status: a running engine that has never completed a cycle says so (#756)" {
   # `engine running` reports that a process is alive, which is true and is not
   # the question an operator has. In #744's report an engine failed every cycle
