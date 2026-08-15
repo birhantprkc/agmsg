@@ -377,9 +377,155 @@ EOF
 # temp file in the same directory, then rename(2) it over <dest>. The rename is
 # atomic, so a concurrent unlocked reader sees either the old or the new file,
 # never a truncated one.
+# Best effort, and said out loud rather than assumed: `rm` is NOT on the PATH
+# that `join` is required to work under, so on that path a failed write leaves
+# its temp behind. The temp is 0600 and holds no more than the destination
+# would have, so what is lost is tidiness, not privacy -- and this is the one
+# place in here allowed to shrug, because it runs only after a failure that has
+# already been reported.
+_agmsg_discard_temp() {
+  if command -v rm >/dev/null 2>&1; then
+    rm -f "$1"
+  fi
+}
+
+# Remove what a failed attempt left, and NEVER let the removal speak for the
+# attempt.
+#
+# Both commands are neutralised with `|| :`. Many of this repository's scripts
+# run under `set -e`, where a `rmdir` that fails on a directory it could not
+# empty aborts the shell BEFORE the caller's diagnostic is printed and before
+# its `return 1` -- turning a named failure into a silent exit. Cleanup is
+# allowed to fail here. It is not allowed to decide (#804, raised in review).
+_agmsg_cleanup_attempt() {
+  _agmsg_discard_temp "$1" || :
+  rmdir "$2" 2>/dev/null || :
+}
+
+# SAID, NOT SWALLOWED (#802). On the PATH `join` is required to work under there
+# is no `rm`, so a failed write cannot be removed and the directory holding it
+# cannot be removed either. What survives is 0700 with a 0600 file inside --
+# privacy intact, tidiness not -- and the operator is told WHERE in the same
+# breath as the failure rather than finding it later.
+_agmsg_say_residue() {
+  if [ -d "$1" ]; then
+    printf 'agmsg: a private copy of the failed attempt is left in %s\n' "$1" >&2
+  fi
+}
+
 agmsg_write_atomic() {
   local dest="$1" content="$2" tmp
-  tmp="$dest.tmp.$$"
-  printf '%s\n' "$content" > "$tmp"
-  mv "$tmp" "$dest"
+  # The temp is CREATED, never adopted, using only what the minimal PATH
+  # guarantees: `umask` and `printf` from the shell, and `mkdir`, `mv` and
+  # `rmdir`, which are on that list. It said "only shell builtins" while calling
+  # three external commands -- true of a revision that used `noclobber`, and
+  # contradicted twelve lines further down by the paragraph explaining why
+  # `mkdir` and `rmdir` are safe to depend on.
+  #
+  # `> "$dest.tmp.$$"` onto a file a killed run left behind only truncates it:
+  # the redirect does not touch the mode, and `umask` applies to creation, so
+  # the content would exist at whatever that leftover was set to. For a binding
+  # that is a disclosure -- `remote_binding.endpoint` is the credential on a
+  # hosted deployment (#804).
+  #
+  # `mktemp` would solve it and CANNOT BE USED HERE. `join` is required to work
+  # on a PATH that carries only bash, dirname, sqlite3, sed, date, mkdir, rmdir,
+  # cat, mv, head, od, tr, sort, basename and paste -- there is a test for it,
+  # and it caught the first attempt at this fix. `chmod` is not on that list
+  # either; the version before this one called it and only survived because its
+  # failure was ignored.
+  #
+  # So: `umask`, plus `mkdir` and `rmdir`, which that list does carry. An
+  # earlier revision of this fix used `noclobber` (`set -C`) to refuse an
+  # existing file; that is gone, and the paragraph describing it went with it,
+  # because a comment that explains a primitive the code no longer uses is read
+  # as enforcement by whoever arrives next. What replaced it is below: the temp
+  # lives inside a directory this call created, and the name carries $RANDOM so
+  # a leftover does not block the write forever.
+  #
+  # 0600 applies to every caller of this helper -- team configs, roster
+  # journals, the codex port file, migrations. That is deliberate: it is how
+  # this product already treats its own state (`key.sh`, the handoff bundle).
+  # THE TEMP LIVES IN A DIRECTORY THIS CALL MADE, and that is the whole point.
+  #
+  # Two earlier shapes were refused by review, and the second one is why this is
+  # a directory:
+  #
+  #   - creating the temp empty under `set -C` and then opening `$tmp` AGAIN to
+  #     write it. The second open resolves the name a second time, so what the
+  #     exclusive creation established could be replaced in between. An
+  #     exclusive create whose result is reached BY NAME is not exclusive.
+  #
+  #   - merging those into one `>` and testing `[ -e ]` first. That test is a
+  #     filter and not a guarantee -- which the comment said -- and then the
+  #     failure branch removed `$tmp` on the reading that this process must have
+  #     made it. When the loser of a real race takes that branch, the file it
+  #     removes belongs to the WINNER. `$$` does not rescue the reasoning: a
+  #     subshell shares its parent's pid, so two concurrent calls in one process
+  #     tree draw from the same `$$.$RANDOM` space. The removal was the defect,
+  #     not the detection.
+  #
+  # `mkdir` answers both. It is atomic, it fails rather than joining an existing
+  # directory, and its SUCCESS is the proof of ownership that `[ -e ]` could
+  # never be: everything inside belongs to this call, so the payload is written
+  # into a name nothing else can be holding, and removing that name cannot
+  # remove anyone else's. It is the same primitive this file already trusts for
+  # the registry lock, for the same reason.
+  #
+  # `mkdir` and `rmdir` are both on the PATH `join` is required to work under --
+  # checked, because that list is what ruled out `mktemp` and `chmod`.
+  local attempts=0 tmpdir
+  while :; do
+    tmpdir="$dest.tmp.$$.$RANDOM.d"
+    if ( umask 077; mkdir "$tmpdir" ) 2>/dev/null; then
+      break
+    fi
+    # Taken, by anyone, for any reason: draw another name. Nothing is removed
+    # here, because nothing here was created.
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 32 ]; then
+      printf 'agmsg: could not create a private temporary directory beside %s\n' "$dest" >&2
+      return 1
+    fi
+  done
+  tmp="$tmpdir/new"
+
+  # 0700 on the directory and 0600 on the file. The content is written once,
+  # into a fresh name inside a directory only this call can enter.
+  if ! ( umask 077; printf '%s\n' "$content" > "$tmp" ) 2>/dev/null; then
+    _agmsg_cleanup_attempt "$tmp" "$tmpdir"
+    printf 'agmsg: could not write the new contents for %s\n' "$dest" >&2
+    _agmsg_say_residue "$tmpdir"
+    return 1
+  fi
+
+  # The `mv` is what makes a reader see the whole new file or the whole old one.
+  # The gate above is what makes the CONTENT whole: a `printf` that wrote half
+  # the payload and then failed would otherwise be published, indivisibly, as
+  # the truncated destination.
+  if ! mv "$tmp" "$dest"; then
+    _agmsg_cleanup_attempt "$tmp" "$tmpdir"
+    printf 'agmsg: could not move the new contents into place at %s\n' "$dest" >&2
+    _agmsg_say_residue "$tmpdir"
+    return 1
+  fi
+
+  # PUBLISHED. EVERYTHING BELOW IS TIDYING, AND TIDYING DOES NOT GET A VOTE.
+  #
+  # This function used to end on a bare `rmdir`, so the status of the tidy-up
+  # became the status of the write: a `rmdir` that failed after a `mv` that
+  # succeeded returned non-zero, and the caller treated a committed write as a
+  # failure. That needs no `set -e` to happen -- the last command's status is
+  # the function's -- and under `set -e` it is worse, because the caller aborts
+  # on a write that in fact landed. Review named it (#804).
+  #
+  # So the removal is checked, its failure is SAID rather than swallowed (#802),
+  # and the return is explicit and unconditional. After a successful `mv` the
+  # directory is empty and 0700, so a failure here is close to impossible; if it
+  # happens, what leaks is an empty private directory, and the operator is told
+  # which one rather than left to find it.
+  if ! rmdir "$tmpdir" 2>/dev/null; then
+    printf 'agmsg: wrote %s, but could not remove the temporary directory %s\n' "$dest" "$tmpdir" >&2
+  fi
+  return 0
 }
