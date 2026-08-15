@@ -1711,39 +1711,33 @@ function bindingNote(binding) {
 // has today, since a driver that stops reading a pipe fails at once while a
 // driver handed a file is waited for. This is a fix for one caller and it is
 // scoped to that caller.
-function handOverInput(input) {
+function stageInput(input, staging) {
+  // Filled IN PLACE, so that one cleanup path can undo whatever part of it got
+  // made. The first version cleaned up inside here as well as at settle, which
+  // is two routes doing the same job -- and the one in here could not be
+  // reached by any test, so it was a guarantee nothing was holding up. There is
+  // one route now, and the caller owns it.
+  //
   // 0700 by mkdtemp and 0600 on the file. These records are message content,
   // and putting them in a file puts them at rest on disk, which a pipe did not.
-  const directory = mkdtempSync(join(tmpdir(), "agmsg-driver-input-"));
-  const path = join(directory, "input.jsonl");
-  let fd;
-  try {
-    writeFileSync(path, input.map((record) => `${JSON.stringify(record)}\n`).join(""),
-      { mode: 0o600 });
-    // A fresh read-only descriptor. Passing on the one the write used would
-    // hand over a descriptor sitting at EOF, and the driver would read an empty
-    // input and report a successful sync of nothing.
-    fd = openSync(path, "r");
-  } catch (error) {
-    // The content is already written by the time `openSync` can fail, and there
-    // is no descriptor yet for anything downstream to clean up from. Failing
-    // out of here without this leaves message content in a temp directory that
-    // nothing else knows the name of.
-    discardInputDirectory(directory, "staging the driver's input failed");
-    throw error;
-  }
+  staging.directory = mkdtempSync(join(tmpdir(), "agmsg-driver-input-"));
+  const path = join(staging.directory, "input.jsonl");
+  writeFileSync(path, input.map((record) => `${JSON.stringify(record)}\n`).join(""),
+    { mode: 0o600 });
+  // A fresh read-only descriptor. Passing on the one the write used would hand
+  // over a descriptor sitting at EOF, and the driver would read an empty input
+  // and report a successful sync of nothing.
+  staging.fd = openSync(path, "r");
   // Then take the name away immediately, while the descriptor stays open: the
   // spawn duplicates it into the child, so both sides keep reading a file that
   // nothing can any longer open by name, and a parent that dies leaves no
   // message content behind. Windows cannot unlink an open file, so there it
   // stays until the call settles -- which is why the directory is still tracked
   // and removed there rather than only here.
-  let unlinked = false;
   try {
-    rmSync(directory, { recursive: true, force: true });
-    unlinked = true;
+    rmSync(staging.directory, { recursive: true, force: true });
+    staging.directory = null;
   } catch { /* Windows, or a tmpdir that will not allow it; settle cleans up */ }
-  return { directory: unlinked ? null : directory, fd };
 }
 
 // Removing a temp directory must not fail the call around it -- refusing a sync
@@ -1781,54 +1775,48 @@ function runDriver({ args, label, operation, parse, input, rosterFile, team, bin
     // comment rather than in the function. Naming the single variable keeps the
     // guarantee where it can be checked.
     if (rosterFile) childEnvironment.AGMSG_SYNC_LOCAL_ROSTER_FILE = rosterFile;
-    // Staged before the spawn, so before the lock: a failure to stage the input
-    // is a failure with no child and no lock to leak. Only for the caller that
-    // holds the lock -- everyone else keeps the pipe, and with it the bounded
-    // failure a pipe gives and an input that never reaches disk.
-    let handover = null;
-    if (holdsRegistryLock) {
-      try {
-        handover = handOverInput(input);
-      } catch (error) {
-        reject(error);
-        return;
-      }
-    }
-
-    // Ours to close: a descriptor handed to `stdio` is duplicated for the child,
-    // and the parent's copy stays open until the parent closes it. Declared
-    // before the spawn because the spawn itself can throw, and a throw between
-    // the handover and the settle path would otherwise strand both the
-    // descriptor and, on Windows, a named file of message content.
+    // The staged input, and the ONE place that undoes it. Whatever part of the
+    // staging exists when something goes wrong -- a directory and no descriptor,
+    // both, or neither -- this is what puts it back, and it is the only thing
+    // that does. That matters more than it looks: the routes into it that a
+    // test cannot reach are undone by the same lines as the route a test can,
+    // so binding one binds them all.
+    const staging = { directory: null, fd: null };
     const releaseInput = () => {
-      if (!handover) return;
-      const { directory, fd } = handover;
-      handover = null;
-      try { closeSync(fd); } catch { /* already closed */ }
-      // Null when the directory was already taken away at handover, which is
-      // the ordinary case everywhere the file could be unlinked while open.
-      if (directory !== null) {
-        discardInputDirectory(directory, "the driver call ended");
+      if (staging.fd !== null) {
+        try { closeSync(staging.fd); } catch { /* already closed */ }
+        staging.fd = null;
+      }
+      // Already null whenever the file could be unlinked while still open,
+      // which is everywhere except Windows.
+      if (staging.directory !== null) {
+        discardInputDirectory(staging.directory, "the driver call ended");
+        staging.directory = null;
       }
     };
 
-    // Read once, here. `handover` is nulled when the input is released, so it
-    // cannot be asked later whether there was ever a pipe to write to.
-    const staged = handover !== null;
     let child;
     try {
-      // The fd is opened read-only and fresh, never the one the write used --
-      // that one sits at EOF, which the driver would read as an empty input and
-      // report as a successful sync of nothing.
-      child = spawn("bash", args,
-        { stdio: [staged ? handover.fd : "pipe", "pipe", "pipe"], env: childEnvironment });
+      // Staged before the spawn, so before the lock: a failure to stage is a
+      // failure with no child and no lock to leak. Only for the caller that
+      // holds the lock -- everyone else keeps the pipe, and with it the bounded
+      // failure a pipe gives and an input that never reaches disk.
+      if (holdsRegistryLock) stageInput(input, staging);
+      child = spawn("bash", args, {
+        stdio: [staging.fd === null ? "pipe" : staging.fd, "pipe", "pipe"],
+        env: childEnvironment,
+      });
     } catch (error) {
-      // A synchronous spawn failure never reaches 'error', so nothing else here
-      // would run. There is no child, so there is nothing else to undo.
+      // Reached by a staging failure and by a synchronous spawn failure alike.
+      // Neither leaves a child, and a synchronous spawn failure never reaches
+      // 'error', so nothing else here would run for it.
       releaseInput();
       reject(error);
       return;
     }
+    // Read once, here: `staging.fd` is nulled on release, so it cannot be asked
+    // later whether there was ever a pipe to write to.
+    const staged = staging.fd !== null;
     let stdout = ""; let stderr = ""; let settled = false; let failure = null;
 
     const settle = (error, value) => {
@@ -1855,7 +1843,7 @@ function runDriver({ args, label, operation, parse, input, rosterFile, team, bin
           // running would trade "the process dies" for "the process cannot
           // exit". What changed is only who can be on that path -- a driver
           // holding the registry lock is handed a file instead, so it is never
-          // the one being killed. See the note on handOverInput.
+          // the one being killed. See the note on stageInput.
           child.kill("SIGKILL");
           return;
         } catch { /* already gone; fall through and settle now */ }
