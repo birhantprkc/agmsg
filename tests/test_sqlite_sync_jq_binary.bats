@@ -187,3 +187,67 @@ staged_hex() {
   [ -n "$hex" ]
   refute grep -qi '0D$' <<< "$hex"
 }
+
+# A jq that prints the right bytes and then fails. Both halves of the contract
+# are required: LF-terminated output AND a jq that completed.
+stub_jq_clean_but_failing() {
+  local bin="$TEST_SKILL_DIR/jq-clean-fail"
+  mkdir -p "$bin"
+  cat > "$bin/jq" <<STUB
+#!/usr/bin/env bash
+for a in "\$@"; do
+  case "\$a" in -b|-b*) printf 'agmsg-probe\n'; exit 3 ;;
+  esac
+done
+exec "$(command -v jq)" "\$@"
+STUB
+  chmod +x "$bin/jq"
+  printf '%s' "$bin"
+}
+
+@test "sync: a jq that prints clean bytes and then fails is refused too (#829)" {
+  # THE OTHER HALF OF THE CONTRACT. Reading the sentinel proves the bytes; it
+  # does not prove jq finished. Observed through a process substitution the exit
+  # status is unreachable, and a jq that wrote the right line and exited 3 was
+  # cached as usable (raised in review).
+  local bin; bin="$(stub_jq_clean_but_failing)"
+
+  run env PATH="$bin:$PATH" bash -c '
+    . "$1/drivers/storage/sqlite-sync.sh"
+    _sqlite_sync_require_jq_binary
+  ' _ "$SCRIPTS"
+
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -q 'requires a jq whose -b (binary output) produces LF-terminated lines'
+}
+
+@test "sync: the second refusal in one shell says it too (#829)" {
+  # A CACHED NO USED TO BE SILENT. The result is cached because probing costs a
+  # process, but the engine retries on its cycle: the first attempt explained
+  # itself and every attempt after it failed without a word, so the explanation
+  # scrolled away and never came back.
+  local bin; bin="$(stub_jq_without_b)"
+
+  # NO PIPELINE. Piping each call into `sed` put it in a subshell, so the cache
+  # set by the first call never reached the second and BOTH ran the uncached
+  # path -- the case passed while the cached branch was never entered. Measured:
+  # making the cached refusal silent reddened nothing. `{ …; } 2>file` keeps the
+  # calls in one shell.
+  run env REAL_PATH="$PATH" PATH="$bin:$PATH" bash -c '
+    cd "$2"
+    . "$1/drivers/storage/sqlite-sync.sh"
+    { _sqlite_sync_require_jq_binary; } 2>err1
+    { _sqlite_sync_require_jq_binary; } 2>err2
+    echo "cached=$_AGMSG_JQ_BINARY_OK"
+    echo "first: $(head -1 err1)"
+    echo "second: $(head -1 err2)"
+  ' _ "$SCRIPTS" "$BATS_TEST_TMPDIR"
+
+  # BOTH, named separately: a control that only counted occurrences would pass
+  # on two copies of the first one.
+  # The cache really was consulted -- otherwise this proves nothing about the
+  # cached branch.
+  echo "$output" | grep -q 'cached=no'
+  echo "$output" | grep -q 'first: agmsg: sending requires a jq whose -b'
+  echo "$output" | grep -q 'second: agmsg: sending requires a jq whose -b'
+}

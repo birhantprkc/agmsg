@@ -105,38 +105,49 @@ _sqlite_sync_sequence() {
 # afterwards is deliberately NOT offered: it guesses at which CRs were added,
 # and the guess is wrong for any value that legitimately ends a line with one.
 _AGMSG_JQ_BINARY_OK=""
-_sqlite_sync_require_jq_binary() {
-  case "$_AGMSG_JQ_BINARY_OK" in
-    yes) return 0 ;;
-    no)  return 1 ;;
-  esac
-  local probe=""
-  # THE CONTRACT, NOT THE FLAG.
-  #
-  # An earlier version probed with `jq -b -r 'empty'`, which emits nothing: a jq
-  # that ACCEPTS `-b` and still writes CRLF passed it. The field report is about
-  # the bytes on stdout, so the probe has to produce a line and look at how that
-  # line ends (raised in review).
-  #
-  # Read with `read`, never through `$( )`. Command substitution on MSYS drops
-  # the final CR -- that is the very behaviour that hid this defect from a
-  # single-value capture -- so inspecting the probe that way would report clean
-  # output from a jq that is still adding CR. `read` stops at the LF and leaves
-  # the CR in the variable, so `probe` and `probe<CR>` are distinguishable here.
-  #
-  # A jq that fails outright leaves `probe` empty, which is also not the
-  # expected value, so a broken jq and a CRLF jq both fall to the refusal below
-  # -- and the message names the capability rather than guessing which it was.
-  IFS= read -r probe < <(printf '{}\n' | jq -b -r '"agmsg-probe"' 2>/dev/null) || probe=""
-  if [ "$probe" = "agmsg-probe" ]; then
-    _AGMSG_JQ_BINARY_OK=yes
-    return 0
-  fi
-  _AGMSG_JQ_BINARY_OK=no
+
+# Said every time it refuses, not only the first time (#829, raised in review).
+#
+# The result is cached because the probe costs a process, but a cached NO used to
+# `return 1` in silence: the first push in a long-lived shell explained itself and
+# every push after it just failed. A caller that retries -- which is what the
+# engine does on its cycle -- would see one sentence and then nothing, and the
+# one sentence scrolls away.
+_sqlite_sync_jq_binary_refusal() {
   echo "agmsg: sending requires a jq whose -b (binary output) produces LF-terminated lines" >&2
   echo "agmsg:   this jq: $(jq --version 2>/dev/null || echo 'unknown')" >&2
   echo "agmsg:   a Windows jq without it emits CRLF, and the trailing CR rides into" >&2
   echo "agmsg:   the values this sends, which the server rejects (#829)." >&2
+}
+
+_sqlite_sync_require_jq_binary() {
+  case "$_AGMSG_JQ_BINARY_OK" in
+    yes) return 0 ;;
+    no)  _sqlite_sync_jq_binary_refusal; return 1 ;;
+  esac
+  local probe="" status=1 out="${TMPDIR:-/tmp}/agmsg-jq-probe.$$"
+  # BOTH HALVES: the bytes AND jq's own exit status.
+  #
+  # Probing with `jq -b -r 'empty'` tested option parsing only -- it emits
+  # nothing, so a jq that accepts `-b` and still writes CRLF passed. Reading a
+  # sentinel fixes that half. The other half is that a jq can print the right
+  # bytes and still fail; observed through a process substitution, that status is
+  # unreachable, and the probe would cache `yes` for a jq that exited non-zero
+  # (raised in review). So the output goes to a file, the status is taken from
+  # the pipeline, and the bytes are read back afterwards.
+  #
+  # Read with `read`, never through `$( )`: command substitution on MSYS drops
+  # the final CR, which is exactly the byte this is looking for.
+  printf '{}\n' | jq -b -r '"agmsg-probe"' > "$out" 2>/dev/null
+  status=$?
+  IFS= read -r probe < "$out" 2>/dev/null || probe=""
+  if command -v rm >/dev/null 2>&1; then rm -f "$out"; fi
+  if [ "$status" -eq 0 ] && [ "$probe" = "agmsg-probe" ]; then
+    _AGMSG_JQ_BINARY_OK=yes
+    return 0
+  fi
+  _AGMSG_JQ_BINARY_OK=no
+  _sqlite_sync_jq_binary_refusal
   return 1
 }
 
