@@ -4,6 +4,12 @@ set -euo pipefail
 # The launcher is detached from codex-monitor.sh and may outlive the shell that
 # invoked it. Never retain test-harness result/trace descriptors through the
 # dispatcher -> role child -> bridge process chain.
+#
+# 3 and 4 are closed here, as early as the script can, and then EVERY inherited
+# descriptor is closed once lib/close-fds.sh is reachable (just below). Naming
+# the two we expect is not enough: the harness picks the number, and a bridge
+# that kept it hung a macOS CI shard for 25 minutes with every test already
+# green. See scripts/lib/close-fds.sh.
 exec 3>&- 4>&-
 
 # Runs outside Codex's tool sandbox and owns the app-server connections. The
@@ -24,6 +30,12 @@ ROLE_PAIR="${5:-}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 RUN_DIR="$SKILL_DIR/run"
+# Before anything long-lived is spawned. Nothing above forks a process that
+# outlives this script, so closing here is as good as closing at line 1 — and
+# it is the earliest point at which lib/ is resolvable.
+# shellcheck source=../../../lib/close-fds.sh
+source "$SCRIPT_DIR/../../../lib/close-fds.sh"
+agmsg_close_inherited_fds
 # shellcheck source=../../../lib/hash.sh
 source "$SCRIPT_DIR/../../../lib/hash.sh"
 # The liveness helpers. Every lifetime and lock-owner check below goes through
