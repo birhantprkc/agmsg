@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { existsSync, readdirSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, unlink,
   writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -17,6 +18,7 @@ import {
   consistentReadStateContext,
   configure,
   cycle,
+  discardInputDirectory,
   driver,
   exportAgeHandoff,
   exportAgeSnapshot,
@@ -1889,23 +1891,88 @@ async function driverLifecycleFixture(t, { script, calls, root }) {
   return { started, gone };
 }
 
-test("a driver that stops reading its input fails the call and is not left running",
+test("the roster driver that stops reading its input is left to release its own lock",
   { timeout: 30_000 }, async (t) => {
-  // The write loses its reader and takes EPIPE, which arrives on the stdin
-  // stream rather than on the child -- and an unhandled stream 'error' is
-  // thrown, not returned. So the failure escaped the promise and killed the
-  // process, surfacing as an uncaughtException inside whichever unrelated test
-  // was running when it fired, which is how it read as a flake.
+  // This was a test about EPIPE. The parent wrote the input down a pipe, a
+  // driver that had stopped reading took the write's error, and the call
+  // answered by SIGKILLing that driver -- which is the one thing it must not do.
+  // roster-sync-driver.sh takes the team's registry lock as its first act and
+  // holds it for the whole call, and its only release routes are traps. SIGKILL
+  // runs none of them, so the fast failure was bought by leaving `.config.lock`
+  // behind with no owner, and every later run for that team then waits on a
+  // directory nobody is going to remove.
   //
-  // Rejecting is only half of it: a rejected call that leaves the driver running
-  // trades "the process dies" for "the process cannot exit". So the fixture
-  // records its pid, and leaves a background descendant holding the inherited
-  // pipes -- what a real driver that starts a helper does, and the thing that
-  // keeps 'close' from ever arriving -- then replaces itself with a sleep longer
-  // than this test may run, so nothing here can pass by waiting.
+  // So the fixture now takes a lock the way the driver does -- a directory,
+  // released from an EXIT trap -- and stops reading its input while still
+  // holding it. It keeps the background descendant that holds the inherited
+  // pipes, which is what a real driver starting a helper leaves and the reason
+  // 'close' never arrives, but it ends itself rather than sleeping past the
+  // test: nothing here may pass by waiting, and nothing may hang.
   //
   // The payload is past any platform's pipe buffer (64 KiB on Linux, less on
-  // macOS), so the write cannot complete unread.
+  // macOS): under the old code the write could not complete unread, which is
+  // what made it fail there.
+  //
+  // Measured against the previous implementation this test fails -- the driver
+  // is killed about 20ms in and the trap never runs. What it costs is the fast
+  // failure: the call now waits for the driver to end instead of ending it.
+  // That trade is deliberate, and bounding a driver that HANGS is separate work
+  // that is not done here.
+  const root = await mkdtemp(join(tmpdir(), "agmsg-sync-driver-lock-"));
+  const lockFor = (pidFile) => `${pidFile}.lock`;
+  const script = (pidFile, helperFile) => `#!/usr/bin/env bash
+echo $$ > ${JSON.stringify(pidFile)}
+sleep 300 &
+echo $! > ${JSON.stringify(helperFile)}
+mkdir ${JSON.stringify(lockFor(pidFile))} || exit 1
+trap 'rmdir ${JSON.stringify(lockFor(pidFile))} 2>/dev/null' EXIT
+exec 0<&-
+sleep 2
+exit 7
+`;
+  const wide = "x".repeat(4096);
+  const input = Array.from({ length: 512 }, (_, index) => ({ type: "probe", index, wide }));
+  // The ROSTER driver only. It is the one that holds the lock, and it is the
+  // only one handed a staged file; the storage driver keeps its pipe and is
+  // covered by the test below, with the expectations it always had.
+  const { started, gone } = await withDriverEnvironment(t, root, script,
+    (mock, config) => [
+      () => rosterDriver("apply", config, input),
+    ]);
+
+  for (const [index, { promise, childPid }] of started.entries()) {
+    // The call still fails, but through the ordinary route -- the driver's own
+    // exit status -- rather than through a write whose reader went away. Both
+    // halves are asserted: a rejection carrying the stdin-write marker would
+    // mean the pipe write came back, and that marker is set in exactly one
+    // place, so it cannot be satisfied by accident.
+    await assert.rejects(() => promise,
+      (error) => error.driverFailurePhase === undefined &&
+        /exit/iu.test(String(error.message)));
+    // No poll and no grace period. The call settles only after the driver has
+    // exited, so by this line it is already gone.
+    assert.ok(gone(childPid), "the failed driver was left running");
+    // The property this test exists for.
+    assert.ok(!existsSync(lockFor(join(root, `child-${index}.pid`))),
+      "the driver was killed before its trap could release the lock");
+  }
+});
+
+test("the storage driver that stops reading its input fails the call and is not left running",
+  { timeout: 30_000 }, async (t) => {
+  // Unchanged behaviour, kept under its own test so that it stays unchanged.
+  //
+  // The storage driver takes no registry lock, so nothing about it needs the
+  // staged file the roster driver gets, and giving it one would cost it both an
+  // input that never touches disk -- after evaluatePull() these records are
+  // decrypted message content, on E2EE teams as much as plain ones -- and the
+  // bounded failure it has here. A driver handed a file is waited for; a driver
+  // that stops reading a pipe fails at once.
+  //
+  // So this is the original EPIPE test, scoped to the caller it was always
+  // about: the write loses its reader, the failure arrives on the stdin stream,
+  // and the driver does not survive the call. Flip `holdsRegistryLock` on for
+  // the storage driver and this test says so.
   const root = await mkdtemp(join(tmpdir(), "agmsg-sync-driver-epipe-"));
   const script = (pidFile, helperFile) => `#!/usr/bin/env bash
 echo $$ > ${JSON.stringify(pidFile)}
@@ -1919,25 +1986,294 @@ exec sleep 300
   const { started, gone } = await withDriverEnvironment(t, root, script,
     (mock, config) => [
       () => driver("prepare", config, input, ["1"]),
-      () => rosterDriver("apply", config, input),
     ]);
 
   for (const { promise, childPid } of started) {
-    // On the marker the stdin handler sets, not on the errno. This asserted
-    // EPIPE first and so passed or failed by platform -- macOS answers ENOTCONN
-    // or EPIPE from the same event -- and enumerating the codes seen so far only
-    // moves the problem to whichever spelling appears next. The set of errnos is
-    // not closed; the set of places that set this marker is.
-    //
-    // It stays load-bearing for the same reason it is stable: only that handler
-    // sets it, so a rejection arriving from 'close' cannot satisfy this, and
-    // removing the handler fails the test.
+    // On the marker the stdin handler sets, not on the errno: macOS answers
+    // ENOTCONN or EPIPE from the same event, and the set of spellings is not
+    // closed. The set of places that set this marker is -- there is one.
     await assert.rejects(() => promise,
       (error) => error.driverFailurePhase === "stdin-write");
     // No poll and no grace period. The call settles only after the driver has
     // exited, so by this line it is already gone.
     assert.ok(gone(childPid), "the failed driver was left running");
   }
+});
+
+test("a driver is handed its whole input, from the start of it",
+  { timeout: 30_000 }, async (t) => {
+  // The input is staged in a file and that file's descriptor is handed over as
+  // the child's stdin. Two ways that goes silently wrong, and neither one
+  // announces itself -- the driver reads a short input or an empty one and
+  // reports a perfectly successful sync of nothing:
+  //
+  //   - the descriptor the write used is passed on, and it sits at EOF
+  //   - the file is still being written when the child starts reading
+  //
+  // So the driver counts what it actually received and the count is asserted
+  // against what was sent. A payload well past any pipe buffer, because a small
+  // one is delivered correctly by almost any mistake.
+  const root = await mkdtemp(join(tmpdir(), "agmsg-sync-driver-input-"));
+  const script = (pidFile, helperFile) => `#!/usr/bin/env bash
+echo $$ > ${JSON.stringify(pidFile)}
+echo $$ > ${JSON.stringify(helperFile)}
+lines=$(wc -l)
+printf '{"lines":%d}\\n' "$lines"
+`;
+  const wide = "x".repeat(4096);
+  const RECORDS = 512;
+  const input = Array.from({ length: RECORDS },
+    (_, index) => ({ type: "probe", index, wide }));
+  const { started } = await withDriverEnvironment(t, root, script,
+    (mock, config) => [
+      () => driver("prepare", config, input, ["1"]),
+      () => rosterDriver("apply", config, input),
+    ]);
+
+  for (const { promise } of started) {
+    const result = await promise;
+    assert.equal(result[0]?.lines, RECORDS,
+      "the driver did not receive every record that was sent");
+  }
+});
+
+test("a staged input leaves nothing behind, whether the call succeeds or fails",
+  { timeout: 30_000 }, async (t) => {
+  // What is staged is message content, so the temp directory is not a tidiness
+  // matter. Two routes have to be checked and neither is the interesting one:
+  // it is the DULL paths that leak, because the failure path is the one people
+  // write cleanup for.
+  //
+  // Counted by name in the system temp directory rather than by watching the
+  // implementation, so a future change of mechanism is still measured. The
+  // baseline is taken first: this is a shared directory and something else may
+  // already have left one, and asserting zero would be asserting about the
+  // machine rather than about this call.
+  const residue = async () => (await readdir(tmpdir()))
+    .filter((entry) => entry.startsWith("agmsg-driver-input-")).length;
+  const before = await residue();
+
+  const root = await mkdtemp(join(tmpdir(), "agmsg-sync-driver-residue-"));
+  const input = Array.from({ length: 8 }, (_, index) => ({ type: "probe", index }));
+
+  const ok = (pidFile, helperFile) => `#!/usr/bin/env bash
+echo $$ > ${JSON.stringify(pidFile)}
+echo $$ > ${JSON.stringify(helperFile)}
+cat > /dev/null
+printf '{"ok":true}\\n'
+`;
+  // Repeated, and counted on descriptors as well as directories, because the
+  // ORDINARY path is the one that matters most here: this runs every sync
+  // cycle for the life of the engine. On this platform the file is already
+  // unlinked by settle time, so a settle that forgot to release would leave no
+  // directory at all and leak one descriptor per cycle -- invisible to a
+  // directory count, and fatal over a long run.
+  const descriptors = () => {
+    try { return readdirSync("/dev/fd").length; } catch { return null; }
+  };
+  // Sequential, and driven directly rather than through the pid fixture. That
+  // fixture waits for every driver to record a pid before it returns, and 24
+  // bash processes at once is a lot to ask of a Windows runner -- a timeout
+  // there would fail this test for the runner's speed rather than for a leak,
+  // which is the wrong thing for it to be sensitive to.
+  const okDriver = join(root, "ok-driver.sh");
+  await writeFile(okDriver,
+    "#!/usr/bin/env bash\ncat > /dev/null\nprintf '{\"ok\":true}\\n'\n",
+    { mode: 0o700 });
+  const previousRosterDriver = process.env.AGMSG_SYNC_ROSTER_DRIVER;
+  process.env.AGMSG_SYNC_ROSTER_DRIVER = okDriver;
+  t.after(() => {
+    if (previousRosterDriver === undefined) delete process.env.AGMSG_SYNC_ROSTER_DRIVER;
+    else process.env.AGMSG_SYNC_ROSTER_DRIVER = previousRosterDriver;
+  });
+  const config = {
+    local_team: "residue", server_instance_id: "018f0000-0000-7000-8000-000000000001",
+    remote_team_id: "018f0000-0000-7000-8000-000000000002", protocol_version: 1,
+  };
+  const openBefore = descriptors();
+  for (let attempt = 0; attempt < 24; attempt += 1) {
+    await rosterDriver("apply", config, input);
+  }
+  assert.equal(await residue(), before, "a successful call left its input behind");
+  if (openBefore !== null) {
+    // A bound, not equality: this process has descriptors of its own. Twenty-
+    // four is not a margin.
+    assert.ok(descriptors() < openBefore + 12,
+      `successful calls leaked descriptors: ${openBefore} -> ${descriptors()}`);
+  }
+
+  const bad = await mkdtemp(join(tmpdir(), "agmsg-sync-driver-residue-"));
+  const fails = (pidFile, helperFile) => `#!/usr/bin/env bash
+echo $$ > ${JSON.stringify(pidFile)}
+echo $$ > ${JSON.stringify(helperFile)}
+echo "refused" >&2
+exit 9
+`;
+  const { started: broken } = await withDriverEnvironment(t, bad, fails,
+    (mock, config) => [() => rosterDriver("apply", config, input)]);
+  for (const { promise } of broken) await assert.rejects(() => promise);
+  assert.equal(await residue(), before, "a failed call left its input behind");
+
+  // The third route, and the one nothing else here reaches: the spawn itself
+  // fails. It is staged by then -- the input is written before the spawn, on
+  // purpose -- so this is the window where the descriptor and, on Windows, a
+  // named file of message content have no owner at all. A synchronous spawn
+  // failure never reaches 'error', so the settle path that cleans up after
+  // every other route is not on this one.
+  //
+  // Forced through the arguments rather than through the environment: a NUL in
+  // an argument is rejected by spawn() before it does anything, which is a
+  // synchronous throw and not an ENOENT the runner would answer later.
+  // Called directly, without the driver fixture: nothing is started, so there
+  // is no pid for that helper to wait on, and the driver script is never read
+  // because the spawn does not get that far.
+  // On this platform the directory count cannot see this route at all, and
+  // saying so is the point: the name is taken away at handover, so what a
+  // spawn failure strands here is the DESCRIPTOR, not a directory. Windows,
+  // where the file cannot be unlinked while open, is the other way round --
+  // there the directory assertion above is the one that catches it, which is
+  // why this test runs in the focused Windows leg too.
+  //
+  // So the descriptor is counted, and the route is run enough times that one
+  // leaked per call is unmistakable rather than lost in noise.
+  const spawnOpenBefore = descriptors();
+  for (let attempt = 0; attempt < 24; attempt += 1) {
+    await assert.rejects(() => rosterDriver("apply", {
+      local_team: "team\u0000name",
+      server_instance_id: "018f0000-0000-7000-8000-000000000001",
+      remote_team_id: "018f0000-0000-7000-8000-000000000002",
+      protocol_version: 1,
+    }, input));
+  }
+  assert.equal(await residue(), before, "a failed spawn left its input behind");
+  if (spawnOpenBefore !== null) {
+    // Not exact equality: this process is doing other things, and a count that
+    // has to be identical would fail on something unrelated. Twenty-four leaked
+    // descriptors is not a margin, it is the defect.
+    assert.ok(descriptors() < spawnOpenBefore + 12,
+      `a failed spawn leaked its descriptor: ${spawnOpenBefore} -> ${descriptors()}`);
+  }
+});
+
+test("the staged input has no name for as long as the driver is reading it",
+  { timeout: 30_000 }, async (t) => {
+  // The claim this binds is the security one, and until now nothing tested it:
+  // the file is unlinked as soon as its read-only descriptor is open, so for
+  // the whole life of the call there is a file being read that nothing can
+  // open by name -- which is what makes "a parent that dies leaves no message
+  // content behind" true rather than hopeful.
+  //
+  // Every other test here looks AFTER the call, and by then the settle path has
+  // cleaned up whether the handover unlinked or not. So this one looks WHILE
+  // the driver is alive and still reading, which is the only window where the
+  // two differ.
+  //
+  // POSIX only, and not skipped quietly on Windows for a bad reason: there a
+  // file cannot be unlinked while open, so the directory is SUPPOSED to survive
+  // until settle, and the residue test is what covers it.
+  if (process.platform === "win32") {
+    t.skip("Windows cannot unlink an open file; settle-time removal covers it there");
+    return;
+  }
+  const residue = async () => (await readdir(tmpdir()))
+    .filter((entry) => entry.startsWith("agmsg-driver-input-")).length;
+  const before = await residue();
+
+  const root = await mkdtemp(join(tmpdir(), "agmsg-sync-driver-unnamed-"));
+  // Writes its pid, then stays alive without having read its input yet -- the
+  // fixture helper returns once that pid is on disk, so the check below lands
+  // inside the call rather than after it.
+  const script = (pidFile, helperFile) => `#!/usr/bin/env bash
+echo $$ > ${JSON.stringify(pidFile)}
+echo $$ > ${JSON.stringify(helperFile)}
+sleep 2
+cat > /dev/null
+printf '{"ok":true}\\n'
+`;
+  const input = Array.from({ length: 2000 }, (_, index) => ({ type: "probe", index }));
+  const { started } = await withDriverEnvironment(t, root, script,
+    (mock, config) => [() => rosterDriver("apply", config, input)]);
+
+  assert.equal(await residue(), before,
+    "the staged input still had a name while the driver was reading it");
+  for (const { promise } of started) await promise;
+  assert.equal(await residue(), before, "and none after it settled");
+});
+
+test("a cleanup that cannot remove the staged input says so, and does not fail the call",
+  { timeout: 30_000 }, async (t) => {
+  // The staged file is message content. When its removal fails there are two
+  // wrong answers and this takes neither: failing the call would trade a sync
+  // that completed for a cleanup detail the caller cannot act on, and staying
+  // silent would leave that content on disk with nobody told.
+  //
+  // Driven directly rather than through a driver call, because the state it
+  // needs -- a directory that refuses removal -- cannot be arranged from
+  // outside `runDriver` without reaching into the timing of its own staging,
+  // and a test that depends on that timing breaks on the next refactor for
+  // reasons unrelated to what it checks.
+  if (process.platform === "win32") {
+    t.skip("chmod is the mechanism here and Windows does not honour it that way");
+    return;
+  }
+  if (process.getuid?.() === 0) {
+    t.skip("root ignores the permissions this arranges, so the failure never happens");
+    return;
+  }
+  const parent = await mkdtemp(join(tmpdir(), "agmsg-sync-stuck-"));
+  // Registered against the parent the moment it exists, before anything below
+  // can throw. Hooking cleanup up only once the fixture is fully built means
+  // the half-built cases -- the ones a failure actually produces -- are the
+  // ones that leak.
+  t.after(async () => {
+    // The chmod is best effort on purpose: it runs before the directory below
+    // necessarily exists, and its only job is to make the removal possible.
+    await chmod(join(parent, "refuses-removal"), 0o700).catch(() => {});
+    // The removal is NOT. `force: true` already treats a path that is not there
+    // as success, so a catch here could only ever hide a real failure -- and
+    // what it would hide is this fixture's content staying on disk while the
+    // test reports green, which is the exact shape this test is about.
+    await rm(parent, { recursive: true, force: true });
+  });
+  // NOT named `agmsg-driver-input-*`. That prefix is what the residue test
+  // counts, and a fixture standing in the middle of another test's instrument
+  // is a fixture that can fail it -- or, worse, hide a real leak inside its own
+  // noise. What is under test here is the helper, which takes any path.
+  const directory = join(parent, "refuses-removal");
+  await mkdir(directory);
+  const staged = join(directory, "input.jsonl");
+  await writeFile(staged, "{\"a\":1}\n");
+  // Not writable, so the file inside it cannot be unlinked and the recursive
+  // removal has to fail.
+  await chmod(directory, 0o500);
+  // Everything comes back afterwards -- see the hook above, registered before
+  // this could throw. This test's whole subject is content left on disk when a
+  // removal fails; leaving that content on disk would be an odd way to make
+  // the point, and the run after this one inherits it.
+
+  const warnings = [];
+  const collect = (warning) => warnings.push(warning);
+  process.on("warning", collect);
+  try {
+    // Must not throw. That is half the contract, and it is asserted by this
+    // call standing here: a throw propagates out of the finally and fails the
+    // test before it can reach the assertion below.
+    discardInputDirectory(directory, "the driver call ended");
+    // emitWarning is delivered on the next tick.
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    // In a finally, not on the straight line. A regression that makes the
+    // helper throw would otherwise leave this listener attached for the rest
+    // of the file -- so the first failure would be followed by a second,
+    // unrelated one, in whichever test happens to warn next.
+    process.off("warning", collect);
+  }
+
+  // The directory itself, because that is the one thing an operator needs in
+  // order to go and remove it. A warning that says "cleanup failed" and not
+  // where is a warning that cannot be acted on.
+  assert.ok(warnings.some((warning) => warning.message.includes(directory)),
+    `no warning named the directory left behind: ${warnings.map((w) => w.message)}`);
 });
 
 test("a driver that fails after starting a helper fails the call, and says how",
