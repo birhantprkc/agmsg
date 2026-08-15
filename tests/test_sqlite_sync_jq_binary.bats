@@ -253,7 +253,8 @@ STUB
 }
 
 @test "sync: concurrent probes in one process tree do not break each other (#829)" {
-  # THE DEFECT THE FIRST VERSION SHIPPED. The probe wrote jq's output to
+  # THE DEFECT AN EARLIER PUSHED HEAD CARRIED -- never landed, never released.
+  # That head's probe wrote jq's output to
   # `${TMPDIR}/agmsg-jq-probe.$$`. Inside a subshell `$$` is the PARENT's pid, so
   # concurrent sealers in one process tree shared that path: one removed the file
   # while another was still reading it, the read failed, and a perfectly good jq
