@@ -62,7 +62,7 @@ env:
   # binary, not whatever the feed is serving today (#824). Bumping this is one
   # cache miss and one trip to chocolatey, which is the only time the community
   # feed is asked at all.
-  WINDOWS_SQLITE_VERSION: '0.0.0-probe-824'   # PROBE 2: reverted in the next commit
+  WINDOWS_SQLITE_VERSION: '0.0.0-probe-824b'  # PROBE 2b: reverted in the next commit
 
 jobs:
   # Cheap gate: is this PR's diff entirely documentation? Pushes to main always
