@@ -2221,14 +2221,23 @@ test("a cleanup that cannot remove the staged input says so, and does not fail t
     return;
   }
   const parent = await mkdtemp(join(tmpdir(), "agmsg-sync-stuck-"));
-  const directory = join(parent, "agmsg-driver-input-stuck");
+  // NOT named `agmsg-driver-input-*`. That prefix is what the residue test
+  // counts, and a fixture standing in the middle of another test's instrument
+  // is a fixture that can fail it -- or, worse, hide a real leak inside its own
+  // noise. What is under test here is the helper, which takes any path.
+  const directory = join(parent, "refuses-removal");
   await mkdir(directory);
-  await writeFile(join(directory, "input.jsonl"), "{\"a\":1}\n");
+  const staged = join(directory, "input.jsonl");
+  await writeFile(staged, "{\"a\":1}\n");
   // Not writable, so the file inside it cannot be unlinked and the recursive
   // removal has to fail.
   await chmod(directory, 0o500);
+  // And put it back afterwards, all of it. This test's whole subject is content
+  // left on disk when a removal fails; leaving that content on disk would be an
+  // odd way to make the point, and the run after this one inherits it.
   t.after(async () => {
     await chmod(directory, 0o700).catch(() => {});
+    await rm(parent, { recursive: true, force: true }).catch(() => {});
   });
 
   const warnings = [];
