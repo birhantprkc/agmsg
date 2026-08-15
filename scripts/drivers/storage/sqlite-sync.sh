@@ -81,12 +81,54 @@ _sqlite_sync_sequence() {
   [ "$(_sqlite_sync_decimal_le "$1" 9223372036854775807)" = 1 ]
 }
 
+
+# `jq -b` IS REQUIRED HERE, AND THE REQUIREMENT FAILS CLOSED (#829).
+#
+# A native Windows jq opens stdout in text mode, so every line it prints ends
+# CRLF. Two values this driver sends ride out of a final-stage `jq … | @tsv`
+# read by `while IFS=$'\t' read -r`: `read` consumes the LF, `IFS` has no CR,
+# so the CR sticks to the LAST field -- the message `wire_id` and the base64
+# envelope `blob`. The server then answers HTTP 400. Measured on the reporting
+# machine: `hex(wire_id)` and `hex(blob)` both end `0D`, and stripping that byte
+# and resending produces `push.ack … stored`.
+#
+# `-b` is jq's own answer to this and the manual names this exact case. It is
+# the short form on purpose: `--binary` is rejected by jq-1.7.1-apple (measured:
+# rc 2, same as an unknown option), while `-b` is accepted there and on the
+# reporting machine's jq 1.8.2.
+#
+# REFUSING IS THE POINT. This repository checks that jq EXISTS and never that it
+# is a particular version -- `doctor` does not look at jq at all -- so there is
+# no floor to lean on. A jq without `-b` would exit 2 on every call, which is a
+# failure either way; saying so by name here is the difference between "the sync
+# is broken" and "this jq cannot do binary output". Falling back to stripping CR
+# afterwards is deliberately NOT offered: it guesses at which CRs were added,
+# and the guess is wrong for any value that legitimately ends a line with one.
+_AGMSG_JQ_BINARY_OK=""
+_sqlite_sync_require_jq_binary() {
+  case "$_AGMSG_JQ_BINARY_OK" in
+    yes) return 0 ;;
+    no)  return 1 ;;
+  esac
+  if printf '{}\n' | jq -b -r 'empty' >/dev/null 2>&1; then
+    _AGMSG_JQ_BINARY_OK=yes
+    return 0
+  fi
+  _AGMSG_JQ_BINARY_OK=no
+  echo "agmsg: Stage-1 sync requires a jq that supports -b (binary output)" >&2
+  echo "agmsg:   this jq: $(jq --version 2>/dev/null || echo 'unknown')" >&2
+  echo "agmsg:   without -b, a Windows jq emits CRLF and the trailing CR rides" >&2
+  echo "agmsg:   into the values this sends, which the server rejects (#829)." >&2
+  return 1
+}
+
 # <team> is the storage selector, threaded from the contract that called us.
 _sqlite_sync_schema() {
   command -v jq >/dev/null 2>&1 || {
     echo "agmsg: Stage-1 sync requires jq" >&2
     return 10
   }
+  _sqlite_sync_require_jq_binary || return 10
   storage_init "$1" >/dev/null || return 13
   local db generation
   db="$(_sqlite_db "$1")"
@@ -545,7 +587,7 @@ storage_sync_prepare_push() {
       seal_wire[$prepared]="$wire"; prepared=$((prepared + 1))
     done < <(paste <(printf '%s\n' "$uuids") \
                    <(printf '%s\n' "$rows" | jq -c 'select(.reserved==null)') \
-             | jq -rR 'split("\t") as $pair | ($pair[1] | fromjson) as $row
+             | jq -b -rR 'split("\t") as $pair | ($pair[1] | fromjson) as $row
                        | [$row.local_position, $row.local_id, $pair[0]] | @tsv')
     [ "$prepared" -eq "$pending" ] || return 13
     if [ -n "$key_id" ]; then q="'$(_sqlite_lit "$key_id")'"; else q="NULL"; fi
@@ -612,7 +654,7 @@ storage_sync_prepare_push() {
            projection:{body:$row.body,created_at:$created,
                        from_agent:$row.from_agent,to_agent:$row.to_agent}}' \
       | "$node_bin" "$cipher_helper" seal-batch "$pending" \
-      | jq -r --unbuffered --arg cipher "$cipher" --argjson key "$key_json" '
+      | jq -b -r --unbuffered --arg cipher "$cipher" --argjson key "$key_json" '
           select(.type=="sync_seal_result")
           | [(.index|tostring),
              (if .status=="ok" and .envelope.v==1 and .envelope.cipher==$cipher
