@@ -166,3 +166,228 @@ skip_if_root() {
   refute grep -qF "Nothing is syncing for this team" <<<"$output"
   refute grep -qF "could not start the sync engine" <<<"$output"
 }
+
+@test "sync start: the registry lock is free while readiness is still polled (#817)" {
+  # THE FIELD DEFECT, OBSERVED FROM OUTSIDE THE COMMAND.
+  #
+  # `cmd_sync_start` took the team's registry lock, started the engine, and then
+  # polled for a readiness marker while still holding it.
+  #
+  # The engine emits that marker BEFORE it asks for the same lock, so the order
+  # was never the problem -- an earlier version of this comment said it was. On
+  # the reporting machine the loop never reached the marker check:
+  # `_remote_sync_engine_status` answered `stale` for a pid this shell had just
+  # started (#652), so the condition short-circuited, and the ceiling it then ran
+  # to is counted in iterations rather than time (#779). The lock was held for
+  # all of it.
+  #
+  # #812 removed that direct cause. What this case pins is the contract, not the
+  # cure: the lock covers deciding whether to start and starting, and nothing
+  # after -- so a marker that is late or missing for any reason costs this caller
+  # its own wait and not the rest of the machine.
+  #
+  # So this asserts the property from outside: while the starter is STILL
+  # polling, the lock must not be held. Nothing here inspects the loop.
+  local lock="$TEST_SKILL_DIR/teams/testteam/.config.lock"
+  local pidfile="$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
+  local starter i=0 j=0 freed=0
+
+  bash "$SCRIPTS/remote.sh" sync start testteam >/dev/null 2>&1 &
+  starter=$!
+
+  # The engine existing is what says the START is over and the WAIT has begun.
+  while [ ! -f "$pidfile" ] && [ "$i" -lt 400 ]; do i=$((i + 1)); sleep 0.05; done
+  [ -f "$pidfile" ]
+
+  # Both halves in one condition, deliberately: a free lock AFTER the starter
+  # has returned proves nothing -- that is the old behaviour too. What has to
+  # hold is free WHILE it is still in there.
+  while [ "$j" -lt 60 ]; do
+    if [ ! -d "$lock" ] && kill -0 "$starter" 2>/dev/null; then freed=1; break; fi
+    j=$((j + 1)); sleep 0.05
+  done
+  [ "$freed" -eq 1 ]
+
+  kill "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null || true
+  wait "$starter" 2>/dev/null || true
+}
+
+@test "sync start: two at once leave exactly one engine, on the blind probe (#817, #652)" {
+  # THE INVARIANT THE EARLY RELEASE RESTS ON, DRIVEN ON THE PLATFORM THAT BREAKS IT.
+  #
+  # Letting go of the lock before the readiness wait is only safe because a
+  # second `sync start` reads `running` from `_remote_sync_engine_status` and
+  # returns without starting anything. That reading asks whether the pid is
+  # alive -- and on Windows the non-local probe cannot see a pid this shell
+  # minted (#652), so it answers `stale`, the second caller does NOT stop, and
+  # two engines end up running for one team.
+  #
+  # I asserted that invariant from reading the code and did not measure it on the
+  # platform that breaks it. Review caught that. So it is driven here rather than
+  # argued: `MSYSTEM` plus a `tasklist` that answers nothing is the condition
+  # #652 reproduces, and it runs on any host.
+  #
+  # A TEAM NAME NOBODY ELSE USES, because this test counts processes.
+  #
+  # It first counted with `pgrep -f "... --team testteam"`, which is machine-wide
+  # and names a team half this suite also uses: it counted -- and KILLED --
+  # engines belonging to other cases, other files and other shards. Scoping by
+  # `$TEST_SKILL_DIR` would not help either, since the store is passed in the
+  # environment and never appears in argv. The team name IS in argv, so making it
+  # unique makes every match this test's own (raised in review).
+  local team="lockrace817"
+  bash "$SCRIPTS/join.sh" "$team" alice claude-code /tmp/project-lockrace >/dev/null
+
+  local cfg="$TEST_SKILL_DIR/teams/$team/config.json" escaped updated
+  escaped="$(sed "s/'/''/g" "$cfg")"
+  updated="$(sqlite_mem "
+    SELECT json_set('$escaped', '\$.remote_binding', json_object(
+      'endpoint', 'https://remote.example',
+      'server_instance_id', '018f0000-0000-7000-8000-000000000001',
+      'remote_team_id', '018f0000-0000-7000-8000-000000000002',
+      'protocol_version', 1,
+      'capabilities', json_object('write_allowed_ciphers', json_array('none')),
+      'connected_at', '2026-07-30T00:00:00Z',
+      'disconnected_at', null
+    ));")"
+  printf '%s\n' "$updated" > "$cfg"
+
+  local pattern="remote-sync.mjs run --team $team"
+  # Nothing of this name may exist yet; if it does, the isolation is not real
+  # and every count below would be meaningless.
+  [ -z "$(pgrep -f "$pattern")" ]
+
+  local blind="$TEST_SKILL_DIR/blind-probe"
+  mkdir -p "$blind"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$blind/tasklist"
+  chmod +x "$blind/tasklist"
+
+  local pidfile="$TEST_SKILL_DIR/run/remote-sync.$team.pid"
+  local one two i=0 k=0 running=0
+
+  env PATH="$blind:$PATH" MSYSTEM=MINGW64 bash "$SCRIPTS/remote.sh" sync start "$team" >/dev/null 2>&1 &
+  one=$!
+  while [ ! -f "$pidfile" ] && [ "$i" -lt 400 ]; do i=$((i + 1)); sleep 0.05; done
+  [ -f "$pidfile" ]
+  env PATH="$blind:$PATH" MSYSTEM=MINGW64 bash "$SCRIPTS/remote.sh" sync start "$team" >/dev/null 2>&1 &
+  two=$!
+
+  # NOT waiting for either starter to return, deliberately. With the blind probe
+  # the readiness marker can never be satisfied, so each starter runs its whole
+  # 1600-turn loop -- minutes here, and the thing being measured is over long
+  # before that. A second engine, if it is going to exist, exists as soon as the
+  # second caller has decided; that decision is what this watches.
+  while [ "$k" -lt 60 ]; do
+    running="$(pgrep -f "$pattern" | wc -l | tr -d ' ')"
+    [ "$running" -gt 1 ] && break        # fail fast: the defect has happened
+    kill -0 "$two" 2>/dev/null || break  # the second caller is done deciding
+    k=$((k + 1)); sleep 0.05
+  done
+  running="$(pgrep -f "$pattern" | wc -l | tr -d ' ')"
+
+  # Counted by what is actually running rather than by what the pidfile says --
+  # the pidfile only ever names the most recent, which is how a second engine
+  # hides from anyone who asks the file. Everything torn down here carries this
+  # test's own team name, so nothing else on the machine is touched.
+  pkill -f "$pattern" 2>/dev/null || true
+  kill "$one" "$two" 2>/dev/null || true
+  wait "$one" "$two" 2>/dev/null || true
+
+  [ "$running" -le 1 ]
+}
+
+@test "sync start: a timed-out starter does not clear another engine's records (#817)" {
+  # THE CLEANUP AFTER THE WAIT WRITES SHARED STATE, and the early release means
+  # it can arrive to find that state belonging to somebody else.
+  #
+  # The pidfile and the cycle stamp are per team, not per caller. While this
+  # starter polls, another `sync start` may complete and record its own engine --
+  # and that pidfile is the only thing naming it.
+  #
+  # ORDER MATTERS HERE, and the first version got it wrong. It wrote the foreign
+  # pid while this starter's own engine was still alive, so
+  # `_remote_sync_engine_reap_owned` saw a record it could not prove was ours and
+  # returned non-zero -- the branch holding the removal was never entered, and
+  # the case passed with the guard removed too. Ending our own engine FIRST makes
+  # the reap succeed on its "already gone" path, which is the only way into the
+  # removal (raised in review).
+  local pidfile="$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
+  local cycles="$TEST_SKILL_DIR/run/remote-sync.testteam.cycles.json"
+  local starter engine foreign i=0
+
+  bash "$SCRIPTS/remote.sh" sync start testteam >/dev/null 2>&1 &
+  starter=$!
+  while [ ! -f "$pidfile" ] && [ "$i" -lt 400 ]; do i=$((i + 1)); sleep 0.05; done
+  [ -f "$pidfile" ]
+  engine="$(cat "$pidfile")"
+
+  # Our own engine ends first, so the reap reaches its success path.
+  kill "$engine" 2>/dev/null || true
+  i=0
+  while kill -0 "$engine" 2>/dev/null && [ "$i" -lt 200 ]; do i=$((i + 1)); sleep 0.05; done
+  refute kill -0 "$engine" 2>/dev/null
+
+  # Somebody else's engine, recorded while this starter is still polling. BOTH
+  # files, because the cleanup removes them on two separate lines and a control
+  # that watches one does not protect the other (raised in review).
+  sleep 300 &
+  foreign=$!
+  printf '%s\n' "$foreign" > "$pidfile"
+  printf '%s\n' "REPLACEMENT-CYCLE-STATE" > "$cycles"
+
+  wait "$starter" 2>/dev/null || true
+
+  # The record survives, and still names the other engine.
+  [ -f "$pidfile" ]
+  [ "$(cat "$pidfile")" = "$foreign" ]
+  # And so does the other half of it, byte for byte.
+  [ -f "$cycles" ]
+  [ "$(cat "$cycles")" = "REPLACEMENT-CYCLE-STATE" ]
+
+  kill "$foreign" 2>/dev/null || true
+  wait "$foreign" 2>/dev/null || true
+}
+
+@test "sync start: a cleanup that cannot retake the lock says so and keeps the record (#817)" {
+  # THE RETAKE, OBSERVED WHERE IT DIFFERS FROM NOT RETAKING.
+  #
+  # After the early release the timeout cleanup writes shared state, so it takes
+  # the lock back first. That is only distinguishable from not taking it when
+  # somebody else is holding it -- so a helper holds this team's lock for the
+  # whole window, and the starter has to arrive at its cleanup and find it taken.
+  #
+  # Our own engine is ended first for the same reason as the case above: it is
+  # the only way `_remote_sync_engine_reap_owned` reaches its success path, and
+  # therefore the only way the cleanup gets as far as the records.
+  local pidfile="$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
+  local lock="$TEST_SKILL_DIR/teams/testteam/.config.lock"
+  local cycles="$TEST_SKILL_DIR/run/remote-sync.testteam.cycles.json"
+  local starter engine i=0 err="$TEST_SKILL_DIR/retake.err"
+
+  bash "$SCRIPTS/remote.sh" sync start testteam >"$err" 2>&1 &
+  starter=$!
+  while [ ! -f "$pidfile" ] && [ "$i" -lt 400 ]; do i=$((i + 1)); sleep 0.05; done
+  [ -f "$pidfile" ]
+  engine="$(cat "$pidfile")"
+
+  # Somebody else takes the lock and keeps it. Held with mkdir directly, the way
+  # the library takes it, so no helper of ours has to survive the wait.
+  mkdir "$lock"
+  printf '%s\n' "KEPT-CYCLE-STATE" > "$cycles"
+
+  kill "$engine" 2>/dev/null || true
+  i=0
+  while kill -0 "$engine" 2>/dev/null && [ "$i" -lt 200 ]; do i=$((i + 1)); sleep 0.05; done
+
+  wait "$starter" 2>/dev/null || true
+
+  # 1. it said it could not retake, rather than clearing the records blind
+  grep -q 'could not retake the registry lock' "$err"
+  # 2. and BOTH records are still there. Two separate removals, two assertions:
+  # watching only the pidfile leaves the cycle line unguarded (raised in review).
+  [ -f "$pidfile" ]
+  [ -f "$cycles" ]
+  [ "$(cat "$cycles")" = "KEPT-CYCLE-STATE" ]
+
+  rmdir "$lock" 2>/dev/null || true
+}
