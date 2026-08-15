@@ -312,6 +312,7 @@ skip_if_root() {
   # the reap succeed on its "already gone" path, which is the only way into the
   # removal (raised in review).
   local pidfile="$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
+  local cycles="$TEST_SKILL_DIR/run/remote-sync.testteam.cycles.json"
   local starter engine foreign i=0
 
   bash "$SCRIPTS/remote.sh" sync start testteam >/dev/null 2>&1 &
@@ -326,16 +327,22 @@ skip_if_root() {
   while kill -0 "$engine" 2>/dev/null && [ "$i" -lt 200 ]; do i=$((i + 1)); sleep 0.05; done
   refute kill -0 "$engine" 2>/dev/null
 
-  # Somebody else's engine, recorded while this starter is still polling.
+  # Somebody else's engine, recorded while this starter is still polling. BOTH
+  # files, because the cleanup removes them on two separate lines and a control
+  # that watches one does not protect the other (raised in review).
   sleep 300 &
   foreign=$!
   printf '%s\n' "$foreign" > "$pidfile"
+  printf '%s\n' "REPLACEMENT-CYCLE-STATE" > "$cycles"
 
   wait "$starter" 2>/dev/null || true
 
   # The record survives, and still names the other engine.
   [ -f "$pidfile" ]
   [ "$(cat "$pidfile")" = "$foreign" ]
+  # And so does the other half of it, byte for byte.
+  [ -f "$cycles" ]
+  [ "$(cat "$cycles")" = "REPLACEMENT-CYCLE-STATE" ]
 
   kill "$foreign" 2>/dev/null || true
   wait "$foreign" 2>/dev/null || true
@@ -354,6 +361,7 @@ skip_if_root() {
   # therefore the only way the cleanup gets as far as the records.
   local pidfile="$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
   local lock="$TEST_SKILL_DIR/teams/testteam/.config.lock"
+  local cycles="$TEST_SKILL_DIR/run/remote-sync.testteam.cycles.json"
   local starter engine i=0 err="$TEST_SKILL_DIR/retake.err"
 
   bash "$SCRIPTS/remote.sh" sync start testteam >"$err" 2>&1 &
@@ -365,6 +373,7 @@ skip_if_root() {
   # Somebody else takes the lock and keeps it. Held with mkdir directly, the way
   # the library takes it, so no helper of ours has to survive the wait.
   mkdir "$lock"
+  printf '%s\n' "KEPT-CYCLE-STATE" > "$cycles"
 
   kill "$engine" 2>/dev/null || true
   i=0
@@ -374,8 +383,11 @@ skip_if_root() {
 
   # 1. it said it could not retake, rather than clearing the records blind
   grep -q 'could not retake the registry lock' "$err"
-  # 2. and the record is still there
+  # 2. and BOTH records are still there. Two separate removals, two assertions:
+  # watching only the pidfile leaves the cycle line unguarded (raised in review).
   [ -f "$pidfile" ]
+  [ -f "$cycles" ]
+  [ "$(cat "$cycles")" = "KEPT-CYCLE-STATE" ]
 
   rmdir "$lock" 2>/dev/null || true
 }
