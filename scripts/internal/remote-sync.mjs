@@ -1522,6 +1522,25 @@ async function health(serverUrl, teamId) {
     throw error;
   }
   if (response.headers.get("agmsg-protocol-version") !== PROTOCOL) {
+    // AN ERROR PAGE IS NOT A PROTOCOL MISMATCH.
+    //
+    // A gateway that is down answers 502/503/504 with its own body and none of
+    // our headers, so the version check fails for a reason that has nothing to
+    // do with versions. `request()` already draws this line and names it
+    // "intermediary failure"; this function did not, and this is the one the
+    // engine's loop calls every cycle — so a 90-second outage ended both
+    // engines permanently and silently, and the remote recovering did not
+    // bring them back (#814).
+    //
+    // The distinction is what makes this safe: a 200 whose header says a
+    // different version IS a real mismatch and must still be fatal. Only an
+    // unsuccessful 502/503/504 is treated as weather.
+    if (!response.ok && [502, 503, 504].includes(response.status)) {
+      const error = new Error(`HTTP ${response.status} intermediary failure`);
+      error.status = response.status;
+      error.retryable = true;
+      throw error;
+    }
     throw new Error("health protocol version mismatch");
   }
   const body = await response.json();
