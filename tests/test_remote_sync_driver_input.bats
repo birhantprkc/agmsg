@@ -19,6 +19,13 @@
   run node --test \
     --test-name-pattern 'whole input, from the start|leaves nothing behind' \
     "$BATS_TEST_DIRNAME/remote_sync_engine.test.mjs"
+  # The whole captured output on failure, to fd 3, because bats truncates its
+  # own "Last output" and the first failure of this leg was unreadable for
+  # exactly that reason -- a Windows-only failure with its assertion cut off is
+  # a leg that tells you it broke and not what broke.
+  if [ "$status" -ne 0 ]; then
+    printf '%s\n' "$output" >&3
+  fi
   [ "$status" -eq 0 ]
   # A pattern that selects nothing exits 0 with nothing run, which is precisely
   # the shape of a leg that looks green because it never happened. So the count

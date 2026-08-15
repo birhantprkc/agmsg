@@ -2070,11 +2070,29 @@ printf '{"ok":true}\\n'
   const descriptors = () => {
     try { return readdirSync("/dev/fd").length; } catch { return null; }
   };
+  // Sequential, and driven directly rather than through the pid fixture. That
+  // fixture waits for every driver to record a pid before it returns, and 24
+  // bash processes at once is a lot to ask of a Windows runner -- a timeout
+  // there would fail this test for the runner's speed rather than for a leak,
+  // which is the wrong thing for it to be sensitive to.
+  const okDriver = join(root, "ok-driver.sh");
+  await writeFile(okDriver,
+    "#!/usr/bin/env bash\ncat > /dev/null\nprintf '{\"ok\":true}\\n'\n",
+    { mode: 0o700 });
+  const previousRosterDriver = process.env.AGMSG_SYNC_ROSTER_DRIVER;
+  process.env.AGMSG_SYNC_ROSTER_DRIVER = okDriver;
+  t.after(() => {
+    if (previousRosterDriver === undefined) delete process.env.AGMSG_SYNC_ROSTER_DRIVER;
+    else process.env.AGMSG_SYNC_ROSTER_DRIVER = previousRosterDriver;
+  });
+  const config = {
+    local_team: "residue", server_instance_id: "018f0000-0000-7000-8000-000000000001",
+    remote_team_id: "018f0000-0000-7000-8000-000000000002", protocol_version: 1,
+  };
   const openBefore = descriptors();
-  const { started: fine } = await withDriverEnvironment(t, root, ok,
-    (mock, config) => Array.from({ length: 24 },
-      () => () => rosterDriver("apply", config, input)));
-  for (const { promise } of fine) await promise;
+  for (let attempt = 0; attempt < 24; attempt += 1) {
+    await rosterDriver("apply", config, input);
+  }
   assert.equal(await residue(), before, "a successful call left its input behind");
   if (openBefore !== null) {
     // A bound, not equality: this process has descriptors of its own. Twenty-
