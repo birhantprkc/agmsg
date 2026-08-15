@@ -125,24 +125,30 @@ _sqlite_sync_require_jq_binary() {
     yes) return 0 ;;
     no)  _sqlite_sync_jq_binary_refusal; return 1 ;;
   esac
-  local probe="" status=1 out="${TMPDIR:-/tmp}/agmsg-jq-probe.$$"
-  # BOTH HALVES: the bytes AND jq's own exit status.
+  local probe="" ok=""
+  # BOTH HALVES, AND NO SHARED FILE.
   #
   # Probing with `jq -b -r 'empty'` tested option parsing only -- it emits
   # nothing, so a jq that accepts `-b` and still writes CRLF passed. Reading a
-  # sentinel fixes that half. The other half is that a jq can print the right
-  # bytes and still fail; observed through a process substitution, that status is
-  # unreachable, and the probe would cache `yes` for a jq that exited non-zero
-  # (raised in review). So the output goes to a file, the status is taken from
-  # the pipeline, and the bytes are read back afterwards.
+  # sentinel fixes that half; the other half is that a jq can print the right
+  # bytes and still fail, and through a process substitution that status is
+  # unreachable (both raised in review).
   #
-  # Read with `read`, never through `$( )`: command substitution on MSYS drops
-  # the final CR, which is exactly the byte this is looking for.
-  printf '{}\n' | jq -b -r '"agmsg-probe"' > "$out" 2>/dev/null
-  status=$?
-  IFS= read -r probe < "$out" 2>/dev/null || probe=""
-  if command -v rm >/dev/null 2>&1; then rm -f "$out"; fi
-  if [ "$status" -eq 0 ] && [ "$probe" = "agmsg-probe" ]; then
+  # The first attempt at getting both wrote jq's output to
+  # `${TMPDIR}/agmsg-jq-probe.$$` and took the status from the pipeline. `$$` is
+  # the PARENT's pid inside a subshell, so concurrent sealers in one process tree
+  # shared that path: one removed it while another was still reading, and the
+  # driver refused a jq that was fine. `concurrent age-v1 sealers` caught it.
+  # This is the same reasoning about `$$` that was wrong once already (#804).
+  #
+  # So the status travels in the stream instead of in a file. jq writes the
+  # sentinel; `&&` appends a second line only if jq exited 0. Two `read`s, no
+  # shared name, nothing to clean up -- and still `read` rather than `$( )`,
+  # because command substitution on MSYS drops the byte this is looking for.
+  { IFS= read -r probe; IFS= read -r ok; } < <(
+    printf '{}\n' | { jq -b -r '"agmsg-probe"' && printf 'agmsg-ok\n'; } 2>/dev/null
+  )
+  if [ "$probe" = "agmsg-probe" ] && [ "$ok" = "agmsg-ok" ]; then
     _AGMSG_JQ_BINARY_OK=yes
     return 0
   fi

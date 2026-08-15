@@ -251,3 +251,30 @@ STUB
   echo "$output" | grep -q 'first: agmsg: sending requires a jq whose -b'
   echo "$output" | grep -q 'second: agmsg: sending requires a jq whose -b'
 }
+
+@test "sync: concurrent probes in one process tree do not break each other (#829)" {
+  # THE DEFECT THE FIRST VERSION SHIPPED. The probe wrote jq's output to
+  # `${TMPDIR}/agmsg-jq-probe.$$`. Inside a subshell `$$` is the PARENT's pid, so
+  # concurrent sealers in one process tree shared that path: one removed the file
+  # while another was still reading it, the read failed, and a perfectly good jq
+  # was refused. `concurrent age-v1 sealers publish one transaction winner`
+  # turned red on it in CI.
+  #
+  # Same shape as the `$$` reasoning that was already wrong once in #804. The
+  # probe carries no shared name now, and this holds it there.
+  run bash -c '
+    . "$1/drivers/storage/sqlite-sync.sh"
+    rc=0
+    for _ in 1 2 3 4 5 6 7 8; do
+      ( _sqlite_sync_require_jq_binary ) || rc=1 &
+    done
+    wait
+    exit "$rc"
+  ' _ "$SCRIPTS"
+
+  # Every one of them accepted the same real jq. A shared path shows up here as
+  # an intermittent refusal, which is what it did on the runner.
+  [ "$status" -eq 0 ]
+  # And nothing was said, because nothing was wrong.
+  [ -z "$output" ]
+}
