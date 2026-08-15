@@ -2441,6 +2441,64 @@ test("age configure extends a stored chain and activates its announced epoch", a
   });
 });
 
+test("health treats a 503 error page as weather, not a protocol mismatch (#814)", async () => {
+  // A gateway that is down answers 502/503/504 with its own body and none of
+  // our headers, so the version check fails for a reason that has nothing to do
+  // with versions. `request()` already drew this line; `health()` did not — and
+  // `health()` is what the engine's loop calls every cycle, so a 90-second
+  // outage ended both engines on a live two-machine setup, permanently and
+  // silently. The remote recovered; they did not.
+  const previousFetch = globalThis.fetch;
+  await withConnectedCredential(async (root) => {
+    await writeConnectedTeam(root, { capabilities: { write_allowed_ciphers: ["none"] } });
+    globalThis.fetch = async () =>
+      new Response("<html>503 Service Unavailable</html>",
+        { status: 503, headers: { "Content-Type": "text/html" } });
+    try {
+      await assert.rejects(
+        configure({ team: "demo", server: "https://sync.example",
+          "team-id": config.remote_team_id, "minimum-security": "plaintext-allowed" }),
+        (error) => {
+          // Retryable is the whole point: the loop keeps the engine alive and
+          // the machine comes back on its own when the remote does.
+          assert.equal(error.retryable, true, "a 503 error page must be retryable");
+          assert.equal(error.status, 503);
+          return true;
+        });
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+});
+
+test("health still refuses a 200 that names a different protocol version (#814)", async () => {
+  // The other half, and the reason the fix is a narrowed guard rather than
+  // "retry everything": a successful response whose header says another version
+  // IS a real mismatch. Making the first case retryable must not make this one
+  // retryable too — one condition covering both cases is what the defect was.
+  const previousFetch = globalThis.fetch;
+  await withConnectedCredential(async (root) => {
+    await writeConnectedTeam(root, { capabilities: { write_allowed_ciphers: ["none"] } });
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ status: "ok", database: "ok",
+        server_instance_id: config.server_instance_id,
+        team_id: config.remote_team_id }),
+        { status: 200, headers: { "Agmsg-Protocol-Version": "999" } });
+    try {
+      await assert.rejects(
+        configure({ team: "demo", server: "https://sync.example",
+          "team-id": config.remote_team_id, "minimum-security": "plaintext-allowed" }),
+        (error) => {
+          assert.notEqual(error.retryable, true,
+            "a 200 with a different protocol version must NOT be retryable");
+          return /protocol version mismatch/u.test(error.message);
+        });
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+});
+
 test("configured native identity must belong to its epoch recipient manifest", async () => {
   const root = await mkdtemp(join(tmpdir(), "agmsg-age-identity-"));
   const identity = join(root, "identity");
