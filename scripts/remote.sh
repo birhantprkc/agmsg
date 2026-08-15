@@ -1726,11 +1726,17 @@ _remote_sync_engine_status() {
     return
   fi
   command="$(compat_get_cmdline "$pid" 2>/dev/null || true)"
-  expected="$SCRIPT_DIR/internal/remote-sync.mjs run --team $team"
-  case "$command" in
-    *"$expected") printf 'running\t%s\n' "$pid" ;;
-    *) printf 'stale\t%s\n' "$pid" ;;
-  esac
+  # Two conditions where there was one suffix match, and neither one is written
+  # in a path alphabet: the cmdline has to NAME the engine script -- asked
+  # through the comparator, which knows the OS may spell that path its own way
+  # (#652) -- and it has to END with this team's arguments, which is what kept
+  # another team's engine from answering for this one.
+  if agmsg_cmdline_names_path "$command" "$SCRIPT_DIR/internal/remote-sync.mjs" &&
+     case "$command" in *" run --team $team") true ;; *) false ;; esac; then
+    printf 'running\t%s\n' "$pid"
+  else
+    printf 'stale\t%s\n' "$pid"
+  fi
 }
 
 _remote_sync_engine_reap_owned() {

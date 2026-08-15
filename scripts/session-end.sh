@@ -62,10 +62,9 @@ if [ -f "$PIDFILE" ]; then
     # watch.sh. Pids can be recycled — a stale pidfile could point at an
     # unrelated process that took the same pid.
     cmd=$(compat_get_cmdline "$pid" 2>/dev/null || true)
-    case "$cmd" in
-      *"$SKILL_DIR/scripts/watch.sh"*) kill "$pid" 2>/dev/null || true ;;
-      *) ;;
-    esac
+    if agmsg_cmdline_names_path "$cmd" "$SKILL_DIR/scripts/watch.sh"; then
+      kill "$pid" 2>/dev/null || true
+    fi
   fi
   rm -f "$PIDFILE"
 fi
