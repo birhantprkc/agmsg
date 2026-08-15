@@ -204,3 +204,75 @@ skip_if_root() {
   kill "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null || true
   wait "$starter" 2>/dev/null || true
 }
+
+@test "sync start: two at once leave exactly one engine, on the blind probe (#817, #652)" {
+  # THE INVARIANT THE EARLY RELEASE RESTS ON, DRIVEN ON THE PLATFORM THAT BREAKS IT.
+  #
+  # Letting go of the lock before the readiness wait is only safe because a
+  # second `sync start` reads `running` from `_remote_sync_engine_status` and
+  # returns without starting anything. That reading asks whether the pid is
+  # alive -- and on Windows the non-local probe cannot see a pid this shell
+  # minted (#652), so it answers `stale`, the second caller does NOT stop, and
+  # two engines end up running for one team.
+  #
+  # I asserted that invariant from reading the code and did not measure it on the
+  # platform that breaks it. Review caught that. So it is driven here rather than
+  # argued: `MSYSTEM` plus a `tasklist` that answers nothing is the condition
+  # #652 reproduces, and it runs on any host.
+  # FROM A KNOWN STATE, because this test COUNTS.
+  #
+  # Earlier cases in this file start real engines for this same team, and the
+  # count below would include them -- so the first draft passed alone and failed
+  # in the full file. Worse than flaky: a surviving engine makes the second
+  # `sync start` read `running` from the PIDFILE and return, which hides exactly
+  # the defect this exists to catch. The fixture stood inside its own instrument.
+  pkill -f "remote-sync.mjs run --team testteam" 2>/dev/null || true
+  rm -f "$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
+  local settle=0
+  while [ "$settle" -lt 100 ]; do
+    [ -z "$(pgrep -f "remote-sync.mjs run --team testteam")" ] && break
+    settle=$((settle + 1)); sleep 0.05
+  done
+  [ -z "$(pgrep -f "remote-sync.mjs run --team testteam")" ]
+
+  local blind="$TEST_SKILL_DIR/blind-probe"
+  mkdir -p "$blind"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$blind/tasklist"
+  chmod +x "$blind/tasklist"
+
+  local pidfile="$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
+  local one two
+
+  env PATH="$blind:$PATH" MSYSTEM=MINGW64 bash "$SCRIPTS/remote.sh" sync start testteam >/dev/null 2>&1 &
+  one=$!
+  # The second starts once the first has an engine -- which is exactly the
+  # window the early release opens, and the window this has to be safe in.
+  local i=0
+  while [ ! -f "$pidfile" ] && [ "$i" -lt 400 ]; do i=$((i + 1)); sleep 0.05; done
+  [ -f "$pidfile" ]
+  env PATH="$blind:$PATH" MSYSTEM=MINGW64 bash "$SCRIPTS/remote.sh" sync start testteam >/dev/null 2>&1 &
+  two=$!
+
+  # NOT waiting for either starter to return, deliberately. With the blind probe
+  # in place the readiness marker can never be satisfied, so each starter runs
+  # its whole 1600-turn loop -- minutes here, and the thing being measured is
+  # over long before that. A second engine, if it is going to exist, exists as
+  # soon as the second caller has decided; that decision is what this watches.
+  local k=0 running=0
+  while [ "$k" -lt 60 ]; do
+    running="$(pgrep -f "remote-sync.mjs run --team testteam" | wc -l | tr -d ' ')"
+    [ "$running" -gt 1 ] && break        # fail fast: the defect has happened
+    kill -0 "$two" 2>/dev/null || break  # the second caller is done deciding
+    k=$((k + 1)); sleep 0.05
+  done
+  running="$(pgrep -f "remote-sync.mjs run --team testteam" | wc -l | tr -d ' ')"
+
+  # Counted by what is actually running rather than by what the pidfile says --
+  # the pidfile only ever names the most recent, which is how a second engine
+  # hides from anyone who asks the file.
+  pkill -f "remote-sync.mjs run --team testteam" 2>/dev/null || true
+  kill "$one" "$two" 2>/dev/null || true
+  wait "$one" "$two" 2>/dev/null || true
+
+  [ "$running" -le 1 ]
+}
