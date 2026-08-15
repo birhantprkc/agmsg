@@ -295,21 +295,29 @@ skip_if_root() {
   #
   # The pidfile and the cycle stamp are per team, not per caller. While this
   # starter polls, another `sync start` may complete and record its own engine --
-  # and that pidfile is the only thing naming it. Retaking the lock stops the
-  # file changing under the removal; it does not make the file this call's to
-  # remove. Both are needed, and this drives the second.
+  # and that pidfile is the only thing naming it.
   #
-  # The other starter is simulated rather than run: what matters to the code
-  # under test is a pidfile naming a pid that is not the one it started, which
-  # is exactly what a completed second start leaves. Running a real one would
-  # need the blind probe, and with it a second 1600-turn wait.
+  # ORDER MATTERS HERE, and the first version got it wrong. It wrote the foreign
+  # pid while this starter's own engine was still alive, so
+  # `_remote_sync_engine_reap_owned` saw a record it could not prove was ours and
+  # returned non-zero -- the branch holding the removal was never entered, and
+  # the case passed with the guard removed too. Ending our own engine FIRST makes
+  # the reap succeed on its "already gone" path, which is the only way into the
+  # removal (raised in review).
   local pidfile="$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
-  local starter foreign i=0
+  local starter engine foreign i=0
 
   bash "$SCRIPTS/remote.sh" sync start testteam >/dev/null 2>&1 &
   starter=$!
   while [ ! -f "$pidfile" ] && [ "$i" -lt 400 ]; do i=$((i + 1)); sleep 0.05; done
   [ -f "$pidfile" ]
+  engine="$(cat "$pidfile")"
+
+  # Our own engine ends first, so the reap reaches its success path.
+  kill "$engine" 2>/dev/null || true
+  i=0
+  while kill -0 "$engine" 2>/dev/null && [ "$i" -lt 200 ]; do i=$((i + 1)); sleep 0.05; done
+  refute kill -0 "$engine" 2>/dev/null
 
   # Somebody else's engine, recorded while this starter is still polling.
   sleep 300 &
