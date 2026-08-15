@@ -2221,6 +2221,14 @@ test("a cleanup that cannot remove the staged input says so, and does not fail t
     return;
   }
   const parent = await mkdtemp(join(tmpdir(), "agmsg-sync-stuck-"));
+  // Registered against the parent the moment it exists, before anything below
+  // can throw. Hooking cleanup up only once the fixture is fully built means
+  // the half-built cases -- the ones a failure actually produces -- are the
+  // ones that leak.
+  t.after(async () => {
+    await chmod(join(parent, "refuses-removal"), 0o700).catch(() => {});
+    await rm(parent, { recursive: true, force: true }).catch(() => {});
+  });
   // NOT named `agmsg-driver-input-*`. That prefix is what the residue test
   // counts, and a fixture standing in the middle of another test's instrument
   // is a fixture that can fail it -- or, worse, hide a real leak inside its own
@@ -2232,23 +2240,28 @@ test("a cleanup that cannot remove the staged input says so, and does not fail t
   // Not writable, so the file inside it cannot be unlinked and the recursive
   // removal has to fail.
   await chmod(directory, 0o500);
-  // And put it back afterwards, all of it. This test's whole subject is content
-  // left on disk when a removal fails; leaving that content on disk would be an
-  // odd way to make the point, and the run after this one inherits it.
-  t.after(async () => {
-    await chmod(directory, 0o700).catch(() => {});
-    await rm(parent, { recursive: true, force: true }).catch(() => {});
-  });
+  // Everything comes back afterwards -- see the hook above, registered before
+  // this could throw. This test's whole subject is content left on disk when a
+  // removal fails; leaving that content on disk would be an odd way to make
+  // the point, and the run after this one inherits it.
 
   const warnings = [];
   const collect = (warning) => warnings.push(warning);
   process.on("warning", collect);
-  // Must not throw. That is half the contract and it is asserted by being here
-  // at all -- a throw fails this test on the line above the assertions.
-  discardInputDirectory(directory, "the driver call ended");
-  // emitWarning is delivered on the next tick.
-  await new Promise((resolve) => setImmediate(resolve));
-  process.off("warning", collect);
+  try {
+    // Must not throw. That is half the contract, and it is asserted by this
+    // call standing here: a throw propagates out of the finally and fails the
+    // test before it can reach the assertion below.
+    discardInputDirectory(directory, "the driver call ended");
+    // emitWarning is delivered on the next tick.
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    // In a finally, not on the straight line. A regression that makes the
+    // helper throw would otherwise leave this listener attached for the rest
+    // of the file -- so the first failure would be followed by a second,
+    // unrelated one, in whichever test happens to warn next.
+    process.off("warning", collect);
+  }
 
   // The directory itself, because that is the one thing an operator needs in
   // order to go and remove it. A warning that says "cleanup failed" and not
