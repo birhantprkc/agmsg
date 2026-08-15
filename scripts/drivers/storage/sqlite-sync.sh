@@ -81,6 +81,82 @@ _sqlite_sync_sequence() {
   [ "$(_sqlite_sync_decimal_le "$1" 9223372036854775807)" = 1 ]
 }
 
+
+# `jq -b` IS REQUIRED HERE, AND THE REQUIREMENT FAILS CLOSED (#829).
+#
+# A native Windows jq opens stdout in text mode, so every line it prints ends
+# CRLF. Two values this driver sends ride out of a final-stage `jq … | @tsv`
+# read by `while IFS=$'\t' read -r`: `read` consumes the LF, `IFS` has no CR,
+# so the CR sticks to the LAST field -- the message `wire_id` and the base64
+# envelope `blob`. The server then answers HTTP 400. Measured on the reporting
+# machine: `hex(wire_id)` and `hex(blob)` both end `0D`, and stripping that byte
+# and resending produces `push.ack … stored`.
+#
+# `-b` is jq's own answer to this and the manual names this exact case. It is
+# the short form on purpose: `--binary` is rejected by jq-1.7.1-apple (measured:
+# rc 2, same as an unknown option), while `-b` is accepted there and on the
+# reporting machine's jq 1.8.2.
+#
+# REFUSING IS THE POINT. This repository checks that jq EXISTS and never that it
+# is a particular version -- `doctor` does not look at jq at all -- so there is
+# no floor to lean on. A jq without `-b` would exit 2 on every call, which is a
+# failure either way; saying so by name here is the difference between "the sync
+# is broken" and "this jq cannot do binary output". Falling back to stripping CR
+# afterwards is deliberately NOT offered: it guesses at which CRs were added,
+# and the guess is wrong for any value that legitimately ends a line with one.
+_AGMSG_JQ_BINARY_OK=""
+
+# Said every time it refuses, not only the first time (#829, raised in review).
+#
+# The result is cached because the probe costs a process, but a cached NO used to
+# `return 1` in silence: the first push in a long-lived shell explained itself and
+# every push after it just failed. A caller that retries -- which is what the
+# engine does on its cycle -- would see one sentence and then nothing, and the
+# one sentence scrolls away.
+_sqlite_sync_jq_binary_refusal() {
+  echo "agmsg: sending requires a jq whose -b (binary output) produces LF-terminated lines" >&2
+  echo "agmsg:   this jq: $(jq --version 2>/dev/null || echo 'unknown')" >&2
+  echo "agmsg:   a Windows jq without it emits CRLF, and the trailing CR rides into" >&2
+  echo "agmsg:   the values this sends, which the server rejects (#829)." >&2
+}
+
+_sqlite_sync_require_jq_binary() {
+  case "$_AGMSG_JQ_BINARY_OK" in
+    yes) return 0 ;;
+    no)  _sqlite_sync_jq_binary_refusal; return 1 ;;
+  esac
+  local probe="" ok=""
+  # BOTH HALVES, AND NO SHARED FILE.
+  #
+  # Probing with `jq -b -r 'empty'` tested option parsing only -- it emits
+  # nothing, so a jq that accepts `-b` and still writes CRLF passed. Reading a
+  # sentinel fixes that half; the other half is that a jq can print the right
+  # bytes and still fail, and through a process substitution that status is
+  # unreachable (both raised in review).
+  #
+  # The first attempt at getting both wrote jq's output to
+  # `${TMPDIR}/agmsg-jq-probe.$$` and took the status from the pipeline. `$$` is
+  # the PARENT's pid inside a subshell, so concurrent sealers in one process tree
+  # shared that path: one removed it while another was still reading, and the
+  # driver refused a jq that was fine. `concurrent age-v1 sealers` caught it.
+  # This is the same reasoning about `$$` that was wrong once already (#804).
+  #
+  # So the status travels in the stream instead of in a file. jq writes the
+  # sentinel; `&&` appends a second line only if jq exited 0. Two `read`s, no
+  # shared name, nothing to clean up -- and still `read` rather than `$( )`,
+  # because command substitution on MSYS drops the byte this is looking for.
+  { IFS= read -r probe; IFS= read -r ok; } < <(
+    printf '{}\n' | { jq -b -r '"agmsg-probe"' && printf 'agmsg-ok\n'; } 2>/dev/null
+  )
+  if [ "$probe" = "agmsg-probe" ] && [ "$ok" = "agmsg-ok" ]; then
+    _AGMSG_JQ_BINARY_OK=yes
+    return 0
+  fi
+  _AGMSG_JQ_BINARY_OK=no
+  _sqlite_sync_jq_binary_refusal
+  return 1
+}
+
 # <team> is the storage selector, threaded from the contract that called us.
 _sqlite_sync_schema() {
   command -v jq >/dev/null 2>&1 || {
@@ -460,6 +536,12 @@ storage_sync_prepare_push() {
   case "$limit" in ''|*[!0-9]*) return 13 ;; esac
   [ "$limit" -ge 1 ] && [ "$limit" -le 1000 ] || return 13
   _sqlite_sync_schema "$team" || return $?
+  # HERE, NOT IN THE SCHEMA. `_sqlite_sync_schema` gates every Stage-1 call, so
+  # requiring `-b` there refused receiving and status as well -- on a POSIX jq
+  # that never needed binary stdout. The defect this closes is "can receive but
+  # never send", and this is the only path that produces the two values the CR
+  # rides on. Placed before anything is reserved or written (raised in review).
+  _sqlite_sync_require_jq_binary || return 10
 
   local prepare generation db tl input_ok version cipher key_json key_id recipients max_blob allow_new
   prepare=$(cat)
@@ -545,7 +627,7 @@ storage_sync_prepare_push() {
       seal_wire[$prepared]="$wire"; prepared=$((prepared + 1))
     done < <(paste <(printf '%s\n' "$uuids") \
                    <(printf '%s\n' "$rows" | jq -c 'select(.reserved==null)') \
-             | jq -rR 'split("\t") as $pair | ($pair[1] | fromjson) as $row
+             | jq -b -rR 'split("\t") as $pair | ($pair[1] | fromjson) as $row
                        | [$row.local_position, $row.local_id, $pair[0]] | @tsv')
     [ "$prepared" -eq "$pending" ] || return 13
     if [ -n "$key_id" ]; then q="'$(_sqlite_lit "$key_id")'"; else q="NULL"; fi
@@ -612,7 +694,7 @@ storage_sync_prepare_push() {
            projection:{body:$row.body,created_at:$created,
                        from_agent:$row.from_agent,to_agent:$row.to_agent}}' \
       | "$node_bin" "$cipher_helper" seal-batch "$pending" \
-      | jq -r --unbuffered --arg cipher "$cipher" --argjson key "$key_json" '
+      | jq -b -r --unbuffered --arg cipher "$cipher" --argjson key "$key_json" '
           select(.type=="sync_seal_result")
           | [(.index|tostring),
              (if .status=="ok" and .envelope.v==1 and .envelope.cipher==$cipher
