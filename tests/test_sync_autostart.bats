@@ -397,3 +397,32 @@ write_fake_remote() {
 #
 # Recorded rather than silently dropped, because "there used to be a check"
 # reads as an oversight to whoever finds this next.
+
+@test "a team whose temp file cannot be made is reported, and the rest are still tried (#810)" {
+  # `mktemp` failing is a start that did not happen, and #761/#765 exist so
+  # that a start that did not happen is never silent. Before this, the function
+  # returned early: no engine, NO OUTPUT — the started/slow/failed blocks are
+  # built after the loop — and every team after this one abandoned untried.
+  #
+  # Driven by putting `mktemp` on PATH as a command that fails, which is what
+  # a full or unwritable temp filesystem looks like from inside this function.
+  source "$SCRIPTS/lib/sync-autostart.sh"
+  local bindir="$TEST_SKILL_DIR/failing-bin"
+  mkdir -p "$bindir"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' > "$bindir/mktemp"
+  chmod +x "$bindir/mktemp"
+
+  local fake; fake="$(write_answering_remote started)"
+  PATH="$bindir:$PATH" run agmsg_sync_autostart "$fake" teamone teamtwo
+  [ "$status" -eq 0 ]
+
+  # Said, in the #765 block, with its runnable remedy.
+  printf '%s' "$output" | grep -q 'connected, but not syncing'
+  printf '%s' "$output" | grep -q 'temporary file'
+  # BOTH teams: the second must not be abandoned because the first could not
+  # allocate. That is what `return` did and `continue` does not.
+  printf '%s' "$output" | grep -q 'teamone'
+  printf '%s' "$output" | grep -q 'teamtwo'
+  # The remedy is per team and runnable, unchanged from #765.
+  printf '%s' "$output" | grep -q 'sync start'
+}

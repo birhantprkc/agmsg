@@ -90,8 +90,29 @@ agmsg_sync_autostart() {
     # reaping rule — seven review rounds of machinery to make a lookup safe
     # that the thing it protected against no longer needs. Reading the engine
     # is what settled it, not the review count.
+    # A START THAT DID NOT HAPPEN IS A FAILED START, AND IS SAID SO (#810).
+    #
+    # This used to `return 0` here. Three things went with it: no engine was
+    # started, NOTHING was printed — the started/slow/failed blocks are all
+    # built after the loop, so leaving early skips every one of them — and the
+    # teams after this one were abandoned without being tried.
+    #
+    # The cost is specific. #761/#765 exist so that "connected, and not
+    # syncing" is never silent, and #775 replaced their warning with this
+    # function on the stated grounds that the warning survives whenever a start
+    # fails. On this path it did not: the operator was told nothing, which is
+    # the exact state those issues were opened about, reachable by another door.
+    #
+    # `mktemp` failing is not a missing binary — it is `TMPDIR` unset to a path
+    # that does not exist, or not writable, or a full filesystem. The last one
+    # is uncomfortable here, because a start that outruns its budget
+    # deliberately leaves its two temp files behind, so this feature can
+    # contribute to the condition that used to silence it.
     tmp="$(mktemp 2>/dev/null)" || tmp=""
-    [ -n "$tmp" ] || return 0
+    if [ -z "$tmp" ]; then
+      failed="$failed$team	could not create a temporary file (is the temp filesystem full or unwritable?)"$'\n'
+      continue
+    fi
     # stderr folded in: `cmd_sync_start` says why it refused on stderr, and that
     # sentence is the useful half of a failure. Swallowing it would leave this
     # printing "could not start" with the reason on the floor.
