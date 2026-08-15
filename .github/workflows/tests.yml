@@ -545,6 +545,16 @@ jobs:
           - leg: windows runtime (#567)
             filter: "windows-native"
             target: tests/test_codex_monitor.bats tests/test_codex_bridge_launcher.bats
+          # The roster driver's staged input (#817). Same reasoning as the leg
+          # above, one layer down: the fix is for Windows, and two of the things
+          # it rests on -- an ordinary file descriptor arriving as Git Bash's
+          # stdin, and a temp file that cannot be unlinked while open -- behave
+          # differently there than on the hosts that were measured. The engine's
+          # own bats leg is ubuntu and macos only, so this selects the two tests
+          # that would notice and runs them on the platform in question.
+          - leg: driver input (#817)
+            filter: "driver-input"
+            target: tests/test_remote_sync_driver_input.bats
     defaults:
       run:
         # bats is bash; on Windows runners `shell: bash` is Git Bash, the same

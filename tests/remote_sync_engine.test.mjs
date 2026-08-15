@@ -1890,7 +1890,7 @@ async function driverLifecycleFixture(t, { script, calls, root }) {
   return { started, gone };
 }
 
-test("a driver that stops reading its input is left to release its own lock",
+test("the roster driver that stops reading its input is left to release its own lock",
   { timeout: 30_000 }, async (t) => {
   // This was a test about EPIPE. The parent wrote the input down a pipe, a
   // driver that had stopped reading took the write's error, and the call
@@ -1931,9 +1931,11 @@ exit 7
 `;
   const wide = "x".repeat(4096);
   const input = Array.from({ length: 512 }, (_, index) => ({ type: "probe", index, wide }));
+  // The ROSTER driver only. It is the one that holds the lock, and it is the
+  // only one handed a staged file; the storage driver keeps its pipe and is
+  // covered by the test below, with the expectations it always had.
   const { started, gone } = await withDriverEnvironment(t, root, script,
     (mock, config) => [
-      () => driver("prepare", config, input, ["1"]),
       () => rosterDriver("apply", config, input),
     ]);
 
@@ -1952,6 +1954,48 @@ exit 7
     // The property this test exists for.
     assert.ok(!existsSync(lockFor(join(root, `child-${index}.pid`))),
       "the driver was killed before its trap could release the lock");
+  }
+});
+
+test("the storage driver that stops reading its input fails the call and is not left running",
+  { timeout: 30_000 }, async (t) => {
+  // Unchanged behaviour, kept under its own test so that it stays unchanged.
+  //
+  // The storage driver takes no registry lock, so nothing about it needs the
+  // staged file the roster driver gets, and giving it one would cost it both an
+  // input that never touches disk -- after evaluatePull() these records are
+  // decrypted message content, on E2EE teams as much as plain ones -- and the
+  // bounded failure it has here. A driver handed a file is waited for; a driver
+  // that stops reading a pipe fails at once.
+  //
+  // So this is the original EPIPE test, scoped to the caller it was always
+  // about: the write loses its reader, the failure arrives on the stdin stream,
+  // and the driver does not survive the call. Flip `holdsRegistryLock` on for
+  // the storage driver and this test says so.
+  const root = await mkdtemp(join(tmpdir(), "agmsg-sync-driver-epipe-"));
+  const script = (pidFile, helperFile) => `#!/usr/bin/env bash
+echo $$ > ${JSON.stringify(pidFile)}
+sleep 300 &
+echo $! > ${JSON.stringify(helperFile)}
+exec 0<&-
+exec sleep 300
+`;
+  const wide = "x".repeat(4096);
+  const input = Array.from({ length: 512 }, (_, index) => ({ type: "probe", index, wide }));
+  const { started, gone } = await withDriverEnvironment(t, root, script,
+    (mock, config) => [
+      () => driver("prepare", config, input, ["1"]),
+    ]);
+
+  for (const { promise, childPid } of started) {
+    // On the marker the stdin handler sets, not on the errno: macOS answers
+    // ENOTCONN or EPIPE from the same event, and the set of spellings is not
+    // closed. The set of places that set this marker is -- there is one.
+    await assert.rejects(() => promise,
+      (error) => error.driverFailurePhase === "stdin-write");
+    // No poll and no grace period. The call settles only after the driver has
+    // exited, so by this line it is already gone.
+    assert.ok(gone(childPid), "the failed driver was left running");
   }
 });
 
@@ -1990,6 +2034,49 @@ printf '{"lines":%d}\\n' "$lines"
     assert.equal(result[0]?.lines, RECORDS,
       "the driver did not receive every record that was sent");
   }
+});
+
+test("a staged input leaves nothing behind, whether the call succeeds or fails",
+  { timeout: 30_000 }, async (t) => {
+  // What is staged is message content, so the temp directory is not a tidiness
+  // matter. Two routes have to be checked and neither is the interesting one:
+  // it is the DULL paths that leak, because the failure path is the one people
+  // write cleanup for.
+  //
+  // Counted by name in the system temp directory rather than by watching the
+  // implementation, so a future change of mechanism is still measured. The
+  // baseline is taken first: this is a shared directory and something else may
+  // already have left one, and asserting zero would be asserting about the
+  // machine rather than about this call.
+  const residue = async () => (await readdir(tmpdir()))
+    .filter((entry) => entry.startsWith("agmsg-driver-input-")).length;
+  const before = await residue();
+
+  const root = await mkdtemp(join(tmpdir(), "agmsg-sync-driver-residue-"));
+  const input = Array.from({ length: 8 }, (_, index) => ({ type: "probe", index }));
+
+  const ok = (pidFile, helperFile) => `#!/usr/bin/env bash
+echo $$ > ${JSON.stringify(pidFile)}
+echo $$ > ${JSON.stringify(helperFile)}
+cat > /dev/null
+printf '{"ok":true}\\n'
+`;
+  const { started: fine } = await withDriverEnvironment(t, root, ok,
+    (mock, config) => [() => rosterDriver("apply", config, input)]);
+  for (const { promise } of fine) await promise;
+  assert.equal(await residue(), before, "a successful call left its input behind");
+
+  const bad = await mkdtemp(join(tmpdir(), "agmsg-sync-driver-residue-"));
+  const fails = (pidFile, helperFile) => `#!/usr/bin/env bash
+echo $$ > ${JSON.stringify(pidFile)}
+echo $$ > ${JSON.stringify(helperFile)}
+echo "refused" >&2
+exit 9
+`;
+  const { started: broken } = await withDriverEnvironment(t, bad, fails,
+    (mock, config) => [() => rosterDriver("apply", config, input)]);
+  for (const { promise } of broken) await assert.rejects(() => promise);
+  assert.equal(await residue(), before, "a failed call left its input behind");
 });
 
 test("a driver that fails after starting a helper fails the call, and says how",

@@ -1701,17 +1701,37 @@ function bindingNote(binding) {
 // held. A file cannot fail that way. It is complete before the child exists --
 // therefore before the lock exists -- and the child still reads its stdin
 // exactly as before, so no driver changes.
+//
+// ONLY the driver that holds the lock is handed its input this way, and the
+// caller says which one that is. The storage driver has no registry lock, so
+// nothing about it needs this, and giving it the same treatment would cost it
+// two things for nothing: its input -- which after evaluatePull() is decrypted
+// message content, on E2EE teams as much as plain ones -- would go to rest on
+// disk where only a pipe carried it, and it would lose the bounded failure it
+// has today, since a driver that stops reading a pipe fails at once while a
+// driver handed a file is waited for. This is a fix for one caller and it is
+// scoped to that caller.
 function handOverInput(input) {
   // 0700 by mkdtemp and 0600 on the file. These records are message content,
   // and putting them in a file puts them at rest on disk, which a pipe did not.
   const directory = mkdtempSync(join(tmpdir(), "agmsg-driver-input-"));
   const path = join(directory, "input.jsonl");
-  writeFileSync(path, input.map((record) => `${JSON.stringify(record)}\n`).join(""),
-    { mode: 0o600 });
-  // A fresh read-only descriptor. Passing on the one the write used would hand
-  // over a descriptor sitting at EOF, and the driver would read an empty input
-  // and report a successful sync of nothing.
-  const fd = openSync(path, "r");
+  let fd;
+  try {
+    writeFileSync(path, input.map((record) => `${JSON.stringify(record)}\n`).join(""),
+      { mode: 0o600 });
+    // A fresh read-only descriptor. Passing on the one the write used would
+    // hand over a descriptor sitting at EOF, and the driver would read an empty
+    // input and report a successful sync of nothing.
+    fd = openSync(path, "r");
+  } catch (error) {
+    // The content is already written by the time `openSync` can fail, and there
+    // is no descriptor yet for anything downstream to clean up from. Failing
+    // out of here without this leaves message content in a temp directory that
+    // nothing else knows the name of.
+    discardInputDirectory(directory, "staging the driver's input failed");
+    throw error;
+  }
   // Then take the name away immediately, while the descriptor stays open: the
   // spawn duplicates it into the child, so both sides keep reading a file that
   // nothing can any longer open by name, and a parent that dies leaves no
@@ -1726,7 +1746,24 @@ function handOverInput(input) {
   return { directory: unlinked ? null : directory, fd };
 }
 
-function runDriver({ args, label, operation, parse, input, rosterFile, team, bindingPath }) {
+// Removing a temp directory must not fail the call around it -- refusing a sync
+// that completed, over a file the caller cannot act on, trades a real result
+// for a cleanup detail. But it must not be SILENT either: what is left behind
+// is message content, and a swallowed failure leaves it on disk with nobody
+// told. So the failure is downgraded to a warning that names the directory,
+// which is the one thing an operator needs to remove it.
+function discardInputDirectory(directory, reason) {
+  try {
+    rmSync(directory, { recursive: true, force: true });
+  } catch (error) {
+    process.emitWarning(
+      `${reason}: driver input left at ${directory} (${error.message})`,
+      "AgmsgDriverInputResidue");
+  }
+}
+
+function runDriver({ args, label, operation, parse, input, rosterFile, team, bindingPath,
+  holdsRegistryLock = false }) {
   return new Promise((resolve, reject) => {
     const childEnvironment = { ...process.env };
     delete childEnvironment.AGMSG_SYNC_TOKEN;
@@ -1744,24 +1781,25 @@ function runDriver({ args, label, operation, parse, input, rosterFile, team, bin
     // comment rather than in the function. Naming the single variable keeps the
     // guarantee where it can be checked.
     if (rosterFile) childEnvironment.AGMSG_SYNC_LOCAL_ROSTER_FILE = rosterFile;
-    // Before the spawn, so before the lock: a failure to stage the input is a
-    // failure with no child and no lock to leak.
+    // Staged before the spawn, so before the lock: a failure to stage the input
+    // is a failure with no child and no lock to leak. Only for the caller that
+    // holds the lock -- everyone else keeps the pipe, and with it the bounded
+    // failure a pipe gives and an input that never reaches disk.
     let handover = null;
-    try {
-      handover = handOverInput(input);
-    } catch (error) {
-      reject(error);
-      return;
+    if (holdsRegistryLock) {
+      try {
+        handover = handOverInput(input);
+      } catch (error) {
+        reject(error);
+        return;
+      }
     }
-    // The fd is opened read-only and fresh, never the one the write used --
-    // that one sits at EOF, which the driver would read as an empty input and
-    // report as a successful sync of nothing.
-    const child = spawn("bash", args,
-      { stdio: [handover.fd, "pipe", "pipe"], env: childEnvironment });
-    let stdout = ""; let stderr = ""; let settled = false; let failure = null;
 
     // Ours to close: a descriptor handed to `stdio` is duplicated for the child,
-    // and the parent's copy stays open until the parent closes it.
+    // and the parent's copy stays open until the parent closes it. Declared
+    // before the spawn because the spawn itself can throw, and a throw between
+    // the handover and the settle path would otherwise strand both the
+    // descriptor and, on Windows, a named file of message content.
     const releaseInput = () => {
       if (!handover) return;
       const { directory, fd } = handover;
@@ -1769,13 +1807,29 @@ function runDriver({ args, label, operation, parse, input, rosterFile, team, bin
       try { closeSync(fd); } catch { /* already closed */ }
       // Null when the directory was already taken away at handover, which is
       // the ordinary case everywhere the file could be unlinked while open.
-      // Best effort, and deliberately not a failure: refusing the whole call
-      // because a temp directory outlived it would turn a completed sync into
-      // an error over something the caller cannot act on.
       if (directory !== null) {
-        try { rmSync(directory, { recursive: true, force: true }); } catch { /* ignore */ }
+        discardInputDirectory(directory, "the driver call ended");
       }
     };
+
+    // Read once, here. `handover` is nulled when the input is released, so it
+    // cannot be asked later whether there was ever a pipe to write to.
+    const staged = handover !== null;
+    let child;
+    try {
+      // The fd is opened read-only and fresh, never the one the write used --
+      // that one sits at EOF, which the driver would read as an empty input and
+      // report as a successful sync of nothing.
+      child = spawn("bash", args,
+        { stdio: [staged ? handover.fd : "pipe", "pipe", "pipe"], env: childEnvironment });
+    } catch (error) {
+      // A synchronous spawn failure never reaches 'error', so nothing else here
+      // would run. There is no child, so there is nothing else to undo.
+      releaseInput();
+      reject(error);
+      return;
+    }
+    let stdout = ""; let stderr = ""; let settled = false; let failure = null;
 
     const settle = (error, value) => {
       if (settled) return;
@@ -1796,12 +1850,12 @@ function runDriver({ args, label, operation, parse, input, rosterFile, team, bin
       }
       if (running) {
         try {
-          // Reachable only with a child that is already gone -- see the note on
-          // handOverInput. Every route into fail() is either 'error' (the spawn
-          // itself failed, so there is no process) or the 'exit' handler (the
-          // child has exited, so `running` is false). This stays as the backstop
-          // it was written to be, and it is deliberately still SIGKILL: making
-          // it SIGTERM would only look like lock-safety without being it.
+          // Unchanged, and it still matters: on the pipe path a write that
+          // loses its reader arrives here with the driver alive, and leaving it
+          // running would trade "the process dies" for "the process cannot
+          // exit". What changed is only who can be on that path -- a driver
+          // holding the registry lock is handed a file instead, so it is never
+          // the one being killed. See the note on handOverInput.
           child.kill("SIGKILL");
           return;
         } catch { /* already gone; fall through and settle now */ }
@@ -1820,12 +1874,19 @@ function runDriver({ args, label, operation, parse, input, rosterFile, team, bin
       process.stderr.write(chunk);
     });
     child.on("error", fail);
-    // There is no stdin 'error' handler any more, and no stdin stream to put
-    // one on. The `driverFailurePhase = "stdin-write"` marker went with it: it
-    // existed because a write whose reader is gone is EPIPE on Linux and either
-    // ENOTCONN or EPIPE on macOS, so the failure could not be recognised by
-    // errno downstream. Handing the input over as a file removes the write, and
-    // with it the failure it was labelling.
+    // Only on the pipe path -- a staged input has no stdin stream to put this
+    // on, and no write that could fail.
+    child.stdin?.on("error", (error) => {
+      // Where the failure came from, recorded at the boundary because the OS
+      // code cannot be asked for it: a write whose reader is gone is EPIPE on
+      // Linux, and on macOS -- socketpairs -- either ENOTCONN or EPIPE
+      // depending on how far the write got. That set is not closed, so nothing
+      // downstream can recognise this failure by errno without going stale on
+      // the next platform. The error is otherwise passed through untouched, so
+      // its code and message survive for diagnostics.
+      error.driverFailurePhase = "stdin-write";
+      fail(error);
+    });
     // Every failure ends here, at 'exit'. A driver that merely exits non-zero is
     // the ordinary case and it needs this as much as a stream error does: it too
     // can leave a grandchild holding the inherited pipes, and waiting for 'close'
@@ -1855,7 +1916,11 @@ function runDriver({ args, label, operation, parse, input, rosterFile, team, bin
         settle(error, null);
       }
     });
-    // Nothing is written here. The input was complete on disk before the spawn.
+    // Nothing to write when the input was staged: it was complete on disk
+    // before the spawn, and the child is already reading it.
+    if (!staged) {
+      child.stdin.end(input.map((record) => `${JSON.stringify(record)}\n`).join(""));
+    }
   });
 }
 
@@ -1901,6 +1966,11 @@ export async function rosterDriver(operation, config, input, extra = []) {
     bindingPath: bindingPathOrReason(config.local_team),
     parse: parseJsonl,
     input,
+    // This is the driver that takes the team's registry lock, as its first act,
+    // and releases it only from a trap. It is the reason the input is staged in
+    // a file: nothing here may ever be in a position to kill it. The storage
+    // driver takes no such lock and is deliberately not given this.
+    holdsRegistryLock: true,
     // The roster file, resolved here and handed over as one path — not the
     // directory it sits in. A directory would put the driver back in the
     // business of deriving locations, which is what AGMSG_SYNC_CONNECTION_DIR
