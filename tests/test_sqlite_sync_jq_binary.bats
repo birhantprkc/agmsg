@@ -44,8 +44,8 @@ STUB
   [ "$status" -ne 0 ]
   # NAMED. The point of failing closed is the sentence, so the sentence is what
   # is asserted -- not merely that something went wrong.
-  echo "$output" | grep -q 'requires a jq that supports -b'
-  echo "$output" | grep -q 'CRLF'
+  echo "$output" | grep -q 'requires a jq whose -b (binary output) produces LF-terminated lines'
+  echo "$output" | grep -q 'emits CRLF'
 }
 
 @test "sync: a jq WITH -b is accepted, so the refusal is not unconditional (#829)" {
@@ -70,12 +70,120 @@ STUB
   # what breaks.
   local bin; bin="$(stub_jq_without_b)"
 
+  # THROUGH THE PATH THAT NEEDS IT. The check was moved out of
+  # `_sqlite_sync_schema` -- which gates receiving and status too -- and into the
+  # push path, which is the only one producing the two values the CR rides on.
+  # So the wiring assertion has to enter there.
   run env REAL_PATH="$PATH" PATH="$bin:$PATH" bash -c '
-    . "$1/lib/storage.sh" 2>/dev/null || true
-    . "$1/drivers/storage/sqlite-sync.sh"
-    _sqlite_sync_schema testteam
-  ' _ "$SCRIPTS"
+    export SKILL_DIR="$2" AGMSG_STORAGE_PATH="$3" AGMSG_STORAGE_DRIVER=sqlite
+    . "$1/lib/storage.sh"; agmsg_storage_load
+    storage_init demo >/dev/null 2>&1
+    printf "%s\n" "{\"type\":\"sync_prepare\",\"envelope_v\":1,\"cipher\":\"none\",\"key_id\":null,\"max_blob_bytes\":1048576,\"allow_new\":true}" \
+      | storage_sync_prepare_push demo 018f3f7e-0000-7000-8000-000000000000 018f3f7e-0000-7000-8000-000000000001 1 100
+  ' _ "$SCRIPTS" "$TEST_SKILL_DIR" "$BATS_TEST_TMPDIR/store3"
 
   [ "$status" -ne 0 ]
-  echo "$output" | grep -q 'requires a jq that supports -b'
+  echo "$output" | grep -q 'requires a jq whose -b (binary output) produces LF-terminated lines'
+}
+
+# A jq that adds CR the way the reporting machine's does -- but only to the
+# `@tsv` stages, and that restriction is the honest part.
+#
+# On the reporting machine EVERY jq line ends CRLF, and the shell there drops the
+# trailing CR from a `$( )` capture, so only the `read` sinks are poisoned. This
+# test runs on a shell that does NOT drop it, so a faithful stub also poisons
+# every `VAR=$(… jq …)` in the driver -- `cipher` becomes `none<CR>`, `version`
+# becomes `1<CR>` -- and prepare fails for a reason that cannot happen on the
+# platform being simulated. Measured: it returned 13, silently.
+#
+# So the simulation is scoped to the sink under test: the two final stages that
+# end in `@tsv` and are consumed by `while IFS=$'\t' read -r`. That is where the
+# field report measured the CR, and it is the only place this change touches.
+stub_jq_crlf_without_b() {
+  local bin="$TEST_SKILL_DIR/jq-crlf"
+  mkdir -p "$bin"
+  cat > "$bin/jq" <<STUB
+#!/usr/bin/env bash
+real="$(command -v jq)"
+for a in "\$@"; do
+  case "\$a" in -b|-b*) exec "\$real" "\$@" ;; esac
+done
+tsv=0
+for a in "\$@"; do
+  case "\$a" in *@tsv*) tsv=1 ;; esac
+done
+if [ "\$tsv" = 1 ]; then
+  "\$real" "\$@" | sed 's/\$/\r/'
+  exit "\${PIPESTATUS[0]}"
+fi
+exec "\$real" "\$@"
+STUB
+  chmod +x "$bin/jq"
+  printf '%s' "$bin"
+}
+
+push_fixture() {
+  export SKILL_DIR="$TEST_SKILL_DIR"
+  export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/store"
+  export AGMSG_STORAGE_DRIVER=sqlite
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/storage.sh"
+  agmsg_storage_load
+  storage_init demo >/dev/null
+  SERVER_ID=018f3f7e-0000-7000-8000-000000000000
+  TEAM_ID=018f3f7e-0000-7000-8000-000000000001
+  PREPARE='{"type":"sync_prepare","envelope_v":1,"cipher":"none","key_id":null,"max_blob_bytes":1048576,"allow_new":true}'
+  storage_send demo alice bob "a body that must arrive intact" >/dev/null
+}
+
+staged_hex() {
+  local col="$1" db
+  db="$(printf '%s' "$AGMSG_STORAGE_PATH")/teams/demo/store.db"
+  [ -f "$db" ] || db="$(find "$AGMSG_STORAGE_PATH" -name '*.db' -print -quit)"
+  sqlite3 "$db" "SELECT hex($col) FROM sync_messages WHERE direction='push' LIMIT 1;"
+}
+
+@test "sync: a CRLF jq does not put a trailing CR on the staged wire_id (#829)" {
+  # THE FIELD OBSERVATION, REPRODUCED LOCALLY. On the reporting machine
+  # `hex(wire_id)` ended `0D`; stripping that byte and resending produced
+  # `push.ack … stored`. So the assertion is on the same bytes, in the same
+  # column, and NOT shared with the blob -- one assertion covering both values
+  # would hide a regression in either.
+  push_fixture
+  local bin; bin="$(stub_jq_crlf_without_b)"
+  # RUN IN THIS SHELL. `storage_sync_prepare_push` is a function that
+  # `agmsg_storage_load` defines here; a `bash -c` child does not have it, and
+  # invoking it there reports "command not found" rather than exercising the
+  # driver. Measured: status 127 from the child, which is what the first draft
+  # of this case was actually observing.
+  local saved_path="$PATH"
+  PATH="$bin:$PATH"
+  printf '%s\n' "$PREPARE" \
+    | storage_sync_prepare_push demo "$SERVER_ID" "$TEAM_ID" 1 100 >/dev/null
+  PATH="$saved_path"
+
+  local hex; hex="$(staged_hex wire_id)"
+  [ -n "$hex" ]
+  refute grep -qi '0D$' <<< "$hex"
+}
+
+@test "sync: a CRLF jq does not put a trailing CR on the staged blob (#829)" {
+  # The other half, asserted separately and deliberately: the two values leave
+  # two different final-stage jq calls, so they are two contracts.
+  push_fixture
+  local bin; bin="$(stub_jq_crlf_without_b)"
+  # RUN IN THIS SHELL. `storage_sync_prepare_push` is a function that
+  # `agmsg_storage_load` defines here; a `bash -c` child does not have it, and
+  # invoking it there reports "command not found" rather than exercising the
+  # driver. Measured: status 127 from the child, which is what the first draft
+  # of this case was actually observing.
+  local saved_path="$PATH"
+  PATH="$bin:$PATH"
+  printf '%s\n' "$PREPARE" \
+    | storage_sync_prepare_push demo "$SERVER_ID" "$TEAM_ID" 1 100 >/dev/null
+  PATH="$saved_path"
+
+  local hex; hex="$(staged_hex blob)"
+  [ -n "$hex" ]
+  refute grep -qi '0D$' <<< "$hex"
 }

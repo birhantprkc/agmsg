@@ -110,15 +110,33 @@ _sqlite_sync_require_jq_binary() {
     yes) return 0 ;;
     no)  return 1 ;;
   esac
-  if printf '{}\n' | jq -b -r 'empty' >/dev/null 2>&1; then
+  local probe=""
+  # THE CONTRACT, NOT THE FLAG.
+  #
+  # An earlier version probed with `jq -b -r 'empty'`, which emits nothing: a jq
+  # that ACCEPTS `-b` and still writes CRLF passed it. The field report is about
+  # the bytes on stdout, so the probe has to produce a line and look at how that
+  # line ends (raised in review).
+  #
+  # Read with `read`, never through `$( )`. Command substitution on MSYS drops
+  # the final CR -- that is the very behaviour that hid this defect from a
+  # single-value capture -- so inspecting the probe that way would report clean
+  # output from a jq that is still adding CR. `read` stops at the LF and leaves
+  # the CR in the variable, so `probe` and `probe<CR>` are distinguishable here.
+  #
+  # A jq that fails outright leaves `probe` empty, which is also not the
+  # expected value, so a broken jq and a CRLF jq both fall to the refusal below
+  # -- and the message names the capability rather than guessing which it was.
+  IFS= read -r probe < <(printf '{}\n' | jq -b -r '"agmsg-probe"' 2>/dev/null) || probe=""
+  if [ "$probe" = "agmsg-probe" ]; then
     _AGMSG_JQ_BINARY_OK=yes
     return 0
   fi
   _AGMSG_JQ_BINARY_OK=no
-  echo "agmsg: Stage-1 sync requires a jq that supports -b (binary output)" >&2
+  echo "agmsg: sending requires a jq whose -b (binary output) produces LF-terminated lines" >&2
   echo "agmsg:   this jq: $(jq --version 2>/dev/null || echo 'unknown')" >&2
-  echo "agmsg:   without -b, a Windows jq emits CRLF and the trailing CR rides" >&2
-  echo "agmsg:   into the values this sends, which the server rejects (#829)." >&2
+  echo "agmsg:   a Windows jq without it emits CRLF, and the trailing CR rides into" >&2
+  echo "agmsg:   the values this sends, which the server rejects (#829)." >&2
   return 1
 }
 
@@ -128,7 +146,6 @@ _sqlite_sync_schema() {
     echo "agmsg: Stage-1 sync requires jq" >&2
     return 10
   }
-  _sqlite_sync_require_jq_binary || return 10
   storage_init "$1" >/dev/null || return 13
   local db generation
   db="$(_sqlite_db "$1")"
@@ -502,6 +519,12 @@ storage_sync_prepare_push() {
   case "$limit" in ''|*[!0-9]*) return 13 ;; esac
   [ "$limit" -ge 1 ] && [ "$limit" -le 1000 ] || return 13
   _sqlite_sync_schema "$team" || return $?
+  # HERE, NOT IN THE SCHEMA. `_sqlite_sync_schema` gates every Stage-1 call, so
+  # requiring `-b` there refused receiving and status as well -- on a POSIX jq
+  # that never needed binary stdout. The defect this closes is "can receive but
+  # never send", and this is the only path that produces the two values the CR
+  # rides on. Placed before anything is reserved or written (raised in review).
+  _sqlite_sync_require_jq_binary || return 10
 
   local prepare generation db tl input_ok version cipher key_json key_id recipients max_blob allow_new
   prepare=$(cat)
