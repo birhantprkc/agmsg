@@ -115,6 +115,61 @@ write_node_launcher_fixtures() {
   grep -q "ローカルのメッセージ履歴が読めることは" "$BATS_TEST_DIRNAME/../docs/remote-setup.ja.md"
 }
 
+@test "every agent-readable surface routes key rotate, and none of them calls it unavailable" {
+  # The claim being guarded is not a wording preference: `key rotate` shipped
+  # on 2026-07-22 and seven days later ten surfaces began telling every agent
+  # it was "not available yet (they refuse unconditionally and change no
+  # state)". An agent reads one of these at startup, so the lie was answered
+  # to users far more often than any doc under docs/ is read.
+  #
+  # The negative half alone would pass on a file that says nothing at all, so
+  # both halves are asserted, and the count is explicit for the same reason as
+  # the #682 test above.
+  # A template is an installer INPUT: install.sh renders it with
+  # `sed s/__SKILL_NAME__/$CMD_NAME/g`, so a route written with a literal
+  # `agmsg` sends an agent installed as `--cmd m` at somebody else's install
+  # — and rotation changes key state, so that is not a cosmetic slip. The
+  # path is therefore asserted per surface kind, not as one shared substring:
+  # matching only `key.sh rotate <team>` is green for both spellings and
+  # would have let this through.
+  local surface count=0
+  for surface in "$BATS_TEST_DIRNAME"/../scripts/drivers/types/*/template.md \
+                 "$BATS_TEST_DIRNAME"/../SKILL.md; do
+    [ -f "$surface" ] || continue
+    count=$((count + 1))
+    case "$surface" in
+      */SKILL.md)
+        # The top-level skill doc is a rendered artifact, not an input: it
+        # carries no placeholder at all, so here the literal is correct.
+        grep -Fq 'bash ~/.agents/skills/agmsg/scripts/key.sh rotate <team>' "$surface" \
+          || { echo "SKILL.md does not route rotate through the literal install path: $surface" >&2; return 1; }
+        ;;
+      *)
+        grep -Fq 'bash ~/.agents/skills/__SKILL_NAME__/scripts/key.sh rotate <team>' "$surface" \
+          || { echo "template does not route rotate through __SKILL_NAME__: $surface" >&2; return 1; }
+        ! grep -Fq '~/.agents/skills/agmsg/' "$surface" \
+          || { echo "template hardcodes the default install name: $surface" >&2; return 1; }
+        ;;
+    esac
+    grep -Fq 'Device pairing (`key request` / `key approve`) is not implemented' "$surface" \
+      || { echo "does not state the pairing commands are absent: $surface" >&2; return 1; }
+    ! grep -qiE 'rotat(e|ion)[^.]*not available' "$surface" \
+      || { echo "still calls rotation unavailable: $surface" >&2; return 1; }
+  done
+  # nine templates (agmsg-app has none) plus SKILL.md.
+  [ "$count" -eq 10 ]
+
+  # Bind the claim to the code. If `rotate` ever stops being a subcommand the
+  # surfaces above become wrong again, and this is the line that says so.
+  grep -qE '^[[:space:]]*rotate\)' "$BATS_TEST_DIRNAME/../scripts/key.sh"
+  grep -qE '^cmd_rotate\(\)' "$BATS_TEST_DIRNAME/../scripts/key.sh"
+
+  # The same false sentence also stood in key.sh itself, where `generate`
+  # refuses an existing key: it named rotation unavailable and sent the user
+  # to `show`. Assert the working route is offered there too.
+  grep -Fq 'To mint a replacement epoch instead:' "$BATS_TEST_DIRNAME/../scripts/key.sh"
+}
+
 @test "type-registry: spawnable set is exactly eight of the ten built-ins (#277, #279)" {
   # hermes deliberately stays out (#279): no known CLI mode starts it
   # interactive with a seeded initial prompt. agmsg-app also stays out: it's
