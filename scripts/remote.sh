@@ -68,6 +68,10 @@ source "$SCRIPT_DIR/lib/node.sh"
 # keyed on watcher-only concepts (session/actas) this engine does not have.
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/instance-id.sh"
+# agmsg_sha256 -- the age-v1 checkpoint below is a SHA-256 of the snapshot, and
+# `shasum` is absent in Git for Windows' Git Bash.
+# shellcheck source=lib/hash.sh
+source "$SCRIPT_DIR/lib/hash.sh"
 
 TEAMS_DIR="$CONNECTION_ROOT/teams"
 CRED_ROOT="$CONNECTION_ROOT/run/remote-credentials"
@@ -221,6 +225,113 @@ _remote_prompt_read() {
 # token, no state change, safe whether or not the team is already connected.
 # Currently just the age-binary-presence check (§8) — the natural home for
 # any future preflight check added later.
+# WHICH DIRECTORY TO REMOVE — the thing that was missing (#865).
+#
+# A registry lock left behind by a killed process is never broken by anything:
+# nothing expires, nothing sweeps, and acquire waits out its budget and fails
+# with `timed out acquiring registry lock`, which describes contention. The
+# operator's next move is to look for the process holding it; there is no
+# process, and no message anywhere names the directory to remove. A machine in
+# that state cannot get itself out.
+#
+# This REPORTS and removes nothing. The report alone ends "cannot recover":
+# it says which team, what the lock records, whether that process is running,
+# and prints the removal as a line to paste. Sweeping automatically is a
+# separate decision with a worse failure mode — a wrong verdict takes a lock
+# away from a process that is using it — and it is not made here.
+#
+# Not a check, so no `[x]`/`[ ]` and no effect on the exit code: a lock that
+# exists is not a failed prerequisite, and a doctor that exits non-zero because
+# a team is busy would be wrong every time somebody is joining.
+# One lock, reported. Split out so the two ways of finding them — a named team,
+# or a sweep — share this body and neither has to feed a loop from a string.
+# Joining the paths into one variable and reading it back would mean either an
+# unquoted heredoc, which runs command substitution on a team name, or unquoted
+# word splitting, which globs one.
+_remote_doctor_one_lock() {
+  local lock="$1" team holder pid state q
+  [ -d "$lock" ] || return 0
+  team="${lock%/.config.lock}"
+  team="${team##*/}"
+  if [ "$shown" -eq 0 ]; then
+    echo "Registry locks:"
+    shown=1
+  fi
+  holder="$lock.holder"
+  pid=""
+  [ -f "$holder" ] && pid="$(sed -n 's/^pid //p' "$holder" 2>/dev/null | head -1)"
+  # THREE ANSWERS, NOT TWO. "held" and "the holder is gone" are what the
+  # operator acts on; "cannot tell" is neither — a lock this could not ask
+  # about, and saying it is gone would be a guess. The guess that costs is the
+  # one that calls a live lock dead and then prints the command to remove it.
+  #
+  # WHICH IS WHY THE NUMBER IS VALIDATED BEFORE IT IS ASKED ABOUT.
+  # `_agmsg_pid_alive_local` returns false for a value it never put to the
+  # process table at all — non-numeric, leading zero, past the POSIX ceiling —
+  # and folding that into "not running" turned `pid not-a-pid` into a stale
+  # verdict with a removal beside it (raised in review). The same ceiling the
+  # helper uses, for the same reason it uses it.
+  if [ -z "$pid" ]; then
+    state="cannot tell — no holder recorded"
+  elif ! _agmsg_pid_valid "$pid" 2147483647; then
+    state="cannot tell — the holder record's pid is not a usable number"
+  elif _agmsg_pid_alive_local "$pid"; then
+    state="held — pid $pid is running"
+  else
+    state="stale — pid $pid is not running"
+  fi
+  echo "  $team: $state"
+  if [ -f "$holder" ]; then
+    echo "    records: $(tr '\n' ' ' < "$holder" 2>/dev/null)"
+  fi
+  echo "    created: $(ls -ld "$lock" 2>/dev/null || printf '%s (cannot stat)' "$lock")"
+  # QUOTED, because this is meant to be pasted. The store root and the team
+  # name can both contain a space, and an unquoted path becomes several
+  # arguments to `rm -r`. Same scheme as lib/shquote.sh.
+  q="$(printf "'%s'" "$(printf '%s' "$lock" | sed "s/'/'\\\\''/g")")"
+  if [ "$state" = "held — pid $pid is running" ]; then
+    echo "    a command is using this team. Nothing to do."
+  else
+    echo "    if no agmsg command is running for this team, remove it:"
+    echo "      rm -r $q"
+    [ -f "$holder" ] && echo "      rm -f $q.holder"
+    echo "    nothing but the lock lives in there — it holds no team data."
+  fi
+}
+
+_remote_doctor_locks() {
+  local only_team="${1:-}" lock shown=0
+  # A NAMED TEAM IS LOOKED AT DIRECTLY, and the sweep does not stop at `*`.
+  #
+  # Team names may begin with a dot — the validator rejects empty, `.`, `..`, a
+  # leading `-`, `/`, `\` and control characters, and nothing else — and `*`
+  # does not match a leading dot, so `.foo` was invisible to the sweep (raised
+  # in review). The two extra patterns cover `.foo` and `..foo`; `.` and `..`
+  # themselves cannot be team names.
+  #
+  # Globs rather than `find`, which is not on every PATH this tree is required
+  # to run under. Quoted, so a team name containing a space stays one path.
+  if [ -n "$only_team" ]; then
+    # VALIDATED BEFORE IT BECOMES A PATH. `cmd_doctor` takes its argument and,
+    # until this line, only ever put it in a header sentence — so nothing had
+    # ever checked it. Building `$TEAMS_DIR/$only_team/.config.lock` from it
+    # turned `doctor ../outside` into a read of a directory outside the store,
+    # reported with its records and a `rm -r` to paste (raised in review). The
+    # sweep it replaced never reached one only because no team was named that.
+    #
+    # The same validator every other team-taking path uses: it rejects empty,
+    # `.`, `..`, `/`, `\`, a leading `-` and control characters, and allows a
+    # leading dot and a space, which this reports on and must keep.
+    agmsg_validate_team_name "$only_team" || return 1
+    _remote_doctor_one_lock "$TEAMS_DIR/$only_team/.config.lock"
+  else
+    for lock in "$TEAMS_DIR"/*/.config.lock "$TEAMS_DIR"/.[!.]*/.config.lock "$TEAMS_DIR"/..?*/.config.lock; do
+      _remote_doctor_one_lock "$lock"
+    done
+  fi
+  [ "$shown" -eq 0 ] || echo
+}
+
 cmd_doctor() {
   local team="${1:-}"
   echo "Checking prerequisites${team:+ for team '$team'}..."
@@ -249,6 +360,26 @@ cmd_doctor() {
     echo "See https://github.com/FiloSottile/age for other install methods."
   fi
   echo
+  # Reported with age, and optional for the same reason: only end-to-end
+  # encryption needs it. Not failed=1 -- a machine syncing with cipher "none"
+  # is fully functional without it. Listed at all because when it IS missing
+  # the symptom lands after the team is registered, which reads like a server
+  # problem rather than a missing tool.
+  # "usable", not "on PATH": presence and usability are different questions and
+  # this line answers the second one -- a tool that is installed and fails, or
+  # that returns the wrong digest for a known input, reports unusable here.
+  if agmsg_sha256_usable; then
+    echo "  [x] usable SHA-256 tool  (optional)"
+  else
+    echo "  [ ] usable SHA-256 tool  (optional)"
+    echo
+    echo "End-to-end encryption needs one of 'shasum', 'sha256sum' or 'openssl' for key"
+    echo "fingerprints and the age-v1 checkpoint. Remote sync without --e2ee does not use it:"
+    echo "  macOS (Homebrew):      brew install openssl"
+    echo "  Debian/Ubuntu:         sudo apt install coreutils"
+    echo "  Windows (Git Bash):    ships with Git for Windows; reinstall it if 'sha256sum' is missing"
+  fi
+  echo
   if agmsg_python3_usable; then
     echo "  [x] python3 on PATH"
   else
@@ -275,8 +406,16 @@ cmd_doctor() {
     failed=1
   fi
   echo
+  # A REJECTED TEAM NAME ENDS THE COMMAND. The validator prints why; carrying on
+  # to "All prerequisite checks passed." after refusing to look at what was
+  # asked about would report success for a question nobody answered.
+  _remote_doctor_locks "$team" || exit 1
   if [ "$failed" -eq 0 ]; then
-    echo "All checks passed."
+    # NARROWED, because a lock report can sit above this line. "All checks
+    # passed." after "stale — pid 4711 is not running" and a `rm -r` reads as
+    # cancelling it, and the exit code deliberately does not move: a locked team
+    # is not a failed prerequisite (raised in review).
+    echo "All prerequisite checks passed."
   else
     echo "Some checks failed. See above."
     exit 1
@@ -284,6 +423,17 @@ cmd_doctor() {
 }
 
 # --- shared HTTP helpers (B1: never put secrets in curl's own argv/ps) ---
+
+# _remote_curl_path <path> — render <path> for embedding INSIDE a curl -K config
+# file. On Windows/Git Bash, MSYS translates POSIX paths to Windows form only for
+# a native binary's argv, NOT for paths read from a config file's contents, so an
+# embedded /tmp or /c/.. path is unopenable by native curl (→ curl fails → the
+# caller's HTTP 000). cygpath -m yields a Windows drive path with FORWARD slashes;
+# -w is wrong here because curl's config parser treats backslashes as escapes.
+# Capability-gated on cygpath so macOS/Linux (no cygpath) are unchanged.
+_remote_curl_path() {
+  if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s' "$1"; fi
+}
 
 # _remote_http_post_json <url> <body_file> <out_body_file> <out_header_file> -> prints http_code
 # Posts <body_file> as the request body via a curl -K config file, so the
@@ -295,27 +445,57 @@ _remote_http_post_json() {
   cfg="$(mktemp "${TMPDIR:-/tmp}/agmsg-curl-cfg.XXXXXX")"
   fifo_dir="$(mktemp -d "${TMPDIR:-/tmp}/agmsg-header-pipe.XXXXXX")"
   header_fifo="$fifo_dir/header"
-  mkfifo "$header_fifo"
   chmod 600 "$cfg"
-  trap 'rm -f "$cfg" "$header_fifo"; rmdir "$fifo_dir" 2>/dev/null || true' EXIT INT TERM
-  # Reaped on both normal paths below (waited on success, killed and waited on
-  # failure), so this is short-lived by construction -- but the EXIT trap only
-  # removes files, it does not kill the copier. A signal arriving before curl
-  # opens the fifo therefore leaves it blocked on open() with no writer ever
-  # coming, and an inherited fd 3 would then hold a bats test file open to the
-  # timeout. Closing the fds costs nothing and removes that one path.
-  python3 "$SCRIPT_DIR/internal/bounded-copy.py" 65536 < "$header_fifo" > "$header_file" 3>&- 4>&- &
-  copier_pid=$!
+  # The headers go through a fifo so a hostile or broken server cannot make us
+  # buffer an unbounded response — bounded-copy.py enforces the ceiling while
+  # the transfer is still running. That mechanism needs a real named pipe.
+  #
+  # On Windows/Git Bash there is no real named pipe to have: MSYS emulates
+  # mkfifo with a .lnk file that only MSYS-aware programs understand, and curl
+  # there is a NATIVE binary. It cannot open what mkfifo made, so it fails and
+  # the caller sees the "000" it reports for every failure alike.
+  #
+  # Where cygpath exists, dump straight to the destination file and skip both
+  # the fifo and the copier. That gives up streaming enforcement of the size
+  # ceiling on that platform — curl's own `max-filesize` still applies to the
+  # BODY, and the header dump is what becomes unbounded. Stated rather than
+  # hidden, because it is a real difference between the platforms and not a
+  # detail of how the file is named.
+  #
+  # Gated on `command -v cygpath`, not on an OS name. Say what that probe
+  # actually asks, because it is narrower than the thing we care about: it is a
+  # CAPABILITY MARKER for an environment where MSYS fifos and a native curl
+  # coexist -- it does not test whether a real fifo can be made, and nothing
+  # here does. An earlier version of this comment claimed it did, which would
+  # have told the next reader that a machine passing the probe had been checked
+  # for the property that matters.
+  if command -v cygpath >/dev/null 2>&1; then
+    header_fifo="$header_file"
+    : > "$header_fifo"
+    copier_pid=""
+    trap 'rm -f "$cfg"; rmdir "$fifo_dir" 2>/dev/null || true' EXIT INT TERM
+  else
+    mkfifo "$header_fifo"
+    trap 'rm -f "$cfg" "$header_fifo"; rmdir "$fifo_dir" 2>/dev/null || true' EXIT INT TERM
+    # Reaped on both normal paths below (waited on success, killed and waited on
+    # failure), so this is short-lived by construction -- but the EXIT trap only
+    # removes files, it does not kill the copier. A signal arriving before curl
+    # opens the fifo therefore leaves it blocked on open() with no writer ever
+    # coming, and an inherited fd 3 would then hold a bats test file open to the
+    # timeout. Closing the fds costs nothing and removes that one path.
+    python3 "$SCRIPT_DIR/internal/bounded-copy.py" 65536 < "$header_fifo" > "$header_file" 3>&- 4>&- &
+    copier_pid=$!
+  fi
   {
     printf 'url = "%s"\n' "$url"
     printf 'request = "POST"\n'
     printf 'header = "Content-Type: application/json"\n'
     printf 'header = "Agmsg-Protocol-Version: 1"\n'
-    printf 'dump-header = "%s"\n' "$header_fifo"
+    printf 'dump-header = "%s"\n' "$(_remote_curl_path "$header_fifo")"
     printf 'connect-timeout = "10"\n'
     printf 'max-time = "15"\n'
     printf 'max-filesize = "2097152"\n'
-    printf 'data = "@%s"\n' "$body_file"
+    printf 'data = "@%s"\n' "$(_remote_curl_path "$body_file")"
   } > "$cfg"
   if curl_output=$(curl -sS -o "$out_file" -w '%{http_code}' -K "$cfg" 2>/dev/null); then
     :
@@ -323,15 +503,20 @@ _remote_http_post_json() {
     curl_status=$?
   fi
   if [ "$curl_status" -ne 0 ]; then
-    kill "$copier_pid" 2>/dev/null || true
-    wait "$copier_pid" 2>/dev/null || true
+    [ -n "$copier_pid" ] && { kill "$copier_pid" 2>/dev/null || true; wait "$copier_pid" 2>/dev/null || true; }
     http_code="000"
-  elif wait "$copier_pid"; then
+  elif [ -z "$copier_pid" ] || wait "$copier_pid"; then
     http_code="$curl_output"
   else
     http_code="000"
   fi
-  rm -f "$cfg" "$header_fifo"
+  # Only remove the fifo, never the caller's header file. On the cygpath path
+  # `header_fifo` IS `header_file`, so an unconditional `rm -f "$header_fifo"`
+  # here deletes the headers this function was asked to produce — before the
+  # caller has read them. The fifo exists only when a copier was started, so
+  # that is the condition to key on.
+  rm -f "$cfg"
+  [ -n "$copier_pid" ] && rm -f "$header_fifo"
   rmdir "$fifo_dir" 2>/dev/null || true
   trap - EXIT INT TERM
   printf '%s' "$http_code"
@@ -1821,7 +2006,7 @@ _remote_configure_keyed_team() {
     echo "agmsg: could not export the initial age-v1 snapshot for team '$team'; sync was not started." >&2
     return 1
   fi
-  snapshot_sha="$(shasum -a 256 "$snapshot_file" | awk '{print $1}')"
+  snapshot_sha="$(agmsg_sha256 < "$snapshot_file")"
   if ! bash "$SCRIPT_DIR/remote-sync.sh" configure \
       --team "$team" \
       --server "$endpoint" \
@@ -1875,6 +2060,16 @@ cmd_connect() {
       ;;
   esac
   key_id="$(_remote_read_config_field "$cfg" '$.remote_key.current.key_id')"
+  # Asked HERE: before the key is minted and before the registration POST.
+  # Every SHA-256 in the e2ee path -- the fingerprint printed by `key.sh
+  # generate`, and the age-v1 checkpoint that starts the sync engine -- happens
+  # at or after those, so a device without one used to register the team and
+  # only then fail, reporting "binding recorded, sync engine not started" for
+  # what is a missing command-line tool. Same category as the `age` preflight:
+  # a prerequisite of end-to-end encryption, so it is only asked under --e2ee.
+  if [ "$e2ee" -eq 1 ]; then
+    agmsg_require_sha256 || exit 1
+  fi
   if [ "$e2ee" -eq 1 ] && { [ -z "$key_id" ] || [ "$key_id" = "null" ]; }; then
     bash "$SCRIPT_DIR/key.sh" generate "$team" || exit 1
     key_id="$(_remote_read_config_field "$cfg" '$.remote_key.current.key_id')"
