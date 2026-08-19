@@ -4085,3 +4085,125 @@ test("runLoop: a non-retryable error that is NOT a refusal still ends the loop",
     eventCall: async () => {},
   }), /config is unreadable/);
 });
+
+test("pull bootstrap reports progress on stderr and leaves stdout as the result channel", async () => {
+  const teamId = "018f3f7e-0000-7000-8000-000000000001";
+  const serverId = "018f3f7e-0000-7000-8000-000000000002";
+  // Both streams are captured, not just the one under test. `cmd_pull` reads
+  // this process's stdout as the result -- result="$(... pull-bootstrap ...)"
+  // then greps it for pull_bootstrap_result -- so a progress line landing there
+  // is the regression this case exists to catch, and it is invisible unless
+  // stdout is measured too.
+  const out = [];
+  const err = [];
+  const realOut = process.stdout.write.bind(process.stdout);
+  const realErr = process.stderr.write.bind(process.stderr);
+  process.stdout.write = (chunk) => { out.push(String(chunk)); return true; };
+  process.stderr.write = (chunk) => { err.push(String(chunk)); return true; };
+  try {
+    await pullBootstrap({
+      team: "clone", "team-id": teamId,
+      // The shape a hosted endpoint really has: the path IS the capability.
+      endpoint: "https://user:pa55word@sync.example.test:8443/t/agsy_SECRETCAP123?q=1#f",
+    }, {
+      publicSnapshotCall: async () => ({
+        server_instance_id: serverId, team_id: teamId, team_name: "source",
+        min_available_seq: "0",
+      }),
+      requestPublicCall: async () => ({
+        messages: [{ id: "01", seq: "1", envelope: { v: 1, cipher: "plain", blob: "x" } }],
+        next_after: "1", has_more: false,
+      }),
+      evaluateCall: async () => ({
+        status: "importable", policy_revision: "0", local_security_revision: "0",
+      }),
+      driverCall: async () => [{ type: "sync_apply_result", transport_cursor: "1", corrupt_count: 0 }],
+      rosterDriverCall: async () => [],
+      eventCall: async () => {},
+    });
+  } finally {
+    process.stdout.write = realOut;
+    process.stderr.write = realErr;
+  }
+
+  // stdout: exactly the result, still parseable as one JSON line.
+  const stdoutLines = out.join("").split("\n").filter((line) => line !== "");
+  assert.equal(stdoutLines.length, 1);
+  assert.equal(JSON.parse(stdoutLines[0]).type, "pull_bootstrap_result");
+
+  // stderr: the operator can see it start, and can see it move. Both halves are
+  // named, because when this stops moving the line it stopped on says whether
+  // to look at the network or at the driver's child process.
+  const stderrText = err.join("");
+  assert.match(stderrText, /agmsg: \[\d+s\] pulling clone from sync\.example\.test:8443 /);
+  // WHAT MUST NOT BE THERE, named one piece at a time. This is the line a person
+  // pastes into an issue when a pull is taking too long, so the capability in
+  // the path, the credential before the host, and the query and fragment beside
+  // them all have to be absent -- and asserting the host is present does not say
+  // that any of them are gone.
+  for (const secret of ["agsy_SECRETCAP123", "pa55word", "/t/", "q=1", "#f"]) {
+    assert.ok(!stderrText.includes(secret), `stderr must not carry ${secret}`);
+  }
+  assert.ok(!out.join("").includes("agsy_SECRETCAP123"), "stdout must not carry it either");
+  assert.match(stderrText, /agmsg: \[\d+s\] fetching messages after /);
+  assert.match(stderrText, /agmsg: \[\d+s\] applying 1 messages/);
+});
+
+test("pull bootstrap prints a server cursor only when it is a canonical sequence", async () => {
+  // WHERE A MALFORMED CURSOR ACTUALLY COMES FROM. The first cursor is not ours:
+  // it is `teamSnapshot.min_available_seq`, and `publicSnapshot` checks only the
+  // team id and the server instance id -- the sequence is never validated, so a
+  // server's value reaches the first progress line exactly as it was sent.
+  //
+  // The second page cannot be the case this pins, even though it looks like the
+  // better one. A malformed `next_after` would have to survive the driver first,
+  // and the real sqlite driver refuses a non-numeric `sync_pull_cursor`
+  // (sqlite-sync.sh:891-897, `return 13`) before the loop comes round again. A
+  // fixture built there is testing a path only a stubbed driver allows.
+  //
+  // The line matters because it is the one people paste when a pull is slow: an
+  // escape sequence in a pasted log is a terminal doing what the server's
+  // operator told it.
+  const ESC = String.fromCharCode(27);
+  const evil = `${ESC}[2Jwiped`;
+  const teamId = "018f3f7e-0000-7000-8000-000000000001";
+
+  const run = async (minAvailableSeq) => {
+    const err = [];
+    const realErr = process.stderr.write.bind(process.stderr);
+    const realOut = process.stdout.write.bind(process.stdout);
+    process.stderr.write = (chunk) => { err.push(String(chunk)); return true; };
+    process.stdout.write = () => true;
+    try {
+      await pullBootstrap({
+        team: "clone", "team-id": teamId, endpoint: "https://sync.example.test/t/agsy_X",
+      }, {
+        publicSnapshotCall: async () => ({
+          server_instance_id: "018f3f7e-0000-7000-8000-000000000002",
+          team_id: teamId, team_name: "source", min_available_seq: minAvailableSeq,
+        }),
+        requestPublicCall: async () => ({ messages: [], next_after: "9", has_more: false }),
+        evaluateCall: async () => ({ status: "importable" }),
+        driverCall: async () => [{ type: "sync_apply_result", transport_cursor: "9", corrupt_count: 0 }],
+        rosterDriverCall: async () => [],
+        eventCall: async () => {},
+      });
+    } finally {
+      process.stderr.write = realErr;
+      process.stdout.write = realOut;
+    }
+    return err.join("");
+  };
+
+  const bad = await run(evil);
+  assert.match(bad, /fetching messages after an unreadable cursor /);
+  assert.ok(!bad.includes(ESC), "no escape byte reaches stderr");
+  assert.ok(!bad.includes("wiped"), "and nothing that rode with it");
+
+  // The control on the replacement: a sequence prints as itself. Without this a
+  // guard that had decayed into printing the placeholder for everything would
+  // satisfy every assertion above -- redacting and erasing are not the same act.
+  const good = await run("41");
+  assert.match(good, /fetching messages after 41 /);
+  assert.ok(!good.includes("an unreadable cursor"), "a real sequence is not replaced");
+});
