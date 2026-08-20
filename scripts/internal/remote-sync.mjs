@@ -608,12 +608,76 @@ export function authorityFileFault(stats, { maxBytes, privateFile }) {
   // there -- and because it is the LAST thing consulted, no message above can
   // be about it. That ordering is the fix, not a detail of it.
   if (process.platform !== "win32" && (stats.mode & (privateFile ? 0o077 : 0o022)) !== 0) {
+    // The mode it HAS, not only the mode it may not have. An operator reading
+    // "must not be writable by group or others" cannot tell whether they are
+    // looking at 0664 or 0666 or a directory bit, and the two remedies differ.
+    // Printed the way `chmod` and `ls` speak, four digits, so it can be
+    // compared with what `stat` prints without arithmetic.
+    const mode = (stats.mode & 0o7777).toString(8).padStart(4, "0");
     return privateFile
-      ? "must not be readable or writable by group or others"
-      : "must not be writable by group or others";
+      ? `must not be readable or writable by group or others (it is ${mode})`
+      : `must not be writable by group or others (it is ${mode})`;
   }
   return null;
 }
+
+// The command that clears the fault above, or null when there is nothing to
+// type. Same conditions, same function pair, deliberately: the sentence and
+// the condition drifted apart once already (#781), and a remedy derived by
+// re-reading the SENTENCE would drift the same way the moment the wording
+// changes. This re-asks the stats.
+//
+// Only the permission fault has one. A symlink, a directory or an oversized
+// file are not fixed by a mode change, and offering `chmod` for them would send
+// someone to do the wrong thing confidently.
+//
+// `go-w` and `go-rwx` rather than `644` and `600`: the check is about the group
+// and other bits, so the remedy touches those and leaves the owner's alone. A
+// numeric mode would also silently strip a read bit the operator meant to keep.
+// A path as ONE shell argument, for a command someone is expected to paste and
+// run. Same scheme as scripts/lib/shquote.sh: wrap in single quotes and replace
+// each embedded ' with '\'' -- close the quote, emit an escaped literal quote,
+// reopen it.
+//
+// Not cosmetic. A team name is validated only against empty / `.` / `..` / `/`
+// / `\` / a leading `-` / control characters (lib/validate.sh), so a space and
+// a single quote are both legal in one, and the store lives under $HOME, which
+// is outside our control entirely. An unquoted path turns the remedy we printed
+// into a command that operates on a DIFFERENT file, or on several -- the worst
+// possible outcome for a line whose whole job is "run this and you are fixed".
+export function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+export function authorityFileRemedy(stats, { privateFile }) {
+  if (process.platform === "win32") return null;
+  if (stats.isSymbolicLink() || !stats.isFile()) return null;
+  if ((stats.mode & (privateFile ? 0o077 : 0o022)) === 0) return null;
+  return privateFile ? "chmod go-rwx" : "chmod go-w";
+}
+// One sentence, built in one place. `authorityFileFault` exists as a single
+// function because the wording and the condition drifted apart once (#781);
+// two call sites assembling the sentence around it is the same hazard one level
+// out. Measured: unquoting the path at only the checkpoint site left the whole
+// suite green, because nothing drove that site -- so the pin has to be on the
+// construction, not on each caller.
+//
+// The remedy goes last, so the sentence still reads as a diagnosis first. An
+// operator who already knows what to do stops at the path; one who does not
+// gets a line to paste, quoted, about the file that is actually wrong.
+export function authorityFileError(subject, path, stats, { maxBytes, privateFile }) {
+  // `maxBytes` is forwarded, not dropped. Omitting it made this return null for
+  // an oversized file whose caller had already decided there WAS a fault, and
+  // the caller then threw that null. The suite caught it; the lesson is that a
+  // wrapper around a predicate has to take every argument the predicate reads.
+  const fault = authorityFileFault(stats, { maxBytes, privateFile });
+  if (!fault) return null;
+  const remedy = authorityFileRemedy(stats, { privateFile });
+  return new Error(
+    `${subject} ${fault}: ${path}` +
+    (remedy ? ` — fix it with: ${remedy} ${shellQuote(path)}` : ""));
+}
+
 
 async function readBoundedAuthorityFile(path, maxBytes, privateFile) {
   const before = await lstat(path);
@@ -621,8 +685,9 @@ async function readBoundedAuthorityFile(path, maxBytes, privateFile) {
   if (fault) {
     // The path too: the previous message named a property without naming what
     // had it, on a machine that may hold several.
-    throw new Error(
-      `${privateFile ? "remote credential" : "connected team binding"} ${fault}: ${path}`);
+    throw authorityFileError(
+      privateFile ? "remote credential" : "connected team binding",
+      path, before, { maxBytes, privateFile });
   }
   const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {
@@ -1281,8 +1346,9 @@ function compareRetainedCheckpoint(config, retained) {
 
 async function readRetainedCheckpointFile(path) {
   const metadata = await lstat(path);
-  const fault = authorityFileFault(metadata, { privateFile: true });
-  if (fault) throw new Error(`retained age checkpoint ${fault}: ${path}`);
+  const checkpointFault = authorityFileError(
+    "retained age checkpoint", path, metadata, { privateFile: true });
+  if (checkpointFault) throw checkpointFault;
   const records = parseStrictJsonl(await readFile(path, "utf8"));
   if (records.length < 1 || records.length > 4096) {
     throw new Error("retained age checkpoint history is invalid");

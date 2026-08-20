@@ -973,3 +973,202 @@ CYG
   run cat "$SK/VERSION"
   [ "$output" = "$expected" ]
 }
+
+# #804, the upgrade half. test_binding_mode.bats covers the write side: join.sh
+# now writes 0600, so bindings created from here on are fine. These cover the
+# bindings that already exist. A machine that joined on v1.2.0-rc.5 has a 0664
+# binding on disk, and --update does not rewrite a file that is already there,
+# so without the store walk the upgrade we tell people to run leaves them exactly
+# as stuck as before -- having done what we asked.
+@test "install --update: clears group-write on a binding an older release left 0664 (#804)" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  bash "$SK/scripts/join.sh" upg alice claude-code /tmp/install-804-a
+
+  local cfg before after
+  cfg="$SK/teams/upg/config.json"
+  [ -f "$cfg" ]
+
+  # Put the file into the state the older release left, and prove it took --
+  # otherwise a chmod that silently did nothing would make the assertion below
+  # pass on a file that was never wrong.
+  chmod 0664 "$cfg"
+  before="$(file_mode "$cfg")"
+  [ "$before" = "664" ]
+
+  run env HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
+  [ "$status" -eq 0 ]
+
+  after="$(file_mode "$cfg")"
+  # It changed at all...
+  [ "$after" != "$before" ]
+  # ...and it changed into a mode the readers accept, stated the way they state
+  # it. Both halves: "something happened" is not "the right thing happened".
+  [ "$(( 8#$after & 8#0022 ))" -eq 0 ]
+
+  # And it said so. A permission change nobody can see is indistinguishable from
+  # one that did not happen, and this one runs without being asked for.
+  # `grep`, not `[[ ]]`: a non-last `[[ ]]` cannot fail under errexit on bash
+  # 3.2, so this one works only for as long as it stays the last line.
+  grep -Fq "$cfg" <<<"$output"
+}
+
+@test "install --update: leaves a binding the readers already accept alone (#804)" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  bash "$SK/scripts/join.sh" keep alice claude-code /tmp/install-804-b
+
+  local cfg before after
+  cfg="$SK/teams/keep/config.json"
+  [ -f "$cfg" ]
+
+  # 0600 is what join.sh writes. The point is not that 0600 survives but that
+  # the walk is a correction and not a normalisation: a blanket `chmod 0644`
+  # would pass the test above and quietly widen every binding on the machine.
+  chmod 0600 "$cfg"
+  before="$(file_mode "$cfg")"
+  [ "$before" = "600" ]
+
+  run env HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
+  [ "$status" -eq 0 ]
+
+  after="$(file_mode "$cfg")"
+  [ "$after" = "600" ]
+  # Nothing was announced about it either.
+  refute grep -Fq "$cfg" <<<"$output"
+}
+
+# The condition is two tests, not one: `find -perm -MODE` means ALL of the named
+# bits, so a single `-go+w` would skip a file writable by only one of them. Each
+# half needs its own row, or deleting either one stays green. 0664 is the
+# reported shape; this is the other.
+@test "install --update: clears other-write on a binding left 0646 (#804)" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  bash "$SK/scripts/join.sh" oth alice claude-code /tmp/install-804-c
+
+  local cfg before after
+  cfg="$SK/teams/oth/config.json"
+  [ -f "$cfg" ]
+
+  chmod 0646 "$cfg"
+  before="$(file_mode "$cfg")"
+  [ "$before" = "646" ]
+
+  run env HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
+  [ "$status" -eq 0 ]
+
+  after="$(file_mode "$cfg")"
+  [ "$after" != "$before" ]
+  [ "$(( 8#$after & 8#0022 ))" -eq 0 ]
+  grep -Fq "$cfg" <<<"$output"
+}
+
+# The engine refuses a symlink BEFORE it looks at the mode ("must not be a
+# symbolic link"), so a symlinked binding is not in the set this walk is for.
+# `[ -f ]` follows symlinks and so does `chmod`: the old shape would have
+# changed a file OUTSIDE the store and announced a repair that repaired nothing,
+# because the binding stays refused either way.
+@test "install --update: does not follow a symlinked binding to something outside the store (#804)" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  bash "$SK/scripts/join.sh" lnk alice claude-code /tmp/install-804-d
+
+  local cfg outside before after
+  cfg="$SK/teams/lnk/config.json"
+  outside="$FAKE_HOME/outside.json"
+
+  cp "$cfg" "$outside"
+  chmod 0664 "$outside"
+  rm -f "$cfg"
+  ln -s "$outside" "$cfg"
+
+  # A symlink's OWN mode decides whether a walk missing `-type f` would even
+  # select it, and that mode is not the same everywhere: Linux creates them
+  # 0777, macOS 0755. Without this the test passes on macOS for a reason that
+  # has nothing to do with the code -- the link is simply never selected -- and
+  # the platform where it does not hold is the platform CI mostly runs on.
+  # `chmod -h` sets the link itself on BSD; GNU chmod has no such flag and does
+  # not need one.
+  chmod -h go+w "$cfg" 2>/dev/null || true
+  local linkmode
+  linkmode="$(file_mode "$cfg")"
+  if [ "$(( 8#$linkmode & 8#0022 ))" -eq 0 ]; then
+    skip "symlinks here are $linkmode; a walk without -type f could not select one anyway"
+  fi
+
+  before="$(file_mode "$outside")"
+  [ "$before" = "664" ]
+
+  run env HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
+  [ "$status" -eq 0 ]
+
+  after="$(file_mode "$outside")"
+  # The file the symlink pointed at is untouched...
+  [ "$after" = "664" ]
+  # ...and nothing was claimed about it.
+  refute grep -Fq "$cfg" <<<"$output"
+  refute grep -Fq "$outside" <<<"$output"
+}
+
+# lib/validate.sh rejects `.` and `..` and allows `.anything`, so a team whose
+# name starts with a dot is a legal team with a real binding. A `teams/*/` glob
+# does not match it -- silently, which is the whole failure mode of this issue
+# repeated one level up.
+@test "install --update: corrects a binding under a dot-leading team name (#804)" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  bash "$SK/scripts/join.sh" .dotteam alice claude-code /tmp/install-804-e
+
+  local cfg before after
+  cfg="$SK/teams/.dotteam/config.json"
+  [ -f "$cfg" ]
+
+  chmod 0664 "$cfg"
+  before="$(file_mode "$cfg")"
+  [ "$before" = "664" ]
+
+  run env HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
+  [ "$status" -eq 0 ]
+
+  after="$(file_mode "$cfg")"
+  [ "$after" != "$before" ]
+  [ "$(( 8#$after & 8#0022 ))" -eq 0 ]
+}
+
+# The engine guards its mode check with `process.platform !== "win32"` and it is
+# the LAST thing it consults, so on Windows no binding is ever refused for its
+# mode. MSYS also reports modes the filesystem does not carry. Correcting there
+# would announce that the sync engine refuses a file the sync engine is happy
+# with -- on every update, on the one platform where that sentence cannot be
+# true.
+@test "install --update: does not touch or announce bindings on Windows (#804)" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  bash "$SK/scripts/join.sh" win alice claude-code /tmp/install-804-f
+
+  local cfg before after
+  cfg="$SK/teams/win/config.json"
+  chmod 0664 "$cfg" 2>/dev/null || true
+  before="$(file_mode "$cfg")"
+
+  run env HOME="$FAKE_HOME" AGMSG_FORCE_WINDOWS=1 bash "$REPO_ROOT/install.sh" --update
+  [ "$status" -eq 0 ]
+
+  # Nothing announced, and nothing changed. Both hold on every platform.
+  refute grep -Fq "tightened" <<<"$output"
+  after="$(file_mode "$cfg")"
+  [ "$after" = "$before" ]
+
+  # The rest only says something if the file was group- or other-writable to
+  # begin with, and on MSYS it cannot be: modes there are synthetic and
+  # `chmod 0664` does not take, which is how this row first went red on the
+  # Windows leg. Say where the boundary is instead of asserting through it --
+  # the guard itself is measured on POSIX, where AGMSG_FORCE_WINDOWS drives
+  # exactly the same branch with a mode that is real.
+  if [ "$(( 8#$before & 8#0022 ))" -eq 0 ]; then
+    # `return 0`, not `skip`. A skip after passing assertions still reports the
+    # row as skipped, so the two checks above -- which DID run and DID have to
+    # pass to get here -- are counted as unmeasured by every reader and tally.
+    # This ends the test normally and records the boundary in the output.
+    echo "boundary: modes are synthetic here (chmod 0664 left it $before);" \
+      "the 0664 premise is fixed on POSIX, where AGMSG_FORCE_WINDOWS drives" \
+      "the same branch with a real mode"
+    return 0
+  fi
+  [ "$before" = "664" ]
+}

@@ -13,6 +13,8 @@ import {
   ageSnapshotDigest,
   activateKeyRotations,
   authorityFileFault,
+  authorityFileRemedy,
+  shellQuote,
   describeChildExit,
   canonicalJson,
   consistentReadStateContext,
@@ -508,6 +510,137 @@ test("a file fault names the condition that failed, and permissions last", () =>
     assert.match(
       authorityFileFault(stats({ mode: 0o666 }), { maxBytes: 100 }),
       /must not be writable by group or others/u);
+
+    // The mode it HAS. #804: a machine that joined on an older version carries
+    // a 0664 config, upgrading does not rewrite it, and the operator was told
+    // which bits are forbidden without being told which ones are set.
+    assert.match(
+      authorityFileFault(stats({ mode: 0o664 }), { maxBytes: 100 }), /\(it is 0664\)/u);
+    assert.match(
+      authorityFileFault(stats({ mode: 0o666 }), { maxBytes: 100, privateFile: true }),
+      /\(it is 0666\)/u);
+    // Four digits, so it can be compared with `stat` output without arithmetic
+    // -- and so a setuid bit shows up rather than being masked away.
+    assert.match(
+      authorityFileFault(stats({ mode: 0o4664 }), { maxBytes: 100 }), /\(it is 4664\)/u);
+  }
+});
+
+test("the permission fault carries the command that clears it, and nothing else does", () => {
+  const stats = (over = {}) => ({
+    isSymbolicLink: () => false, isFile: () => true, size: 10, mode: 0o600, ...over,
+  });
+  if (process.platform === "win32") return;
+
+  // The two faults a mode change fixes, and the two different remedies. `go-w`
+  // for the binding and `go-rwx` for the credential: the checks differ, so the
+  // commands do.
+  assert.equal(authorityFileRemedy(stats({ mode: 0o664 }), {}), "chmod go-w");
+  assert.equal(
+    authorityFileRemedy(stats({ mode: 0o640 }), { privateFile: true }), "chmod go-rwx");
+
+  // Nothing to type. Offering `chmod` for these would send someone to do the
+  // wrong thing confidently, which is worse than saying less.
+  assert.equal(authorityFileRemedy(stats({ isSymbolicLink: () => true, mode: 0o666 }), {}), null);
+  assert.equal(authorityFileRemedy(stats({ isFile: () => false, mode: 0o666 }), {}), null);
+  // Already correct: no fault, so no remedy.
+  assert.equal(authorityFileRemedy(stats({ mode: 0o644 }), {}), null);
+  assert.equal(authorityFileRemedy(stats({ mode: 0o600 }), { privateFile: true }), null);
+
+  // The pair must agree. A remedy offered where there is no fault, or withheld
+  // where there is one, is the drift this function pair exists to prevent --
+  // the same drift #781 fixed between the sentence and the condition.
+  for (const mode of [0o600, 0o640, 0o644, 0o660, 0o664, 0o666, 0o700, 0o777]) {
+    for (const privateFile of [false, true]) {
+      const fault = authorityFileFault(stats({ mode }), { maxBytes: 100, privateFile });
+      const remedy = authorityFileRemedy(stats({ mode }), { privateFile });
+      assert.equal(
+        remedy !== null, fault !== null,
+        `mode 0${mode.toString(8)} privateFile=${privateFile}: fault=${fault} remedy=${remedy}`);
+    }
+  }
+});
+
+test("the remedy we print is a command that runs, on a path that fights back", async () => {
+  if (process.platform === "win32") return;
+
+  // THE PRODUCTION ENTRY, not the pieces beside it. An earlier version of this
+  // test built the command itself out of `authorityFileRemedy` and
+  // `shellQuote` -- which proves those two work and says nothing about whether
+  // the sentence production emits uses either. Deleting the `shellQuote` call
+  // from both throw sites left it green. This drives `loadConfig`, takes the
+  // message it actually throws, and cuts the command out of that.
+  //
+  // A team name may contain a space and a single quote -- lib/validate.sh
+  // rejects only empty, `.`, `..`, `/`, `\\`, a leading `-`, and control
+  // characters -- and the store sits under $HOME, which is outside our control
+  // entirely.
+  const root = await mkdtemp(join(tmpdir(), "agmsg-remedy-"));
+  const previousConnection = process.env.AGMSG_SYNC_CONNECTION_DIR;
+  const previousSkill = process.env.SKILL_DIR;
+  try {
+    const team = "a b's team";
+    const dir = join(root, "teams", team);
+    await mkdir(dir, { recursive: true });
+    const target = join(dir, "config.json");
+    const bystander = join(root, "bystander");
+    await writeFile(target, JSON.stringify({ local_team: team }));
+    await writeFile(bystander, "{}\n");
+    await chmod(target, 0o664);
+    await chmod(bystander, 0o664);
+
+    process.env.AGMSG_SYNC_CONNECTION_DIR = root;
+    delete process.env.SKILL_DIR;
+
+    // The premise: production refuses this file, and says so with a command.
+    // Without asserting it, a message that stopped offering one would leave the
+    // rest of this test skipping quietly.
+    let message = null;
+    await assert.rejects(() => loadConfig(team), (error) => {
+      message = error.message;
+      return true;
+    });
+    assert.match(message, /must not be writable by group or others \(it is 0664\)/u);
+    assert.ok(message.includes(" — fix it with: "), `no remedy offered: ${message}`);
+
+    const command = message.split(" — fix it with: ")[1];
+    const ran = spawnSync("sh", ["-c", command], { encoding: "utf8" });
+    assert.equal(ran.status, 0, `printed command failed: ${command}\n${ran.stderr}`);
+
+    const after = await stat(target);
+    // It changed, into a mode the engine accepts, stated the way it states it.
+    assert.notEqual(after.mode & 0o7777, 0o664);
+    assert.equal(after.mode & 0o022, 0);
+    assert.equal(authorityFileFault(after, { maxBytes: 100, privateFile: false }), null);
+    // And only it. Unquoted, the command would have split at the space and been
+    // about a different file, or about several.
+    assert.equal((await stat(bystander)).mode & 0o7777, 0o664);
+  } finally {
+    if (previousConnection === undefined) delete process.env.AGMSG_SYNC_CONNECTION_DIR;
+    else process.env.AGMSG_SYNC_CONNECTION_DIR = previousConnection;
+    if (previousSkill === undefined) delete process.env.SKILL_DIR;
+    else process.env.SKILL_DIR = previousSkill;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("shellQuote survives what the validator lets through", () => {
+  if (process.platform === "win32") return;
+
+  // Round-trip through a real shell rather than comparing to an expected
+  // string: the question is what the pasting shell does with it, and an
+  // expected-string assertion would only re-state the implementation.
+  for (const value of [
+    "/plain/path",
+    "/with a space/config.json",
+    "/with'a'quote/config.json",
+    "/both it's here/config.json",
+    "/$(touch pwned)/config.json",
+    "/back\\slash/config.json",
+  ]) {
+    const out = spawnSync("sh", ["-c", `printf %s ${shellQuote(value)}`], { encoding: "utf8" });
+    assert.equal(out.status, 0, `shell rejected ${shellQuote(value)}`);
+    assert.equal(out.stdout, value, `did not round-trip: ${value}`);
   }
 });
 
