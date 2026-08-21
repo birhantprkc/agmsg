@@ -1836,6 +1836,34 @@ export function discardInputDirectory(directory, reason) {
   }
 }
 
+// How long to wait for a driver that has stopped reading its stdin to exit on
+// its own before the pipe path's bound (the SIGKILL in runDriver's `fail`) is
+// applied. Derived from the storage busy timeout, since the only exit worth
+// waiting for is a busy child's, which comes that timeout after it starts
+// waiting; a few seconds of teardown slack past it.
+//
+// Bounded on BOTH ends. Below: a value that is not a sane non-negative integer
+// -- NaN, negative, or a huge one -- falls to the 5 s default. Above: the busy
+// timeout is capped at an hour before the slack is added, so the result can
+// never approach setTimeout's 32-bit millisecond limit. Past that limit Node
+// clamps a delay to 1 ms and would kill a busy child almost at once -- the
+// opposite of a grace -- so `Number.isSafeInteger` alone (which admits values
+// far past the timer limit) is not enough; the cap is what closes that.
+export function storageDriverExitGraceMs(busyTimeoutEnv = process.env.AGMSG_BUSY_TIMEOUT) {
+  // Empty is the 5 s default, exactly as the child reads it: storage.sh and the
+  // adapter use `${AGMSG_BUSY_TIMEOUT:-5000}`, where unset AND empty both mean
+  // 5000. Number("") is 0, not that default -- so an empty value taken literally
+  // would make the grace 5 s, equal to the child's busy timeout, and the SIGKILL
+  // would fire at the same moment a busy child exits 11, dropping it again. So
+  // normalise empty to the default before parsing, and keep this in step with
+  // the child's own default if that ever changes.
+  const raw = busyTimeoutEnv === undefined || busyTimeoutEnv === "" ? "5000" : busyTimeoutEnv;
+  const busyTimeoutMs = Number(raw);
+  const usable = Number.isSafeInteger(busyTimeoutMs) &&
+    busyTimeoutMs >= 0 && busyTimeoutMs <= 3_600_000 ? busyTimeoutMs : 5000;
+  return usable + 5000;
+}
+
 function runDriver({ args, label, operation, parse, input, rosterFile, team, bindingPath,
   holdsRegistryLock = false }) {
   return new Promise((resolve, reject) => {
@@ -1898,10 +1926,17 @@ function runDriver({ args, label, operation, parse, input, rosterFile, team, bin
     // later whether there was ever a pipe to write to.
     const staged = staging.fd !== null;
     let stdout = ""; let stderr = ""; let settled = false; let failure = null;
+    // The last stdin-write error, kept only so a child that exits 0 despite a
+    // broken write is not reported as a silent success. See the stdin handler.
+    let lastStdinError = null;
+    // Armed when a stdin write loses its reader, cleared when the call settles.
+    // See the stdin handler for what it bounds and why its length is what it is.
+    let stdinExitTimer = null;
 
     const settle = (error, value) => {
       if (settled) return;
       settled = true;
+      if (stdinExitTimer !== null) { clearTimeout(stdinExitTimer); stdinExitTimer = null; }
       releaseInput();
       if (error) reject(error); else resolve(value);
     };
@@ -1944,16 +1979,46 @@ function runDriver({ args, label, operation, parse, input, rosterFile, team, bin
     child.on("error", fail);
     // Only on the pipe path -- a staged input has no stdin stream to put this
     // on, and no write that could fail.
+    //
+    // A write to stdin that loses its reader is a SYMPTOM, not the verdict: the
+    // child exited before the whole input was sent and closing its read end
+    // turned the next write into EPIPE (on macOS -- socketpairs -- ENOTCONN or
+    // EPIPE depending on how far the write got; the errno set is not closed).
+    // The reason it exited is its exit code, and a busy `apply` exits 11 exactly
+    // here -- its page is larger than the pipe buffer, so it waits out the busy
+    // timeout and exits while the parent is still writing. Concluding
+    // "stdin-write failed" on the errno, ahead of the exit, is what masked that
+    // retryable 11 as an unrecoverable EPIPE and ended #910's reprocess.
+    //
+    // So stop writing and let 'exit' rule on the code. Keep the marker for
+    // diagnostics, but do not settle on it here: `failure` stays unset, so
+    // 'exit' reports the child's own answer.
+    //
+    // Not forever, though. This path keeps its pipe (the roster path stages, so
+    // it never has a lost-reader write), and the pipe path's bound against a
+    // child that stops reading AND does not exit is the SIGKILL in `fail` --
+    // written for exactly this, so "the process dies" is not traded for "the
+    // process cannot exit". Deferring to 'exit' must not drop that bound, so a
+    // timer keeps it: if no exit arrives, `fail` runs and kills, as before.
+    //
+    // Its length (storageDriverExitGraceMs) is not a tuning knob and not a wait
+    // the fast path ever feels: the only child worth waiting for is a busy one,
+    // which exits the busy timeout after it starts waiting, so any bound past
+    // that timeout catches every exit that is coming and delays only an
+    // already-broken child's failure.
+    //
+    // `settled` first, so nothing here runs after the call has ended -- a stdin
+    // error can arrive after 'exit' has already settled a non-zero exit, and
+    // without this it would arm a fresh timer past the cleared one.
     child.stdin?.on("error", (error) => {
-      // Where the failure came from, recorded at the boundary because the OS
-      // code cannot be asked for it: a write whose reader is gone is EPIPE on
-      // Linux, and on macOS -- socketpairs -- either ENOTCONN or EPIPE
-      // depending on how far the write got. That set is not closed, so nothing
-      // downstream can recognise this failure by errno without going stale on
-      // the next platform. The error is otherwise passed through untouched, so
-      // its code and message survive for diagnostics.
+      if (settled) return;
       error.driverFailurePhase = "stdin-write";
-      fail(error);
+      lastStdinError = error;
+      child.stdin.destroy();
+      if (stdinExitTimer === null) {
+        stdinExitTimer = setTimeout(() => fail(error), storageDriverExitGraceMs());
+        stdinExitTimer.unref?.();
+      }
     });
     // Every failure ends here, at 'exit'. A driver that merely exits non-zero is
     // the ordinary case and it needs this as much as a stream error does: it too
@@ -1962,6 +2027,10 @@ function runDriver({ args, label, operation, parse, input, rosterFile, team, bin
     // goes on to 'close', because only success has to parse all of stdout.
     child.on("exit", (code, signal) => {
       if (failure) { fail(failure); return; }
+      // A clean exit after a broken write is not a clean sync: the child cannot
+      // have read input the parent never finished sending, so a "success" here
+      // would be a sync of a truncated page. Report the write failure instead.
+      if (code === 0 && !signal && lastStdinError) { fail(lastStdinError); return; }
       if (code === 0 && !signal) return;
       // The team and the binding path, because the previous fallback said
       // "inspect its team storage and binding" and named neither -- on a
@@ -1983,6 +2052,13 @@ function runDriver({ args, label, operation, parse, input, rosterFile, team, bin
     });
     child.on("close", () => {
       if (failure) { settle(failure, null); return; }
+      // Order-independent with the exit above: whichever of them ran, a stdin
+      // write that lost its reader means the child cannot have received the
+      // whole page, so 'close' must not settle success on a truncated input --
+      // it fails closed on the recorded write error instead. The exit handler
+      // catches this when the exit is seen first; this catches the case where
+      // the write error was recorded only after a clean exit had returned.
+      if (lastStdinError) { settle(lastStdinError, null); return; }
       try {
         settle(null, parse(stdout));
       } catch (error) {
