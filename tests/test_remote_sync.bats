@@ -569,6 +569,115 @@ _reconcile_one_ack() {
     | storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1
 }
 
+# The #780 guard, on the ACK path. The existing "two JSON values on one line"
+# test drives `sync_pull_message`, so the same guard on reconcile was carried by
+# nothing: a second value on the line would emit a second full set of
+# assignments, `jq_ok` included, and the last one would win.
+@test "sync contract: reconcile refuses two JSON values on one ack line (#780)" {
+  _seed_legacy_history
+  prepare_push >/dev/null
+  local one two
+  one='{"type":"sync_push_ack","local_position":"1","id":"00000000-0000-4000-8000-000000000000","server_seq":"1","disposition":"stored"}'
+  # Second value hides a different position on the same line.
+  two='{"type":"sync_push_ack","local_position":"2","id":"00000000-0000-4000-8000-000000000001","server_seq":"2","disposition":"stored"}'
+  # Drive it in THIS shell, for the reason _reconcile_one_ack documents: a 127
+  # from an undefined function would look like the rejection being asserted.
+  run printf_two_acks_through_reconcile "$one" "$two"
+  [ "$status" -eq 13 ]
+}
+
+printf_two_acks_through_reconcile() {
+  printf '%s %s\n' "$1" "$2" | storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1
+}
+
+# `@sh` turns an ARRAY into a list of shell WORDS, so an array-typed field does
+# not merely slip past the whitelist -- it changes what `eval` is handed.
+# `"local_position": ["1","<name>"]` expands to `pos='1' '<name>'`, which is a
+# command-prefix assignment: it RUNS `<name>`, leaves `pos` holding the previous
+# line's value, and still reaches `jq_ok=1`, so the line is accepted.
+#
+# Two assertions, because "refused" and "did not execute" are different claims
+# and only one of them is about the exit status.
+@test "sync contract: an array-typed ack field is refused and does not execute (#780)" {
+  _seed_legacy_history
+  prepare_push >/dev/null
+  local marker shim good
+  marker="$BATS_TEST_TMPDIR/executed"
+  shim="$BATS_TEST_TMPDIR/bin"
+  mkdir -p "$shim"
+  printf '#!/bin/sh\ntouch %s\n' "$marker" > "$shim/agmsg-exec-probe"
+  chmod +x "$shim/agmsg-exec-probe"
+
+  # The probe must be runnable, or "it did not run" proves nothing.
+  PATH="$shim:$PATH" agmsg-exec-probe
+  [ -f "$marker" ]
+  rm -f "$marker"
+
+  good='{"type":"sync_push_ack","local_position":"1","id":"00000000-0000-4000-8000-000000000000","server_seq":"1","disposition":"stored"}'
+  run _reconcile_array_position "$good"
+  # Execution first: it is the more severe of the two claims, and asserting the
+  # exit status ahead of it would stop the test before this ever ran.
+  refute test -f "$marker"
+  [ "$status" -eq 13 ]
+}
+
+_reconcile_array_position() {
+  local bad
+  bad='{"type":"sync_push_ack","local_position":["1","agmsg-exec-probe"],"id":"00000000-0000-4000-8000-000000000001","server_seq":"2","disposition":"stored"}'
+  # PATH is exported for the WHOLE function, not prefixed to `printf`. A prefix
+  # assignment would scope it to the left side of the pipe, while the `eval` that
+  # could run the probe is on the right -- so the "did not execute" assertion
+  # would hold because the probe was unreachable, not because nothing ran it.
+  export PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+  printf '%s\n%s\n' "$1" "$bad" | storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1
+}
+
+# The sentinel, driven the only way that can fail. A single unparseable line is
+# caught anyway -- with no assignments the fields are empty and the position
+# whitelist refuses "" -- so the shape that separates a working sentinel from a
+# broken one is a GOOD line followed by a BAD one: without it the bad line
+# silently re-uses the good line's position, wire id and sequence, and is
+# counted a second time.
+@test "sync contract: an unparseable ack line does not inherit the previous line (#780)" {
+  _seed_legacy_history
+  prepare_push >/dev/null
+  local good
+  good='{"type":"sync_push_ack","local_position":"1","id":"00000000-0000-4000-8000-000000000000","server_seq":"1","disposition":"stored"}'
+  run _reconcile_good_then_garbage "$good"
+  [ "$status" -eq 13 ]
+}
+
+_reconcile_good_then_garbage() {
+  printf '%s\n{not json\n' "$1" | storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1
+}
+
+# The wire-id check stopped being a `grep -Eq '^[0-9a-f-]{36}$'` and became two
+# builtin `case` patterns. Same whitelist or not is the question, and `$wire`
+# goes straight into SQL, so it is asked with the shapes that separate the two:
+# right length wrong charset, right charset wrong length, and an injection that
+# is neither.
+@test "sync contract: an ack wire id stays a whitelist after the grep was removed" {
+  _seed_legacy_history
+  prepare_push >/dev/null
+  local bad
+  for bad in \
+    "00000000-0000-4000-8000-00000000000" \
+    "00000000-0000-4000-8000-0000000000000" \
+    "00000000-0000-4000-8000-00000000000g" \
+    "00000000-0000-4000-8000-00000000000'" \
+    "'; DROP TABLE sync_messages; --" \
+    "" \
+    "00000000-0000-4000-8000-0000000000 0"; do
+    run _reconcile_one_ack_wire "$bad"
+    [ "$status" -eq 13 ]
+  done
+}
+
+_reconcile_one_ack_wire() {
+  printf '{"type":"sync_push_ack","local_position":"1","id":"%s","server_seq":"1","disposition":"stored"}\n' \
+    "$1" | storage_sync_reconcile_push demo "$SERVER_ID" "$TEAM_ID" 1
+}
+
 @test "sync contract: an ack position stays a whitelist after allowing negatives" {
   # local_position is interpolated straight into SQL, so widening it to accept
   # projected (negative) positions must not widen it to anything else.
